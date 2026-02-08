@@ -1,0 +1,11 @@
+nvidia-dali-cuda120 --find-links https://pypi.nvidia.com
+torch --find-links https://download.pytorch.org/whl/cu128
+torchvision --find-links https://download.pytorch.org/whl/cu128
+huggingface_hub
+kornia
+numpy
+onnx
+onnxruntime-gpu
+opencv-python-headless
+tensorboard
+tqdm
