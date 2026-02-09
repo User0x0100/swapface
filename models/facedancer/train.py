@@ -39,7 +39,7 @@ class Trainer:
         batch_size: int = 12,
         lr: float = 1.1e-4,
         lr_scheduler_t_max: int = 0,
-        d_train_setp: int = 4,
+        d_train_setp: int = 3,
         bf16: bool = True,
         device: str = "cuda:0",
         compile_module: bool = True,
@@ -316,7 +316,7 @@ if __name__ == "__main__":
         ("/opt/share/deepfake/dataset_1/youtube/4k_Face_Close_Up_HDR_Video_Vivid_Colors_Ambient_Sound_-_Relaxing_align_results", 0.0),
         ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
     ]
-    trainer = Trainer(src, dst, weight="train_log/facedancer/ckpt/356019.pth")
+    trainer = Trainer(src, dst, weight="train_log/facedancer/ckpt/445039.pth")
 
     try:
         trainer.train()
