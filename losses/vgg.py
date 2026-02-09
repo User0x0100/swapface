@@ -141,6 +141,9 @@ class VGGFeatureExtractor(nn.Module):
 
         vgg_features: nn.Module = create_vgg_fn(weights=weights).features
 
+        vgg_features.eval()
+        vgg_features.requires_grad_(False)
+
         self.use_input_norm = use_input_norm
         if self.use_input_norm:
             self.register_buffer("mean", torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))

@@ -59,7 +59,7 @@ class ResidualUpBlock(nn.Module):
         self.conv_r = nn.Conv2d(in_ch, out_ch, 1)
         self.conv = nn.Conv2d(in_ch, out_ch, 3, padding=1)
 
-        self.norm = nn.InstanceNorm2d(in_ch, affine=True)
+        self.norm = nn.InstanceNorm2d(in_ch, affine=False)
         self.adain = AdaIN(in_ch, w_dim)
         self.act = nn.LeakyReLU(0.2)
 
@@ -108,7 +108,7 @@ class AdaptiveFeatureFusionUpBlock(nn.Module):
         self.attn = AdaptiveAttentionBlock(in_ch)
         self.conv_r = nn.Conv2d(in_ch, out_ch, 1)
 
-        self.norm = nn.InstanceNorm2d(in_ch, affine=True)
+        self.norm = nn.InstanceNorm2d(in_ch, affine=False)
         self.adain = AdaIN(in_ch, w_dim)
         self.act = nn.LeakyReLU(0.2)
         self.conv = nn.Conv2d(in_ch, out_ch, 3, padding=1)
@@ -138,7 +138,7 @@ class ConcatUpBlock(nn.Module):
         self.resample = resample
 
         self.conv_r = nn.Conv2d(in_ch * 2, out_ch, 1)
-        self.norm = nn.InstanceNorm2d(in_ch * 2, affine=True)
+        self.norm = nn.InstanceNorm2d(in_ch * 2, affine=False)
         self.adain = AdaIN(in_ch * 2, w_dim)
         self.act = nn.LeakyReLU(0.2)
         self.conv = nn.Conv2d(in_ch * 2, out_ch, 3, padding=1)

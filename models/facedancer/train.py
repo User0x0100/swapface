@@ -36,9 +36,10 @@ class Trainer:
         self,
         src: list[tuple[str, float]],
         dst: list[tuple[str, float]],
-        batch_size: int = 10,
-        lr: float = 1e-4,
+        batch_size: int = 12,
+        lr: float = 1.1e-4,
         lr_scheduler_t_max: int = 0,
+        d_train_setp: int = 4,
         bf16: bool = True,
         device: str = "cuda:0",
         compile_module: bool = True,
@@ -77,6 +78,7 @@ class Trainer:
     ):
         self.device = torch.device(device)
         self.batch_size = batch_size
+        self.d_train_setp = d_train_setp
 
         self.bf16 = bool(bf16 and torch.cuda.is_bf16_supported())
         if bf16 and not self.bf16:
@@ -102,7 +104,7 @@ class Trainer:
 
             self.net_g = Generator(input_res=self.size)
             self.net_d = Discriminator(input_res=self.size)
-            self.net_g.load_state_dict(weight["net_g"])
+            self.net_g.load_state_dict(weight["net_g"], strict=False)
             self.net_d.load_state_dict(weight["net_d"])
 
         else:
@@ -118,7 +120,7 @@ class Trainer:
 
         # ========================= Optim =========================
         self.optim_g = optim.Adam(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
-        self.optim_d = optim.Adam(self.net_d.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
+        self.optim_d = optim.Adam(self.net_d.parameters(), lr=lr * 0.97, betas=(0.0, 0.99), fused=True)
 
         if self.enable_lr_scheduler:
             self.lr_scheduler_g = CosineAnnealingLR(self.optim_g, T_max=lr_scheduler_t_max, eta_min=lr * 0.1)
@@ -167,7 +169,7 @@ class Trainer:
 
         for net_name in ["net_g", "net_d"]:
             net: nn.Module = getattr(self, net_name)
-            self.train_module[net_name] = torch.compile(net, fullgraph=True, dynamic=False, options={"epilogue_fusion": True, "max_autotune": True}) if compile_module else net
+            self.train_module[net_name] = torch.compile(net, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True}) if compile_module else net
 
     @torch.no_grad()
     def log(self, k: str, v: Tensor) -> None:
@@ -214,28 +216,26 @@ class Trainer:
                 fake: Tensor = net_g(dst, src_id_feats)
 
                 # ========================= train d =========================
-                self.optim_d.zero_grad()
+                if self.iter % self.d_train_setp == 0:
+                    self.optim_d.zero_grad()
 
-                is_r1_reg_setp = self.iter % 16 == 0
+                    real_img = dst.detach()
+                    real_img.requires_grad_(True)
 
-                real_img = dst.detach()
-                real_img.requires_grad_(is_r1_reg_setp)
+                    fake_score: Tensor = net_d(fake.detach())
+                    real_score: Tensor = net_d(real_img)
 
-                fake_score: Tensor = net_d(fake.detach())
-                real_score: Tensor = net_d(real_img)
+                    d_loss: Tensor = self.d_loss(fake_score, real_score)
+                    self.log("d_loss", d_loss)
 
-                d_loss: Tensor = self.d_loss(fake_score, real_score)
-                self.log("d_loss", d_loss)
-
-                if is_r1_reg_setp:
                     r1_loss = r1_reg_loss(real_score, real_img)
                     self.log("r1_loss", r1_loss)
                     d_loss += r1_loss
 
-            d_loss.backward()
-            self.optim_d.step()
+                    with autocast(device_type="cuda", enabled=False):
+                        d_loss.backward()
+                        self.optim_d.step()
 
-            with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
                 # ========================= train g =========================
                 self.optim_g.zero_grad()
                 loss: Tensor
@@ -316,7 +316,7 @@ if __name__ == "__main__":
         ("/opt/share/deepfake/dataset_1/youtube/4k_Face_Close_Up_HDR_Video_Vivid_Colors_Ambient_Sound_-_Relaxing_align_results", 0.0),
         ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
     ]
-    trainer = Trainer(src, dst, log_path="train_log/sss", sample_save_every=100)
+    trainer = Trainer(src, dst, weight="train_log/facedancer/ckpt/356019.pth")
 
     try:
         trainer.train()

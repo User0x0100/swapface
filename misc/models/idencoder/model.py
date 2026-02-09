@@ -68,8 +68,8 @@ class IDEncoder(nn.Module):
         weight = torch.load(weight, weights_only=True, map_location=torch.device("cpu"))
         self.backbone.load_state_dict(weight)
 
-        self.eval()
-        self.requires_grad_(False)
+        self.backbone.eval()
+        self.backbone.requires_grad_(False)
 
     def forward(self, x: Tensor) -> Tensor:
         """前向传播
