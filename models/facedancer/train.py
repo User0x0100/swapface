@@ -2,20 +2,19 @@ import itertools
 from pathlib import Path
 from typing import Any
 
+from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 import cv2
 import torch
 from torch import optim, nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 from torch import Tensor
 from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
 from torchvision.utils import make_grid
+from tqdm import tqdm
 
-from losses import IDLoss, l1_loss_fn, PerceptualLoss, DLoss, GANLoss, IFSRLoss
-
+from losses import IDLoss, l1_loss_fn, PerceptualLoss, DLoss, GANLoss, IFSRLoss, r1_reg_loss
 
 from .dataloader import datasetloader
 from .networks.generator import Generator
@@ -24,24 +23,12 @@ from .networks.discriminator import Discriminator
 
 EPS = 1e-6
 
+assert torch.cuda.is_available(), "仅支持使用NVIDIA显卡训练"
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
-
-
-def ifsr_loss_func(bs: int, src_ifsr_feats: dict[str, Tensor], dst_ifsr_feats: dict[str, Tensor], ifsr_dict: dict[str, float]):
-    loss = 0.0
-    for layer_name, margin in ifsr_dict.items():
-
-        feat_true_flat = src_ifsr_feats[layer_name].reshape(bs, -1)
-        feat_pred_flat = dst_ifsr_feats[layer_name].reshape(bs, -1)
-        distance = (1.0 - F.cosine_similarity(feat_true_flat, feat_pred_flat, dim=1)).mean()
-
-        d_loss = F.relu(distance - margin)
-        loss += d_loss
-
-    return loss
 
 
 class Trainer:
@@ -56,14 +43,15 @@ class Trainer:
         device: str = "cuda:0",
         compile_module: bool = True,
         weight: str | None = None,
-        log_path: str = "log_dfm/train_facedancer",
+        log_path: str = "train_log/facedancer",
+        log_interval: int = 10,
         sample_save_every: int = 1000,
         weight_save_every: int = 10000,
         # 模型配置
         size: int = 256,
         # 损失配置
         ifsr_scale: float = 1.2,
-        ifsr_dict: dict[str, float] = {
+        ifsr_dict: dict[str, tuple[float, float]] = {
             "layer3.5": (0.121357, 1.0),
             "layer3.4": (0.128827, 1.0),
             "layer3.3": (0.117972, 1.0),
@@ -89,15 +77,14 @@ class Trainer:
     ):
         self.device = torch.device(device)
         self.batch_size = batch_size
-        if bf16:
-            if torch.cuda.is_bf16_supported():
-                self.bf16 = True
-            else:
-                print("Warning: 当前显卡不支持BF16")
-                self.bf16 = False
+
+        self.bf16 = bool(bf16 and torch.cuda.is_bf16_supported())
+        if bf16 and not self.bf16:
+            print("Warning: 当前显卡不支持 BF16")
 
         self.sample_save_every = sample_save_every
         self.weight_save_every = weight_save_every
+        self.log_interval = log_interval
         self.enable_lr_scheduler = lr_scheduler_t_max > 0
 
         # ========================= Init Model =========================
@@ -152,18 +139,18 @@ class Trainer:
         base_log_path = Path(log_path)
         self.ckpt_dir = base_log_path.joinpath("ckpt")
         self.sample_dir = base_log_path.joinpath("sample")
-        self.tb_log_dir = base_log_path.joinpath("tb_log")
+        self.tensorboard_dir = base_log_path.joinpath("tensorboard")
 
-        for p in [self.ckpt_dir, self.sample_dir, self.tb_log_dir]:
+        for p in [self.ckpt_dir, self.sample_dir, self.tensorboard_dir]:
             p.mkdir(exist_ok=True, parents=True)
 
-        self.log_writer = SummaryWriter(log_dir=self.tb_log_dir)
+        self.log_writer = SummaryWriter(self.tensorboard_dir)
 
         # ========================= Sample =========================
         pipe = datasetloader(
             batch_size=self.batch_size,
-            num_threads=16,
-            prefetch_queue_depth=2,
+            num_threads=8,
+            prefetch_queue_depth=10,
             py_num_workers=1,
             py_start_method="spawn",
             device_id=self.device.index,
@@ -176,7 +163,6 @@ class Trainer:
         self.dataset = DALIGenericIterator(pipelines=pipe, output_map=["src", "dst", "is_same"], auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
 
         # ========================= compile_module =========================
-
         self.train_module: dict[str, nn.Module] = {}
 
         for net_name in ["net_g", "net_d"]:
@@ -184,15 +170,16 @@ class Trainer:
             self.train_module[net_name] = torch.compile(net, fullgraph=True, dynamic=False, options={"epilogue_fusion": True, "max_autotune": True}) if compile_module else net
 
     @torch.no_grad()
-    def log(self, k: str, v: Tensor, now: bool = False) -> None:
-        if now or self.iter % 10 == 0:
+    def log(self, k: str, v: Tensor) -> None:
+        if self.iter % self.log_interval == 0:
             self.log_writer.add_scalar(f"Loss/{k}", v.detach().mean().item(), self.iter)
 
     @torch.no_grad()
     def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor]:
         data: dict[str, Tensor] = self.dataset.next()[0]
         src, dst, is_same = (data[k] for k in ("src", "dst", "is_same"))
-        is_same = is_same.squeeze(-1)
+        is_same = is_same.squeeze_(-1)
+
         return src, dst, is_same
 
     @torch.no_grad()
@@ -216,47 +203,48 @@ class Trainer:
 
         for self.iter in pbar:
             src, dst, is_same = self.fetch_sample()
-            continue
+
+            torch.compiler.cudagraph_mark_step_begin()
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
 
                 with torch.inference_mode():
                     src_id_feats = self.id_loss.get_id_feats(src)
                     dst_ifsr_feats = self.ifsr_loss.get_ifsr_feats(dst)
 
-                torch.compiler.cudagraph_mark_step_begin()
                 fake: Tensor = net_g(dst, src_id_feats)
 
                 # ========================= train d =========================
                 self.optim_d.zero_grad()
 
-                dst_d = dst.detach().requires_grad_(True)
+                is_r1_reg_setp = self.iter % 16 == 0
+
+                real_img = dst.detach()
+                real_img.requires_grad_(is_r1_reg_setp)
 
                 fake_score: Tensor = net_d(fake.detach())
-                real_score: Tensor = net_d(dst_d)
+                real_score: Tensor = net_d(real_img)
 
                 d_loss: Tensor = self.d_loss(fake_score, real_score)
                 self.log("d_loss", d_loss)
 
-                real_grads = torch.autograd.grad(outputs=real_score.sum(), inputs=dst_d, create_graph=True, retain_graph=True, only_inputs=True)[0]
-                gp = real_grads.pow(2).sum(dim=(1, 2, 3))
-                gp_loss = (gp * (10.0 * 0.5)).mean()
+                if is_r1_reg_setp:
+                    r1_loss = r1_reg_loss(real_score, real_img)
+                    self.log("r1_loss", r1_loss)
+                    d_loss += r1_loss
 
-                d_loss += gp_loss
+            d_loss.backward()
+            self.optim_d.step()
 
-                d_loss.backward()
-                self.optim_d.step()
-
+            with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
                 # ========================= train g =========================
                 self.optim_g.zero_grad()
-
-                loss: float | Tensor
-                loss = 0.0
+                loss: Tensor
 
                 # loss gan
                 fake_score = net_d(fake)
                 gan_loss = self.gan_loss(fake_score)
                 self.log("gan_loss", gan_loss)
-                loss += gan_loss
+                loss = gan_loss
 
                 # loss id
                 fake_id_feats = self.id_loss.get_id_feats(fake)
@@ -276,24 +264,24 @@ class Trainer:
                 loss += vgg19_loss
 
                 # loss rec
-                rec_loss: Tensor = self.rec_loss(fake, dst)  # BCHW
+                rec_loss = self.rec_loss(fake, dst)  # BCHW
                 rec_loss = rec_loss.mean(dim=[1, 2, 3])
                 rec_loss = (rec_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
                 self.log("rec_loss", rec_loss)
                 loss += rec_loss
 
-                loss.backward()
-                self.optim_g.step()
+            loss.backward()
+            self.optim_g.step()
 
-                if self.enable_lr_scheduler:
-                    self.lr_scheduler_g.step()
-                    self.lr_scheduler_d.step()
+            if self.enable_lr_scheduler:
+                self.lr_scheduler_g.step()
+                self.lr_scheduler_d.step()
 
             if self.iter % self.weight_save_every == 0:
                 self.save_state_dict()
 
             if self.iter % self.sample_save_every == 0:
-                with torch.no_grad():
+                with torch.inference_mode():
                     attn_map: list[Tensor] = self.net_g.get_attention_maps()
 
                     maps = []
@@ -316,13 +304,19 @@ class Trainer:
 
 if __name__ == "__main__":
     src = [
-        ("/mnt/c/Users/Developer/Desktop/StyleSwap_data/dataset/FFHQ_1024x1024/", 0.0),
+        ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
+        ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
     ]
 
     dst = [
-        ("/mnt/c/Users/Developer/Desktop/StyleSwap_data/dataset/FFHQ_1024x1024/", 0.0),
+        ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
+        ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
+        ("/opt/share/deepfake/dataset_1/RealOcc/image/realign_arcface_dst", 2.0),
+        ("/opt/share/deepfake/dataset_1/youtube/What_s_considered_tall_in_South_Korea_Street_Interview_align_results", 0.0),
+        ("/opt/share/deepfake/dataset_1/youtube/4k_Face_Close_Up_HDR_Video_Vivid_Colors_Ambient_Sound_-_Relaxing_align_results", 0.0),
+        ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
     ]
-    trainer = Trainer(src, dst, log_path="log_dfm/train_facedancer_BLENDFACE_512", size=128, batch_size=10)
+    trainer = Trainer(src, dst, log_path="train_log/sss", sample_save_every=100)
 
     try:
         trainer.train()

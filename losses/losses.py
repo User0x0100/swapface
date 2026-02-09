@@ -1,7 +1,7 @@
 from typing import Literal
 import torch
 import torch.nn.functional as F
-from torch import Tensor, nn
+from torch import Tensor, nn, autocast
 from kornia.color import rgb_to_lab
 from typing import Literal, Callable
 
@@ -47,7 +47,7 @@ def bce_loss_fn(weight: float = 1, reduction: Literal["none", "mean", "sum"] = "
     f = create_weighted_loss(F.binary_cross_entropy, weight, reduction)
 
     def disable_amp(*args, **kwargs):
-        with torch.autocast(device_type="cuda", enabled=False):
+        with autocast(device_type="cuda", enabled=False):
             return f(*args, **kwargs)
 
     return disable_amp
@@ -199,6 +199,13 @@ class StyleLossLabChroma(nn.Module):
         return self._style_loss_mean_std(pred_ab, target_ab, self.weight)
 
 
+@autocast(device_type="cuda", enabled=False)
+def r1_reg_loss(real_score: Tensor, real_img: Tensor, gamma: float = 10.0) -> Tensor:
+    real_grads = torch.autograd.grad(outputs=real_score.sum(), inputs=real_img, create_graph=True, retain_graph=True, only_inputs=True)[0]
+    penalty = real_grads.square().sum(dim=(1, 2, 3))
+    return 0.5 * gamma * penalty.mean()
+
+
 class DLoss(nn.Module):
     def __init__(self, loss_type: Literal["hinge", "wgan", "ls", "bce"] = "hinge", weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "none"):
         super().__init__()
@@ -303,7 +310,7 @@ class IDLoss(nn.Module):
         return self.idencoder(face)
 
     def forward(self, fake_id: Tensor, real_id: Tensor) -> Tensor:
-        loss = 1.0 - F.cosine_similarity(fake_id, real_id) * self.weight
+        loss = (1.0 - F.cosine_similarity(fake_id, real_id)) * self.weight
 
         match self.reduction:
             case "none":

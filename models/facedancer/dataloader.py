@@ -116,10 +116,7 @@ def datasetloader(
 
     src_raw, dst_raw = external_source
 
-    dst = fn.decoders.image(dst_raw, device="cpu", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
-
-    dst = fn.copy(dst, device="gpu")
-
+    dst = fn.decoders.image(dst_raw, device="mixed", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
     dst = fn.resize(dst, device="gpu", size=resize, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
 
     if fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.BOOL):
@@ -142,8 +139,7 @@ def datasetloader(
         src = dst
     else:
         is_same = Constant(value=0.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])
-        src = fn.decoders.image(src_raw, device="cpu", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
-        src = fn.copy(src, device="gpu")
+        src = fn.decoders.image(src_raw, device="mixed", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
         src = fn.resize(src, device="gpu", size=resize, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
         if fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.BOOL):
             src = fn.flip(src, device="gpu")

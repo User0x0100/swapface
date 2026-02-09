@@ -1,6 +1,9 @@
-nvidia-dali-cuda120 --find-links https://pypi.nvidia.com
-torch --find-links https://download.pytorch.org/whl/cu128
-torchvision --find-links https://download.pytorch.org/whl/cu128
+# --find-links https://pypi.nvidia.com
+# --find-links https://download.pytorch.org/whl/cu128
+
+nvidia-dali-cuda120
+torch
+torchvision
 huggingface_hub
 kornia
 numpy
