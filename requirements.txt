@@ -8,6 +8,8 @@ huggingface_hub
 kornia
 numpy
 onnx
+onnxscript
+pyinstrument
 onnxruntime-gpu
 opencv-python-headless
 tensorboard

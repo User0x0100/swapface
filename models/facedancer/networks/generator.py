@@ -1,25 +1,87 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
-import torch.nn.functional as F
+
+
+def get_act() -> nn.Module:
+    # act = nn.LeakyReLU(0.2)
+    act = nn.SiLU()
+    return act
+
+
+BASE_CH = 64
+MAX_CH = 512
 
 
 class AdaIN(nn.Module):
     def __init__(self, num_channels: int, w_dim: int) -> None:
         super().__init__()
 
+        self.norm = nn.InstanceNorm2d(num_channels, affine=False)
+
         self.fc_gamma = nn.Linear(w_dim, num_channels)
         self.fc_beta = nn.Linear(w_dim, num_channels)
 
         nn.init.xavier_uniform_(self.fc_gamma.weight)
         nn.init.xavier_uniform_(self.fc_beta.weight)
+        nn.init.zeros_(self.fc_gamma.bias)
+        nn.init.zeros_(self.fc_beta.bias)
 
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
+
+        x = self.norm(x)
+
         gamma: Tensor = self.fc_gamma(w)
         beta: Tensor = self.fc_beta(w)
         gamma = gamma.unsqueeze(-1).unsqueeze(-1)
         beta = beta.unsqueeze(-1).unsqueeze(-1)
-        return gamma * x + beta
+
+        
+
+        return x * (gamma + 1.0) + beta
+
+
+class ResidualDownBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, resample: bool = True) -> None:
+        super().__init__()
+
+        self.residual = nn.Sequential(
+            nn.InstanceNorm2d(in_ch, affine=True),
+            get_act(),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            *([nn.AvgPool2d(2)] if resample else []),
+        )
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 1),
+            *([nn.AvgPool2d(2)] if resample else []),
+        )
+
+    def forward(self, x: Tensor):
+        return self.residual(x) + self.shortcut(x)
+
+
+class ResidualUpBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample: bool = True) -> None:
+        super().__init__()
+
+        self.adain = AdaIN(in_ch, w_dim)
+        self.residual = nn.Sequential(
+            get_act(),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            *([nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)] if resample else []),
+        )
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 1),
+            *([nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)] if resample else []),
+        )
+
+    def forward(self, x: Tensor, w: Tensor) -> Tensor:
+        skip = self.shortcut(x)
+
+        x = self.adain(x, w)
+        x = self.residual(x)
+
+        return x + skip
 
 
 class AdaptiveAttention(nn.Module):
@@ -27,108 +89,62 @@ class AdaptiveAttention(nn.Module):
         return (1.0 - m) * a + m * i
 
 
-class ResidualDownBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, resample: bool = True) -> None:
-        super().__init__()
-
-        self.conv_r = nn.Conv2d(in_ch, out_ch, 1)
-        if resample:
-            self.conv_r = nn.Sequential(self.conv_r, nn.AvgPool2d(2))
-
-        self.main_path = nn.Sequential(
-            nn.InstanceNorm2d(in_ch, affine=True),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-        )
-
-        if resample:
-            self.main_path.add_module("avgpool", nn.AvgPool2d(2))
-
-    def forward(self, x: Tensor):
-        r = self.conv_r(x)
-        x = self.main_path(x)
-        return x + r
-
-
-class ResidualUpBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample: bool = True) -> None:
-        super().__init__()
-
-        self.resample = resample
-
-        self.conv_r = nn.Conv2d(in_ch, out_ch, 1)
-        self.conv = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-
-        self.norm = nn.InstanceNorm2d(in_ch, affine=False)
-        self.adain = AdaIN(in_ch, w_dim)
-        self.act = nn.LeakyReLU(0.2)
-
-    def forward(self, x: Tensor, w: Tensor) -> Tensor:
-        r = self.conv_r(x)
-        if self.resample:
-            r = F.interpolate(r, scale_factor=2, mode="bilinear", align_corners=False)
-
-        x = self.norm(x)
-        x = self.adain(x, w)
-        x = self.act(x)
-        x = self.conv(x)
-
-        if self.resample:
-            x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-
-        return x + r
-
-
 class AdaptiveAttentionBlock(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(channels * 2, channels // 4, 3, padding=1)
-        self.conv2 = nn.Conv2d(channels // 4, channels, 1)
-        self.norm = nn.InstanceNorm2d(channels // 4, affine=True)
-        self.act = nn.LeakyReLU(0.2)
+
+        self.attn_mask_proj = nn.Sequential(
+            nn.Conv2d(channels * 2, channels // 4, 3, padding=1),
+            get_act(),
+            nn.InstanceNorm2d(channels // 4, affine=True),
+            nn.Conv2d(channels // 4, channels, 1),
+            nn.Sigmoid(),
+        )
+
         self.attn = AdaptiveAttention()
-        self.last_attention_mask = None
+        self.last_attn_mask = None
 
     def forward(self, x_t: Tensor, x_s: Tensor) -> Tensor:
+
+        m: Tensor
+
         m = torch.cat([x_t, x_s], dim=1)
-        m = self.conv1(m)
-        m = self.act(m)
-        m = self.norm(m)
-        m = torch.sigmoid(self.conv2(m))
-        self.last_attention_mask = m.detach().requires_grad_(False)
-        return self.attn(m, x_t, x_s)
+
+        m = self.attn_mask_proj(m)
+
+        self.last_attn_mask = m.detach().requires_grad_(False)
+
+        m = self.attn(m, x_t, x_s)
+
+        return m
 
 
 class AdaptiveFeatureFusionUpBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample: bool = True) -> None:
         super().__init__()
 
-        self.resample = resample
+        self.adain = AdaIN(in_ch, w_dim)
+        self.residual = nn.Sequential(
+            get_act(),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            *([nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)] if resample else []),
+        )
 
         self.attn = AdaptiveAttentionBlock(in_ch)
-        self.conv_r = nn.Conv2d(in_ch, out_ch, 1)
-
-        self.norm = nn.InstanceNorm2d(in_ch, affine=False)
-        self.adain = AdaIN(in_ch, w_dim)
-        self.act = nn.LeakyReLU(0.2)
-        self.conv = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 1),
+            *([nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)] if resample else []),
+        )
 
     def forward(self, x_t: Tensor, x_s: Tensor, w: Tensor) -> Tensor:
         x = self.attn(x_t, x_s)
 
-        r = self.conv_r(x)
-        if self.resample:
-            r = F.interpolate(r, scale_factor=2, mode="bilinear", align_corners=False)
+        skip = self.shortcut(x)
 
-        x = self.norm(x)
         x = self.adain(x, w)
-        x = self.act(x)
-        x = self.conv(x)
+        x = self.residual(x)
 
-        if self.resample:
-            x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-
-        return x + r
+        return x + skip
 
 
 class ConcatUpBlock(nn.Module):
@@ -137,47 +153,42 @@ class ConcatUpBlock(nn.Module):
 
         self.resample = resample
 
-        self.conv_r = nn.Conv2d(in_ch * 2, out_ch, 1)
-        self.norm = nn.InstanceNorm2d(in_ch * 2, affine=False)
         self.adain = AdaIN(in_ch * 2, w_dim)
-        self.act = nn.LeakyReLU(0.2)
-        self.conv = nn.Conv2d(in_ch * 2, out_ch, 3, padding=1)
+        self.residual = nn.Sequential(
+            get_act(),
+            nn.Conv2d(in_ch * 2, out_ch, 3, padding=1),
+            *([nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)] if resample else []),
+        )
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(in_ch * 2, out_ch, 1),
+            *([nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)] if resample else []),
+        )
 
     def forward(self, x_t: Tensor, x_s: Tensor, w: Tensor) -> Tensor:
         x = torch.cat([x_t, x_s], dim=1)
 
-        r = self.conv_r(x)
-        if self.resample:
-            r = F.interpolate(r, scale_factor=2, mode="bilinear", align_corners=False)
+        skip = self.shortcut(x)
 
-        x = self.norm(x)
         x = self.adain(x, w)
-        x = self.act(x)
-        x = self.conv(x)
+        x = self.residual(x)
 
-        if self.resample:
-            x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-
-        return x + r
+        return x + skip
 
 
 class Generator(nn.Module):
     def __init__(self, input_res: int = 256, bottleneck_res: int = 8, mapping_depth: int = 4, mapping_size: int = 512, z_dim: int = 512) -> None:
         super().__init__()
 
-        base_ch = 64
-        max_ch = 512
-
         self.mapping = self._build_mapping(z_dim, mapping_depth, mapping_size)
 
-        self.conv_in = nn.Conv2d(3, base_ch, 3, padding=1)
+        self.conv_in = nn.Conv2d(3, BASE_CH, 3, padding=1)
 
         num_down = int(torch.log2(torch.tensor(input_res // bottleneck_res)))
         self.down = nn.ModuleList()
         ch_pairs = []
-        down_in_ch = base_ch
+        down_in_ch = BASE_CH
         for _ in range(num_down):
-            down_out_ch = min(down_in_ch * 2, max_ch)
+            down_out_ch = min(down_in_ch * 2, MAX_CH)
             ch_pairs.append((down_in_ch, down_out_ch))
             self.down.append(ResidualDownBlock(down_in_ch, down_out_ch, resample=True))
             down_in_ch = down_out_ch
@@ -202,7 +213,7 @@ class Generator(nn.Module):
         layers = []
         current_dim = z_dim
         for _ in range(max(depth - 1, 0)):
-            layers += [nn.Linear(current_dim, output_dim), nn.LeakyReLU(0.2)]
+            layers += [nn.Linear(current_dim, output_dim), get_act()]
             current_dim = output_dim
 
         if depth >= 1:
@@ -214,8 +225,7 @@ class Generator(nn.Module):
         attention_maps = []
         for module in self.up:
             if isinstance(module, AdaptiveFeatureFusionUpBlock):
-                if hasattr(module.attn, "last_attention_mask") and module.attn.last_attention_mask is not None:
-                    attention_maps.append(module.attn.last_attention_mask)
+                attention_maps.append(module.attn.last_attn_mask)
         return attention_maps
 
     def forward(self, x_target: Tensor, z_source: Tensor) -> Tensor:
