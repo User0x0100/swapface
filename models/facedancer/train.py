@@ -36,14 +36,14 @@ class Trainer:
         self,
         src: list[tuple[str, float]],
         dst: list[tuple[str, float]],
-        batch_size: int = 12,
-        lr: float = 1.1e-4,
+        batch_size: int = 10,
+        lr: float = 1e-4,
         lr_scheduler_t_max: int = 0,
         d_train_setp: int = 3,
         bf16: bool = True,
         device: str = "cuda:0",
         compile_module: bool = True,
-        weight: str | None = None,
+        ckpt: str | None = None,
         log_path: str = "train_log/facedancer",
         log_interval: int = 10,
         sample_save_every: int = 1000,
@@ -91,21 +91,29 @@ class Trainer:
 
         # ========================= Init Model =========================
 
-        if weight is not None:
-            if Path(weight).exists() == False:
-                raise FileNotFoundError(f"Weight file: {weight} Not found")
+        if ckpt is not None:
+            if Path(ckpt).exists() == False:
+                raise FileNotFoundError(f"ckpt file: {ckpt} Not found")
 
-            print(f"Loading weight from {weight}")
-            weight: dict[str, Any] = torch.load(weight, map_location=torch.device("cpu"), weights_only=False)
+            print(f"Loading ckpt from {ckpt}")
+            ckpt: dict[str, Any] = torch.load(ckpt, map_location=torch.device("cpu"), weights_only=False)
 
-            self.iter, self.size = (weight[k] for k in ("iter", "size"))
+            self.iter = ckpt["iter"]
 
-            print(f"Weight Info:\n" f"  {'iter':25}: {self.iter}\n" f"  {'size':25}: {self.size}\n")
+            print(f"ckpt Info:\n" f"  {'iter':25}: {self.iter}")
+            print("net_g:")
+            for k, v in ckpt["net_g"]["network_cfg"].items():
+                print(f"  {k:25}: {v}")
+            print("net_d:")
+            for k, v in ckpt["net_d"]["network_cfg"].items():
+                print(f"  {k:25}: {v}")
 
-            self.net_g = Generator(input_res=self.size)
-            self.net_d = Discriminator(input_res=self.size)
-            self.net_g.load_state_dict(weight["net_g"], strict=False)
-            self.net_d.load_state_dict(weight["net_d"])
+            self.size = ckpt["net_g"]["network_cfg"]["input_res"]
+
+            self.net_g = Generator(**ckpt["net_g"]["network_cfg"])
+            self.net_d = Discriminator(**ckpt["net_d"]["network_cfg"])
+            self.net_g.load_state_dict(ckpt["net_g"]["state_dict"])
+            self.net_d.load_state_dict(ckpt["net_d"]["state_dict"])
 
         else:
 
@@ -185,18 +193,28 @@ class Trainer:
         return src, dst, is_same
 
     @torch.no_grad()
-    def save_state_dict(self):
+    def save_ckpt(self):
+
+        net_g = {
+            "network_cfg": self.net_g.network_cfg,
+            "state_dict": self.net_g.state_dict(),
+        }
+
+        net_d = {
+            "network_cfg": self.net_d.network_cfg,
+            "state_dict": self.net_d.state_dict(),
+        }
+
         state_dict = {
             "iter": self.iter,
-            "size": self.size,
-            "net_g": self.net_g.state_dict(),
-            "net_d": self.net_d.state_dict(),
+            "net_g": net_g,
+            "net_d": net_d,
         }
         try:
             ckpt_file = self.ckpt_dir / f"{self.iter}.pth"
             torch.save(state_dict, ckpt_file)
         except Exception as e:
-            print(f"Failed to save checkpoint: {e}")
+            print(f"Failed to save ckpt: {e}")
 
     def train(self):
         pbar = tqdm(itertools.count(start=self.iter), initial=self.iter, mininterval=1.0, bar_format="{n_fmt:7} | speed {rate_fmt:3} | train time {elapsed}")
@@ -278,7 +296,7 @@ class Trainer:
                 self.lr_scheduler_d.step()
 
             if self.iter % self.weight_save_every == 0:
-                self.save_state_dict()
+                self.save_ckpt()
 
             if self.iter % self.sample_save_every == 0:
                 with torch.inference_mode():
@@ -311,14 +329,11 @@ if __name__ == "__main__":
     dst = [
         ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
         ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
-        ("/opt/share/deepfake/dataset_1/RealOcc/image/realign_arcface_dst", 2.0),
-        ("/opt/share/deepfake/dataset_1/youtube/What_s_considered_tall_in_South_Korea_Street_Interview_align_results", 0.0),
-        ("/opt/share/deepfake/dataset_1/youtube/4k_Face_Close_Up_HDR_Video_Vivid_Colors_Ambient_Sound_-_Relaxing_align_results", 0.0),
-        ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
+        ("/opt/share/deepfake/dataset_1/RealOcc/image/realign_arcface_dst", 1.0),
     ]
-    trainer = Trainer(src, dst, weight="train_log/facedancer/ckpt/445039.pth")
+    trainer = Trainer(src, dst, log_path="train_log/256_blendface_1")
 
     try:
         trainer.train()
     finally:
-        trainer.save_state_dict()
+        trainer.save_ckpt()

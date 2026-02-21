@@ -28,9 +28,9 @@ def get_align_landmarks(dst_size: int = 112) -> np.ndarray:
 
 
 class PROVIDER(Enum):
-    ARCFACE_OFFICIAL_R50 = 1
-    ARCFACE_OFFICIAL_R100 = 2
-    BLENDFACE = 3
+    BLENDFACE = 1
+    MS1MV3_ARCFACE_R50_FP16 = 2
+    MS1MV3_ARCFACE_R100_FP16 = 3
 
 
 class IDEncoder(nn.Module):
@@ -54,12 +54,12 @@ class IDEncoder(nn.Module):
                 weight = hf_hub_download(repo_id=REPO_ID, filename="blendface.pth")
                 self.backbone = iresnet100()
 
-            case PROVIDER.ARCFACE_OFFICIAL_R50:
-                weight = hf_hub_download(repo_id=REPO_ID, filename="glint360k_r50_fp16.pth")
+            case PROVIDER.MS1MV3_ARCFACE_R50_FP16:
+                weight = hf_hub_download(repo_id=REPO_ID, filename="ms1mv3_arcface_r50_fp16.pth")
                 self.backbone = iresnet50()
 
-            case PROVIDER.ARCFACE_OFFICIAL_R100:
-                weight = hf_hub_download(repo_id=REPO_ID, filename="glint360k_cosface_r100_fp16_0.1.pth")
+            case PROVIDER.MS1MV3_ARCFACE_R100_FP16:
+                weight = hf_hub_download(repo_id=REPO_ID, filename="ms1mv3_arcface_r100_fp16.pth")
                 self.backbone = iresnet100()
 
             case _:
@@ -89,4 +89,4 @@ class IDEncoder(nn.Module):
 
 if __name__ == "__main__":
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    idencoder = IDEncoder(provider=PROVIDER.ARCFACE_OFFICIAL_R50).to(device)
+    idencoder = IDEncoder(provider=PROVIDER.glint360k_r50_fp16).to(device)

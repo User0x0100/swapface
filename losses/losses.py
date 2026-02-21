@@ -62,12 +62,16 @@ class PerceptualLoss(nn.Module):
                 1.0 in calculting losses.
         use_input_norm (bool):  If True, normalize the input image in vgg.
             Default: True.
+        range_norm (bool): If True, norm images with range [-1, 1] to [0, 1].
+            Default: False.
     """
 
-    def __init__(self, layer_weights: dict[str, float], criterion: Literal["l1", "mse", "charbonnier"] = "l1"):
+    def __init__(
+        self, layer_weights: dict[str, float], criterion: Literal["l1", "mse", "charbonnier"] = "l1", vgg_type="vgg19", use_input_norm: bool = True, range_norm: bool = True
+    ):
         super().__init__()
 
-        self.vgg = VGGFeatureExtractor(list(layer_weights.keys()))
+        self.vgg = VGGFeatureExtractor(layer_names=list(layer_weights.keys()), vgg_type=vgg_type, use_input_norm=use_input_norm, range_norm=range_norm)
         self.vgg.eval()
         self.vgg.requires_grad_(False)
 
@@ -295,7 +299,7 @@ class IDLoss(nn.Module):
 
     Provider = PROVIDER
 
-    def __init__(self, provider: Provider = Provider.ARCFACE_OFFICIAL_R50, weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean"):
+    def __init__(self, provider: Provider = Provider.MS1MV3_ARCFACE_R50_FP16, weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean"):
         super().__init__()
 
         self.weight = weight
@@ -322,7 +326,7 @@ class IDLoss(nn.Module):
 
 
 class IFSRLoss(nn.Module):
-    def __init__(self, ifsr_scale: float, ifsr_dict: dict[str, tuple[float, float]], idencoder_provider: PROVIDER = PROVIDER.ARCFACE_OFFICIAL_R50):
+    def __init__(self, ifsr_scale: float, ifsr_dict: dict[str, tuple[float, float]], idencoder_provider: PROVIDER = PROVIDER.MS1MV3_ARCFACE_R50_FP16):
         super().__init__()
 
         idencoder = IDEncoder(provider=idencoder_provider)
