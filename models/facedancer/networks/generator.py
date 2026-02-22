@@ -1,7 +1,7 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
-from .layers import ResBlock, ResBlockMode
+from .layers import ResBlock, RBResampleMode
 
 
 class AdaIN(nn.Module):
@@ -30,12 +30,12 @@ class AdaIN(nn.Module):
         return x * gamma + beta
 
 
-class DownBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, resample: bool = True) -> None:
+class NormRB(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, resample_mode: RBResampleMode) -> None:
         super().__init__()
 
         self.norm = nn.InstanceNorm2d(in_ch, affine=False)
-        self.resblock = ResBlock(ResBlockMode.DOWNSAMPLE, in_ch, out_ch, resample)
+        self.resblock = ResBlock(in_ch, out_ch, resample_mode)
 
     def forward(self, x: Tensor) -> Tensor:
 
@@ -47,12 +47,12 @@ class DownBlock(nn.Module):
         return x + skip
 
 
-class AdaInUpBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample: bool = True) -> None:
+class AdaInRB(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample_mode: RBResampleMode) -> None:
         super().__init__()
 
         self.adain = AdaIN(in_ch, w_dim)
-        self.resblock = ResBlock(ResBlockMode.UPSAMPLE, in_ch, out_ch, resample)
+        self.resblock = ResBlock(in_ch, out_ch, resample_mode)
 
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
 
@@ -86,15 +86,15 @@ class AdaptiveAttentionBlock(nn.Module):
 
         self.last_attn_mask = m.detach().requires_grad_(False)
 
-        return m * x_t + (1.0 - m) * x_s
+        return (1.0 - m) * x_t + m * x_s
 
 
-class AFFAUpBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample: bool = True) -> None:
+class AFFARB(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample_mode: RBResampleMode) -> None:
         super().__init__()
 
         self.adain = AdaIN(in_ch, w_dim)
-        self.resblock = ResBlock(ResBlockMode.UPSAMPLE, in_ch, out_ch, resample)
+        self.resblock = ResBlock(in_ch, out_ch, resample_mode)
         self.attn = AdaptiveAttentionBlock(in_ch)
 
     def forward(self, x_t: Tensor, x_s: Tensor, w: Tensor) -> Tensor:
@@ -108,14 +108,14 @@ class AFFAUpBlock(nn.Module):
         return x + skip
 
 
-class ConcatUpBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample: bool = True) -> None:
+class ConcatRB(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample_mode: RBResampleMode) -> None:
         super().__init__()
 
         in_ch = in_ch * 2
 
         self.adain = AdaIN(in_ch, w_dim)
-        self.resblock = ResBlock(ResBlockMode.UPSAMPLE, in_ch, out_ch, resample)
+        self.resblock = ResBlock(in_ch, out_ch, resample_mode)
 
     def forward(self, x_t: Tensor, x_s: Tensor, w: Tensor) -> Tensor:
 
@@ -160,28 +160,28 @@ class Generator(nn.Module):
         for _ in range(num_encoder):
             down_out_ch = min(down_in_ch * 2, max_ch)
             ch_pairs.append((down_in_ch, down_out_ch))
-            self.encoder.append(DownBlock(down_in_ch, down_out_ch, resample=True))
+            self.encoder.append(NormRB(down_in_ch, down_out_ch, RBResampleMode.DOWNSAMPLE))
             down_in_ch = down_out_ch
 
-        self.encoder.append(DownBlock(down_out_ch, down_out_ch, resample=False))
+        self.encoder.append(NormRB(down_out_ch, down_out_ch, RBResampleMode.NONE))
 
-        self.decoder_first = AdaInUpBlock(down_out_ch, down_out_ch, mapping_size, resample=False)
+        self.decoder_first = AdaInRB(down_out_ch, down_out_ch, mapping_size, RBResampleMode.NONE)
         reversed_ch_pairs = [(out_ch, in_ch) for in_ch, out_ch in reversed(ch_pairs)]
 
         self.decoder = nn.ModuleList()
         for i, (up_in_ch, up_out_ch) in enumerate(reversed_ch_pairs):
             if i < 2:
-                self.decoder.append(AdaInUpBlock(up_in_ch, up_out_ch, mapping_size, True))
+                self.decoder.append(AdaInRB(up_in_ch, up_out_ch, mapping_size, RBResampleMode.UPSAMPLE))
             else:
-                self.decoder.append(AFFAUpBlock(up_in_ch, up_out_ch, mapping_size, True))
+                self.decoder.append(AFFARB(up_in_ch, up_out_ch, mapping_size, RBResampleMode.UPSAMPLE))
 
         _, up_in_ch = reversed_ch_pairs[-1]
-        self.decoder.append(ConcatUpBlock(up_in_ch, 3, mapping_size, False))
+        self.decoder.append(ConcatRB(up_in_ch, 3, mapping_size, RBResampleMode.NONE))
 
     def get_attention_maps(self):
         attention_maps = []
         for module in self.decoder:
-            if isinstance(module, AFFAUpBlock):
+            if isinstance(module, AFFARB):
                 attention_maps.append(module.attn.last_attn_mask)
         return attention_maps
 
@@ -200,7 +200,7 @@ class Generator(nn.Module):
         x = self.decoder_first(feats[-1], w)
 
         for i, up_block in enumerate(self.decoder):
-            if isinstance(up_block, AFFAUpBlock) or isinstance(up_block, ConcatUpBlock):
+            if isinstance(up_block, AFFARB) or isinstance(up_block, ConcatRB):
                 encoder_feat = feats[-(i + 2)]
                 x = up_block(encoder_feat, x, w)
             else:
@@ -210,28 +210,32 @@ class Generator(nn.Module):
 
 
 if __name__ == "__main__":
+
     import torch
+    from fvcore.nn import FlopCountAnalysis
 
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    batch_size = 2
+    batch_size = 1
     img_size = 512
     z_dim = 512
 
-    model = Generator(mapping_depth=4, mapping_size=256, z_dim=z_dim).to(device)
+    model = Generator(img_size).to(device)
 
     model.eval()
 
     x_target = torch.randn(batch_size, 3, img_size, img_size, device=device)
     z_source = torch.randn(batch_size, z_dim, device=device)
 
-    with torch.no_grad():
-        out = model(x_target, z_source)
+    flops = FlopCountAnalysis(model, (x_target, z_source))
 
-    print("Input target shape :", x_target.shape)
-    print("Input z_source shape:", z_source.shape)
-    print("Output shape       :", out.shape)
+    total_flops = flops.total()
+    total_params = sum(p.numel() for p in model.parameters())
 
-    assert out.shape == (batch_size, 3, img_size, img_size), "Output shape mismatch!"
-
-    print("Forward pass successful.")
+    print(f"\n=== Model Profile ===")
+    print(f"Device        : {device}")
+    print(f"Batch size    : {batch_size}")
+    print(f"Image size    : {img_size}x{img_size}")
+    print(f"Latent dim    : {z_dim}")
+    print(f"Params        : {total_params/1e6:.3f} M")
+    print(f"FLOPs (total)  : {total_flops/1e9:.3f} GFLOPs\n")

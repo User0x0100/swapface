@@ -167,7 +167,7 @@ class Trainer:
             resize=self.size,
             src=src,
             dst=dst,
-            same_image_prob=0.2,
+            same_image_prob=0.1,
         )
 
         self.dataset = DALIGenericIterator(pipelines=pipe, output_map=["src", "dst", "is_same"], auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
@@ -331,7 +331,7 @@ if __name__ == "__main__":
         ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
         ("/opt/share/deepfake/dataset_1/RealOcc/image/realign_arcface_dst", 1.0),
     ]
-    trainer = Trainer(src, dst, log_path="train_log/256_blendface_1")
+    trainer = Trainer(src, dst, log_path="train_log/256_blendface_BlurPool")
 
     try:
         trainer.train()
