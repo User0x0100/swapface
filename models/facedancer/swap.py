@@ -3,8 +3,8 @@ from typing import Any
 
 import torch
 from torch import nn, Tensor
-from misc.facealign import face_align_batch
-from misc.models.retinaface import get_pts, batch_resize_and_pad_varsize, RetinaFace
+from misc.facealign import face_align_batch, extract_alignface_from_video
+from misc.models.retinaface import get_pts, RetinaFace
 from misc.models.idencoder import IDEncoder, get_align_landmarks
 from .networks.generator import Generator
 from torchcodec.decoders import VideoDecoder
@@ -45,7 +45,10 @@ class Swap:
 
         self.dst_pts = torch.tensor(get_align_landmarks(self.size), device=self.device)
 
-    def get_face_id(self, fp: str) -> Tensor:
+    def extract_id_feats_from_image(self, fp: str) -> Tensor:
+        """
+        返回已经归一化的ID特征，形状为[1, 512]
+        """
 
         image = decode_image(fp).to(device=self.device, dtype=torch.float)
         image.div_(127.5).sub_(1.0).unsqueeze_(0)  # [-1 ~ 1]
@@ -56,46 +59,38 @@ class Swap:
         dst_pts = torch.tensor(dst_pts, device=self.device)
         align_face, _ = face_align_batch(image, src_pts, dst_pts, (self.size, self.size))
 
-        align_face = torch.cat(align_face, dim=0)
+        align_face = align_face[0]
+
+        if align_face.shape[0] == 0:
+            raise AssertionError(f"未从{fp}检测到任何面部")
+        if align_face.shape[0] > 1:
+            print("Warning: 检测到多张面部，仅使用第一张")
+            align_face = align_face[:1]
 
         id_emb = self.idencoder(align_face)
 
-        return id_emb[:1]
+        return id_emb
 
-    def swap_video(self, fp: str, id: str):
+    def swap_video(self, vfp: str, id_fp: str):
 
         batch_size = 8
 
-        id_emb = self.get_face_id(id)
+        id_emb = self.extract_id_feats_from_image(id_fp)
 
-        vr = VideoDecoder(fp, device="cuda")
-        num_frames = vr.metadata.num_frames_from_content
-        pbar = tqdm(range(vr.metadata.num_frames_from_content), unit="frame")
-        slices = [(i, min(i + batch_size, num_frames)) for i in range(0, num_frames, batch_size)]
-        dst_pts = get_align_landmarks(self.size)
-        dst_pts = torch.tensor(dst_pts, device=self.device)
+        for faces, norm_theta in extract_alignface_from_video(vfp, batch_size=batch_size, align_size=self.size, device=self.device):
+            for face in faces:
+                if face.shape[0] == 0:
+                    continue
 
-        for slic in slices:
-            pbar.n = slic[1]
-            pbar.refresh()
+                swap_face: Tensor = self.net_g(face, id_emb.expand(face.shape[0], -1))
 
-            chunk = vr.get_frames_in_range(*slic).data.to(device=self.device, dtype=torch.float).div_(127.5).sub_(1.0)
+                swap_face = swap_face.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)[:, [2, 1, 0], :, :]  # RGB -> BGR
+                swap_face = swap_face.permute(0, 2, 3, 1)  # NCHW -> NHWC
+                frames = swap_face.to(device="cpu", dtype=torch.uint8).numpy()
 
-            detected = self.facedetch.detector(chunk)
-            src_pts = get_pts(detected)
-            align_face, _ = face_align_batch(chunk, src_pts, dst_pts, (self.size, self.size))
-
-            align_face = torch.cat(align_face, dim=0)
-
-            swap_face: Tensor = self.net_g(align_face, id_emb.expand(align_face.shape[0], -1))
-
-            swap_face = swap_face.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)[:, [2, 1, 0], :, :]  # RGB -> BGR
-            swap_face = swap_face.permute(0, 2, 3, 1)  # NCHW -> NHWC
-            frames = swap_face.to(device="cpu", dtype=torch.uint8).numpy()
-
-            for frame in frames:
-                cv2.imshow("swaped", frame)
-                cv2.waitKey(1)
+                for frame in frames:
+                    cv2.imshow("swaped", frame)
+                    cv2.waitKey(1)
 
 
 if __name__ == "__main__":

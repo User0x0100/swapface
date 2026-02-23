@@ -236,6 +236,30 @@ def restore_faces_to_original(org_images: tuple[Tensor] | list[Tensor] | Tensor,
     return result
 
 
+def extract_alignface_from_video(self, vfp: str, batch_size: int, align_size: tuple[int, int], device: torch.device):
+    """
+    batch_size: 每次取出多少帧来进行面部检测与对齐，每帧可能包含多张面部，所以生成器返回的len(list[Tensor]) != batch_size
+    生成器返回的list[Tensor]: Tensor(N, C, H, W), N: 对应帧检测到的面部数量, 值域: [0.0 ~ 255.0]
+
+    """
+
+    detector = RetinaFace().to(device=device)
+    dst_pts = get_align_landmarks(align_size)
+    dst_pts = torch.tensor(dst_pts, device=device)
+
+    decoder = VideoDecoder(vfp, device=device.type)
+    num_frames = decoder.metadata.num_frames
+
+    for i in range(0, num_frames, batch_size):
+        j = min(i + batch_size, num_frames)
+        chunk = decoder.get_frames_in_range(i, j).data.to(device=device, dtype=torch.float)  # [0.0~255.0]
+        detected = detector(chunk)
+        src_pts = get_pts(detected)
+        align_face, norm_theta = face_align_batch(chunk, src_pts, dst_pts, (align_size, align_size))
+
+        yield align_face, norm_theta
+
+
 class FaceAlign(nn.Module):
     def __init__(self, from_normalized: bool = False, from_unit_range: bool = False, from_rgb: bool = True):
         """
@@ -258,12 +282,16 @@ class FaceAlign(nn.Module):
     def device(self) -> torch.device:
         return self.dst_pts.device
 
-    def extract_face_from_video(vfp: str):
-        decoder  = VideoDecoder(vfp, device="cuda")
+    def extract_face_from_video(self, vfp: str, batch_size: int):
+
+        decoder = VideoDecoder(vfp, device="cuda")
         num_frames = decoder.metadata.num_frames
+        device = self.device()
 
-        decoder
-
+        for i in range(0, num_frames, batch_size):
+            j = min(i + batch_size, num_frames)
+            chunk = decoder.get_frames_in_range(i, j).data.to(device=device, dtype=torch.float)
+            self.detector(chunk)
 
 
 def tensor2cv_8uc3_bgr(image: torch.Tensor, value_range=(-1, 1), swap_rb_ch: bool = True) -> np.ndarray:
