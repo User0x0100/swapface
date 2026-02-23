@@ -1,5 +1,5 @@
 from enum import Enum
-import numpy as np
+from math import ceil
 import torch
 from torch import Tensor
 import torch.nn as nn
@@ -12,7 +12,8 @@ class BlurPool(nn.Module):
 
         self.filt_size = filt_size
         self.pad_off = pad_off
-        self.pad_sizes = [int(1.0 * (filt_size - 1) / 2), int(np.ceil(1.0 * (filt_size - 1) / 2)), int(1.0 * (filt_size - 1) / 2), int(np.ceil(1.0 * (filt_size - 1) / 2))]
+        pad = (filt_size - 1) / 2
+        self.pad_sizes = [int(pad), int(ceil(pad)), int(pad), int(ceil(pad))]
         self.pad_sizes = [pad_size + pad_off for pad_size in self.pad_sizes]
         self.stride = stride
         self.channels = channels

@@ -32,11 +32,11 @@ if __name__ == "__main__":
     from .networks import Generator
 
     bs = 1
-    size = 512
+    size = 256
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    net = Generator().to(device)
+    net = Generator(size).to(device)
 
     sample_input = (torch.randn([bs, 3, size, size], dtype=torch.float, device=device), torch.randn([bs, 512], dtype=torch.float, device=device))
 

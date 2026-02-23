@@ -7,8 +7,7 @@ import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 
 from ..iresnet import iresnet50, iresnet100
-
-REPO_ID = "leehx/model_hub"
+from ...models import REPO_ID
 
 
 INPUT_SIZE = (112, 112)
@@ -89,4 +88,4 @@ class IDEncoder(nn.Module):
 
 if __name__ == "__main__":
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    idencoder = IDEncoder(provider=PROVIDER.glint360k_r50_fp16).to(device)
+    idencoder = IDEncoder().to(device)

@@ -217,7 +217,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     batch_size = 1
-    img_size = 512
+    img_size = 256
     z_dim = 512
 
     model = Generator(img_size).to(device)
