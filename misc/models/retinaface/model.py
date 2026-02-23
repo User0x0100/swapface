@@ -61,10 +61,9 @@ class RetinaFace(nn.Module):
     def __init__(self, use_mobile_net: bool = False, from_normalized: bool = False, from_unit_range: bool = False, swap_rb_ch: bool = True) -> None:
         """
         Args:
-            use_mobilenet:  使用轻量级网络.
-            from_normalized: 如果为 True，则假设输入为 [-1, 1]，转换为 [0, 255]
-            from_unit_range: 如果为 True，则假设输入为 [0, 1]，转换为 [0, 255]
-            swap_rb_ch: 交换图像的R,B通道
+            from_normalized: 输入值域是否为 [-1, 1]
+            from_unit_range: 输入值域是否为 [0, 1]
+            from_rgb: 输入图像是否为RGB
         """
         super().__init__()
         if from_normalized and from_unit_range:

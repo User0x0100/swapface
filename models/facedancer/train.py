@@ -17,8 +17,7 @@ from tqdm import tqdm
 from losses import IDLoss, l1_loss_fn, PerceptualLoss, DLoss, GANLoss, IFSRLoss, r1_reg_loss
 
 from .dataloader import datasetloader
-from .networks.generator import Generator
-from .networks.discriminator import Discriminator
+from .networks import Generator, Discriminator
 
 
 EPS = 1e-6

@@ -236,6 +236,36 @@ def restore_faces_to_original(org_images: tuple[Tensor] | list[Tensor] | Tensor,
     return result
 
 
+class FaceAlign(nn.Module):
+    def __init__(self, from_normalized: bool = False, from_unit_range: bool = False, from_rgb: bool = True):
+        """
+        Args:
+            from_normalized: 输入值域是否为 [-1, 1]
+            from_unit_range: 输入值域是否为 [0, 1]
+            from_rgb: 输入图像是否为RGB
+        """
+        super().__init__()
+
+        self.detector = RetinaFace(from_normalized, from_unit_range, from_rgb)
+
+        dst_pts = get_align_landmarks(align_size)
+        dst_pts = torch.tensor(dst_pts, device=device)
+        self.register_buffer("dst_pts", dst_pts, persistent=False)
+
+        self.eval()
+        self.requires_grad_(False)
+
+    def device(self) -> torch.device:
+        return self.dst_pts.device
+
+    def extract_face_from_video(vfp: str):
+        decoder  = VideoDecoder(vfp, device="cuda")
+        num_frames = decoder.metadata.num_frames
+
+        decoder
+
+
+
 def tensor2cv_8uc3_bgr(image: torch.Tensor, value_range=(-1, 1), swap_rb_ch: bool = True) -> np.ndarray:
     """
     将形如 [C, H, W] 或 [B, C, H, W] 的图像 Tensor 转为 OpenCV 使用的 uint8 BGR 格式。
