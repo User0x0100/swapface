@@ -10,7 +10,9 @@ from torch import autocast, nn, Tensor
 from torchcodec.decoders import VideoDecoder
 from tqdm import tqdm
 
-from .models.retinaface import RetinaFace
+
+from .models.idencoder import get_align_landmarks
+from .models.retinaface import RetinaFace, get_pts, batch_resize_and_pad_varsize, iter_detections
 
 
 def compute_similarity_transform(points_x: torch.Tensor, points_y: torch.Tensor) -> torch.Tensor:
@@ -145,8 +147,8 @@ def invert_normalized_theta(theta: torch.Tensor) -> torch.Tensor:
 
 
 def face_align_batch(
-    images: tuple[Tensor] | list[Tensor] | Tensor, src_pts: tuple[Tensor] | list[Tensor], dst_pts: Tensor, out_size: tuple[int, int]
-) -> tuple[list[Tensor], list[Tensor]]:
+    images: tuple[Tensor] | list[Tensor] | Tensor, src_pts: Tensor, src_pts_offset: list[int], dst_pts: Tensor, out_size: tuple[int, int]
+) -> tuple[Tensor, Tensor]:
     """
     对输入图片进行人脸对齐（仿射变换），输出对齐后的图片和仿射矩阵。
 
@@ -172,19 +174,16 @@ def face_align_batch(
 
     aligned: list[Tensor] = []
     norm_theta: list[Tensor] = []
-    for src_point, image in zip(src_pts, images):
-        assert image.dim() == 3
-        N = src_point.shape[0]
+    for src_point, image in zip(iter_detections(src_pts, src_pts_offset), images):
+
+        N = src_point.size(0)
         if N == 0:
-            aligned.append(torch.empty((0), dtype=torch.float))
-            norm_theta.append(torch.empty((0), dtype=torch.float))
             continue
 
-        C = image.shape[0]
-        H, W = image.shape[-2:]
+        C, H, W = image.shape
         image = image.unsqueeze(0).expand(N, -1, -1, -1)
 
-        mats = compute_similarity_transform(src_point, dst_pts.unsqueeze(0).expand(src_point.shape[0], -1, -1))
+        mats = compute_similarity_transform(src_point, dst_pts.unsqueeze(0).expand(N, -1, -1))
         mats = normalize_theta(mats, (H, W), out_size, align_corners=True)
 
         grid = F.affine_grid(mats, (N, C, *out_size), align_corners=True)
@@ -193,15 +192,24 @@ def face_align_batch(
         aligned.append(faces)
         norm_theta.append(mats)
 
+    if len(aligned) == 0:
+        aligned = torch.zeros((0, 3, *out_size), dtype=torch.float, device=src_point.device)
+        norm_theta = torch.zeros((0, 3, *out_size), dtype=torch.float, device=src_point.device)
+    else:
+        aligned = torch.cat(aligned, dim=0)
+        norm_theta = torch.cat(norm_theta, dim=0)
+
     return aligned, norm_theta
 
 
-def restore_faces_to_original(org_images: tuple[Tensor] | list[Tensor] | Tensor, aligned: list[Tensor], norm_theta: list[Tensor]) -> list[Tensor]:
+def restore_faces_to_original(org_images: tuple[Tensor] | list[Tensor] | Tensor, aligned: list[Tensor], norm_theta: list[Tensor], offset: list[int]) -> Tensor | list[Tensor]:
 
     result: list[Tensor] = []
-    for mat, org_image, face in zip(norm_theta, org_images, aligned):
-        N = mat.shape[0]
+    for mat, org_image, face in zip(iter_detections(norm_theta, offset), org_images, iter_detections(aligned, offset)):
+
+        N = mat.size(0)
         if N == 0:
+            result.append(org_image)
             continue
 
         C, H, W = org_image.shape
@@ -233,13 +241,16 @@ def restore_faces_to_original(org_images: tuple[Tensor] | list[Tensor] | Tensor,
         # 恢复原图的 batch 维度（squeeze 掉之前 unsqueeze_ 的维度）
         result.append(org_image.squeeze_(0))
 
+    if isinstance(org_images, Tensor):
+        result = torch.cat(result, dim=0)
+
     return result
 
 
-def extract_alignface_from_video(self, vfp: str, batch_size: int, align_size: tuple[int, int], device: torch.device):
+def extract_alignface_from_video(vfp: str, batch_size: int, align_size: tuple[int, int], device: torch.device):
     """
-    batch_size: 每次取出多少帧来进行面部检测与对齐，每帧可能包含多张面部，所以生成器返回的len(list[Tensor]) != batch_size
-    生成器返回的list[Tensor]: Tensor(N, C, H, W), N: 对应帧检测到的面部数量, 值域: [0.0 ~ 255.0]
+    batch_size: 每次取出多少帧来进行面部检测与对齐，每帧可能包含多张面部，所以生成器返回的Tensor.size(0) != batch_size
+    生成器返回的Tensor: Tensor(N, C, H, W), N: 对应帧检测到的面部数量, 值域: [0.0 ~ 255.0]
 
     """
 
@@ -253,11 +264,11 @@ def extract_alignface_from_video(self, vfp: str, batch_size: int, align_size: tu
     for i in range(0, num_frames, batch_size):
         j = min(i + batch_size, num_frames)
         chunk = decoder.get_frames_in_range(i, j).data.to(device=device, dtype=torch.float)  # [0.0~255.0]
-        detected = detector(chunk)
+        detected, offset = detector.detector(chunk)
         src_pts = get_pts(detected)
-        align_face, norm_theta = face_align_batch(chunk, src_pts, dst_pts, (align_size, align_size))
+        align_face, norm_theta = face_align_batch(chunk, src_pts, offset, dst_pts, (align_size, align_size))
 
-        yield align_face, norm_theta
+        yield align_face, norm_theta, offset
 
 
 class FaceAlign(nn.Module):

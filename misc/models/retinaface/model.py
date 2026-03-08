@@ -1,6 +1,6 @@
 import itertools
-from collections import OrderedDict
 from math import ceil
+from collections import OrderedDict
 
 import torch
 from torch import nn, Tensor
@@ -8,13 +8,9 @@ import torch.nn.functional as F
 from torchvision import models, ops
 from torchvision.models import _utils
 
-
-from .net import FPN, SSH, MobileNetV1, ClassHead, BboxHead, LandmarkHead
-
-
 from huggingface_hub import hf_hub_download
 from ...models import REPO_ID
-
+from .net import FPN, SSH, MobileNetV1, ClassHead, BboxHead, LandmarkHead
 
 CFG_MNET0_25G = {
     "name": "mobilenet0.25",
@@ -133,7 +129,45 @@ class RetinaFace(nn.Module):
             landmarkhead.append(LandmarkHead(inchannels, anchor_num))
         return landmarkhead
 
-    def detector(self, images: list[Tensor] | tuple[Tensor] | Tensor, conf_thresh: float = 0.85, iou_thresh: float = 0.5, min_box_size: tuple[int, int] = (0, 0)) -> list[Tensor]:
+    def detector(
+        self, images: list[Tensor] | tuple[Tensor] | Tensor, conf_thresh: float = 0.9, iou_thresh: float = 0.5, min_box_size: tuple[int, int] = (0, 0)
+    ) -> tuple[Tensor, list[int]]:
+        """
+        RetinaFace 人脸检测。
+
+        支持单张或多张不同尺寸图像输入，内部完成：
+        - resize + padding
+        - 归一化 / 通道转换
+        - backbone + FPN + SSH
+        - bbox / score / landmark 预测
+        - decode + threshold + size filter + NMS
+
+        Args:
+            images:
+                Tensor[B, C, H, W] |
+                list[Tensor[C, H, W]] |
+                tuple[Tensor[C, H, W]]
+                输入图像，支持 batch 或变尺寸 list 输入。
+            conf_thresh:
+                float，人脸置信度阈值，低于该值的候选框会被过滤。
+            iou_thresh:
+                float，NMS IoU 阈值。
+            min_box_size:
+                (min_w, min_h)，小于该尺寸的检测框会被忽略。
+
+        Returns:
+            detections: Tensor[M, 15]
+                拼接 batch 后的检测结果，格式为：
+                [score, x1, y1, x2, y2, x0, y0, ..., x4, y4]
+                其中 (x0,y0)...(x4,y4) 为 5 点关键点。
+
+            offsets: list[int]
+                每个 batch 的检测框数量，用于将 detections 反拆为 batch 结构。
+
+                Example:
+                    det, offsets = detector(...)
+                    per_image = torch.split(det, offsets)
+        """
 
         if isinstance(images, Tensor):
             images, scales = images.clone(), None
@@ -168,6 +202,91 @@ class RetinaFace(nn.Module):
         detected = self._retinaface_postprocess(loc, conf, landms, (H, W), resize=scales, conf_thresh=conf_thresh, iou_thresh=iou_thresh, min_box_size=min_box_size)
 
         return detected
+
+    def _retinaface_postprocess(
+        self, loc: Tensor, conf: Tensor, landms: Tensor, image_shape: tuple[int, int], conf_thresh: float, iou_thresh: float, resize: Tensor | None, min_box_size: tuple[int, int]
+    ) -> tuple[Tensor, list[int]]:
+        """
+        RetinaFace 后处理（decode + threshold + size filter + NMS）
+
+        Args:
+            loc:     Tensor[B, N, 4]   回归偏移 (dx, dy, dw, dh)
+            conf:    Tensor[B, N, 2]   分类 logits（背景 / 人脸）
+            landms:  Tensor[B, N, 10]  关键点偏移
+            image_shape: (H, W)        原始图像尺寸
+            conf_thresh: float         置信度阈值
+            iou_thresh: float          NMS IoU 阈值
+            resize: Tensor[B, 1] | None
+                输入图像 resize 到原图的 scale factor，None 表示 scale=1
+            min_box_size: (min_w, min_h)
+                小于该尺寸的 bbox 会被过滤
+
+        Returns:
+            detections: Tensor[M, 15]
+                拼接 batch 后的检测结果:
+                [score, x1, y1, x2, y2, x0, y0, ..., x4, y4]
+            offsets: list[int]
+                每个 batch 的检测框数量，用于反拆 batch
+        """
+
+        B = loc.shape[0]
+        device = loc.device
+
+        priors = self._generate_grid(*image_shape, device=device)
+
+        if resize is None:
+            resize = torch.ones((B, 1), dtype=torch.float, device=device)
+
+        H, W = image_shape
+        inv_resize = 1.0 / resize
+        variance = self.cfg["variance"]
+
+        detected: list[Tensor] = []
+        offset: list[int] = []
+
+        for b in range(B):
+            conf_b = conf[b]  # [N, 2]
+            scores = conf_b[:, 1]  # 人脸概率
+
+            mask = scores > conf_thresh
+            if mask.sum() == 0:
+                offset.append(0)
+                continue
+
+            boxes_b = decode_boxes(loc[b][mask], priors[mask], variance)
+            # boxes: [x1,y1,x2,y2]
+            boxes_b[:, 0::2] *= W * inv_resize[b]  # X方向
+            boxes_b[:, 1::2] *= H * inv_resize[b]  # Y方向
+
+            widths = boxes_b[:, 2] - boxes_b[:, 0]
+            heights = boxes_b[:, 3] - boxes_b[:, 1]
+            size_mask = (widths >= min_box_size[0]) & (heights >= min_box_size[1])
+
+            if size_mask.sum() == 0:
+                offset.append(0)
+                continue
+
+            boxes_b = boxes_b[size_mask]
+            scores_b = scores[mask][size_mask]
+
+            landms_b = decode_landmarks(landms[b][mask][size_mask], priors[mask][size_mask], variance)
+            landms_b[:, 0::2] *= W * inv_resize[b]
+            landms_b[:, 1::2] *= H * inv_resize[b]
+
+            keep = ops.nms(boxes_b, scores_b, iou_thresh)
+
+            boxes_b = boxes_b[keep]
+            landms_b = landms_b[keep]
+            scores_b = scores_b[keep].unsqueeze(1)  # [K] -> [K, 1]
+
+            detection = torch.cat([scores_b, boxes_b, landms_b], dim=1)  # [K, 15]
+            detected.append(detection)
+            offset.append(detection.size(0))
+
+        if len(detected) == 0:
+            return torch.zeros((0, 15), device=device), offset
+
+        return torch.cat(detected, dim=0), offset
 
     def _generate_grid(self, h: int, w: int, device=torch.device("cpu")) -> Tensor:
 
@@ -211,88 +330,6 @@ class RetinaFace(nn.Module):
             self._prior_cache.popitem(last=False)
 
         return grid
-
-    def _retinaface_postprocess(
-        self,
-        loc: Tensor,
-        conf: Tensor,
-        landms: Tensor,
-        image_shape: tuple[int, int],
-        conf_thresh: float,
-        iou_thresh: float,
-        resize: Tensor | None,
-        min_box_size: tuple[int, int],
-    ) -> list[Tensor]:
-        """
-        Args:
-            loc:     [B, N, 4] - 回归偏移
-            conf:    [B, N, 2] - 分类 logits
-            landms:  [B, N, 10] - 关键点偏移
-            cfg:     dict - 包含 "variance" 项
-            image_shape: tuple[int, int] - 原始图像尺寸 (H, W)
-            conf_thresh: float - 置信度阈值
-            iou_thresh: float - NMS 阈值
-            resize: [N, float] - 输入图像到原图的缩放因子（默认 1）
-            min_box_size: tuple[int, int] - 小于这个尺寸的检测结果将被忽略 (H, W)
-
-        Returns:
-            detected: list[Tensor] - 每个 batch 的检测结果 [N, 15]: score,x1,y1,x2,y2,x0,y0,...,x4,y4
-        """
-
-        cfg = self.cfg
-
-        B = loc.shape[0]
-        device = loc.device
-
-        priors = self._generate_grid(*image_shape, device=device)
-
-        if resize is None:
-            resize = torch.ones((B, 1), dtype=torch.float, device=device)
-
-        H, W = image_shape
-        inv_resize = 1.0 / resize
-
-        detected: list[Tensor] = []
-
-        for b in range(B):
-            conf_b = conf[b]  # [N, 2]
-            scores = conf_b[:, 1]  # 人脸概率
-
-            mask = scores > conf_thresh
-            if mask.sum() == 0:
-                detected.append(torch.zeros((0), dtype=torch.float))
-                continue
-
-            boxes_b = decode_boxes(loc[b][mask], priors[mask], cfg["variance"])
-            # boxes: [x1,y1,x2,y2]
-            boxes_b[:, 0::2] *= W * inv_resize[b]  # X方向
-            boxes_b[:, 1::2] *= H * inv_resize[b]  # Y方向
-
-            widths = boxes_b[:, 2] - boxes_b[:, 0]
-            heights = boxes_b[:, 3] - boxes_b[:, 1]
-            size_mask = (widths >= min_box_size[0]) & (heights >= min_box_size[1])
-
-            if size_mask.sum() == 0:
-                detected.append(torch.zeros((0), dtype=torch.float))
-                continue
-
-            boxes_b = boxes_b[size_mask]
-            scores_b = scores[mask][size_mask]
-
-            landms_b = decode_landmarks(landms[b][mask][size_mask], priors[mask][size_mask], cfg["variance"])
-            landms_b[:, 0::2] *= W * inv_resize[b]
-            landms_b[:, 1::2] *= H * inv_resize[b]
-
-            keep = ops.nms(boxes_b, scores_b, iou_thresh)
-
-            boxes_b = boxes_b[keep]
-            landms_b = landms_b[keep]
-            scores_b = scores_b[keep].unsqueeze(1)
-
-            detection = torch.cat([scores_b, boxes_b, landms_b], dim=1)  # [K, 15]
-            detected.append(detection)
-
-        return detected
 
 
 def batch_resize_and_pad_varsize(imgs: tuple[Tensor] | list[Tensor], out_h: int, out_w: int) -> tuple[Tensor, Tensor]:
@@ -389,7 +426,7 @@ def decode_landmarks(landms: Tensor, priors: Tensor, variances: list[float]) -> 
 
 
 @torch.inference_mode()
-def draw_boxes_batch(images: Tensor | tuple[Tensor] | list[Tensor], boxes_list: list[Tensor], color=(255.0, 0.0, 0.0), thickness=3, point_size=7):
+def draw_boxes_batch(images: Tensor | tuple[Tensor] | list[Tensor], detected: Tensor, offset: Tensor, color=(255.0, 0.0, 0.0), thickness=3, point_size=7) -> Tensor | list[Tensor]:
     """
     Args:
         images: Tensor[B, C, H, W] | tuple[(C,H,W)] | list[(C,H,W)]
@@ -397,7 +434,7 @@ def draw_boxes_batch(images: Tensor | tuple[Tensor] | list[Tensor], boxes_list: 
         color: tuple(float, float, float), RGB颜色
         thickness: int，线宽
     Returns:
-        Tensor[B, C, H, W]，画框后的新图像
+        Tensor[B, C, H, W]，list[Tensor[C, H, W]]画框后的新图像
     """
 
     if isinstance(images, Tensor):
@@ -408,9 +445,9 @@ def draw_boxes_batch(images: Tensor | tuple[Tensor] | list[Tensor], boxes_list: 
         new_images = [image.clone() for image in images]
         color_tensor = torch.tensor(color, device=new_images[0].device).view(3, 1, 1)
 
-    for boxes, image in zip(boxes_list, new_images):
+    for boxes, image in zip(iter_detections(detected, offset), new_images):
 
-        if boxes.numel() == 0:
+        if boxes.size(0) == 0:
             continue
         H, W = image.shape[-2:]
 
@@ -449,15 +486,80 @@ def draw_boxes_batch(images: Tensor | tuple[Tensor] | list[Tensor], boxes_list: 
     return new_images
 
 
-def get_pts(detected: list[Tensor]) -> list[Tensor]:
+def get_pts(detected: Tensor) -> list[Tensor]:
     """
     从检测结果中获取关键点
-    detected: 原始检测结果 (list[Tensor(N, 15)])
+    detected: 原始检测结果 (Tensor(N, 15))
 
-    返回: list[Tensor(N, 5, 2)]
+    返回: Tensor(N, 5, 2)
 
     """
-    return [det[:, -10:].reshape(det.shape[0], 5, 2) for det in detected]
+    return detected[:, -10:].reshape(-1, 5, 2)
+
+    # pts_list = []
+    # for det in detected:
+    #     if det.shape[0] == 0:
+    #         pts = det.new_empty((0, 5, 2))
+    #     else:
+    #         pts = det[:, -10:].reshape(-1, 5, 2)
+    #     pts_list.append(pts)
+    # return pts_list
+
+
+def split_detections(detected: Tensor, offsets: list[int]) -> list[Tensor]:
+    """
+    将 flatten 的检测结果按 offsets 还原为 batch list。
+
+    Args:
+        detected: Tensor[M, 15]
+        offsets: list[int], 每张图的检测数量
+
+    Returns:
+        list[Tensor[Ni, 15]]
+    """
+    return list(torch.split(detected, offsets))
+
+
+def iter_detections(detected: Tensor, offsets: list[int]):
+    """
+    按 offsets 从 flatten 的检测结果中逐张图像迭代检测结果。
+
+    该函数用于将批量检测输出的扁平 Tensor 还原为按 batch 划分的子 Tensor，
+    不进行数据拷贝，仅返回视图（view slice）。
+
+    Args:
+        detected:
+            Tensor[M, D]，拼接后的检测结果。
+            M = sum(offsets)，D 通常为 15（score + bbox + landmarks）。
+        offsets:
+            list[int]，每张输入图像的检测数量，长度等于 batch size。
+
+    Yields:
+        Tensor[Ni, D]：
+            第 i 张图像的检测结果，其中 Ni = offsets[i]。
+            当 offsets[i] == 0 时，返回 shape = (0, D) 的空 Tensor，
+            不会返回 None，不会跳过该 batch index。
+
+    Notes:
+        - 返回的 Tensor 与 detected 共享底层存储（zero-copy）。
+        - 必须保证 sum(offsets) == detected.shape[0]，否则结果未定义。
+        - 空 Tensor 需要显式处理，例如:
+            if det_i.numel() == 0: continue
+
+    Example:
+        detected = torch.randn(3, 15)
+        offsets = [2, 0, 1]
+
+        for det_i in iter_detections(detected, offsets):
+            print(det_i.shape)
+        # torch.Size([2, 15])
+        # torch.Size([0, 15])
+        # torch.Size([1, 15])
+    """
+    start = 0
+    for n in offsets:
+        yield detected[start : start + n]
+        start += n
 
 
 if __name__ == "__main__":
@@ -478,12 +580,12 @@ if __name__ == "__main__":
     # images_org = torch.stack(images_org)
 
     for _ in range(5):
-        detected = model.detector(images_org)
+        detected, offset = model.detector(images_org)
 
     with Timer("model infer"):
-        detected = model.detector(images_org)
+        detected, offset = model.detector(images_org)
 
-    visi = draw_boxes_batch(images_org, detected)
+    visi = draw_boxes_batch(images_org, detected, offset)
 
     if isinstance(visi, (list, tuple)):
         visi, _ = batch_resize_and_pad_varsize(visi, 640, 640)

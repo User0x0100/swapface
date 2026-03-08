@@ -1,4 +1,3 @@
-from enum import Enum
 from math import ceil
 import torch
 from torch import Tensor
@@ -44,27 +43,93 @@ class BlurPool(nn.Module):
             return F.conv2d(self.pad(x), self.filt, stride=self.stride, groups=x.shape[1])
 
 
-class RBResampleMode(Enum):
-    NONE = "none"
-    UPSAMPLE = "upsample"
-    DOWNSAMPLE = "downsample"
+class LearnableLP(nn.Module):
+    """可学习低通滤波器，深度可分离，保持空间尺寸"""
 
-
-class ResBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, resample_mode: RBResampleMode):
+    def __init__(self, channels: int, kernel_size: int = 5):
         super().__init__()
 
-        self.residual = nn.Sequential(nn.SiLU(), nn.Conv2d(in_ch, out_ch, 3, padding=1))
-        self.shortcut = nn.Sequential(nn.Conv2d(in_ch, out_ch, 1))
+        self.dw_conv = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=channels,
+            bias=False,
+        )
 
-        match resample_mode:
-            case RBResampleMode.UPSAMPLE:
-                self.residual.append(nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False))
-                self.shortcut.append(nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False))
+        nn.init.constant_(self.dw_conv.weight, 1.0 / kernel_size**2)
 
-            case RBResampleMode.DOWNSAMPLE:
-                self.residual.append(nn.AvgPool2d(kernel_size=2))
-                self.shortcut.append(nn.AvgPool2d(kernel_size=2))
+    def forward(self, x: Tensor) -> Tensor:
+        return self.dw_conv(x)
 
-            case RBResampleMode.NONE:
-                pass
+
+class SoftNorm(nn.Module):
+    def __init__(self, channels: int, init_scale: float = 0.1):
+        super().__init__()
+
+        self.scale = nn.Parameter(torch.full((1, channels, 1, 1), init_scale))
+
+    def forward(self, x: Tensor) -> Tensor:
+        std = x.std(dim=(2, 3), keepdim=True).clamp(min=1e-8)
+        return (x / std) * self.scale
+
+
+class SpatialGate(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(channels, channels // 4, 1),
+            nn.SiLU(),
+            nn.Conv2d(channels // 4, 1, 3, padding=1),
+            nn.Sigmoid(),
+        )
+
+        nn.init.constant_(self.proj[-2].bias, 2.0)
+
+    def forward(self, x_target: Tensor, x_source: Tensor) -> Tensor:
+        diff = (x_target - x_source).abs()
+        return self.proj(diff)
+
+
+class FreqResidualBlend(nn.Module):
+    def __init__(self, channels: int, w_dim: int, blur_kernel_size: int = 5, init_scale: float = 0.1):
+        super().__init__()
+
+        self.blur = LearnableLP(channels, blur_kernel_size)
+
+        self.id_encoder = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, 3, padding=1, groups=4),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, 1),
+        )
+
+        self.soft_norm = SoftNorm(channels, init_scale)
+        self.spatial_gate = SpatialGate(channels)
+        self.w_gate = nn.Sequential(
+            nn.Linear(w_dim, channels),
+            nn.Sigmoid(),
+        )
+        nn.init.zeros_(self.w_gate[0].weight)
+        nn.init.constant_(self.w_gate[0].bias, 1.0)
+
+        self.last_attn_mask = None
+
+    def forward(self, x_target: Tensor, x_source: Tensor, w: Tensor):
+
+        low_target = self.blur(x_target)
+        low_source = self.blur(x_source)
+        high_source = x_source - low_source
+
+        delta = self.id_encoder(high_source) + high_source
+
+        delta = self.soft_norm(delta)
+
+        s_gate = self.spatial_gate(x_target, x_source)  # (B, 1, H, W)
+        self.last_attn_mask = s_gate.detach()
+
+        w_gate = self.w_gate(w).view(-1, delta.shape[1], 1, 1)  # (B, C, 1, 1)
+
+        return low_target + s_gate * w_gate * delta

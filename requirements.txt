@@ -16,3 +16,6 @@ opencv-python
 tensorboard
 tqdm
 segmentation-models-pytorch
+fvcore
+xformers
+ninja

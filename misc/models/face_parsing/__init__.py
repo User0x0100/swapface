@@ -1,3 +1,3 @@
-from model import FaceParsing
+from .model import FaceParsing
 
 __all__ = ["FaceParsing"]

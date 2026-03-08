@@ -1,4 +1,19 @@
-from .losses import l1_loss_fn, mse_loss_fn, charbonnier_loss_fn, bce_loss_fn, r1_reg_loss, PerceptualLoss, DSSIMLoss, StyleLossLabChroma, DLoss, GANLoss, IDLoss, IFSRLoss
+from .losses import (
+    l1_loss_fn,
+    mse_loss_fn,
+    charbonnier_loss_fn,
+    bce_loss_fn,
+    bce_with_logits_loss_fn,
+    r1_reg_loss,
+    PerceptualLoss,
+    DSSIMLoss,
+    StyleLossLabChroma,
+    DLoss,
+    GANLoss,
+    IDLoss,
+    IFSRLoss,
+    DINOv2PerceptualLoss,
+)
 from .vgg import get_vgg_layer_name
 
 __all__ = [
@@ -6,6 +21,7 @@ __all__ = [
     "mse_loss_fn",
     "charbonnier_loss_fn",
     "bce_loss_fn",
+    "bce_with_logits_loss_fn",
     "PerceptualLoss",
     "DSSIMLoss",
     "StyleLossLabChroma",
@@ -15,4 +31,5 @@ __all__ = [
     "IDLoss",
     "IFSRLoss",
     "get_vgg_layer_name",
+    "DINOv2PerceptualLoss",
 ]

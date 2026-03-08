@@ -8,7 +8,7 @@ from typing import Literal, Callable
 from .vgg import VGGFeatureExtractor
 from misc.models.idencoder import PROVIDER, IDEncoder
 
-EPS = 1e-6
+EPS = 1e-8
 
 LossFn = Callable[[Tensor, Tensor], Tensor]
 
@@ -31,19 +31,19 @@ def charbonnier_loss(pred: Tensor, target: Tensor, reduction: Literal["none", "m
             raise ValueError(f"Invalid reduction: {reduction}")
 
 
-def l1_loss_fn(weight: float = 1, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
+def l1_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
     return create_weighted_loss(F.l1_loss, weight, reduction)
 
 
-def mse_loss_fn(weight: float = 1, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
+def mse_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
     return create_weighted_loss(F.mse_loss, weight, reduction)
 
 
-def charbonnier_loss_fn(weight: float = 1, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
+def charbonnier_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
     return create_weighted_loss(charbonnier_loss, weight, reduction)
 
 
-def bce_loss_fn(weight: float = 1, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
+def bce_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
     f = create_weighted_loss(F.binary_cross_entropy, weight, reduction)
 
     def disable_amp(*args, **kwargs):
@@ -53,22 +53,100 @@ def bce_loss_fn(weight: float = 1, reduction: Literal["none", "mean", "sum"] = "
     return disable_amp
 
 
+def bce_with_logits_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
+    f = create_weighted_loss(F.binary_cross_entropy_with_logits, weight, reduction)
+
+    def disable_amp(*args, **kwargs):
+        with autocast(device_type="cuda", enabled=False):
+            return f(*args, **kwargs)
+
+    return disable_amp
+
+
+class DINOv2PerceptualLoss(nn.Module):
+
+    def __init__(
+        self,
+        layer_weights: dict[int, float],
+        criterion: Literal["l1", "mse", "charbonnier", "cosine"] = "cosine",
+        dino_type="dinov2_vitb14_reg",
+        use_input_norm: bool = True,
+        range_norm: bool = True,
+    ):
+        """
+        Args:
+            layer_weights (dict): The weight for each layer of vgg feature.
+            use_input_norm (bool):  If True, normalize the input image.
+                Default: True.
+            range_norm (bool): If True, norm images with range [-1, 1] to [0, 1].
+                Default: False.
+        """
+        super().__init__()
+
+        self.criterion = {"l1": F.l1_loss, "mse": F.mse_loss, "charbonnier": charbonnier_loss, "cosine": self._cosine_distance}.get(criterion)
+        if self.criterion is None:
+            raise NotImplementedError(f"{criterion} criterion has not been supported. Only 'l1' and 'mse' are supported.")
+        self.layer_weights = layer_weights
+
+        self.dino = torch.hub.load("facebookresearch/dinov2", dino_type)
+        self.dino.eval()
+        self.dino.requires_grad_(False)
+
+        self.n_blocks = max(self.layer_weights.keys()) + 1
+
+        self.use_input_norm = use_input_norm
+        if self.use_input_norm:
+            self.register_buffer("mean", Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+            self.register_buffer("std", Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+        self.range_norm = range_norm
+
+    @staticmethod
+    def _cosine_distance(x: Tensor, y: Tensor) -> Tensor:
+
+        x_norm, y_norm = F.normalize(x, p=2, dim=-1), F.normalize(y, p=2, dim=-1)
+        return 1.0 - F.cosine_similarity(x_norm, y_norm, dim=-1).mean()
+
+    # @torch.compile(fullgraph=True, dynamic=False, options={"epilogue_fusion": True, "max_autotune": True})
+    def forward(self, x: Tensor, y: Tensor) -> Tensor:
+
+        x = F.interpolate(x, [224, 224], mode="bilinear", align_corners=False)
+        y = F.interpolate(y, [224, 224], mode="bilinear", align_corners=False)
+
+        if self.range_norm:
+            x = (x + 1) * 0.5
+            y = (y + 1) * 0.5
+        if self.use_input_norm:
+            x = (x - self.mean) / self.std
+            y = (y - self.mean) / self.std
+
+        x_patch = self.dino.get_intermediate_layers(x, n=self.n_blocks)
+        y_patch = self.dino.get_intermediate_layers(y, n=self.n_blocks)
+
+        loss = torch.tensor(0.0, dtype=x.dtype, device=x.device)
+        for idx, weight in self.layer_weights.items():
+            x_feat, y_feat = x_patch[idx], y_patch[idx]
+            loss += self.criterion(x_feat, y_feat) * weight
+
+        return loss
+
+
 class PerceptualLoss(nn.Module):
-    """
-    Args:
-        layer_weights (dict): The weight for each layer of vgg feature.
-                Here is an example: {'conv5_4': 1.}, which means the conv5_4
-                feature layer (before relu5_4) will be extracted with weight
-                1.0 in calculting losses.
-        use_input_norm (bool):  If True, normalize the input image in vgg.
-            Default: True.
-        range_norm (bool): If True, norm images with range [-1, 1] to [0, 1].
-            Default: False.
-    """
 
     def __init__(
         self, layer_weights: dict[str, float], criterion: Literal["l1", "mse", "charbonnier"] = "l1", vgg_type="vgg19", use_input_norm: bool = True, range_norm: bool = True
     ):
+        """
+        Args:
+            layer_weights (dict): The weight for each layer of vgg feature.
+                    Here is an example: {'conv5_4': 1.}, which means the conv5_4
+                    feature layer (before relu5_4) will be extracted with weight
+                    1.0 in calculting losses.
+            use_input_norm (bool):  If True, normalize the input image in vgg.
+                Default: True.
+            range_norm (bool): If True, norm images with range [-1, 1] to [0, 1].
+                Default: False.
+        """
         super().__init__()
 
         self.vgg = VGGFeatureExtractor(layer_names=list(layer_weights.keys()), vgg_type=vgg_type, use_input_norm=use_input_norm, range_norm=range_norm)
@@ -173,9 +251,15 @@ class DSSIMLoss(nn.Module):
 
 
 class StyleLossLabChroma(nn.Module):
-    def __init__(self, weight: float = 1.0):
+    def __init__(self, weight: float = 1.0, range_norm: bool = True):
+        """
+        Args:
+            range_norm (bool): 如果输入值域为 [-1, 1] 则转换为 [0, 1].
+                Default: True.
+        """
         super().__init__()
 
+        self.range_norm = range_norm
         self.weight = weight
 
     def _mean_std(self, x: Tensor) -> tuple[Tensor, Tensor]:
@@ -194,13 +278,18 @@ class StyleLossLabChroma(nn.Module):
 
     @torch.compile(fullgraph=True, dynamic=False, options={"epilogue_fusion": True, "max_autotune": True})
     def forward(self, pred_rgb: Tensor, target_rgb: Tensor) -> Tensor:
+
+        if self.range_norm:
+            pred_rgb = pred_rgb.add(1.0).mul(0.5)
+            target_rgb = target_rgb.add(1.0).mul(0.5)
+
+        pred_rgb = pred_rgb.clamp(0.0, 1.0)
+        target_rgb = target_rgb.clamp(0.0, 1.0)
+
         pred_lab = rgb_to_lab(pred_rgb)
         target_lab = rgb_to_lab(target_rgb)
 
-        pred_ab = pred_lab[:, 1:3]
-        target_ab = target_lab[:, 1:3]
-
-        return self._style_loss_mean_std(pred_ab, target_ab, self.weight)
+        return self._style_loss_mean_std(pred_lab, target_lab, self.weight)
 
 
 @autocast(device_type="cuda", enabled=False)
@@ -388,18 +477,22 @@ class IFSRLoss(nn.Module):
 
 
 if __name__ == "__main__":
+    import random
+    from torchvision.io import read_image
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batch_size = 32
 
-    i = IFSRLoss().to(device)
-    bs = 8
+    losses = DINOv2PerceptualLoss(
+        layer_weights={
+            11: 1.0,  # 面部组件对齐（眼鼻口位置）
+        },
+        range_norm=False,
+    ).to(device)
 
-    x = torch.randn([8, 3, 112, 112], dtype=torch.float, device=device)
-    y = torch.randn([8, 3, 112, 112], dtype=torch.float, device=device)
-
-    f = i.get_ifsr_feats(x)
-    z = i.get_ifsr_feats(y)
-
-    loss = i(f, z)
+    x = read_image(f"/opt/share/deepfake/dataset_1/ffhq_1024/{random.randint(0,69999):05d}.png").to(device=device, dtype=torch.float).div(255.0).unsqueeze(0)
+    y = read_image(f"/opt/share/deepfake/dataset_1/ffhq_1024/{random.randint(0,69999):05d}.png").to(device=device, dtype=torch.float).div(255.0).unsqueeze(0)
+    # y = x
+    loss: torch.Tensor = losses(x, y)
 
     print(loss.item())

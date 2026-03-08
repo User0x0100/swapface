@@ -1,20 +1,22 @@
 from pathlib import Path
 from typing import Any
+import multiprocessing as mp
 
 import torch
-from torch import nn, Tensor
+from torch import Tensor
+import torchvision.transforms.functional as F
 from misc.facealign import face_align_batch, extract_alignface_from_video
 from misc.models.retinaface import get_pts, RetinaFace
-from misc.models.idencoder import IDEncoder, get_align_landmarks
-from .networks.generator import Generator
-from torchcodec.decoders import VideoDecoder
+from misc.models.idencoder import IDEncoder, get_align_landmarks, PROVIDER
+from misc.models.face_parsing import FaceParsing
+from .networks import Generator
 from torchvision.io import decode_image
 from tqdm import tqdm
 import cv2
 
 
 class Swap:
-    def __init__(self, ckpt: str, device: str = "cuda") -> None:
+    def __init__(self, ckpt: str, idencoder_provider: PROVIDER, device: str = "cuda") -> None:
         super().__init__()
 
         if Path(ckpt).exists() == False:
@@ -38,10 +40,12 @@ class Swap:
         self.size = ckpt["net_g"]["network_cfg"]["input_res"]
 
         self.net_g = Generator(**ckpt["net_g"]["network_cfg"]).to(device=self.device)
-        self.net_g.load_state_dict(ckpt["net_g"]["state_dict"])
+        self.net_g.load_state_dict(ckpt["net_g"]["state_dict"], strict=False)
+        self.net_g.eval()
 
-        self.facedetch = RetinaFace(from_normalized=True).to(device=self.device)
-        self.idencoder = IDEncoder().to(device=self.device)
+        self.facedetch = RetinaFace(from_normalized=True).to(device=self.device).eval()
+        self.idencoder = IDEncoder(provider=idencoder_provider).to(device=self.device).eval()
+        self.face_mask = FaceParsing(range_norm=True, occ=True).to(device=self.device)
 
         self.dst_pts = torch.tensor(get_align_landmarks(self.size), device=self.device)
 
@@ -53,17 +57,17 @@ class Swap:
         image = decode_image(fp).to(device=self.device, dtype=torch.float)
         image.div_(127.5).sub_(1.0).unsqueeze_(0)  # [-1 ~ 1]
 
-        detected = self.facedetch.detector(image)
+        detected, offset = self.facedetch.detector(image)
         src_pts = get_pts(detected)
         dst_pts = get_align_landmarks(self.size)
         dst_pts = torch.tensor(dst_pts, device=self.device)
-        align_face, _ = face_align_batch(image, src_pts, dst_pts, (self.size, self.size))
+        align_face, _ = face_align_batch(image, src_pts, offset, dst_pts, (self.size, self.size))
 
-        align_face = align_face[0]
+        N = align_face.size(0)
 
-        if align_face.shape[0] == 0:
+        if N == 0:
             raise AssertionError(f"未从{fp}检测到任何面部")
-        if align_face.shape[0] > 1:
+        if N > 1:
             print("Warning: 检测到多张面部，仅使用第一张")
             align_face = align_face[:1]
 
@@ -71,32 +75,66 @@ class Swap:
 
         return id_emb
 
+    @staticmethod
+    def _display_worker(q: mp.Queue, fps=25):
+        delay = int(1000 / fps)
+        while True:
+            frames = q.get()
+            if frames is None:
+                break
+
+            for frame in frames:
+                cv2.imshow("swaped", frame)
+                cv2.waitKey(delay)
+
+    @torch.inference_mode()
     def swap_video(self, vfp: str, id_fp: str):
+
+        mp.set_start_method("spawn", force=True)
+        q = mp.Queue(maxsize=15)
+        p = mp.Process(target=self._display_worker, args=(q,), daemon=True)
+        p.start()
 
         batch_size = 8
 
         id_emb = self.extract_id_feats_from_image(id_fp)
 
-        for faces, norm_theta in extract_alignface_from_video(vfp, batch_size=batch_size, align_size=self.size, device=self.device):
-            for face in faces:
-                if face.shape[0] == 0:
-                    continue
+        for faces, norm_theta, offset in extract_alignface_from_video(vfp, batch_size=batch_size, align_size=self.size, device=self.device):
+            N = faces.size(0)
+            if N == 0:
+                continue
+            faces.div_(127.5).sub_(1.0)
 
-                swap_face: Tensor = self.net_g(face, id_emb.expand(face.shape[0], -1))
+            with torch.autocast(device_type="cuda"):
+                swap_face: Tensor = self.net_g(faces, id_emb.expand(N, -1))
+                mask = self.face_mask(faces)
+                mask = F.gaussian_blur(mask, 7, 13)
+                swap_face = faces * (1.0 - mask) + swap_face * mask
+                mask = mask * 2.0 - 1.0
 
-                swap_face = swap_face.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)[:, [2, 1, 0], :, :]  # RGB -> BGR
-                swap_face = swap_face.permute(0, 2, 3, 1)  # NCHW -> NHWC
-                frames = swap_face.to(device="cpu", dtype=torch.uint8).numpy()
+            swap_face = torch.cat((faces, swap_face, mask.expand(N, 3, -1, -1)), dim=3)
+            swap_face = swap_face.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)[:, [2, 1, 0], :, :]  # RGB -> BGR
+            swap_face = swap_face.permute(0, 2, 3, 1)  # NCHW -> NHWC
+            frames = swap_face.to(device="cpu", dtype=torch.uint8).numpy()
 
-                for frame in frames:
-                    cv2.imshow("swaped", frame)
-                    cv2.waitKey(1)
+            q.put(frames)
+
+        q.put(None)
+        p.join()
 
 
 if __name__ == "__main__":
 
-    video = "/opt/share/deepfake/linshi/录屏素材/2023-04-14(李云帆 陈雨)/20230414-163616614陈雨(电脑录屏).mp4"
-    id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
-    swapper = Swap("train_log/256_blendface/ckpt/1180000.pth")
+    # video = "/opt/share/deepfake/linshi/录屏素材/2023-04-14(李云帆 陈雨)/20230414-163616614陈雨(电脑录屏).mp4"
+    # id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
+    # id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
+    # id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
+
+    video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
+    id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
+    # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
+    # id = "/home/liaohaixun/swap/IDAssets/2025-06-15 18_19_50小树🌿人间体验卡限时掉落✨ _3.jpg"
+
+    swapper = Swap("train_log/256_BLENDFACE_2_WFM_LOW_VGGRELU_WFM0.5_REC2.5/ckpt/840000.pth", PROVIDER.BLENDFACE)
 
     swapper.swap_video(video, id)
