@@ -100,6 +100,7 @@ class Trainer:
             "layer1.2": (0.035144, 1.0),
         },
     ):
+        self.rng = random.Random()
         self.device = torch.device(device)
         self.batch_size = batch_size
         self.d_train_setp = d_train_setp
@@ -265,7 +266,7 @@ class Trainer:
                         dst_ifsr_feats = self.ifsr_loss.get_ifsr_feats(dst)
 
                 id_feats_mix = False
-                if id_feats_mix and random.random() < 0.5:
+                if id_feats_mix and self.rng.random() < 0.5:
 
                     w1_all = self.net_g.mapping_z_source(src_id_feats)
                     w2_all = self.net_g.mapping_z_source(torch.randn_like(src_id_feats))
@@ -384,10 +385,10 @@ class Trainer:
                         amax = attn.amax(dim=(2, 3), keepdim=True)
                         attn_norm = 2.0 * (attn - amin) / (amax - amin + 1e-6) - 1.0
 
-                grid = torch.cat((src, dst, fake, attn_norm), dim=0)
-                grid.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)
-                grid = make_grid(grid, nrow=self.batch_size)[[2, 1, 0], :, :]  # RGB -> BGR
-                grid = grid.permute(1, 2, 0)  # CHW -> HWC
+                    grid = torch.cat((src, dst, fake, attn_norm), dim=0)
+                    grid.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)
+                    grid = make_grid(grid, nrow=self.batch_size)[[2, 1, 0], :, :]  # RGB -> BGR
+                    grid = grid.permute(1, 2, 0)  # CHW -> HWC
                 grid_cpu = grid.to(device="cpu", dtype=torch.uint8).numpy()
                 cv2.imwrite(self.sample_dir / f"{self.iter}.png", grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3])
 
