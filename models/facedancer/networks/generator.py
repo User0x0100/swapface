@@ -216,8 +216,20 @@ class AdaInRB(nn.Module):
 
 
 class FusionMode(Enum):
+    ADD = "add"
     CONCAT = "concat"
     ATTN = "attn"
+
+
+class AddFusion(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+
+        self.weight = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x_target: Tensor, x_source: Tensor) -> Tensor:
+        w = self.weight.view(1, -1, 1, 1)
+        return x_target + w * x_source
 
 
 class Concat(nn.Module):
@@ -258,7 +270,7 @@ class SkipFusionModConv(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample_mode: RBReSampleMode, fusion_mode: FusionMode, use_refinement: bool = False) -> None:
         super().__init__()
 
-        self.fusion = {FusionMode.CONCAT: Concat(1), FusionMode.ATTN: Attn(in_ch)}.get(fusion_mode)
+        self.fusion = {FusionMode.CONCAT: Concat(1), FusionMode.ATTN: Attn(in_ch), FusionMode.ADD: AddFusion(in_ch)}.get(fusion_mode)
         if self.fusion is None:
             raise KeyError(f"Unsupported fusion mode: {fusion_mode}")
 
@@ -278,7 +290,7 @@ class SkipFusionAdaIN(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample_mode: RBReSampleMode, fusion_mode: FusionMode) -> None:
         super().__init__()
 
-        self.fusion = {FusionMode.CONCAT: Concat(1), FusionMode.ATTN: Attn(in_ch)}.get(fusion_mode)
+        self.fusion = {FusionMode.CONCAT: Concat(1), FusionMode.ATTN: Attn(in_ch), FusionMode.ADD: AddFusion(in_ch)}.get(fusion_mode)
         if self.fusion is None:
             raise KeyError(f"Unsupported fusion mode: {fusion_mode}")
 

@@ -8,8 +8,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 batch_size = 1
 img_size = 256
 
-# model = Discriminator(img_size).to(device)
-model = Stylegan2DiscriminatorLite(img_size, group_size=1).to(device)
+model = Discriminator(img_size).to(device)
+# model = Stylegan2DiscriminatorLite(img_size, group_size=1).to(device)
 # model = UNetDualDiscriminator().to(device)
 # model = UNetDiscriminatorSN().to(device)
 # model = StyleGAN2Discriminator(img_size).to(device)
@@ -18,7 +18,9 @@ model.eval()
 
 x_target = torch.randn(batch_size, 3, img_size, img_size, device=device)
 
-model(x_target)
+x, feats = model(x_target, True)
+print([x.shape for x in feats])
+
 
 flops = FlopCountAnalysis(model, x_target)
 
