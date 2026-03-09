@@ -13,8 +13,9 @@ from .losses import (
     IDLoss,
     IFSRLoss,
     DINOv2PerceptualLoss,
+    WFMLoss,
 )
-from .vgg import get_vgg_layer_name
+from .vgg import get_vgg_layer_name, get_vgg_support_vgg_type
 
 __all__ = [
     "l1_loss_fn",
@@ -30,6 +31,8 @@ __all__ = [
     "GANLoss",
     "IDLoss",
     "IFSRLoss",
+    "get_vgg_support_vgg_type",
     "get_vgg_layer_name",
     "DINOv2PerceptualLoss",
+    "WFMLoss",
 ]

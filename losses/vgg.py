@@ -128,6 +128,10 @@ VGG_Layer_Name = {
 }
 
 
+def get_vgg_support_vgg_type() -> list[str]:
+    return VGG_Layer_Name.keys()
+
+
 def get_vgg_layer_name(vgg_type: str):
     return VGG_Layer_Name[vgg_type]
 

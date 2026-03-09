@@ -122,9 +122,6 @@ class ModConvRB(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample_mode: RBReSampleMode, use_refinement: bool = False):
         super().__init__()
 
-        self.resample_mode = resample_mode
-
-        self.resample_mode = resample_mode
         self.modconv = ModulatedConv2d(in_ch, out_ch, w_dim, use_refinement=use_refinement)
         self.bias = nn.Parameter(torch.zeros(out_ch))
         self.act = nn.LeakyReLU(0.2)
@@ -133,8 +130,8 @@ class ModConvRB(nn.Module):
             case RBReSampleMode.UPSAMPLE:
                 self.resample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
                 self.shortcut = nn.Sequential(
-                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
                     nn.Conv2d(in_ch, out_ch, 1),
+                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
                 )
 
             case RBReSampleMode.DOWNSAMPLE:
@@ -152,10 +149,10 @@ class ModConvRB(nn.Module):
 
         skip = self.shortcut(x)
 
-        x = self.act(x)
         x = self.modconv(x, w)
-        x = self.resample(x)
         x = x + self.bias.view(1, -1, 1, 1)
+        x = self.act(x)
+        x = self.resample(x)
 
         return x + skip
 

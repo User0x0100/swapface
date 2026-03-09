@@ -10,11 +10,11 @@ class DownBlock(nn.Module):
             nn.AvgPool2d(2),
         )
         self.residual = nn.Sequential(
-            nn.InstanceNorm2d(in_ch, affine=False),
+            # nn.InstanceNorm2d(in_ch, affine=False),
             nn.LeakyReLU(0.2),
             nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
             nn.AvgPool2d(2),
-            nn.InstanceNorm2d(out_ch, affine=False),
+            # nn.InstanceNorm2d(out_ch, affine=False),
             nn.LeakyReLU(0.2),
             nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
         )

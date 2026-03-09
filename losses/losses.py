@@ -1,9 +1,8 @@
-from typing import Literal
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn, autocast
 from kornia.color import rgb_to_lab
-from typing import Literal, Callable
+from typing import Literal, Callable, Mapping
 
 from .vgg import VGGFeatureExtractor
 from misc.models.idencoder import PROVIDER, IDEncoder
@@ -63,11 +62,29 @@ def bce_with_logits_loss_fn(weight: float = 1.0, reduction: Literal["none", "mea
     return disable_amp
 
 
-class DINOv2PerceptualLoss(nn.Module):
+class WFMLoss(nn.Module):
+    def __init__(self, layer_weights: Mapping[int, float], criterion: Literal["l1", "mse", "charbonnier"] = "l1"):
+        super().__init__()
 
+        self.criterion = {"l1": F.l1_loss, "mse": F.mse_loss, "charbonnier": charbonnier_loss}.get(criterion)
+        if self.criterion is None:
+            raise NotImplementedError(f"{criterion} criterion has not been supported. Only 'l1' 'mse' 'charbonnier' are supported.")
+
+        self.layer_weights = layer_weights
+
+    def forward(self, x_feats: list[Tensor], y_feats: list[Tensor]) -> Tensor:
+
+        loss = x_feats[0].new_tensor(0.0)
+        for idx, weight in self.layer_weights.items():
+            loss += self.criterion(x_feats[idx], y_feats[idx]) * weight
+
+        return loss
+
+
+class DINOv2PerceptualLoss(nn.Module):
     def __init__(
         self,
-        layer_weights: dict[int, float],
+        layer_weights: Mapping[int, float],
         criterion: Literal["l1", "mse", "charbonnier", "cosine"] = "cosine",
         dino_type="dinov2_vitb14_reg",
         use_input_norm: bool = True,
@@ -75,7 +92,7 @@ class DINOv2PerceptualLoss(nn.Module):
     ):
         """
         Args:
-            layer_weights (dict): The weight for each layer of vgg feature.
+            layer_weights (Mapping): The weight for each layer of vgg feature.
             use_input_norm (bool):  If True, normalize the input image.
                 Default: True.
             range_norm (bool): If True, norm images with range [-1, 1] to [0, 1].
@@ -85,7 +102,7 @@ class DINOv2PerceptualLoss(nn.Module):
 
         self.criterion = {"l1": F.l1_loss, "mse": F.mse_loss, "charbonnier": charbonnier_loss, "cosine": self._cosine_distance}.get(criterion)
         if self.criterion is None:
-            raise NotImplementedError(f"{criterion} criterion has not been supported. Only 'l1' and 'mse' are supported.")
+            raise NotImplementedError(f"{criterion} criterion has not been supported. Only 'l1' 'mse' 'charbonnier' 'cosine' are supported.")
         self.layer_weights = layer_weights
 
         self.dino = torch.hub.load("facebookresearch/dinov2", dino_type)
@@ -132,13 +149,12 @@ class DINOv2PerceptualLoss(nn.Module):
 
 
 class PerceptualLoss(nn.Module):
-
     def __init__(
-        self, layer_weights: dict[str, float], criterion: Literal["l1", "mse", "charbonnier"] = "l1", vgg_type="vgg19", use_input_norm: bool = True, range_norm: bool = True
+        self, layer_weights: Mapping[str, float], criterion: Literal["l1", "mse", "charbonnier"] = "l1", vgg_type="vgg19", use_input_norm: bool = True, range_norm: bool = True
     ):
         """
         Args:
-            layer_weights (dict): The weight for each layer of vgg feature.
+            layer_weights (Mapping): The weight for each layer of vgg feature.
                     Here is an example: {'conv5_4': 1.}, which means the conv5_4
                     feature layer (before relu5_4) will be extracted with weight
                     1.0 in calculting losses.
@@ -155,7 +171,7 @@ class PerceptualLoss(nn.Module):
 
         self.criterion = {"l1": F.l1_loss, "mse": F.mse_loss, "charbonnier": charbonnier_loss}.get(criterion)
         if self.criterion is None:
-            raise NotImplementedError(f"{criterion} criterion has not been supported. Only 'l1' and 'mse' are supported.")
+            raise NotImplementedError(f"{criterion} criterion has not been supported. Only 'l1' 'mse' 'charbonnier' are supported.")
 
         self.weights = list(layer_weights.values())
 
@@ -307,9 +323,8 @@ class DLoss(nn.Module):
         self.weight = weight
 
         self.loss_fn = {"hinge": self._hinge, "wgan": self._wgan, "ls": self._ls, "bce": self._bce}.get(loss_type)
-
         if self.loss_fn is None:
-            raise ValueError(f"Unsupported loss_type: {loss_type}")
+            raise ValueError(f"Unsupported loss_type: {loss_type}. Only 'hinge' 'wgan' 'ls' 'bce' are supported.")
 
     def _hinge(self, fake_score: Tensor, real_score: Tensor) -> Tensor:
         loss_real = torch.relu(1.0 - real_score)
@@ -358,7 +373,7 @@ class GANLoss(nn.Module):
 
         self.loss_fn = {"hinge": self._hinge_and_wgan, "wgan": self._hinge_and_wgan, "ls": self._ls, "bce": self._bce}.get(loss_type)
         if self.loss_fn is None:
-            raise ValueError(f"Unsupported loss_type: {loss_type}")
+            raise ValueError(f"Unsupported loss_type: {loss_type}. Only 'hinge' 'wgan' 'ls' 'bce' are supported.")
 
     def _hinge_and_wgan(self, pred_score: Tensor) -> Tensor:
         return -pred_score
@@ -415,19 +430,19 @@ class IDLoss(nn.Module):
 
 
 class IFSRLoss(nn.Module):
-    def __init__(self, ifsr_scale: float, ifsr_dict: dict[str, tuple[float, float]], idencoder_provider: PROVIDER = PROVIDER.MS1MV3_ARCFACE_R50_FP16):
+    def __init__(self, ifsr_scale: float, ifsr_weight: Mapping[str, tuple[float, float]], idencoder_provider: PROVIDER = PROVIDER.MS1MV3_ARCFACE_R50_FP16):
         super().__init__()
 
         idencoder = IDEncoder(provider=idencoder_provider)
         self.feature_layer_indices: dict[int, str] = {}
-        self.ifsr_dict = ifsr_dict
+        self.ifsr_weight = ifsr_weight
 
-        for key, (margin, weight) in self.ifsr_dict.items():
-            ifsr_dict[key] = (margin * ifsr_scale, weight)
+        for key, (margin, weight) in self.ifsr_weight.items():
+            ifsr_weight[key] = (margin * ifsr_scale, weight)
 
         net = nn.ModuleList()
 
-        ifsr_layer_name = list(ifsr_dict.keys())
+        ifsr_layer_name = list(ifsr_weight.keys())
         max_layer_idx = 0
         idx = 0
         for module_name_0, module_0 in idencoder.backbone.named_children():
@@ -464,7 +479,7 @@ class IFSRLoss(nn.Module):
 
     def forward(self, src_ifsr_feats: dict[str, Tensor], dst_ifsr_feats: dict[str, Tensor]):
         loss = 0.0
-        for layer_name, (margin, weight) in self.ifsr_dict.items():
+        for layer_name, (margin, weight) in self.ifsr_weight.items():
 
             feat_true_flat = src_ifsr_feats[layer_name].flatten(1)
             feat_pred_flat = dst_ifsr_feats[layer_name].flatten(1)
