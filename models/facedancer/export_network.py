@@ -6,22 +6,22 @@ import onnx
 def exp(model: nn.Module, sample_input: tuple[Tensor], opset_version: int | None, onnx_path: str):
 
     model.eval()
-    with torch.inference_mode():
-        torch.onnx.export(
-            model,
-            sample_input,
-            onnx_path,
-            opset_version=opset_version,
-            export_params=True,
-            dynamo=True,
-            fallback=False,
-            optimize=True,
-            verify=True,
-            external_data=False,
-            keep_initializers_as_inputs=False,
-            verbose=True,
-            profile=True,
-        )
+
+    torch.onnx.export(
+        model,
+        sample_input,
+        onnx_path,
+        opset_version=opset_version,
+        export_params=True,
+        dynamo=True,
+        fallback=False,
+        optimize=True,
+        verify=True,
+        external_data=False,
+        keep_initializers_as_inputs=False,
+        verbose=True,
+        profile=True,
+    )
 
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model, full_check=True)

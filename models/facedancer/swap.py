@@ -9,7 +9,16 @@ from misc.facealign import face_align_batch, extract_alignface_from_video
 from misc.models.retinaface import get_pts, RetinaFace
 from misc.models.idencoder import IDEncoder, get_align_landmarks, PROVIDER
 from misc.models.face_parsing import FaceParsing
-from .networks import Generator
+from .networks import (
+    Generator,
+    NormType,
+    InjectModule,
+    Bottleneck,
+    SkipFusionModule,
+    Discriminator,
+    Stylegan2DiscriminatorLite,
+    AlphaFaceDiscriminator,
+)
 from torchvision.io import decode_image
 from tqdm import tqdm
 import cv2
@@ -19,7 +28,7 @@ class Swap:
     def __init__(self, ckpt: str, idencoder_provider: PROVIDER, device: str = "cuda") -> None:
         super().__init__()
 
-        if Path(ckpt).exists() == False:
+        if not Path(ckpt).exists():
             raise FileNotFoundError(f"ckpt file: {ckpt} Not found")
 
         self.device = torch.device(device)
@@ -29,7 +38,7 @@ class Swap:
 
         self.iter = ckpt["iter"]
 
-        print(f"ckpt Info:\n" f"  {'iter':25}: {self.iter}")
+        print(f"ckpt Info:\n  {'iter':25}: {self.iter}")
         print("net_g:")
         for k, v in ckpt["net_g"]["network_cfg"].items():
             print(f"  {k:25}: {v}")
@@ -37,7 +46,7 @@ class Swap:
         for k, v in ckpt["net_d"]["network_cfg"].items():
             print(f"  {k:25}: {v}")
 
-        self.size = ckpt["net_g"]["network_cfg"]["input_res"]
+        self.img_resolution = ckpt["net_g"]["network_cfg"]["img_resolution"]
 
         self.net_g = Generator(**ckpt["net_g"]["network_cfg"]).to(device=self.device)
         self.net_g.load_state_dict(ckpt["net_g"]["state_dict"], strict=False)
@@ -47,7 +56,7 @@ class Swap:
         self.idencoder = IDEncoder(provider=idencoder_provider).to(device=self.device).eval()
         self.face_mask = FaceParsing(range_norm=True, occ=True).to(device=self.device)
 
-        self.dst_pts = torch.tensor(get_align_landmarks(self.size), device=self.device)
+        self.dst_pts = torch.tensor(get_align_landmarks(self.img_resolution), device=self.device)
 
     def extract_id_feats_from_image(self, fp: str) -> Tensor:
         """
@@ -59,9 +68,9 @@ class Swap:
 
         detected, offset = self.facedetch.detector(image)
         src_pts = get_pts(detected)
-        dst_pts = get_align_landmarks(self.size)
+        dst_pts = get_align_landmarks(self.img_resolution)
         dst_pts = torch.tensor(dst_pts, device=self.device)
-        align_face, _ = face_align_batch(image, src_pts, offset, dst_pts, (self.size, self.size))
+        align_face, _ = face_align_batch(image, src_pts, offset, dst_pts, (self.img_resolution, self.img_resolution))
 
         N = align_face.size(0)
 
@@ -99,7 +108,7 @@ class Swap:
 
         id_emb = self.extract_id_feats_from_image(id_fp)
 
-        for faces, norm_theta, offset in extract_alignface_from_video(vfp, batch_size=batch_size, align_size=self.size, device=self.device):
+        for faces, norm_theta, offset in extract_alignface_from_video(vfp, batch_size=batch_size, align_size=self.img_resolution, device=self.device):
             N = faces.size(0)
             if N == 0:
                 continue
@@ -124,17 +133,16 @@ class Swap:
 
 
 if __name__ == "__main__":
-
-    # video = "/opt/share/deepfake/linshi/录屏素材/2023-04-14(李云帆 陈雨)/20230414-163616614陈雨(电脑录屏).mp4"
-    # id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
+    video = "/opt/share/deepfake/linshi/录屏素材/2023-04-14(李云帆 陈雨)/20230414-163616614陈雨(电脑录屏).mp4"
+    id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
     # id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
     # id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
 
-    video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
-    id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
+    # video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
+    # id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
     # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
     # id = "/home/liaohaixun/swap/IDAssets/2025-06-15 18_19_50小树🌿人间体验卡限时掉落✨ _3.jpg"
 
-    swapper = Swap("train_log/256_BLENDFACE_2_WFM_LOW_VGGRELU_WFM0.5_REC2.5/ckpt/840000.pth", PROVIDER.BLENDFACE)
+    swapper = Swap("train_log/256_BLENDFACE_ModConv_New_id_loss_weight10/ckpt/520000.pth", PROVIDER.BLENDFACE)
 
     swapper.swap_video(video, id)

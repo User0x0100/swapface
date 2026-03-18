@@ -27,9 +27,9 @@ def get_align_landmarks(dst_size: int = 112) -> np.ndarray:
 
 
 class PROVIDER(Enum):
-    BLENDFACE = 1
-    MS1MV3_ARCFACE_R50_FP16 = 2
-    MS1MV3_ARCFACE_R100_FP16 = 3
+    BLENDFACE = {"backbone": iresnet100, "weight": "blendface.pth"}
+    MS1MV3_ARCFACE_R50_FP16 = {"backbone": iresnet50, "weight": "ms1mv3_arcface_r50_fp16.pth"}
+    MS1MV3_ARCFACE_R100_FP16 = {"backbone": iresnet100, "weight": "ms1mv3_arcface_r100_fp16.pth"}
 
 
 class IDEncoder(nn.Module):
@@ -48,21 +48,8 @@ class IDEncoder(nn.Module):
     def __init__(self, provider: PROVIDER = PROVIDER.BLENDFACE) -> None:
         super().__init__()
 
-        match provider:
-            case PROVIDER.BLENDFACE:
-                weight = hf_hub_download(repo_id=REPO_ID, filename="blendface.pth")
-                self.backbone = iresnet100()
-
-            case PROVIDER.MS1MV3_ARCFACE_R50_FP16:
-                weight = hf_hub_download(repo_id=REPO_ID, filename="ms1mv3_arcface_r50_fp16.pth")
-                self.backbone = iresnet50()
-
-            case PROVIDER.MS1MV3_ARCFACE_R100_FP16:
-                weight = hf_hub_download(repo_id=REPO_ID, filename="ms1mv3_arcface_r100_fp16.pth")
-                self.backbone = iresnet100()
-
-            case _:
-                raise TypeError(f"不支持的编码器提供者: {provider}")
+        weight = hf_hub_download(repo_id=REPO_ID, filename=provider.value["weight"])
+        self.backbone = provider.value["backbone"]()
 
         weight = torch.load(weight, weights_only=True, map_location=torch.device("cpu"))
         self.backbone.load_state_dict(weight)
@@ -81,7 +68,7 @@ class IDEncoder(nn.Module):
         """
 
         if x.shape[2:] != INPUT_SIZE:
-            x = F.interpolate(x, INPUT_SIZE, mode="bicubic", align_corners=False)
+            x = F.interpolate(x, INPUT_SIZE, mode="bilinear", align_corners=False)
         id = self.backbone(x)
         return F.normalize(id, p=2, dim=1)
 

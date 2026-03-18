@@ -30,6 +30,21 @@ def charbonnier_loss(pred: Tensor, target: Tensor, reduction: Literal["none", "m
             raise ValueError(f"Invalid reduction: {reduction}")
 
 
+def orthogonal_loss(x: Tensor, y: Tensor, reduction: Literal["none", "mean", "sum"] = "mean") -> Tensor:
+    x = F.normalize(x, dim=1)
+    y = F.normalize(y, dim=1)
+
+    loss = torch.abs(torch.sum(x * y, dim=1))
+
+    match reduction:
+        case "none":
+            return loss
+        case "mean":
+            return loss.mean()
+        case "sum":
+            return loss.sum()
+
+
 def l1_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
     return create_weighted_loss(F.l1_loss, weight, reduction)
 
@@ -62,11 +77,19 @@ def bce_with_logits_loss_fn(weight: float = 1.0, reduction: Literal["none", "mea
     return disable_amp
 
 
+def orthogonal_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
+    return create_weighted_loss(orthogonal_loss, weight, reduction)
+
+
 class WFMLoss(nn.Module):
     def __init__(self, layer_weights: Mapping[int, float], criterion: Literal["l1", "mse", "charbonnier"] = "l1"):
         super().__init__()
 
-        self.criterion = {"l1": F.l1_loss, "mse": F.mse_loss, "charbonnier": charbonnier_loss}.get(criterion)
+        self.criterion = {
+            "l1": F.l1_loss,
+            "mse": F.mse_loss,
+            "charbonnier": charbonnier_loss,
+        }.get(criterion)
         if self.criterion is None:
             raise NotImplementedError(f"{criterion} criterion has not been supported. Only 'l1' 'mse' 'charbonnier' are supported.")
 
@@ -100,7 +123,12 @@ class DINOv2PerceptualLoss(nn.Module):
         """
         super().__init__()
 
-        self.criterion = {"l1": F.l1_loss, "mse": F.mse_loss, "charbonnier": charbonnier_loss, "cosine": self._cosine_distance}.get(criterion)
+        self.criterion = {
+            "l1": F.l1_loss,
+            "mse": F.mse_loss,
+            "charbonnier": charbonnier_loss,
+            "cosine": self._cosine_distance,
+        }.get(criterion)
         if self.criterion is None:
             raise NotImplementedError(f"{criterion} criterion has not been supported. Only 'l1' 'mse' 'charbonnier' 'cosine' are supported.")
         self.layer_weights = layer_weights
@@ -150,39 +178,93 @@ class DINOv2PerceptualLoss(nn.Module):
 
 class PerceptualLoss(nn.Module):
     def __init__(
-        self, layer_weights: Mapping[str, float], criterion: Literal["l1", "mse", "charbonnier"] = "l1", vgg_type="vgg19", use_input_norm: bool = True, range_norm: bool = True
+        self,
+        layer_weights: Mapping[str, float],
+        criterion: Literal["l1", "mse", "charbonnier"] = "l1",
+        reduction: Literal["mean", "sum", "none"] = "mean",
+        vgg_type="vgg16",
+        use_input_norm: bool = True,
+        range_norm: bool = True,
     ):
         """
-        Args:
-            layer_weights (Mapping): The weight for each layer of vgg feature.
-                    Here is an example: {'conv5_4': 1.}, which means the conv5_4
-                    feature layer (before relu5_4) will be extracted with weight
-                    1.0 in calculting losses.
-            use_input_norm (bool):  If True, normalize the input image in vgg.
-                Default: True.
-            range_norm (bool): If True, norm images with range [-1, 1] to [0, 1].
-                Default: False.
+        参数：
+            layer_weights (Mapping[str, float]):
+                指定需要提取的 VGG 特征层以及对应的损失权重。
+                例如：{'conv5_4': 1.0} 表示提取 VGG 的 conv5_4（relu5_4 之前）
+                特征，并在计算感知损失时乘以权重 1.0。
+
+            criterion (str):
+                用于计算特征图差异的损失函数类型，可选：
+                    - 'l1'：L1 损失
+                    - 'mse'：均方误差损失
+                    - 'charbonnier'：Charbonnier 损失（L1 的平滑版本）
+
+            reduction (str):
+                指定每一层特征损失的聚合方式，可选：
+
+                    - 'mean'：
+                        对特征差异的所有元素求平均值，
+                        最终返回一个标量 loss。
+
+                    - 'sum'：
+                        对特征差异的所有元素求和，
+                        最终返回一个标量 loss。
+
+                    - 'none'：
+                        不对 batch 维度进行聚合。内部仍会对
+                        (C, H, W) 维度求平均，因此返回 shape
+                        为 (N,) 的逐样本 perceptual loss。
+
+            vgg_type (str):
+                使用的 VGG 网络类型，例如 'vgg16' 或 'vgg19'。
+
+            use_input_norm (bool):
+                若为 True，则在输入 VGG 前使用 ImageNet
+                的均值和方差对输入图像进行归一化。
+
+            range_norm (bool):
+                若为 True，则会先将输入图像从 [-1, 1] 范围
+                映射到 [0, 1]，再进行 VGG 归一化。
         """
         super().__init__()
 
-        self.vgg = VGGFeatureExtractor(layer_names=list(layer_weights.keys()), vgg_type=vgg_type, use_input_norm=use_input_norm, range_norm=range_norm)
+        self.vgg = VGGFeatureExtractor(
+            layer_names=list(layer_weights.keys()),
+            vgg_type=vgg_type,
+            use_input_norm=use_input_norm,
+            range_norm=range_norm,
+        )
         self.vgg.eval()
         self.vgg.requires_grad_(False)
 
-        self.criterion = {"l1": F.l1_loss, "mse": F.mse_loss, "charbonnier": charbonnier_loss}.get(criterion)
+        self.criterion = {
+            "l1": F.l1_loss,
+            "mse": F.mse_loss,
+            "charbonnier": charbonnier_loss,
+        }.get(criterion)
         if self.criterion is None:
             raise NotImplementedError(f"{criterion} criterion has not been supported. Only 'l1' 'mse' 'charbonnier' are supported.")
 
         self.weights = list(layer_weights.values())
+        self.reduction = reduction
 
     @torch.compile(fullgraph=True, dynamic=False, options={"epilogue_fusion": True, "max_autotune": True})
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
         fx: list[Tensor] = self.vgg(x)
-        fy: list[Tensor] = self.vgg(y)
+
+        with torch.inference_mode():
+            fy: list[Tensor] = self.vgg(y)
 
         loss = 0.0
         for weight, a, b in zip(self.weights, fx, fy):
-            loss += weight * self.criterion(a, b, reduction="mean")
+            match self.reduction:
+                case "mean":
+                    loss += self.criterion(a, b, reduction="mean") * weight
+                case "sum":
+                    loss += self.criterion(a, b, reduction="sum") * weight
+                case "none":
+                    diff = self.criterion(a, b, reduction="none")
+                    loss += diff.mean(dim=(1, 2, 3)) * weight
 
         return loss
 
@@ -200,7 +282,10 @@ class DSSIMLoss(nn.Module):
         self.sigma = sigma
         self.reduction = reduction
 
-        self.register_buffer("window", self._create_window(window_size, sigma).expand(self.C, 1, self.window_size, self.window_size))
+        self.register_buffer(
+            "window",
+            self._create_window(window_size, sigma).expand(self.C, 1, self.window_size, self.window_size),
+        )
 
     @staticmethod
     def _gaussian_1d(window_size: int, sigma: float) -> Tensor:
@@ -308,15 +393,22 @@ class StyleLossLabChroma(nn.Module):
         return self._style_loss_mean_std(pred_lab, target_lab, self.weight)
 
 
-@autocast(device_type="cuda", enabled=False)
 def r1_reg_loss(real_score: Tensor, real_img: Tensor, gamma: float = 10.0) -> Tensor:
-    real_grads = torch.autograd.grad(outputs=real_score.sum(), inputs=real_img, create_graph=True, retain_graph=True, only_inputs=True)[0]
-    penalty = real_grads.square().sum(dim=(1, 2, 3))
-    return 0.5 * gamma * penalty.mean()
+
+    r1_grads = torch.autograd.grad(outputs=[real_score.sum()], inputs=[real_img], create_graph=True, only_inputs=True)[0]
+    r1_penalty = r1_grads.square().sum([1, 2, 3])
+    r1_loss = r1_penalty * (gamma / 2)
+
+    return r1_loss.mean()
 
 
 class DLoss(nn.Module):
-    def __init__(self, loss_type: Literal["hinge", "wgan", "ls", "bce"] = "hinge", weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "none"):
+    def __init__(
+        self,
+        loss_type: Literal["hinge", "wgan", "ls", "bce"] = "hinge",
+        weight: float = 1.0,
+        reduction: Literal["none", "mean", "sum"] = "none",
+    ):
         super().__init__()
 
         self.reduction = reduction
@@ -329,7 +421,7 @@ class DLoss(nn.Module):
     def _hinge(self, fake_score: Tensor, real_score: Tensor) -> Tensor:
         loss_real = torch.relu(1.0 - real_score)
         loss_fake = torch.relu(1.0 + fake_score)
-        loss = 0.5 * (loss_real + loss_fake)
+        loss = loss_real + loss_fake
         return loss
 
     def _wgan(self, fake_score: Tensor, real_score: Tensor) -> Tensor:
@@ -339,16 +431,16 @@ class DLoss(nn.Module):
     def _ls(self, fake_score: Tensor, real_score: Tensor) -> Tensor:
         loss_real = (real_score - 1) ** 2
         loss_fake = fake_score**2
-        loss = 0.5 * (loss_real + loss_fake)
+        loss = loss_real + loss_fake
         return loss
 
     @torch.autocast(device_type="cuda", enabled=False)
     def _bce(self, fake_score: Tensor, real_score: Tensor) -> Tensor:
         real_label = torch.ones_like(real_score)
         fake_label = torch.zeros_like(fake_score)
-        loss_real = F.binary_cross_entropy_with_logits(real_score, real_label)
-        loss_fake = F.binary_cross_entropy_with_logits(fake_score, fake_label)
-        loss = 0.5 * (loss_real + loss_fake)
+        loss_real = F.binary_cross_entropy_with_logits(real_score, real_label, reduction="none")
+        loss_fake = F.binary_cross_entropy_with_logits(fake_score, fake_label, reduction="none")
+        loss = loss_real + loss_fake
         return loss
 
     def forward(self, fake_score: Tensor, real_score: Tensor) -> Tensor:
@@ -384,7 +476,7 @@ class GANLoss(nn.Module):
     @torch.autocast(device_type="cuda", enabled=False)
     def _bce(self, pred_score: Tensor) -> Tensor:
         real_label = torch.ones_like(pred_score)
-        return F.binary_cross_entropy_with_logits(pred_score, real_label)
+        return F.binary_cross_entropy_with_logits(pred_score, real_label, reduction="none")
 
     def forward(self, pred_score: Tensor) -> Tensor:
 
@@ -400,7 +492,6 @@ class GANLoss(nn.Module):
 
 
 class IDLoss(nn.Module):
-
     Provider = PROVIDER
 
     def __init__(self, provider: Provider = Provider.MS1MV3_ARCFACE_R50_FP16, weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean"):
@@ -430,7 +521,7 @@ class IDLoss(nn.Module):
 
 
 class IFSRLoss(nn.Module):
-    def __init__(self, ifsr_scale: float, ifsr_weight: Mapping[str, tuple[float, float]], idencoder_provider: PROVIDER = PROVIDER.MS1MV3_ARCFACE_R50_FP16):
+    def __init__(self, ifsr_scale: float, ifsr_weight: dict[str, tuple[float, float]], idencoder_provider: PROVIDER = PROVIDER.MS1MV3_ARCFACE_R50_FP16):
         super().__init__()
 
         idencoder = IDEncoder(provider=idencoder_provider)
@@ -446,14 +537,12 @@ class IFSRLoss(nn.Module):
         max_layer_idx = 0
         idx = 0
         for module_name_0, module_0 in idencoder.backbone.named_children():
-
             if not list(module_0.children()):
                 net.append(module_0)
                 idx += 1
                 continue
 
             for module_name_1, module_1 in module_0.named_children():
-
                 module_name = f"{module_name_0}.{module_name_1}"
 
                 net.append(module_1)
@@ -465,7 +554,11 @@ class IFSRLoss(nn.Module):
 
         self.net = net[: max_layer_idx + 1]
 
-    @torch.compile(fullgraph=True, dynamic=False, options={"epilogue_fusion": True, "max_autotune": True})
+    @torch.compile(
+        fullgraph=True,
+        dynamic=False,
+        options={"epilogue_fusion": True, "max_autotune": True},
+    )
     def get_ifsr_feats(self, x: Tensor) -> dict[str, Tensor]:
         feates: dict[str, Tensor] = {}
 
@@ -480,7 +573,6 @@ class IFSRLoss(nn.Module):
     def forward(self, src_ifsr_feats: dict[str, Tensor], dst_ifsr_feats: dict[str, Tensor]):
         loss = 0.0
         for layer_name, (margin, weight) in self.ifsr_weight.items():
-
             feat_true_flat = src_ifsr_feats[layer_name].flatten(1)
             feat_pred_flat = dst_ifsr_feats[layer_name].flatten(1)
             distance = (1.0 - F.cosine_similarity(feat_true_flat, feat_pred_flat, dim=1)).mean()
@@ -492,22 +584,21 @@ class IFSRLoss(nn.Module):
 
 
 if __name__ == "__main__":
-    import random
-    from torchvision.io import read_image
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 32
 
-    losses = DINOv2PerceptualLoss(
+    losses = PerceptualLoss(
         layer_weights={
-            11: 1.0,  # 面部组件对齐（眼鼻口位置）
+            "relu2_2": 1.0,
+            "relu3_3": 1.0,
         },
         range_norm=False,
+        reduction="none",
     ).to(device)
 
-    x = read_image(f"/opt/share/deepfake/dataset_1/ffhq_1024/{random.randint(0,69999):05d}.png").to(device=device, dtype=torch.float).div(255.0).unsqueeze(0)
-    y = read_image(f"/opt/share/deepfake/dataset_1/ffhq_1024/{random.randint(0,69999):05d}.png").to(device=device, dtype=torch.float).div(255.0).unsqueeze(0)
-    # y = x
-    loss: torch.Tensor = losses(x, y)
+    x = torch.randn((batch_size, 3, 256, 256), dtype=torch.float, device=device)
+    y = torch.randn((batch_size, 3, 256, 256), dtype=torch.float, device=device)
 
-    print(loss.item())
+    loss: Tensor = losses(x, y)
+
+    print(loss.shape)

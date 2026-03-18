@@ -14,6 +14,7 @@ from .losses import (
     IFSRLoss,
     DINOv2PerceptualLoss,
     WFMLoss,
+    orthogonal_loss_fn,
 )
 from .vgg import get_vgg_layer_name, get_vgg_support_vgg_type
 
@@ -35,4 +36,5 @@ __all__ = [
     "get_vgg_layer_name",
     "DINOv2PerceptualLoss",
     "WFMLoss",
+    "orthogonal_loss_fn",
 ]

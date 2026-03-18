@@ -81,20 +81,29 @@ class DiscriminatorBlock(nn.Module):
         return (x + residual) * self.scale
 
 
-class MiniBatchStdDev(nn.Module):
-    def __init__(self, group_size: int = 4) -> Tensor:
+class MinibatchStdLayer(nn.Module):
+    def __init__(self, group_size: int = 5, num_channels: int = 1) -> None:
         super().__init__()
 
         self.group_size = group_size
+        self.num_channels = num_channels
 
     def forward(self, x: Tensor) -> Tensor:
 
-        grouped = x.view(self.group_size, -1)
-        std = torch.sqrt(grouped.var(dim=0) + 1e-8)
-        std = std.mean().view(1, 1, 1, 1)
-        B, _, H, W = x.shape
-        std = std.expand(B, -1, H, W)
-        return torch.cat([x, std], dim=1)
+        N, C, H, W = x.shape
+        G = min(self.group_size, N)
+        F = self.num_channels
+        c = C // F
+
+        y = x.reshape(G, -1, F, c, H, W)
+        y = y - y.mean(dim=0)
+        y = y.square().mean(dim=0)
+        y = (y + 1e-8).sqrt()
+        y = y.mean(dim=[2, 3, 4])
+        y = y.reshape(-1, F, 1, 1)
+        y = y.repeat(G, 1, H, W)
+        x = torch.cat([x, y], dim=1)
+        return x
 
 
 class EqualizedLinear(nn.Module):
@@ -110,28 +119,29 @@ class EqualizedLinear(nn.Module):
 
 
 class Stylegan2DiscriminatorLite(nn.Module):
-    def __init__(self, input_res: int, base_ch: int = 64, max_ch: int = 512, group_size: int = 5) -> None:
+    def __init__(self, img_resolution: int = 256, img_channels: int = 3, base_ch: int = 64, max_ch: int = 512, group_size: int = 5) -> None:
         super().__init__()
 
         self.network_cfg = {
-            "input_res": input_res,
+            "img_resolution": img_resolution,
+            "img_channels": img_channels,
             "base_ch": base_ch,
             "max_ch": max_ch,
             "group_size": group_size,
         }
 
         self.from_rgb = nn.Sequential(
-            EqualizedConv2d(3, base_ch, 1),
+            EqualizedConv2d(img_channels, base_ch, 1),
             nn.LeakyReLU(0.2),
         )
 
-        features = [min(max_ch, base_ch * (2**i)) for i in range(int(math.log2(input_res)) - 1)]
+        features = [min(max_ch, base_ch * (2**i)) for i in range(int(math.log2(img_resolution)) - 1)]
 
         n_blocks = len(features) - 1
 
         self.blocks = nn.ModuleList([DiscriminatorBlock(features[i], features[i + 1]) for i in range(n_blocks)])
 
-        self.std_dev = MiniBatchStdDev(group_size)
+        self.std_dev = MinibatchStdLayer(group_size)
 
         final_features = features[-1] + 1
 

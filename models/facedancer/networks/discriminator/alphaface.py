@@ -1,89 +1,111 @@
 import math
+import torch
 from torch import nn, Tensor
+from ..layers import BlurPool
 
 
-class ResBlk(nn.Module):
-    def __init__(self, dim_in, dim_out, normalize=False, downsample=False):
+class MinibatchStdLayer(nn.Module):
+    def __init__(self, group_size: int = 5, num_channels: int = 1) -> None:
         super().__init__()
 
-        shortcut_layers = []
-        if dim_in != dim_out:
-            shortcut_layers.append(nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=False))
+        self.group_size = group_size
+        self.num_channels = num_channels
 
-        if downsample:
-            shortcut_layers.append(nn.AvgPool2d(2))
+    def forward(self, x: Tensor) -> Tensor:
 
-        self.shortcut = nn.Sequential(*shortcut_layers) if shortcut_layers else nn.Identity()
+        N, C, H, W = x.shape
+        G = min(self.group_size, N)
+        F = self.num_channels
+        c = C // F
 
-        residual_layers = []
-        if normalize:
-            residual_layers.append(nn.InstanceNorm2d(dim_in, affine=True))
+        y = x.reshape(G, -1, F, c, H, W)
+        y = y - y.mean(dim=0)
+        y = y.square().mean(dim=0)
+        y = (y + 1e-8).sqrt()
+        y = y.mean(dim=[2, 3, 4])
+        y = y.reshape(-1, F, 1, 1)
+        y = y.repeat(G, 1, H, W)
+        x = torch.cat([x, y], dim=1)
+        return x
 
-        residual_layers.append(nn.LeakyReLU(0.2))
-        residual_layers.append(nn.Conv2d(dim_in, dim_in, 3, 1, 1))
 
-        if downsample:
-            residual_layers.append(nn.AvgPool2d(2))
+class DownRB(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
 
-        if normalize:
-            residual_layers.append(nn.InstanceNorm2d(dim_in, affine=True))
+        self.shortcut = nn.Sequential(
+            # BlurPool(in_ch),
+            nn.Conv2d(in_ch, out_ch, 1, 2, 0),
+        )
 
-        residual_layers.append(nn.LeakyReLU(0.2))
-        residual_layers.append(nn.Conv2d(dim_in, dim_out, 3, 1, 1))
+        self.residual = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, 3, 1, 1),
+            nn.LeakyReLU(0.2),
+            # BlurPool(in_ch),
+            nn.Conv2d(in_ch, out_ch, 3, 2, 1),
+            nn.LeakyReLU(0.2),
+        )
 
-        self.residual = nn.Sequential(*residual_layers)
-
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         return (self.shortcut(x) + self.residual(x)) / math.sqrt(2)
 
 
 class AlphaFaceDiscriminator(nn.Module):
-    def __init__(self, input_res: int = 256, max_ch: int = 512):
+    def __init__(self, img_resolution: int = 256, img_channels: int = 3, base_ch: int = 64, max_ch: int = 512, group_size: int = 5):
         super().__init__()
 
         self.network_cfg = {
-            "input_res": input_res,
+            "img_resolution": img_resolution,
+            "img_channels": img_channels,
+            "base_ch": base_ch,
             "max_ch": max_ch,
+            "group_size": group_size,
         }
 
-        dim_in = 2**14 // input_res
-        num_domains = 1
-        blocks = []
-        blocks += [nn.Conv2d(3, dim_in, 3, 1, 1)]
-        repeat_num = int(math.log2(input_res)) - 1
-        for i in range(repeat_num):
-            dim_out = min(dim_in * 2, max_ch)
-            if i % 2 == 0:
-                blocks += [ResBlk(dim_in, dim_out, downsample=False)]
-            else:
-                blocks += [ResBlk(dim_in, dim_out, downsample=True)]
-            dim_in = dim_out
+        self.from_rgb = nn.Sequential(
+            nn.Conv2d(img_channels, base_ch, 3, 1, 1),
+            nn.LeakyReLU(0.2),
+        )
 
-        blocks += [nn.LeakyReLU(0.2)]
-        blocks += [nn.Conv2d(dim_out, dim_out, 1, 1, 0)]
-        blocks += [nn.LeakyReLU(0.2)]
-        blocks += [nn.Conv2d(dim_out, num_domains, 1, 1, 0)]
-        blocks += [nn.LeakyReLU(0.2)]
-        self.main = nn.Sequential(*blocks)
+        features = [min(max_ch, base_ch * (2**i)) for i in range(int(math.log2(img_resolution)) - 1)]
+        n_blocks = len(features) - 1
+
+        self.down_blocks = nn.ModuleList([DownRB(features[i], features[i + 1]) for i in range(n_blocks)])
+
+        self.mini_batch_std = MinibatchStdLayer(group_size)
+
+        final_features = features[-1] + 1
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(final_features, final_features, 3),  # 4×4 → 2×2
+            nn.LeakyReLU(0.2),
+            nn.Flatten(),
+            nn.Linear(2 * 2 * final_features, final_features),
+            nn.LeakyReLU(0.2),
+            nn.Linear(final_features, 1),
+        )
 
     def get_feats(self, x: Tensor) -> list[Tensor]:
 
+        x = self.from_rgb(x)
+
         feats = []
-        for depth, block in enumerate(self.main):
-            x = block(x)
-            if 7 < depth < 10:
-                feats.append(x)
+        for down_block in self.down_blocks:
+            x = down_block(x)
+            feats.append(x)
 
         return feats
 
     def forward(self, x: Tensor, return_feats: bool = False) -> Tensor | tuple[Tensor, list[Tensor]]:
 
+        x = self.from_rgb(x)
+
         feats = [] if return_feats else None
-        for depth, block in enumerate(self.main):
-            x = block(x)
-            if return_feats and 7 < depth < 10:
+        for down_block in self.down_blocks:
+            x = down_block(x)
+            if return_feats:
                 feats.append(x)
 
-        x = x.view(x.size(0), -1)
+        x = self.mini_batch_std(x)
+        x = self.final_conv(x)
 
         return (x, feats) if feats is not None else x

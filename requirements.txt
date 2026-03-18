@@ -18,4 +18,4 @@ tqdm
 segmentation-models-pytorch
 fvcore
 xformers
-ninja
+torchinfo

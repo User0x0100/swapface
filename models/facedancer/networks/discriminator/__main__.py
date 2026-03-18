@@ -1,40 +1,40 @@
-from . import *
+from . import Discriminator, AlphaFaceDiscriminator, Stylegan2DiscriminatorLite
 
 import torch
-from fvcore.nn import FlopCountAnalysis
+from torchinfo import summary
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 batch_size = 1
-img_size = 256
+img_resolution = 256
 
-model = Discriminator(img_size).to(device)
-# model = Stylegan2DiscriminatorLite(img_size, group_size=1).to(device)
-# model = UNetDualDiscriminator().to(device)
+# model = Discriminator(img_resolution).to(device)
+# model = Stylegan2DiscriminatorLite(img_resolution, group_size=1).to(device)
+model = AlphaFaceDiscriminator(img_resolution).to(device)
 # model = UNetDiscriminatorSN().to(device)
 # model = StyleGAN2Discriminator(img_size).to(device)
 
 model.eval()
 
-x_target = torch.randn(batch_size, 3, img_size, img_size, device=device)
+x = torch.randn(batch_size, 3, img_resolution, img_resolution, device=device)
+model(x)
 
-x, feats = model(x_target, True)
-print([x.shape for x in feats])
+with torch.inference_mode():
+    y, feats = model(x, True)
+print([feat.shape for feat in feats])
+print(y.shape)
 
 
-flops = FlopCountAnalysis(model, x_target)
-
-total_flops = flops.total()
-total_params = sum(p.numel() for p in model.parameters())
-
-print("\n=== Model Profile ===")
-labels = [
-    ("Batch size", batch_size),
-    ("Network Info", model.network_cfg),
-    ("Params", f"{total_params/1e6:.3f} M"),
-    ("FLOPs (total)", f"{total_flops/1e9:.3f} GFLOPs"),
-]
-max_label_len = max(len(label) for label, _ in labels)
-for label, value in labels:
-    print(f"{label:<{max_label_len}} : {value}")
-print()
+summary(
+    model,
+    input_data=(x),
+    depth=2,
+    col_names=(
+        "input_size",
+        "output_size",
+        "num_params",
+        "kernel_size",
+        "mult_adds",
+    ),
+    row_settings=("var_names",),
+)

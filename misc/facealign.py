@@ -12,10 +12,17 @@ from tqdm import tqdm
 
 
 from .models.idencoder import get_align_landmarks
-from .models.retinaface import RetinaFace, get_pts, batch_resize_and_pad_varsize, iter_detections
+from .models.retinaface import (
+    RetinaFace,
+    get_pts,
+    batch_resize_and_pad_varsize,
+    iter_detections,
+)
 
 
-def compute_similarity_transform(points_x: torch.Tensor, points_y: torch.Tensor) -> torch.Tensor:
+def compute_similarity_transform(
+    points_x: torch.Tensor, points_y: torch.Tensor
+) -> torch.Tensor:
     """
     计算两组点之间的相似变换 (similarity transform)
 
@@ -104,11 +111,17 @@ def normalize_theta(affine_src2dst, in_hw, out_hw, align_corners=True):
 
     theta[:, 0, 0] = scale_in_x * (inv_a * scale_out_x)
     theta[:, 0, 1] = scale_in_x * (inv_b * scale_out_y)
-    theta[:, 0, 2] = scale_in_x * (inv_a * offset_out_x + inv_b * offset_out_y + inv_tx) + offset_in_x
+    theta[:, 0, 2] = (
+        scale_in_x * (inv_a * offset_out_x + inv_b * offset_out_y + inv_tx)
+        + offset_in_x
+    )
 
     theta[:, 1, 0] = scale_in_y * (inv_c * scale_out_x)
     theta[:, 1, 1] = scale_in_y * (inv_d * scale_out_y)
-    theta[:, 1, 2] = scale_in_y * (inv_c * offset_out_x + inv_d * offset_out_y + inv_ty) + offset_in_y
+    theta[:, 1, 2] = (
+        scale_in_y * (inv_c * offset_out_x + inv_d * offset_out_y + inv_ty)
+        + offset_in_y
+    )
 
     return theta
 
@@ -147,7 +160,11 @@ def invert_normalized_theta(theta: torch.Tensor) -> torch.Tensor:
 
 
 def face_align_batch(
-    images: tuple[Tensor] | list[Tensor] | Tensor, src_pts: Tensor, src_pts_offset: list[int], dst_pts: Tensor, out_size: tuple[int, int]
+    images: tuple[Tensor] | list[Tensor] | Tensor,
+    src_pts: Tensor,
+    src_pts_offset: list[int],
+    dst_pts: Tensor,
+    out_size: tuple[int, int],
 ) -> tuple[Tensor, Tensor]:
     """
     对输入图片进行人脸对齐（仿射变换），输出对齐后的图片和仿射矩阵。
@@ -175,7 +192,6 @@ def face_align_batch(
     aligned: list[Tensor] = []
     norm_theta: list[Tensor] = []
     for src_point, image in zip(iter_detections(src_pts, src_pts_offset), images):
-
         N = src_point.size(0)
         if N == 0:
             continue
@@ -183,7 +199,9 @@ def face_align_batch(
         C, H, W = image.shape
         image = image.unsqueeze(0).expand(N, -1, -1, -1)
 
-        mats = compute_similarity_transform(src_point, dst_pts.unsqueeze(0).expand(N, -1, -1))
+        mats = compute_similarity_transform(
+            src_point, dst_pts.unsqueeze(0).expand(N, -1, -1)
+        )
         mats = normalize_theta(mats, (H, W), out_size, align_corners=True)
 
         grid = F.affine_grid(mats, (N, C, *out_size), align_corners=True)
@@ -193,8 +211,12 @@ def face_align_batch(
         norm_theta.append(mats)
 
     if len(aligned) == 0:
-        aligned = torch.zeros((0, 3, *out_size), dtype=torch.float, device=src_point.device)
-        norm_theta = torch.zeros((0, 3, *out_size), dtype=torch.float, device=src_point.device)
+        aligned = torch.zeros(
+            (0, 3, *out_size), dtype=torch.float, device=src_point.device
+        )
+        norm_theta = torch.zeros(
+            (0, 3, *out_size), dtype=torch.float, device=src_point.device
+        )
     else:
         aligned = torch.cat(aligned, dim=0)
         norm_theta = torch.cat(norm_theta, dim=0)
@@ -202,11 +224,19 @@ def face_align_batch(
     return aligned, norm_theta
 
 
-def restore_faces_to_original(org_images: tuple[Tensor] | list[Tensor] | Tensor, aligned: list[Tensor], norm_theta: list[Tensor], offset: list[int]) -> Tensor | list[Tensor]:
+def restore_faces_to_original(
+    org_images: tuple[Tensor] | list[Tensor] | Tensor,
+    aligned: list[Tensor],
+    norm_theta: list[Tensor],
+    offset: list[int],
+) -> Tensor | list[Tensor]:
 
     result: list[Tensor] = []
-    for mat, org_image, face in zip(iter_detections(norm_theta, offset), org_images, iter_detections(aligned, offset)):
-
+    for mat, org_image, face in zip(
+        iter_detections(norm_theta, offset),
+        org_images,
+        iter_detections(aligned, offset),
+    ):
         N = mat.size(0)
         if N == 0:
             result.append(org_image)
@@ -218,18 +248,26 @@ def restore_faces_to_original(org_images: tuple[Tensor] | list[Tensor] | Tensor,
         org_image = org_image.unsqueeze(0)
 
         grid = F.affine_grid(inv_aff_mat, [N, C, H, W], align_corners=False)
-        faces_on_canvas = F.grid_sample(face, grid, padding_mode="zeros", align_corners=False, mode="bicubic")
+        faces_on_canvas = F.grid_sample(
+            face, grid, padding_mode="zeros", align_corners=False, mode="bicubic"
+        )
 
         # 聚合多张人脸到单张
         sum_faces = faces_on_canvas.sum(dim=0, keepdim=True)  # [1, C, H, W]
 
         # 生成每张人脸的 mask（非零区域），用于计算覆盖权重
-        ones = torch.ones(N, 1, face.shape[2], face.shape[3], device=face.device, dtype=face.dtype)
+        ones = torch.ones(
+            N, 1, face.shape[2], face.shape[3], device=face.device, dtype=face.dtype
+        )
         mask_grid = F.affine_grid(inv_aff_mat, [N, 1, H, W], align_corners=False)
-        masks_on_canvas = F.grid_sample(ones, mask_grid, padding_mode="zeros", align_corners=False, mode="bicubic")
+        masks_on_canvas = F.grid_sample(
+            ones, mask_grid, padding_mode="zeros", align_corners=False, mode="bicubic"
+        )
 
         # 各像素被覆盖的次数（权重图），避免除以零
-        weight = masks_on_canvas.sum(dim=0, keepdim=True).clamp(min=1e-6)  # [1, 1, H, W]
+        weight = masks_on_canvas.sum(dim=0, keepdim=True).clamp(
+            min=1e-6
+        )  # [1, 1, H, W]
 
         # 加权平均后的人脸区域
         avg_faces = sum_faces / weight  # [1, C, H, W]
@@ -247,7 +285,9 @@ def restore_faces_to_original(org_images: tuple[Tensor] | list[Tensor] | Tensor,
     return result
 
 
-def extract_alignface_from_video(vfp: str, batch_size: int, align_size: tuple[int, int], device: torch.device):
+def extract_alignface_from_video(
+    vfp: str, batch_size: int, align_size: tuple[int, int], device: torch.device
+):
     """
     batch_size: 每次取出多少帧来进行面部检测与对齐，每帧可能包含多张面部，所以生成器返回的Tensor.size(0) != batch_size
     生成器返回的Tensor: Tensor(N, C, H, W), N: 对应帧检测到的面部数量, 值域: [0.0 ~ 255.0]
@@ -263,16 +303,25 @@ def extract_alignface_from_video(vfp: str, batch_size: int, align_size: tuple[in
 
     for i in range(0, num_frames, batch_size):
         j = min(i + batch_size, num_frames)
-        chunk = decoder.get_frames_in_range(i, j).data.to(device=device, dtype=torch.float)  # [0.0~255.0]
+        chunk = decoder.get_frames_in_range(i, j).data.to(
+            device=device, dtype=torch.float
+        )  # [0.0~255.0]
         detected, offset = detector.detector(chunk)
         src_pts = get_pts(detected)
-        align_face, norm_theta = face_align_batch(chunk, src_pts, offset, dst_pts, (align_size, align_size))
+        align_face, norm_theta = face_align_batch(
+            chunk, src_pts, offset, dst_pts, (align_size, align_size)
+        )
 
         yield align_face, norm_theta, offset
 
 
 class FaceAlign(nn.Module):
-    def __init__(self, from_normalized: bool = False, from_unit_range: bool = False, from_rgb: bool = True):
+    def __init__(
+        self,
+        from_normalized: bool = False,
+        from_unit_range: bool = False,
+        from_rgb: bool = True,
+    ):
         """
         Args:
             from_normalized: 输入值域是否为 [-1, 1]
@@ -301,11 +350,15 @@ class FaceAlign(nn.Module):
 
         for i in range(0, num_frames, batch_size):
             j = min(i + batch_size, num_frames)
-            chunk = decoder.get_frames_in_range(i, j).data.to(device=device, dtype=torch.float)
+            chunk = decoder.get_frames_in_range(i, j).data.to(
+                device=device, dtype=torch.float
+            )
             self.detector(chunk)
 
 
-def tensor2cv_8uc3_bgr(image: torch.Tensor, value_range=(-1, 1), swap_rb_ch: bool = True) -> np.ndarray:
+def tensor2cv_8uc3_bgr(
+    image: torch.Tensor, value_range=(-1, 1), swap_rb_ch: bool = True
+) -> np.ndarray:
     """
     将形如 [C, H, W] 或 [B, C, H, W] 的图像 Tensor 转为 OpenCV 使用的 uint8 BGR 格式。
 
@@ -341,8 +394,12 @@ def tensor2cv_8uc3_bgr(image: torch.Tensor, value_range=(-1, 1), swap_rb_ch: boo
 
 
 class FaceAlign(nn.Module):
-
-    def __init__(self, from_normalized: bool = False, from_unit_range: bool = False, swap_rb_ch: bool = True):
+    def __init__(
+        self,
+        from_normalized: bool = False,
+        from_unit_range: bool = False,
+        swap_rb_ch: bool = True,
+    ):
         """
         Args:
             from_normalized: 如果为 True，则假设输入为 [-1, 1]，转换为 [0, 255]
@@ -351,7 +408,11 @@ class FaceAlign(nn.Module):
         super().__init__()
         self.register_buffer("device", torch.zeros(1), persistent=False)
 
-        self.detector = RetinaFace.Model(from_normalized=from_normalized, from_unit_range=from_unit_range, swap_rb_ch=swap_rb_ch)
+        self.detector = RetinaFace.Model(
+            from_normalized=from_normalized,
+            from_unit_range=from_unit_range,
+            swap_rb_ch=swap_rb_ch,
+        )
         self.eval()
         self.requires_grad_(False)
 
@@ -359,22 +420,35 @@ class FaceAlign(nn.Module):
         return self.device.device
 
     @staticmethod
-    def align_with(images: list[torch.Tensor] | torch.Tensor, src_pts5_pixel: torch.Tensor, idxs: list[int], out_size: tuple[int, int], dst_pts5_pixel: torch.Tensor):
+    def align_with(
+        images: list[torch.Tensor] | torch.Tensor,
+        src_pts5_pixel: torch.Tensor,
+        idxs: list[int],
+        out_size: tuple[int, int],
+        dst_pts5_pixel: torch.Tensor,
+    ):
 
-        mats = compute_similarity_transform(src_pts5_pixel, dst_pts5_pixel.unsqueeze(0).expand(src_pts5_pixel.shape[0], -1, -1))
+        mats = compute_similarity_transform(
+            src_pts5_pixel,
+            dst_pts5_pixel.unsqueeze(0).expand(src_pts5_pixel.shape[0], -1, -1),
+        )
 
         aligned_list = []
         norm_theata = []
         slic_n = 0
         for image, N in zip(images, idxs):
-
             if N == 0:
                 continue
 
             image = image.unsqueeze(0).expand(N, -1, -1, -1)
             C = image.shape[1]
 
-            mat = normalize_theta(mats[slic_n : slic_n + N], image.shape[-2:], out_size, align_corners=False)
+            mat = normalize_theta(
+                mats[slic_n : slic_n + N],
+                image.shape[-2:],
+                out_size,
+                align_corners=False,
+            )
 
             grid = F.affine_grid(mat, (N, C, *out_size), align_corners=False)
             aligned = F.grid_sample(image, grid, align_corners=False, mode="bicubic")
@@ -384,7 +458,9 @@ class FaceAlign(nn.Module):
             slic_n += N
 
         if len(aligned_list) == 0:
-            return torch.empty((0, 3, *out_size), device=images[0].device), torch.empty((0, 2, 3), device=images[0].device)
+            return torch.empty((0, 3, *out_size), device=images[0].device), torch.empty(
+                (0, 2, 3), device=images[0].device
+            )
 
         aligned = torch.cat(aligned_list, dim=0)
         norm_theata = torch.cat(norm_theata, dim=0)
@@ -392,7 +468,14 @@ class FaceAlign(nn.Module):
         return aligned, norm_theata
 
     @torch.no_grad()
-    def align(self, images: list[torch.Tensor] | torch.Tensor, out_size: tuple[int, int], dst_pts5_pixel: torch.Tensor, conf_thresh: float = 0.85, min_box_size: int = 0):
+    def align(
+        self,
+        images: list[torch.Tensor] | torch.Tensor,
+        out_size: tuple[int, int],
+        dst_pts5_pixel: torch.Tensor,
+        conf_thresh: float = 0.85,
+        min_box_size: int = 0,
+    ):
         """
         对输入图片进行人脸对齐（仿射变换），输出对齐后的图片和仿射矩阵。
 
@@ -419,16 +502,24 @@ class FaceAlign(nn.Module):
             - 每张图片可能检测到多个人脸，返回每个人脸的对齐结果。
         """
 
-        results, idxs = self.detector.detector(images, conf_thresh, min_box_size)  # results [N, 15]
+        results, idxs = self.detector.detector(
+            images, conf_thresh, min_box_size
+        )  # results [N, 15]
 
         all_pts5 = RetinaFace.get_5pts(results)  # [N, 5, 2]
-        aligned, norm_theata = FaceAlign.align_with(images, all_pts5, idxs, out_size, dst_pts5_pixel)
+        aligned, norm_theata = FaceAlign.align_with(
+            images, all_pts5, idxs, out_size, dst_pts5_pixel
+        )
         return aligned, norm_theata, idxs
 
     @autocast(device_type="cuda")
     @staticmethod
     def restore_faces_to_original(
-        align_faces: torch.Tensor, aff_matrix: torch.Tensor, org_images: list[torch.Tensor] | torch.Tensor, idxs: list[int], face_masks: torch.Tensor | None = None
+        align_faces: torch.Tensor,
+        aff_matrix: torch.Tensor,
+        org_images: list[torch.Tensor] | torch.Tensor,
+        idxs: list[int],
+        face_masks: torch.Tensor | None = None,
     ):
         inv_aff_mat = invert_normalized_theta(aff_matrix)
 
@@ -441,21 +532,40 @@ class FaceAlign(nn.Module):
         slic_n = 0
         outputs = []
         for N, org_image in zip(idxs, org_images):
-
             if N == 0:
                 outputs.append(org_image)
                 continue
 
             org_image = org_image.unsqueeze(0)
 
-            grid = F.affine_grid(inv_aff_mat[slic_n : slic_n + N], [N] + list(org_image.shape[1:]), align_corners=False)
+            grid = F.affine_grid(
+                inv_aff_mat[slic_n : slic_n + N],
+                [N] + list(org_image.shape[1:]),
+                align_corners=False,
+            )
 
-            faces_on_canvas = F.grid_sample(align_faces[slic_n : slic_n + N], grid, padding_mode="zeros", align_corners=False, mode="bicubic")
-            mask_on_canvas = F.grid_sample(face_masks[slic_n : slic_n + N], grid, padding_mode="zeros", align_corners=False, mode="nearest")
+            faces_on_canvas = F.grid_sample(
+                align_faces[slic_n : slic_n + N],
+                grid,
+                padding_mode="zeros",
+                align_corners=False,
+                mode="bicubic",
+            )
+            mask_on_canvas = F.grid_sample(
+                face_masks[slic_n : slic_n + N],
+                grid,
+                padding_mode="zeros",
+                align_corners=False,
+                mode="nearest",
+            )
 
             # 聚合多张人脸到单张
-            sum_faces = (faces_on_canvas * mask_on_canvas).sum(dim=0, keepdim=True)  # [1, C, H, W]
-            sum_weights = mask_on_canvas.sum(dim=0, keepdim=True).clamp_min(1e-6)  # [1, 1, H, W]
+            sum_faces = (faces_on_canvas * mask_on_canvas).sum(
+                dim=0, keepdim=True
+            )  # [1, C, H, W]
+            sum_weights = mask_on_canvas.sum(dim=0, keepdim=True).clamp_min(
+                1e-6
+            )  # [1, 1, H, W]
             composite = sum_faces / sum_weights  # [1, C, H, W]
 
             acc_mask = mask_on_canvas.max(dim=0, keepdim=True).values  # [1, 1, H, W]
@@ -481,11 +591,12 @@ class FaceAlign(nn.Module):
 
             slic_align_n = 0
             for n, frame_idx in zip(idxs, range(*slic)):
-
                 faces = aligned[slic_align_n : slic_align_n + n]
 
                 for face_num, face in enumerate(faces):
-                    save_path = Path(wfp) / f"{sf_prefix}{str(frame_idx)}_{str(face_num)}.png"
+                    save_path = (
+                        Path(wfp) / f"{sf_prefix}{str(frame_idx)}_{str(face_num)}.png"
+                    )
                     cv2.imwrite(save_path, face, [cv2.IMWRITE_PNG_COMPRESSION, 1])
 
                 slic_align_n += n
@@ -497,7 +608,7 @@ class FaceAlign(nn.Module):
         dst_pts_pixel: torch.Tensor,
         wfp: str | None = None,
         sf_prefix: str = "",
-        out_size: tuple[int, int] = [512, 512],
+        out_size: tuple[int, int] = (512, 512),
         batch_size: int = 8,
         conf_thresh: float = 0.85,
         min_box_size: int = 256,
@@ -519,22 +630,37 @@ class FaceAlign(nn.Module):
         mp.set_start_method("spawn", force=True)
 
         q = mp.Queue(maxsize=10)
-        p = mp.Process(target=self.video_face_ext_save_worker, args=(q, wfp, sf_prefix, (0, 255)), daemon=True)
+        p = mp.Process(
+            target=self.video_face_ext_save_worker,
+            args=(q, wfp, sf_prefix, (0, 255)),
+            daemon=True,
+        )
         p.start()
 
         pbar = tqdm(range(num_frames), unit="frame")
         pbar.set_description(fn)
 
-        slices = [(i, min(i + batch_size, num_frames)) for i in range(0, num_frames, batch_size)]
+        slices = [
+            (i, min(i + batch_size, num_frames))
+            for i in range(0, num_frames, batch_size)
+        ]
 
         try:
             for slic in slices:
                 pbar.n = slic[1]
                 pbar.refresh()
 
-                chunk = video_reader.get_frames_in_range(*slic).data.to(device=device, dtype=torch.float)
+                chunk = video_reader.get_frames_in_range(*slic).data.to(
+                    device=device, dtype=torch.float
+                )
 
-                aligned, _, idxs = self.align(list(chunk.unbind(dim=0)), out_size, dst_pts_pixel, conf_thresh, min_box_size)
+                aligned, _, idxs = self.align(
+                    list(chunk.unbind(dim=0)),
+                    out_size,
+                    dst_pts_pixel,
+                    conf_thresh,
+                    min_box_size,
+                )
 
                 q.put((idxs, slic, aligned))
 
@@ -557,11 +683,11 @@ class FaceAlign(nn.Module):
 
             slic_align_n = 0
             for n, name in zip(idxs, fn):
-
                 faces = aligned[slic_align_n : slic_align_n + n]
                 for idx, face in enumerate(faces):
-
-                    save_path = Path(wfp) / f"{sf_prefix}{Path(name).stem}_{str(idx)}.png"
+                    save_path = (
+                        Path(wfp) / f"{sf_prefix}{Path(name).stem}_{str(idx)}.png"
+                    )
                     cv2.imwrite(save_path, face, [cv2.IMWRITE_PNG_COMPRESSION, 1])
                 slic_align_n += n
 
@@ -574,7 +700,7 @@ class FaceAlign(nn.Module):
         sfp: str | None = None,
         sf_prefix: str = "",
         batch_size: int = 32,
-        out_size: tuple[int, int] = [512, 512],
+        out_size: tuple[int, int] = (512, 512),
         conf_thresh: float = 0.85,
         min_box_size: int = 256,
     ):
@@ -589,7 +715,11 @@ class FaceAlign(nn.Module):
 
         mp.set_start_method("spawn", force=True)
         q = mp.Queue(maxsize=10)
-        p = mp.Process(target=self.align_folder_save_worker, args=(q, sfp, sf_prefix, (0, 255)), daemon=True)
+        p = mp.Process(
+            target=self.align_folder_save_worker,
+            args=(q, sfp, sf_prefix, (0, 255)),
+            daemon=True,
+        )
         p.start()
 
         dataset = ImageFolder(fp)
@@ -598,12 +728,15 @@ class FaceAlign(nn.Module):
         pbar.set_description(fp)
         try:
             for images, fns in dataset.iter_batch_with_tensor(batch_size, True):
-
                 pbar.update(len(images))
 
-                images = [image.to(device=device, dtype=torch.float) for image in images]
+                images = [
+                    image.to(device=device, dtype=torch.float) for image in images
+                ]
 
-                aligned, _, idxs = self.align(images, out_size, dst_pts_pixel, conf_thresh, min_box_size)
+                aligned, _, idxs = self.align(
+                    images, out_size, dst_pts_pixel, conf_thresh, min_box_size
+                )
 
                 q.put((aligned, idxs, fns))
         except KeyboardInterrupt:
@@ -629,22 +762,28 @@ if __name__ == "__main__":
     dataset = ImageFolder("/home/liaohaixun/swap/IDAssets")
     # dataset = ImageFolder("/opt/share/deepfake/dataset_1/ffhq_1024")
 
-    images_org = [dataset.sample_tensor().float().to(device=device) for _ in range(batch_size)]
+    images_org = [
+        dataset.sample_tensor().float().to(device=device) for _ in range(batch_size)
+    ]
 
     # images_org = torch.stack(images_org)
 
-    detected = model.detector(images_org)
+    detected, offset = model.detector(images_org)
     src_pts = get_pts(detected)
 
     dst_pts = get_align_landmarks(align_size)
     dst_pts = torch.tensor(dst_pts, device=device)
 
-    faces, mats = face_align_batch(images_org, src_pts, dst_pts, (align_size, align_size))
-    restore_images = restore_faces_to_original(images_org, faces, mats)
+    faces, mats = face_align_batch(
+        images_org, src_pts, offset, dst_pts, (align_size, align_size)
+    )
+    restore_images = restore_faces_to_original(images_org, faces, mats, offset)
 
     faces = torch.cat(faces, dim=0)
     utils.save_image(faces, "faces.png", normalize=True, value_range=(0, 255))
 
     restore_images, _ = batch_resize_and_pad_varsize(restore_images, 1024, 1024)
 
-    utils.save_image(restore_images, "restore_images.png", normalize=True, value_range=(0, 255))
+    utils.save_image(
+        restore_images, "restore_images.png", normalize=True, value_range=(0, 255)
+    )

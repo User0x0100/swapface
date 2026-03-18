@@ -486,7 +486,7 @@ def draw_boxes_batch(images: Tensor | tuple[Tensor] | list[Tensor], detected: Te
     return new_images
 
 
-def get_pts(detected: Tensor) -> list[Tensor]:
+def get_pts(detected: Tensor) -> Tensor:
     """
     从检测结果中获取关键点
     detected: 原始检测结果 (Tensor(N, 15))

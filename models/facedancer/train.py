@@ -1,24 +1,44 @@
 import random
 import itertools
+from enum import Enum
+from typing import Any
 from pathlib import Path
-from typing import Any, Mapping
 
-from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
-import cv2
 import torch
-from torch import optim, nn
-import torch.nn.functional as F
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch import Tensor
 from torch.amp import autocast
-from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
+from torch import Tensor, optim, nn
 from torchvision.utils import make_grid
-from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from losses import IDLoss, l1_loss_fn, PerceptualLoss, DLoss, GANLoss, StyleLossLabChroma, DINOv2PerceptualLoss, r1_reg_loss, WFMLoss, IFSRLoss
+import cv2
+from tqdm import tqdm
+from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
+
+from losses import (
+    IDLoss,
+    l1_loss_fn,
+    PerceptualLoss,
+    DLoss,
+    GANLoss,
+    StyleLossLabChroma,
+    r1_reg_loss,
+    WFMLoss,
+    IFSRLoss,
+)
 
 from .dataloader import datasetloader
-from .networks import Generator, Discriminator
+from .networks import (
+    Generator,
+    NormType,
+    InjectModule,
+    Bottleneck,
+    SkipFusionModule,
+    Discriminator,
+    Stylegan2DiscriminatorLite,
+    AlphaFaceDiscriminator,
+)
 
 
 EPS = 1e-8
@@ -31,6 +51,21 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
 
+class DISCRIMINATOR_TYPT(Enum):
+    ORIGIN = Discriminator
+    ALPHAFACE = AlphaFaceDiscriminator
+    STYLEGAN2 = Stylegan2DiscriminatorLite
+
+
+def print_dict(d: dict, indent=0):
+    for k, v in d.items():
+        if isinstance(v, dict):
+            print(" " * indent + f"{k}:")
+            print_dict(v, indent + 2)
+        else:
+            print(" " * indent + f"{k:25}: {v}")
+
+
 class Trainer:
     def __init__(
         self,
@@ -39,8 +74,9 @@ class Trainer:
         batch_size: int = 10,
         lr: float = 1e-4,
         lr_scheduler_t_max: int = 0,
-        d_train_setp: int = 3,
-        r1_reg_step: int = 1,
+        discriminator_typt: DISCRIMINATOR_TYPT = DISCRIMINATOR_TYPT.ALPHAFACE,
+        d_train_setp: int = 1,
+        r1_reg_step: int = 16,
         bf16: bool = True,
         device: str = "cuda:0",
         compile_module: bool = True,
@@ -51,38 +87,22 @@ class Trainer:
         weight_save_every: int = 10000,
         same_image_prob: float = 0.1,
         # 模型配置
-        net_g_cfg={
-            "input_res": 256,
-            "num_encoder": 5,
-            "base_ch": 64,
-            "max_ch": 512,
-            "mapping_size": 512,
-            "z_dim": 512,
-            "skip_conn_start_with": 2,
-        },
-        net_d_cfg: Mapping[str, int] = {
-            "input_res": 256,
-            "num_encoder": 5,
-            "base_ch": 64,
-            "max_ch": 512,
-        },
+        net_g_cfg: dict[str, int] | None = None,
+        net_d_cfg: dict[str, int] | None = None,
         id_encode_provider: IDLoss.Provider = IDLoss.Provider.BLENDFACE,
         id_loss_weight: float = 5.0,
         rec_loss: float = 2.5,
-        use_dinov2: bool = False,
         perceptual_loss_weight: dict[str, float] = {
-            # vgg19
+            # vgg16
             "relu1_2": 0.25,
             "relu2_2": 0.25,
             "relu3_3": 0.25,
             "relu4_2": 0.25,
-            # DINOv2
-            # 2: 0.5,  # 低层纹理/色彩一致性
-            # 5: 1.0,  # 皮肤结构主力层
-            # 8: 0.5,  # 面部组件对齐（眼鼻口位置）
         },
+        enable_wfm_loss: bool = False,
         wfm_loss_weight: dict[int, float] = {
-            1: 0.5,
+            1: 1.0,
+            2: 1.0,
         },
         enable_ifsr_loss: bool = False,
         ifsr_scale: float = 1.2,
@@ -99,13 +119,25 @@ class Trainer:
             "layer2.0": (0.047970, 1.0),
             "layer1.2": (0.035144, 1.0),
         },
+        enable_color_loss: bool = False,
+        color_loss_weight: float = 0.5,
     ):
+
+        args = locals().copy()
+        for k in ["src", "dst", "self"]:
+            args.pop(k)
+
+        print("Train Config:")
+        print_dict(args, 2)
+
         self.rng = random.Random()
         self.device = torch.device(device)
         self.batch_size = batch_size
         self.d_train_setp = d_train_setp
         self.r1_reg_step = r1_reg_step
+        self.enable_wfm_loss = enable_wfm_loss
         self.enable_ifsr_loss = enable_ifsr_loss
+        self.enable_color_loss = enable_color_loss
 
         self.bf16 = bool(bf16 and torch.cuda.is_bf16_supported())
         if bf16 and not self.bf16:
@@ -127,7 +159,7 @@ class Trainer:
 
             self.iter = ckpt["iter"]
 
-            print(f"ckpt Info:\n" f"  {'iter':25}: {self.iter}")
+            print(f"ckpt Info:\n  {'iter':25}: {self.iter}")
             print("net_g:")
             for k, v in ckpt["net_g"]["network_cfg"].items():
                 print(f"  {k:25}: {v}")
@@ -135,23 +167,26 @@ class Trainer:
             for k, v in ckpt["net_d"]["network_cfg"].items():
                 print(f"  {k:25}: {v}")
 
-            self.size = ckpt["net_g"]["network_cfg"]["input_res"]
+            self.img_resolution = ckpt["net_g"]["network_cfg"]["img_resolution"]
 
-            self.net_g = Generator(**ckpt["net_g"]["network_cfg"])
-            self.net_d = Discriminator(**ckpt["net_d"]["network_cfg"])
-            self.net_g.load_state_dict(ckpt["net_g"]["state_dict"])
-            self.net_d.load_state_dict(ckpt["net_d"]["state_dict"])
+            # ckpt["net_g"]["network_cfg"]["skip_index"] = ckpt["net_g"]["network_cfg"].pop("skip_free_depth")
+            # ckpt["net_g"]["network_cfg"]["encode_norm"] = ckpt["net_g"]["network_cfg"].pop("encoder_norm")
+            # ckpt["net_g"]["network_cfg"]["id_inject_mode"] = ckpt["net_g"]["network_cfg"].pop("id_inject_mod")
+            # ckpt["net_g"]["network_cfg"]["bottleneck"] = ckpt["net_g"]["network_cfg"].pop("bottleneck_out")
+            # ckpt["net_g"]["network_cfg"]["id_inject_index"] = 2
+
+            net_g = Generator(**ckpt["net_g"]["network_cfg"])
+            net_d = discriminator_typt.value(**ckpt["net_d"]["network_cfg"])
+            net_g.load_state_dict(ckpt["net_g"]["state_dict"])
+            # net_d.load_state_dict(ckpt["net_d"]["state_dict"])
 
         else:
+            self.iter, self.img_resolution = 0, net_g_cfg["img_resolution"]
+            net_g = Generator(**net_g_cfg)
+            net_d = discriminator_typt.value(**net_d_cfg)
 
-            self.iter, self.size = 0, net_g_cfg["input_res"]
-            self.net_g = Generator(**net_g_cfg)
-            self.net_d = Discriminator(**net_d_cfg)
-
-        self.net_g.to(self.device)
-        self.net_d.to(self.device)
-        self.net_g.train()
-        self.net_d.train()
+        self.net_g = net_g.to(self.device).train()
+        self.net_d = net_d.to(self.device).train()
 
         # ========================= Optim =========================
         self.optim_g = optim.AdamW(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
@@ -169,15 +204,15 @@ class Trainer:
         self.id_loss = IDLoss(weight=id_loss_weight, provider=id_encode_provider).to(self.device)
         self.rec_loss = l1_loss_fn(weight=rec_loss, reduction="none")
 
-        perceptual_loss = DINOv2PerceptualLoss if use_dinov2 else PerceptualLoss
-        self.perceptual_loss = perceptual_loss(layer_weights=perceptual_loss_weight).to(self.device)
+        self.perceptual_loss = PerceptualLoss(layer_weights=perceptual_loss_weight, reduction="none").to(self.device)
 
         if self.enable_ifsr_loss:
-            self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_dict=ifsr_weight).to(self.device)
+            self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight).to(self.device)
 
-        self.wfm_loss = WFMLoss(layer_weights=wfm_loss_weight, criterion="l1").to(self.device)
-
-        self.color_loss = StyleLossLabChroma(weight=1.0, range_norm=True).to(self.device)
+        if self.enable_wfm_loss:
+            self.wfm_loss = WFMLoss(layer_weights=wfm_loss_weight, criterion="l1").to(self.device)
+        if self.enable_color_loss:
+            self.color_loss = StyleLossLabChroma(weight=color_loss_weight, range_norm=True).to(self.device)
 
         # ========================= LOG =========================
         base_log_path = Path(log_path)
@@ -193,12 +228,12 @@ class Trainer:
         # ========================= Sample =========================
         pipe = datasetloader(
             batch_size=self.batch_size,
-            num_threads=8,
-            prefetch_queue_depth=10,
-            py_num_workers=1,
+            num_threads=2,
+            prefetch_queue_depth=5,
+            py_num_workers=3,
             py_start_method="spawn",
             device_id=self.device.index,
-            resize=self.size,
+            resize=self.img_resolution,
             src=src,
             dst=dst,
             same_image_prob=same_image_prob,
@@ -259,42 +294,22 @@ class Trainer:
 
             torch.compiler.cudagraph_mark_step_begin()
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
-
                 with torch.inference_mode():
                     src_id_feats = self.id_loss.get_id_feats(src)
                     if self.enable_ifsr_loss:
                         dst_ifsr_feats = self.ifsr_loss.get_ifsr_feats(dst)
 
-                id_feats_mix = False
-                if id_feats_mix and self.rng.random() < 0.5:
-
-                    w1_all = self.net_g.mapping_z_source(src_id_feats)
-                    w2_all = self.net_g.mapping_z_source(torch.randn_like(src_id_feats))
-
-                    cutoff = torch.randint(1, len(w1_all), (1,)).item()
-
-                    w_all = []
-                    for i in range(len(w1_all)):
-                        if i < cutoff:
-                            w_all.append(w1_all[i])
-                        else:
-                            w_all.append(w2_all[i])
-                else:
-                    w_all = None
-
-                fake = net_g(dst, src_id_feats, w_all)
+                fake: Tensor = net_g(dst, src_id_feats)
 
                 # ========================= train d =========================
                 if self.iter % self.d_train_setp == 0:
                     self.optim_d.zero_grad()
                     d_loss: Tensor = torch.tensor(0.0, device=self.device)
 
-                    real_img = dst.detach()
-
                     d_step = self.iter // self.d_train_setp
                     is_r1_reg_step = d_step % self.r1_reg_step == 0
 
-                    real_img.requires_grad_(is_r1_reg_step)
+                    real_img = dst.detach().requires_grad_(is_r1_reg_step)
 
                     fake_global_score = net_d(fake.detach())
                     real_global_score = net_d(real_img)
@@ -313,20 +328,24 @@ class Trainer:
 
                 # ========================= train g =========================
                 self.optim_g.zero_grad()
-                loss: Tensor
+                loss: Tensor = torch.tensor(0.0, device=self.device)
 
                 # gan_loss
-                fake_global_score, fake_feats = net_d(fake, True)
+                if self.enable_wfm_loss:
+                    fake_global_score, fake_feats = net_d(fake, True)
+                else:
+                    fake_global_score = net_d(fake)
                 global_gan_loss = self.gan_loss(fake_global_score)
                 self.log("global_gan_loss", global_gan_loss)
-                loss = global_gan_loss
+                loss += global_gan_loss
 
                 # wfm_loss
-                with torch.inference_mode():
-                    _, real_feats = net_d(dst, True)
-                wfm_loss = self.wfm_loss(fake_feats, real_feats)
-                self.log("wfm_loss", wfm_loss)
-                loss += wfm_loss
+                if self.enable_wfm_loss:
+                    with torch.inference_mode():
+                        _, real_feats = net_d(dst, True)
+                    wfm_loss = self.wfm_loss(fake_feats, real_feats)
+                    self.log("wfm_loss", wfm_loss)
+                    loss += wfm_loss
 
                 # loss_id
                 fake_id_feats = self.id_loss.get_id_feats(fake)
@@ -342,21 +361,23 @@ class Trainer:
                     loss += ifsr_loss
 
                 # perceptual_loss
-                perceptual_loss = self.perceptual_loss(fake, dst)
-                self.log("perceptual_loss", perceptual_loss)
-                loss += perceptual_loss
+                # perceptual_loss = self.perceptual_loss(fake, dst)
+                # perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                # self.log("perceptual_loss", perceptual_loss)
+                # loss += perceptual_loss
 
                 # rec_loss
-                rec_loss = self.rec_loss(fake, dst)  # BCHW
-                rec_loss = rec_loss.mean(dim=[1, 2, 3])
-                rec_loss = (rec_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
-                self.log("rec_loss", rec_loss)
-                loss += rec_loss
+                # rec_loss = self.rec_loss(fake, dst)  # BCHW
+                # rec_loss = rec_loss.mean(dim=[1, 2, 3])
+                # rec_loss = (rec_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                # self.log("rec_loss", rec_loss)
+                # loss += rec_loss
 
                 # color_loss
-                color_loss = self.color_loss(fake, dst)
-                self.log("color_loss", color_loss)
-                loss += color_loss
+                if self.enable_color_loss:
+                    color_loss = self.color_loss(fake, dst)
+                    self.log("color_loss", color_loss)
+                    loss += color_loss
 
             loss.backward()
             self.optim_g.step()
@@ -373,50 +394,85 @@ class Trainer:
                     attn_map: list[Tensor] = self.net_g.get_attention_maps()
 
                     if len(attn_map) == 0:
-                        attn_norm = torch.full_like(src, -1.0)
+                        grid = torch.cat((src, dst, fake), dim=0)
                     else:
                         maps = []
                         for m in attn_map:
                             m = m.mean(dim=1, keepdim=True)
-                            m = F.interpolate(m, size=self.size, mode="bilinear", align_corners=False)
+                            m = F.interpolate(m, size=self.img_resolution, mode="bilinear", align_corners=False)
                             maps.append(m)
                         attn = torch.mean(torch.stack(maps, dim=0), dim=0).expand(-1, 3, -1, -1)
                         amin = attn.amin(dim=(2, 3), keepdim=True)
                         amax = attn.amax(dim=(2, 3), keepdim=True)
                         attn_norm = 2.0 * (attn - amin) / (amax - amin + 1e-6) - 1.0
+                        grid = torch.cat((src, dst, fake, attn_norm), dim=0)
 
-                    grid = torch.cat((src, dst, fake, attn_norm), dim=0)
                     grid.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)
                     grid = make_grid(grid, nrow=self.batch_size)[[2, 1, 0], :, :]  # RGB -> BGR
                     grid = grid.permute(1, 2, 0)  # CHW -> HWC
                 grid_cpu = grid.to(device="cpu", dtype=torch.uint8).numpy()
-                cv2.imwrite(self.sample_dir / f"{self.iter}.png", grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+                cv2.imwrite(
+                    self.sample_dir / f"{self.iter}.png",
+                    grid_cpu,
+                    [cv2.IMWRITE_PNG_COMPRESSION, 3],
+                )
 
 
 if __name__ == "__main__":
     src = [
         ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
         ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
+        # ("/opt/share/deepfake/dataset_1/vggface2_hq512", 0.0),
     ]
 
     dst = [
         ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
         ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
+        # ("/opt/share/deepfake/dataset_1/vggface2_hq512", 0.0),
         # ("/opt/share/deepfake/dataset_1/RealOcc/image/realign_arcface_dst", 1.0),
         # ("/opt/share/deepfake/dataset_1/youtube/What_s_considered_tall_in_South_Korea_Street_Interview_align_results", 0.0),
         # ("/opt/share/deepfake/dataset_1/youtube/4k_Face_Close_Up_HDR_Video_Vivid_Colors_Ambient_Sound_-_Relaxing_align_results", 0.0),
         # ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
     ]
 
-    def_config = {
-        "src": src,
-        "dst": dst,
-    }
+    def_config = {"src": src, "dst": dst}
 
     def_config.update(
         {
-            "log_path": "train_log/256_BLENDFACE_ModCONV_use_refinement",
-            "id_loss_weight": 7.5,
+            "ckpt": "train_log/256_BLENDFACE_MODCONV_Same0.0/ckpt/410841.pth",
+            "net_g_cfg": {
+                "img_resolution": 256,
+                "img_channels": 3,
+                "num_encoder": 5,
+                "base_ch": 64,
+                "max_ch": 512,
+                "id_dim": 512,
+                "w_dim": 512,
+                "mapping_num": 4,
+                "encode_norm": NormType.NONE,
+                "skip_index": 2,
+                "id_inject_index": 2,
+                "id_inject_mode": InjectModule.MODCONV,
+                "bottleneck": Bottleneck.NormRB,
+                "encode_skip_fusion_mode": SkipFusionModule.ATTEN,
+                "en_refinement_mask": 0,
+                "to_rgb_skip_fusion_mode": SkipFusionModule.CONCAT,
+            },
+            "net_d_cfg": {
+                "img_resolution": 256,
+                "img_channels": 3,
+                "base_ch": 64,
+                "max_ch": 512,
+                "group_size": 5,
+            },
+            "rec_loss": 2.5,
+            "id_loss_weight": 5.0,
+            "log_path": "train_log/256_BLENDFACE_MODCONV_Same0.0_NewDisc_S_stride2Down",
+            "enable_wfm_loss": True,
+            "wfm_loss_weight": {
+                1: 1.0,
+            },
+            "same_image_prob": 0.0,
         }
     )
 

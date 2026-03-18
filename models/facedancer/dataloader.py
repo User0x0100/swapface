@@ -31,7 +31,6 @@ class RndWarpPars(object):
 
         filled = 0
         while filled < size:
-
             remaining = size - filled
             batch_size = int(remaining / accept_prob * 1.2) + 100
 

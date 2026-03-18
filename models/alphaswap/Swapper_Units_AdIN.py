@@ -84,7 +84,7 @@ class Operation_Unit(nn.Module):
         x2 = torch.mul(x0, x1)
         x2 = torch.mul(idf0_0, x2)
         x2 = torch.add(x2, idf0_1)
-        if self.act_out == True:
+        if self.act_out:
             return self.activation(x2)
         else:
             return x2
