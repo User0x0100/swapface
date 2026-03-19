@@ -34,15 +34,15 @@ class DownRB(nn.Module):
         super().__init__()
 
         self.shortcut = nn.Sequential(
-            # BlurPool(in_ch),
-            nn.Conv2d(in_ch, out_ch, 1, 2, 0),
+            nn.Conv2d(in_ch, out_ch, 1, 1, 0, bias=False),
+            BlurPool(out_ch),
         )
 
         self.residual = nn.Sequential(
             nn.Conv2d(in_ch, in_ch, 3, 1, 1),
             nn.LeakyReLU(0.2),
-            # BlurPool(in_ch),
-            nn.Conv2d(in_ch, out_ch, 3, 2, 1),
+            BlurPool(in_ch),
+            nn.Conv2d(in_ch, out_ch, 3, 1, 1),
             nn.LeakyReLU(0.2),
         )
 
@@ -76,7 +76,7 @@ class AlphaFaceDiscriminator(nn.Module):
 
         final_features = features[-1] + 1
         self.final_conv = nn.Sequential(
-            nn.Conv2d(final_features, final_features, 3),  # 4×4 → 2×2
+            nn.Conv2d(final_features, final_features, 3),
             nn.LeakyReLU(0.2),
             nn.Flatten(),
             nn.Linear(2 * 2 * final_features, final_features),

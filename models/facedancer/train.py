@@ -439,7 +439,6 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            "ckpt": "train_log/256_BLENDFACE_MODCONV_Same0.0/ckpt/410841.pth",
             "net_g_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
@@ -467,12 +466,13 @@ if __name__ == "__main__":
             },
             "rec_loss": 2.5,
             "id_loss_weight": 5.0,
-            "log_path": "train_log/256_BLENDFACE_MODCONV_Same0.0_NewDisc_S_stride2Down",
+            "log_path": "train_log/256_BLENDFACE_MODCONV_Same0.0",
             "enable_wfm_loss": True,
             "wfm_loss_weight": {
                 1: 1.0,
             },
             "same_image_prob": 0.0,
+            # "enable_color_loss": True,
         }
     )
 

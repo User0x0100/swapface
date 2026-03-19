@@ -18,19 +18,19 @@ class ResBlockBase(nn.Module):
         match sampling:
             case RBSampleMode.UP:
                 self.residual = nn.Sequential(
-                    nn.SiLU(),
-                    nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
                     nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                    nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
+                    nn.SiLU(),
                 )
                 self.shortcut = nn.Sequential(
-                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
                     nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
                 )
 
             case RBSampleMode.DOWN:
                 self.residual = nn.Sequential(
-                    nn.SiLU(),
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
+                    nn.SiLU(),
                     nn.AvgPool2d(2),
                 )
                 self.shortcut = nn.Sequential(
@@ -40,13 +40,10 @@ class ResBlockBase(nn.Module):
 
             case RBSampleMode.NONE:
                 self.residual = nn.Sequential(
+                    nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
                     nn.SiLU(),
-                    nn.Conv2d(in_ch, out_ch, 3, stride=1, padding=1),
                 )
-                if in_ch == out_ch:
-                    self.shortcut = nn.Identity()
-                else:
-                    self.shortcut = nn.Conv2d(in_ch, out_ch, 1, stride=1, padding=0, bias=shortcut_bias)
+                self.shortcut = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, 1, stride=1, padding=0, bias=shortcut_bias)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.residual(x) + self.shortcut(x)
@@ -82,10 +79,10 @@ class ModulatedConv2d(nn.Module):
 
     def _compute_low_rank_residual(self, w: Tensor) -> Tensor:
 
-        # a = torch.tanh(self.alpha_proj(w))
-        # b = torch.tanh(self.beta_proj(w))
-        a = self.alpha_proj(w)
-        b = self.beta_proj(w)
+        a = torch.tanh(self.alpha_proj(w))
+        b = torch.tanh(self.beta_proj(w))
+        # a = self.alpha_proj(w)
+        # b = self.beta_proj(w)
 
         P_s = a.unsqueeze(2) * self.P.unsqueeze(0)
         Q_s = b.unsqueeze(2) * self.Q.unsqueeze(0)
@@ -101,13 +98,13 @@ class ModulatedConv2d(nn.Module):
         s: Tensor = self.style(w).view(B, 1, C, 1, 1)
         weight = self.weight * s
 
-        if self.en_refinement:
-            delta = self._compute_low_rank_residual(w)
-            weight = weight + delta
-
         if self.demod:
             d = torch.rsqrt(weight.pow(2).sum((2, 3, 4)) + self.eps)
             weight = weight * d.view(B, self.out_ch, 1, 1, 1)
+
+        if self.en_refinement:
+            delta = self._compute_low_rank_residual(w)
+            weight = weight + delta
 
         x = x.view(1, B * C, H, W)
         weight = weight.view(B * self.out_ch, self.in_ch, self.kernel, self.kernel)
@@ -116,19 +113,20 @@ class ModulatedConv2d(nn.Module):
 
 
 class ModulatedConv2dRB(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, w_dim: int, sampling: RBSampleMode, en_refinement: bool = False, shortcut_bias: bool = True) -> None:
+    def __init__(self, in_ch: int, out_ch: int, w_dim: int, sampling: RBSampleMode, en_refinement: bool = False, shortcut_bias: bool = False) -> None:
         super().__init__()
 
         self.modconv = ModulatedConv2d(in_ch, out_ch, w_dim, en_refinement=en_refinement)
         self.bias = nn.Parameter(torch.zeros(out_ch))
         self.act = nn.SiLU()
+        self.sampling = sampling
 
         match sampling:
             case RBSampleMode.UP:
                 self.resample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
                 self.shortcut = nn.Sequential(
-                    nn.Conv2d(in_ch, out_ch, 1, bias=shortcut_bias),
                     nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                    nn.Conv2d(in_ch, out_ch, 1, bias=shortcut_bias),
                 )
 
             case RBSampleMode.DOWN:
@@ -139,17 +137,27 @@ class ModulatedConv2dRB(nn.Module):
                 )
 
             case RBSampleMode.NONE:
-                self.resample = nn.Identity()
                 self.shortcut = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, 1, bias=shortcut_bias)
 
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
 
         skip = self.shortcut(x)
 
-        x = self.modconv(x, w)
-        x = x + self.bias.view(1, -1, 1, 1)
-        x = self.act(x)
-        x = self.resample(x)
+        match self.sampling:
+            case RBSampleMode.UP:
+                x = self.resample(x)
+                x = self.modconv(x, w)
+                x = x + self.bias.view(1, -1, 1, 1)
+                x = self.act(x)
+            case RBSampleMode.DOWN:
+                x = self.modconv(x, w)
+                x = x + self.bias.view(1, -1, 1, 1)
+                x = self.act(x)
+                x = self.resample(x)
+            case RBSampleMode.NONE:
+                x = self.modconv(x, w)
+                x = x + self.bias.view(1, -1, 1, 1)
+                x = self.act(x)
 
         return x + skip
 
@@ -272,9 +280,7 @@ class NormRB(nn.Module):
             NormType.GN: lambda: nn.GroupNorm(max(1, min(32, in_ch // 4)), in_ch),
         }[norm]()
 
-        shortcut_bias = True if norm is NormType.NONE else False
-
-        self.resblock = ResBlockBase(in_ch, out_ch, sampling, shortcut_bias)
+        self.resblock = ResBlockBase(in_ch, out_ch, sampling)
 
     def forward(self, x: Tensor) -> Tensor:
 
@@ -442,29 +448,27 @@ class Generator(nn.Module):
         mapping_layers += [nn.Linear(id_dim, w_dim)]
         self.mapping = nn.Sequential(*mapping_layers)
 
-        self.stem = nn.Conv2d(img_channels, base_ch, 3, padding=1)
+        self.from_rgb = nn.Conv2d(img_channels, base_ch, 3, padding=1)
 
-        self.encoder = nn.ModuleList()
-        ch_pairs = []
-        down_in_ch = base_ch
-        for _ in range(num_encoder):
-            down_out_ch = min(down_in_ch * 2, max_ch)
-            ch_pairs.append((down_in_ch, down_out_ch))
-            self.encoder.append(NormRB(down_in_ch, down_out_ch, RBSampleMode.DOWN, encode_norm))
-            down_in_ch = down_out_ch
+        features = [min(max_ch, base_ch * (2**i)) for i in range(num_encoder + 1)]
 
-        self.bottleneck_encode = NormRB(down_out_ch, down_out_ch, RBSampleMode.NONE, encode_norm)
+        self.encoder = nn.ModuleList([NormRB(features[i], features[i + 1], RBSampleMode.DOWN, encode_norm) for i in range(num_encoder)])
+
+        encoder_final_features = features[-1]
+
+        self.bottleneck_encode = NormRB(encoder_final_features, encoder_final_features, RBSampleMode.NONE, encode_norm)
 
         match bottleneck:
             case Bottleneck.NormRB:
-                self.bottleneck_decode = NormRB(down_out_ch, down_out_ch, RBSampleMode.NONE, encode_norm)
+                self.bottleneck_decode = NormRB(encoder_final_features, encoder_final_features, RBSampleMode.NONE, encode_norm)
             case Bottleneck.AdaINRB:
-                self.bottleneck_decode = AdaINRB(down_out_ch, down_out_ch, w_dim, RBSampleMode.NONE)
+                self.bottleneck_decode = AdaINRB(encoder_final_features, encoder_final_features, w_dim, RBSampleMode.NONE)
             case Bottleneck.ModConvRB:
-                self.bottleneck_decode = ModulatedConv2dRB(down_out_ch, down_out_ch, w_dim, RBSampleMode.NONE, bool(en_refinement_mask & (1 << 0)))
+                self.bottleneck_decode = ModulatedConv2dRB(encoder_final_features, encoder_final_features, w_dim, RBSampleMode.NONE, bool(en_refinement_mask & (1 << 0)))
 
         self.decoder = nn.ModuleList()
-        for i, (up_out_ch, up_in_ch) in enumerate(reversed(ch_pairs)):
+        for i in range(num_encoder):
+            up_in_ch, up_out_ch = features[-(i + 1)], features[-(i + 2)]
             en_refinement_flag = bool(en_refinement_mask & (1 << (i + 1)))
             if i < id_inject_index:
                 decoder_layer = NormRB(up_in_ch, up_out_ch, RBSampleMode.UP, encode_norm)
@@ -510,7 +514,7 @@ class Generator(nn.Module):
 
         feats: list[Tensor] = []
 
-        x = self.stem(x_target)
+        x = self.from_rgb(x_target)
         feats.append(x)
 
         for encoder_layer in self.encoder:
@@ -550,13 +554,13 @@ if __name__ == "__main__":
         "id_dim": 512,
         "w_dim": 512,
         "mapping_num": 4,
-        "encode_norm": NormType.GN,
+        "encode_norm": NormType.NONE,
         "skip_index": 2,
-        "id_inject_index": 0,
+        "id_inject_index": 2,
         "id_inject_mode": InjectModule.MODCONV,
         "bottleneck": Bottleneck.NormRB,
         "encode_skip_fusion_mode": SkipFusionModule.ATTEN,
-        "en_refinement_mask": 0b0000000,
+        "en_refinement_mask": 0,
         "to_rgb_skip_fusion_mode": SkipFusionModule.CONCAT,
     }
 
