@@ -2,7 +2,6 @@ from enum import Enum
 import torch
 from torch import Tensor
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class RBSampleMode(Enum):
@@ -18,19 +17,19 @@ class ResBlockBase(nn.Module):
         match sampling:
             case RBSampleMode.UP:
                 self.residual = nn.Sequential(
-                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                    nn.LeakyReLU(0.2),
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.SiLU(),
+                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
                 )
                 self.shortcut = nn.Sequential(
-                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
                     nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
+                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
                 )
 
             case RBSampleMode.DOWN:
                 self.residual = nn.Sequential(
+                    nn.LeakyReLU(0.2),
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.SiLU(),
                     nn.AvgPool2d(2),
                 )
                 self.shortcut = nn.Sequential(
@@ -40,8 +39,8 @@ class ResBlockBase(nn.Module):
 
             case RBSampleMode.NONE:
                 self.residual = nn.Sequential(
+                    nn.LeakyReLU(0.2),
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.SiLU(),
                 )
                 self.shortcut = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, 1, stride=1, padding=0, bias=shortcut_bias)
 
@@ -49,124 +48,20 @@ class ResBlockBase(nn.Module):
         return self.residual(x) + self.shortcut(x)
 
 
-class ModulatedConv2d(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, style_dim: int, kernel: int = 3, demod: bool = True, eps: float = 1e-8, rank: int = 4, en_refinement: bool = False) -> None:
+class PixelNorm(nn.Module):
+    def __init__(self):
         super().__init__()
 
-        self.in_ch = in_ch
-        self.out_ch = out_ch
-        self.kernel = kernel
-        self.demod = demod
-        self.eps = eps
-        self.en_refinement = en_refinement
-
-        self.weight = nn.Parameter(torch.randn(1, out_ch, in_ch, kernel, kernel))
-        self.style = nn.Linear(style_dim, in_ch)
-        nn.init.normal_(self.style.weight, mean=0.0, std=1.0)
-        nn.init.ones_(self.style.bias)
-
-        if en_refinement:
-            self.P = nn.Parameter(torch.randn(rank, out_ch) * 0.01)
-            self.Q = nn.Parameter(torch.randn(rank, in_ch * self.kernel * self.kernel) * 0.01)
-
-            self.alpha_proj = nn.Linear(style_dim, rank)
-            self.beta_proj = nn.Linear(style_dim, rank)
-
-            nn.init.zeros_(self.alpha_proj.weight)
-            nn.init.zeros_(self.alpha_proj.bias)
-            nn.init.zeros_(self.beta_proj.weight)
-            nn.init.zeros_(self.beta_proj.bias)
-
-    def _compute_low_rank_residual(self, w: Tensor) -> Tensor:
-
-        a = torch.tanh(self.alpha_proj(w))
-        b = torch.tanh(self.beta_proj(w))
-        # a = self.alpha_proj(w)
-        # b = self.beta_proj(w)
-
-        P_s = a.unsqueeze(2) * self.P.unsqueeze(0)
-        Q_s = b.unsqueeze(2) * self.Q.unsqueeze(0)
-
-        delta = torch.bmm(P_s.transpose(1, 2), Q_s)
-        delta = delta.view(-1, self.out_ch, self.in_ch, self.kernel, self.kernel)
-
-        return delta
-
-    def forward(self, x: Tensor, w: Tensor) -> Tensor:
-        B, C, H, W = x.shape
-
-        s: Tensor = self.style(w).view(B, 1, C, 1, 1)
-        weight = self.weight * s
-
-        if self.demod:
-            d = torch.rsqrt(weight.pow(2).sum((2, 3, 4)) + self.eps)
-            weight = weight * d.view(B, self.out_ch, 1, 1, 1)
-
-        if self.en_refinement:
-            delta = self._compute_low_rank_residual(w)
-            weight = weight + delta
-
-        x = x.view(1, B * C, H, W)
-        weight = weight.view(B * self.out_ch, self.in_ch, self.kernel, self.kernel)
-        out = F.conv2d(x, weight, padding=self.kernel // 2, groups=B).view(B, self.out_ch, H, W)
-        return out
-
-
-class ModulatedConv2dRB(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, w_dim: int, sampling: RBSampleMode, en_refinement: bool = False, shortcut_bias: bool = False) -> None:
-        super().__init__()
-
-        self.modconv = ModulatedConv2d(in_ch, out_ch, w_dim, en_refinement=en_refinement)
-        self.bias = nn.Parameter(torch.zeros(out_ch))
-        self.act = nn.SiLU()
-        self.sampling = sampling
-
-        match sampling:
-            case RBSampleMode.UP:
-                self.resample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
-                self.shortcut = nn.Sequential(
-                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                    nn.Conv2d(in_ch, out_ch, 1, bias=shortcut_bias),
-                )
-
-            case RBSampleMode.DOWN:
-                self.resample = nn.AvgPool2d(2)
-                self.shortcut = nn.Sequential(
-                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
-                    nn.AvgPool2d(2),
-                )
-
-            case RBSampleMode.NONE:
-                self.shortcut = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, 1, bias=shortcut_bias)
-
-    def forward(self, x: Tensor, w: Tensor) -> Tensor:
-
-        skip = self.shortcut(x)
-
-        match self.sampling:
-            case RBSampleMode.UP:
-                x = self.resample(x)
-                x = self.modconv(x, w)
-                x = x + self.bias.view(1, -1, 1, 1)
-                x = self.act(x)
-            case RBSampleMode.DOWN:
-                x = self.modconv(x, w)
-                x = x + self.bias.view(1, -1, 1, 1)
-                x = self.act(x)
-                x = self.resample(x)
-            case RBSampleMode.NONE:
-                x = self.modconv(x, w)
-                x = x + self.bias.view(1, -1, 1, 1)
-                x = self.act(x)
-
-        return x + skip
+    def forward(self, x: Tensor) -> Tensor:
+        return x * (x.pow(2).mean(dim=1, keepdim=True) + 1e-8).rsqrt()
 
 
 class AdaIN(nn.Module):
     def __init__(self, channels: int, w_dim: int) -> None:
         super().__init__()
 
-        self.norm = nn.InstanceNorm2d(channels, affine=False)
+        # self.norm = nn.InstanceNorm2d(channels, affine=False)
+        self.norm = PixelNorm()
 
         self.fc_gamma = nn.Linear(w_dim, channels)
         self.fc_beta = nn.Linear(w_dim, channels)
@@ -183,7 +78,7 @@ class AdaIN(nn.Module):
         gamma = self.fc_gamma(w).view(w.size(0), -1, 1, 1)
         beta = self.fc_beta(w).view(w.size(0), -1, 1, 1)
 
-        return x.mul(gamma).add(beta)
+        return x * gamma + beta
 
 
 class AdaINRB(nn.Module):
@@ -203,84 +98,12 @@ class AdaINRB(nn.Module):
         return x + skip
 
 
-class CrossAdaIN(nn.Module):
-    def __init__(self, channels: int, w_dim: int) -> None:
-        super().__init__()
-
-        self.norm = nn.InstanceNorm2d(channels, affine=False)
-
-        self.fc_gamma = nn.Linear(w_dim, channels)
-        self.fc_beta = nn.Linear(w_dim, channels)
-
-        self.t_gamma = nn.Conv2d(channels, channels, 1)
-        self.t_beta = nn.Conv2d(channels, channels, 1)
-
-        nn.init.zeros_(self.fc_gamma.weight)
-        nn.init.ones_(self.fc_gamma.bias)
-        nn.init.zeros_(self.fc_beta.weight)
-        nn.init.zeros_(self.fc_beta.bias)
-
-        nn.init.zeros_(self.t_gamma.weight)
-        nn.init.zeros_(self.t_gamma.bias)
-        nn.init.zeros_(self.t_beta.weight)
-        nn.init.zeros_(self.t_beta.bias)
-
-    def forward(self, x_target: Tensor, x_source: Tensor, w: Tensor) -> Tensor:
-
-        x_source = self.norm(x_source)
-
-        gamma = self.fc_gamma(w).view(w.size(0), -1, 1, 1)
-        beta = self.fc_beta(w).view(w.size(0), -1, 1, 1)
-
-        t_gamma = torch.tanh(self.t_gamma(x_target))
-        t_beta = self.t_beta(x_target)
-
-        gamma = gamma * (1.0 + t_gamma)
-        beta = beta + t_beta
-
-        return x_source * gamma + beta
-
-
-class CrossAdaINRB(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, w_dim: int, sampling: RBSampleMode) -> None:
-        super().__init__()
-
-        self.id_inject = CrossAdaIN(in_ch, w_dim)
-        self.resblock = ResBlockBase(in_ch, out_ch, sampling)
-
-    def forward(self, x_target: Tensor, x_source: Tensor, w: Tensor):
-
-        skip = self.resblock.shortcut(x_source)
-
-        x_source = self.id_inject(x_target, x_source, w)
-        x_source = self.resblock.residual(x_source)
-
-        return x_source + skip
-
-
-class InjectModule(Enum):
-    ADAIN = "AdaIN"
-    MODCONV = "ModConv"
-    CROSSADAIN = "CrossAdaIN"
-
-
-class NormType(Enum):
-    NONE = "None"
-    IN = "InstanceNorm2d"
-    GN = "GroupNorm"
-
-
 class NormRB(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, sampling: RBSampleMode, norm: NormType = NormType.IN) -> None:
+    def __init__(self, in_ch: int, out_ch: int, sampling: RBSampleMode) -> None:
         super().__init__()
 
-        self.norm = {
-            NormType.NONE: nn.Identity,
-            NormType.IN: lambda: nn.InstanceNorm2d(in_ch, affine=False),
-            NormType.GN: lambda: nn.GroupNorm(max(1, min(32, in_ch // 4)), in_ch),
-        }[norm]()
-
-        self.resblock = ResBlockBase(in_ch, out_ch, sampling)
+        self.norm = nn.InstanceNorm2d(in_ch, affine=True)
+        self.resblock = ResBlockBase(in_ch, out_ch, sampling, shortcut_bias=True)
 
     def forward(self, x: Tensor) -> Tensor:
 
@@ -290,17 +113,6 @@ class NormRB(nn.Module):
         x = self.resblock.residual(x)
 
         return x + skip
-
-
-class Add(nn.Module):
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-
-        self.weight = nn.Parameter(torch.zeros(channels))
-
-    def forward(self, x_target: Tensor, x_source: Tensor) -> Tensor:
-        w = self.weight.view(1, -1, 1, 1)
-        return x_target + w * x_source
 
 
 class Concat(nn.Module):
@@ -317,8 +129,8 @@ class Atten(nn.Module):
 
         self.attn_mask_proj = nn.Sequential(
             nn.Conv2d(channels * 2, channels // 4, 3, padding=1),
-            nn.InstanceNorm2d(channels // 4, affine=False),
-            nn.SiLU(),
+            nn.InstanceNorm2d(channels // 4, affine=True),
+            nn.LeakyReLU(0.2),
             nn.Conv2d(channels // 4, channels, 1, padding=0),
             nn.Sigmoid(),
         )
@@ -338,32 +150,8 @@ class Atten(nn.Module):
 
 
 class SkipFusionModule(Enum):
-    ADD = "Add"
     ATTEN = "Atten"
     CONCAT = "Concat"
-
-
-class SkipFusionModConv(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, w_dim: int, sampling: RBSampleMode, fusion_mode: SkipFusionModule, en_refinement: bool = False) -> None:
-        super().__init__()
-
-        self.fusion = {
-            SkipFusionModule.CONCAT: Concat,
-            SkipFusionModule.ATTEN: lambda: Atten(in_ch),
-            SkipFusionModule.ADD: lambda: Add(in_ch),
-        }[fusion_mode]()
-
-        if isinstance(self.fusion, Concat):
-            in_ch = in_ch * 2
-
-        self.resblock = ModulatedConv2dRB(in_ch, out_ch, w_dim, sampling, en_refinement)
-
-    def forward(self, x_target: Tensor, x_source: Tensor, w: Tensor) -> Tensor:
-
-        x = self.fusion(x_target, x_source)
-        x = self.resblock(x, w)
-
-        return x
 
 
 class SkipFusionAdaIN(nn.Module):
@@ -373,7 +161,6 @@ class SkipFusionAdaIN(nn.Module):
         self.fusion = {
             SkipFusionModule.CONCAT: Concat,
             SkipFusionModule.ATTEN: lambda: Atten(in_ch),
-            SkipFusionModule.ADD: lambda: Add(in_ch),
         }[fusion_mode]()
 
         if isinstance(self.fusion, Concat):
@@ -393,12 +180,6 @@ class SkipFusionAdaIN(nn.Module):
         return x + skip
 
 
-class Bottleneck(Enum):
-    NormRB = "NormRB"
-    AdaINRB = "AdaINRB"
-    ModConvRB = "ModConvRB"
-
-
 class Generator(nn.Module):
     def __init__(
         self,
@@ -408,16 +189,9 @@ class Generator(nn.Module):
         base_ch: int = 64,
         max_ch: int = 512,
         id_dim: int = 512,
-        w_dim: int = 512,
+        w_dim: int = 256,
         mapping_num: int = 4,
-        encode_norm: NormType = NormType.IN,
         skip_index: int = 2,
-        id_inject_index: int = 0,
-        id_inject_mode: InjectModule = InjectModule.ADAIN,
-        bottleneck: Bottleneck = Bottleneck.AdaINRB,
-        encode_skip_fusion_mode: SkipFusionModule = SkipFusionModule.ATTEN,
-        en_refinement_mask: int = 0,
-        to_rgb_skip_fusion_mode: SkipFusionModule = SkipFusionModule.CONCAT,
     ) -> None:
         super().__init__()
 
@@ -432,81 +206,41 @@ class Generator(nn.Module):
             "id_dim": id_dim,
             "w_dim": w_dim,
             "mapping_num": mapping_num,
-            "encode_norm": encode_norm,
             "skip_index": skip_index,
-            "id_inject_index": id_inject_index,
-            "id_inject_mode": id_inject_mode,
-            "bottleneck": bottleneck,
-            "encode_skip_fusion_mode": encode_skip_fusion_mode,
-            "en_refinement_mask": en_refinement_mask,
-            "to_rgb_skip_fusion_mode": to_rgb_skip_fusion_mode,
         }
 
-        mapping_layers = []
-        for _ in range(mapping_num - 1):
-            mapping_layers += [nn.Linear(id_dim, id_dim), nn.SiLU()]
-        mapping_layers += [nn.Linear(id_dim, w_dim)]
+        mapping_layers = [nn.Linear(id_dim, w_dim), nn.LeakyReLU(0.2)]
+        for _ in range(mapping_num - 2):
+            mapping_layers += [nn.Linear(w_dim, w_dim), nn.LeakyReLU(0.2)]
+        mapping_layers += [nn.Linear(w_dim, w_dim)]
         self.mapping = nn.Sequential(*mapping_layers)
 
         self.from_rgb = nn.Conv2d(img_channels, base_ch, 3, padding=1)
 
         features = [min(max_ch, base_ch * (2**i)) for i in range(num_encoder + 1)]
 
-        self.encoder = nn.ModuleList([NormRB(features[i], features[i + 1], RBSampleMode.DOWN, encode_norm) for i in range(num_encoder)])
+        self.encoder = nn.ModuleList([NormRB(features[i], features[i + 1], RBSampleMode.DOWN) for i in range(num_encoder)])
 
-        encoder_final_features = features[-1]
+        final_ch = features[-1]
 
-        self.bottleneck_encode = NormRB(encoder_final_features, encoder_final_features, RBSampleMode.NONE, encode_norm)
-
-        match bottleneck:
-            case Bottleneck.NormRB:
-                self.bottleneck_decode = NormRB(encoder_final_features, encoder_final_features, RBSampleMode.NONE, encode_norm)
-            case Bottleneck.AdaINRB:
-                self.bottleneck_decode = AdaINRB(encoder_final_features, encoder_final_features, w_dim, RBSampleMode.NONE)
-            case Bottleneck.ModConvRB:
-                self.bottleneck_decode = ModulatedConv2dRB(encoder_final_features, encoder_final_features, w_dim, RBSampleMode.NONE, bool(en_refinement_mask & (1 << 0)))
+        self.bottleneck_encode = NormRB(final_ch, final_ch, RBSampleMode.NONE)
+        self.bottleneck_decode = AdaINRB(final_ch, final_ch, w_dim, RBSampleMode.NONE)
 
         self.decoder = nn.ModuleList()
         for i in range(num_encoder):
-            up_in_ch, up_out_ch = features[-(i + 1)], features[-(i + 2)]
-            en_refinement_flag = bool(en_refinement_mask & (1 << (i + 1)))
-            if i < id_inject_index:
-                decoder_layer = NormRB(up_in_ch, up_out_ch, RBSampleMode.UP, encode_norm)
-            elif i < skip_index:
-                match id_inject_mode:
-                    case InjectModule.ADAIN:
-                        decoder_layer = AdaINRB(up_in_ch, up_out_ch, w_dim, RBSampleMode.UP)
-                    case InjectModule.MODCONV:
-                        decoder_layer = ModulatedConv2dRB(up_in_ch, up_out_ch, w_dim, RBSampleMode.UP, en_refinement_flag)
-                    case InjectModule.CROSSADAIN:
-                        decoder_layer = NormRB(up_in_ch, up_out_ch, RBSampleMode.UP, encode_norm)
+            in_ch, out_ch = features[-(i + 1)], features[-(i + 2)]
+
+            if i < skip_index:
+                decoder_layer = AdaINRB(in_ch, out_ch, w_dim, RBSampleMode.UP)
             else:
-                match id_inject_mode:
-                    case InjectModule.ADAIN:
-                        decoder_layer = SkipFusionAdaIN(up_in_ch, up_out_ch, w_dim, RBSampleMode.UP, encode_skip_fusion_mode)
-                    case InjectModule.MODCONV:
-                        decoder_layer = SkipFusionModConv(up_in_ch, up_out_ch, w_dim, RBSampleMode.UP, encode_skip_fusion_mode, en_refinement_flag)
-                    case InjectModule.CROSSADAIN:
-                        decoder_layer = CrossAdaINRB(up_in_ch, up_out_ch, w_dim, RBSampleMode.UP)
+                decoder_layer = SkipFusionAdaIN(in_ch, out_ch, w_dim, RBSampleMode.UP, SkipFusionModule.ATTEN)
 
             self.decoder.append(decoder_layer)
 
-        match id_inject_mode:
-            case InjectModule.ADAIN | InjectModule.CROSSADAIN:
-                self.to_rgb = SkipFusionAdaIN(base_ch, img_channels, w_dim, RBSampleMode.NONE, to_rgb_skip_fusion_mode)
-            case InjectModule.MODCONV:
-                self.to_rgb = SkipFusionModConv(base_ch, img_channels, w_dim, RBSampleMode.NONE, to_rgb_skip_fusion_mode, bool(en_refinement_mask & (1 << num_encoder + 1)))
-
-        self.print_refinement_layers()
+        self.to_rgb = SkipFusionAdaIN(base_ch, img_channels, w_dim, RBSampleMode.NONE, SkipFusionModule.CONCAT)
 
     def get_attention_maps(self) -> list[Tensor]:
         return [maps for module in self.decoder.modules() if isinstance(module, Atten) if (maps := module.get_attention_maps()) is not None]
-
-    def print_refinement_layers(self):
-        print("=== Enabled Refinement Layers ===")
-        for module_name, module in self.named_modules():
-            if isinstance(module, ModulatedConv2d):
-                print(f"{module_name:30} en_refinement = {module.en_refinement}")
 
     def forward(self, x_target: Tensor, id_feat: Tensor) -> Tensor:
 
@@ -522,13 +256,11 @@ class Generator(nn.Module):
             feats.append(x)
 
         x = self.bottleneck_encode(x)
-        x = self.bottleneck_decode(x) if isinstance(self.bottleneck_decode, NormRB) else self.bottleneck_decode(x, w)
+        x = self.bottleneck_decode(x, w)
 
         for i, decoder_block in enumerate(self.decoder):
-            if isinstance(decoder_block, (SkipFusionAdaIN, SkipFusionModConv, CrossAdaINRB)):
+            if isinstance(decoder_block, SkipFusionAdaIN):
                 x = decoder_block(feats[-(i + 1)], x, w)
-            elif isinstance(decoder_block, NormRB):
-                x = decoder_block(x)
             else:
                 x = decoder_block(x, w)
 
@@ -552,16 +284,9 @@ if __name__ == "__main__":
         "base_ch": 64,
         "max_ch": 512,
         "id_dim": 512,
-        "w_dim": 512,
+        "w_dim": 256,
         "mapping_num": 4,
-        "encode_norm": NormType.NONE,
         "skip_index": 2,
-        "id_inject_index": 2,
-        "id_inject_mode": InjectModule.MODCONV,
-        "bottleneck": Bottleneck.NormRB,
-        "encode_skip_fusion_mode": SkipFusionModule.ATTEN,
-        "en_refinement_mask": 0,
-        "to_rgb_skip_fusion_mode": SkipFusionModule.CONCAT,
     }
 
     model = Generator(**network_cfg).to(device)
@@ -572,7 +297,7 @@ if __name__ == "__main__":
     summary(
         model,
         input_data=(x_target, id_feat),
-        depth=2,
+        depth=6,
         col_names=(
             "input_size",
             "output_size",

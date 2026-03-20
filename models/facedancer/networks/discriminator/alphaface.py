@@ -1,7 +1,6 @@
 import math
 import torch
 from torch import nn, Tensor
-from ..layers import BlurPool
 
 
 class MinibatchStdLayer(nn.Module):
@@ -35,19 +34,21 @@ class DownRB(nn.Module):
 
         self.shortcut = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, 1, 1, 0, bias=False),
-            BlurPool(out_ch),
+            nn.AvgPool2d(2),
         )
 
         self.residual = nn.Sequential(
             nn.Conv2d(in_ch, in_ch, 3, 1, 1),
             nn.LeakyReLU(0.2),
-            BlurPool(in_ch),
+            nn.AvgPool2d(2),
             nn.Conv2d(in_ch, out_ch, 3, 1, 1),
             nn.LeakyReLU(0.2),
         )
 
+        self.scale = 1.0 / math.sqrt(2)
+
     def forward(self, x: Tensor) -> Tensor:
-        return (self.shortcut(x) + self.residual(x)) / math.sqrt(2)
+        return (self.shortcut(x) + self.residual(x)) * self.scale
 
 
 class AlphaFaceDiscriminator(nn.Module):

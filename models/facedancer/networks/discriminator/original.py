@@ -10,11 +10,11 @@ class DownBlock(nn.Module):
             nn.AvgPool2d(2),
         )
         self.residual = nn.Sequential(
-            nn.InstanceNorm2d(in_ch, affine=False),
+            nn.InstanceNorm2d(in_ch, affine=True),
             nn.LeakyReLU(0.2),
             nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
             nn.AvgPool2d(2),
-            nn.InstanceNorm2d(out_ch, affine=False),
+            nn.InstanceNorm2d(out_ch, affine=True),
             nn.LeakyReLU(0.2),
             nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
         )
@@ -34,30 +34,29 @@ class Discriminator(nn.Module):
             "max_ch": max_ch,
         }
 
-        self.conv_first = nn.Conv2d(img_channels, base_ch, 3, 1, 1)
-        self.blocks = nn.ModuleList()
+        self.from_rgb = nn.Conv2d(img_channels, base_ch, 3, 1, padding=1)
 
-        channels = base_ch
-        for _ in range(num_encoder):
-            next_ch = min(channels * 2, max_ch)
-            self.blocks.append(DownBlock(channels, next_ch))
-            channels = next_ch
+        features = [min(max_ch, base_ch * (2**i)) for i in range(num_encoder + 1)]
+
+        self.down_blocks = nn.ModuleList([DownBlock(features[i], features[i + 1]) for i in range(num_encoder)])
+
+        final_ch = features[-1]
 
         self.final_conv = nn.Sequential(
-            nn.Conv2d(next_ch, next_ch, img_resolution // (2**num_encoder)),
+            nn.Conv2d(final_ch, final_ch, img_resolution // (2**num_encoder)),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(next_ch, 1, 1),
+            nn.Conv2d(final_ch, 1, 1),
             nn.Flatten(),
         )
 
     def forward(self, x: Tensor, return_feats: bool = False) -> Tensor | tuple[Tensor, list[Tensor]]:
 
-        x = self.conv_first(x)
+        x = self.from_rgb(x)
 
         feats = [] if return_feats else None
 
-        for block in self.blocks:
-            x = block(x)
+        for down_block in self.down_blocks:
+            x = down_block(x)
             if return_feats:
                 feats.append(x)
 

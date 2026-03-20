@@ -31,10 +31,6 @@ from losses import (
 from .dataloader import datasetloader
 from .networks import (
     Generator,
-    NormType,
-    InjectModule,
-    Bottleneck,
-    SkipFusionModule,
     Discriminator,
     Stylegan2DiscriminatorLite,
     AlphaFaceDiscriminator,
@@ -74,9 +70,9 @@ class Trainer:
         batch_size: int = 10,
         lr: float = 1e-4,
         lr_scheduler_t_max: int = 0,
-        discriminator_typt: DISCRIMINATOR_TYPT = DISCRIMINATOR_TYPT.ALPHAFACE,
+        discriminator_typt: DISCRIMINATOR_TYPT = DISCRIMINATOR_TYPT.ORIGIN,
         d_train_setp: int = 1,
-        r1_reg_step: int = 16,
+        r1_reg_step: int = 1,
         bf16: bool = True,
         device: str = "cuda:0",
         compile_module: bool = True,
@@ -85,19 +81,24 @@ class Trainer:
         log_interval: int = 10,
         sample_save_every: int = 1000,
         weight_save_every: int = 10000,
-        same_image_prob: float = 0.1,
+        same_image_prob: float = 0.2,
         # 模型配置
         net_g_cfg: dict[str, int] | None = None,
         net_d_cfg: dict[str, int] | None = None,
-        id_encode_provider: IDLoss.Provider = IDLoss.Provider.BLENDFACE,
-        id_loss_weight: float = 5.0,
-        rec_loss: float = 2.5,
+        id_encode_provider: IDLoss.Provider = IDLoss.Provider.MS1MV3_ARCFACE_R50_FP16,
+        id_loss_weight: float = 10.0,
+        rec_loss: float = 5.0,
         perceptual_loss_weight: dict[str, float] = {
             # vgg16
-            "relu1_2": 0.25,
-            "relu2_2": 0.25,
-            "relu3_3": 0.25,
-            "relu4_2": 0.25,
+            # "relu1_2": 0.25,
+            # "relu2_2": 0.25,
+            # "relu3_3": 0.25,
+            # "relu4_2": 0.25,
+            "pool1": 0.2,
+            "pool2": 0.2,
+            "pool3": 0.2,
+            "pool4": 0.2,
+            "pool5": 0.2,
         },
         enable_wfm_loss: bool = False,
         wfm_loss_weight: dict[int, float] = {
@@ -178,7 +179,7 @@ class Trainer:
             net_g = Generator(**ckpt["net_g"]["network_cfg"])
             net_d = discriminator_typt.value(**ckpt["net_d"]["network_cfg"])
             net_g.load_state_dict(ckpt["net_g"]["state_dict"])
-            # net_d.load_state_dict(ckpt["net_d"]["state_dict"])
+            net_d.load_state_dict(ckpt["net_d"]["state_dict"])
 
         else:
             self.iter, self.img_resolution = 0, net_g_cfg["img_resolution"]
@@ -361,17 +362,17 @@ class Trainer:
                     loss += ifsr_loss
 
                 # perceptual_loss
-                # perceptual_loss = self.perceptual_loss(fake, dst)
-                # perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
-                # self.log("perceptual_loss", perceptual_loss)
-                # loss += perceptual_loss
+                perceptual_loss = self.perceptual_loss(fake, dst)
+                perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                self.log("perceptual_loss", perceptual_loss)
+                loss += perceptual_loss
 
                 # rec_loss
-                # rec_loss = self.rec_loss(fake, dst)  # BCHW
-                # rec_loss = rec_loss.mean(dim=[1, 2, 3])
-                # rec_loss = (rec_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
-                # self.log("rec_loss", rec_loss)
-                # loss += rec_loss
+                rec_loss = self.rec_loss(fake, dst)  # BCHW
+                rec_loss = rec_loss.mean(dim=[1, 2, 3])
+                rec_loss = (rec_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                self.log("rec_loss", rec_loss)
+                loss += rec_loss
 
                 # color_loss
                 if self.enable_color_loss:
@@ -392,21 +393,21 @@ class Trainer:
             if self.iter % self.sample_save_every == 0:
                 with torch.inference_mode():
                     attn_map: list[Tensor] = self.net_g.get_attention_maps()
+                    grid = [src, dst, fake]
 
-                    if len(attn_map) == 0:
-                        grid = torch.cat((src, dst, fake), dim=0)
-                    else:
-                        maps = []
+                    if len(attn_map) > 0:
                         for m in attn_map:
                             m = m.mean(dim=1, keepdim=True)
                             m = F.interpolate(m, size=self.img_resolution, mode="bilinear", align_corners=False)
-                            maps.append(m)
-                        attn = torch.mean(torch.stack(maps, dim=0), dim=0).expand(-1, 3, -1, -1)
-                        amin = attn.amin(dim=(2, 3), keepdim=True)
-                        amax = attn.amax(dim=(2, 3), keepdim=True)
-                        attn_norm = 2.0 * (attn - amin) / (amax - amin + 1e-6) - 1.0
-                        grid = torch.cat((src, dst, fake, attn_norm), dim=0)
+                            m = m.expand(-1, 3, -1, -1)
 
+                            amin = m.amin(dim=(2, 3), keepdim=True)
+                            amax = m.amax(dim=(2, 3), keepdim=True)
+                            m = 2.0 * (m - amin) / (amax - amin + 1e-6) - 1.0
+
+                            grid.append(m)
+
+                    grid = torch.cat(grid, dim=0)
                     grid.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)
                     grid = make_grid(grid, nrow=self.batch_size)[[2, 1, 0], :, :]  # RGB -> BGR
                     grid = grid.permute(1, 2, 0)  # CHW -> HWC
@@ -439,6 +440,7 @@ if __name__ == "__main__":
 
     def_config.update(
         {
+            "ckpt": "train_log/256_BLENDFACE_ADAIN/ckpt/549824.pth",
             "net_g_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
@@ -446,35 +448,47 @@ if __name__ == "__main__":
                 "base_ch": 64,
                 "max_ch": 512,
                 "id_dim": 512,
-                "w_dim": 512,
+                "w_dim": 256,
                 "mapping_num": 4,
-                "encode_norm": NormType.NONE,
                 "skip_index": 2,
-                "id_inject_index": 2,
-                "id_inject_mode": InjectModule.MODCONV,
-                "bottleneck": Bottleneck.NormRB,
-                "encode_skip_fusion_mode": SkipFusionModule.ATTEN,
-                "en_refinement_mask": 0,
-                "to_rgb_skip_fusion_mode": SkipFusionModule.CONCAT,
             },
             "net_d_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
+                "num_encoder": 5,
                 "base_ch": 64,
                 "max_ch": 512,
-                "group_size": 5,
             },
-            "rec_loss": 2.5,
-            "id_loss_weight": 5.0,
-            "log_path": "train_log/256_BLENDFACE_MODCONV_Same0.0",
-            "enable_wfm_loss": True,
-            "wfm_loss_weight": {
-                1: 1.0,
-            },
-            "same_image_prob": 0.0,
-            # "enable_color_loss": True,
+            "log_path": "train_log/256_BLENDFACE_ADAIN_WFM_PixelNorm",
         }
     )
+
+    # def_config.update(
+    #     {
+    #         "net_g_cfg": {
+    #             "img_resolution": 256,
+    #             "img_channels": 3,
+    #             "num_encoder": 5,
+    #             "base_ch": 64,
+    #             "max_ch": 512,
+    #             "id_dim": 512,
+    #             "w_dim": 256,
+    #             "mapping_num": 4,
+    #             "skip_index": 2,
+    #         },
+    #         "net_d_cfg": {
+    #             "img_resolution": 256,
+    #             "img_channels": 3,
+    #             "base_ch": 64,
+    #             "max_ch": 512,
+    #             "group_size": 5,
+    #         },
+    #         "log_path": "train_log/256_BLENDFACE_ADAIN_ALPHAFACE_DISC_WFM",
+    #         "discriminator_typt": DISCRIMINATOR_TYPT.ALPHAFACE,
+    #         "ckpt": "train_log/256_BLENDFACE_ADAIN_ALPHAFACE_DISC/ckpt/569563.pth",
+    #         "r1_reg_step": 16,
+    #     }
+    # )
 
     trainer = Trainer(**def_config)
 

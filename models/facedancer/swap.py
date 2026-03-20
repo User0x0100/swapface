@@ -9,16 +9,7 @@ from misc.facealign import face_align_batch, extract_alignface_from_video
 from misc.models.retinaface import get_pts, RetinaFace
 from misc.models.idencoder import IDEncoder, get_align_landmarks, PROVIDER
 from misc.models.face_parsing import FaceParsing
-from .networks import (
-    Generator,
-    NormType,
-    InjectModule,
-    Bottleneck,
-    SkipFusionModule,
-    Discriminator,
-    Stylegan2DiscriminatorLite,
-    AlphaFaceDiscriminator,
-)
+from .networks import Generator
 from torchvision.io import decode_image
 from tqdm import tqdm
 import cv2
@@ -134,8 +125,8 @@ class Swap:
 
 if __name__ == "__main__":
     video = "/opt/share/deepfake/linshi/录屏素材/2023-04-14(李云帆 陈雨)/20230414-163616614陈雨(电脑录屏).mp4"
-    id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
-    # id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
+    # id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
+    id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
     # id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
 
     # video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
@@ -143,6 +134,6 @@ if __name__ == "__main__":
     # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
     # id = "/home/liaohaixun/swap/IDAssets/2025-06-15 18_19_50小树🌿人间体验卡限时掉落✨ _3.jpg"
 
-    swapper = Swap("train_log/256_BLENDFACE_ModConv_New_id_loss_weight10/ckpt/520000.pth", PROVIDER.BLENDFACE)
+    swapper = Swap("train_log/256_BLENDFACE_ADAIN_ALPHAFACE_DISC/ckpt/540000.pth", PROVIDER.MS1MV3_ARCFACE_R50_FP16)
 
     swapper.swap_video(video, id)
