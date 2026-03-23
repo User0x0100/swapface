@@ -16,26 +16,23 @@ class ResBlockBase(nn.Module):
 
         match sampling:
             case RBSampleMode.UP:
+                out_ch = out_ch * 4
                 self.residual = nn.Sequential(
                     nn.LeakyReLU(0.2),
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                    nn.PixelShuffle(2),
                 )
                 self.shortcut = nn.Sequential(
                     nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
-                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                    nn.PixelShuffle(2),
                 )
 
             case RBSampleMode.DOWN:
                 self.residual = nn.Sequential(
                     nn.LeakyReLU(0.2),
-                    nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.AvgPool2d(2),
+                    nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1),
                 )
-                self.shortcut = nn.Sequential(
-                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
-                    nn.AvgPool2d(2),
-                )
+                self.shortcut = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=2, padding=0, bias=shortcut_bias)
 
             case RBSampleMode.NONE:
                 self.residual = nn.Sequential(
@@ -48,20 +45,11 @@ class ResBlockBase(nn.Module):
         return self.residual(x) + self.shortcut(x)
 
 
-class PixelNorm(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x: Tensor) -> Tensor:
-        return x * (x.pow(2).mean(dim=1, keepdim=True) + 1e-8).rsqrt()
-
-
 class AdaIN(nn.Module):
     def __init__(self, channels: int, w_dim: int) -> None:
         super().__init__()
 
-        # self.norm = nn.InstanceNorm2d(channels, affine=False)
-        self.norm = PixelNorm()
+        self.norm = nn.InstanceNorm2d(channels, affine=False)
 
         self.fc_gamma = nn.Linear(w_dim, channels)
         self.fc_beta = nn.Linear(w_dim, channels)
@@ -158,6 +146,8 @@ class SkipFusionAdaIN(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample_mode: RBSampleMode, fusion_mode: SkipFusionModule) -> None:
         super().__init__()
 
+        self.fusion_mode = fusion_mode
+
         self.fusion = {
             SkipFusionModule.CONCAT: Concat,
             SkipFusionModule.ATTEN: lambda: Atten(in_ch),
@@ -171,11 +161,17 @@ class SkipFusionAdaIN(nn.Module):
 
     def forward(self, x_target: Tensor, x_source: Tensor, w: Tensor) -> Tensor:
 
-        x = self.fusion(x_target, x_source)
-        skip = self.resblock.shortcut(x)
-
-        x = self.adain(x, w)
-        x = self.resblock.residual(x)
+        match self.fusion_mode:
+            case SkipFusionModule.ATTEN:
+                x = self.adain(x_target, w)
+                x = self.fusion(x, x_source)
+                skip = self.resblock.shortcut(x_source)
+                x = self.resblock.residual(x)
+            case SkipFusionModule.CONCAT:
+                x = self.fusion(x_target, x_source)
+                skip = self.resblock.shortcut(x)
+                x = self.adain(x, w)
+                x = self.resblock.residual(x)
 
         return x + skip
 
@@ -274,6 +270,7 @@ class Generator(nn.Module):
 if __name__ == "__main__":
     import torch
     from torchinfo import summary
+    from fvcore.nn import FlopCountAnalysis
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 1
@@ -294,20 +291,11 @@ if __name__ == "__main__":
 
     x_target = torch.randn((batch_size, network_cfg["img_channels"], network_cfg["img_resolution"], network_cfg["img_resolution"]), device=device)
     id_feat = torch.randn((batch_size, network_cfg["id_dim"]), device=device)
-    summary(
-        model,
-        input_data=(x_target, id_feat),
-        depth=6,
-        col_names=(
-            "input_size",
-            "output_size",
-            "num_params",
-            "kernel_size",
-            "mult_adds",
-        ),
-        row_settings=("var_names",),
-    )
+    summary(model, input_data=(x_target, id_feat), depth=3, col_names=("input_size", "output_size", "num_params", "kernel_size", "mult_adds"), row_settings=("var_names",))
 
     print("NetWork_Info:")
     for k, v in network_cfg.items():
         print(f"  {k:25}: {v}")
+
+    flops = FlopCountAnalysis(model, (x_target, id_feat))
+    print(f"\n模型总FLOPs: {flops.total() / 1e9:.4f} GFLOPs")

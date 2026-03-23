@@ -1,3 +1,4 @@
+import copy
 import random
 import itertools
 from enum import Enum
@@ -67,6 +68,7 @@ class Trainer:
         self,
         src: list[tuple[str, float]],
         dst: list[tuple[str, float]],
+        identity_root: list[str],
         batch_size: int = 10,
         lr: float = 1e-4,
         lr_scheduler_t_max: int = 0,
@@ -85,20 +87,20 @@ class Trainer:
         # 模型配置
         net_g_cfg: dict[str, int] | None = None,
         net_d_cfg: dict[str, int] | None = None,
-        id_encode_provider: IDLoss.Provider = IDLoss.Provider.MS1MV3_ARCFACE_R50_FP16,
+        id_encode_provider: IDLoss.Provider = IDLoss.Provider.BLENDFACE,
         id_loss_weight: float = 10.0,
         rec_loss: float = 5.0,
         perceptual_loss_weight: dict[str, float] = {
             # vgg16
-            # "relu1_2": 0.25,
-            # "relu2_2": 0.25,
-            # "relu3_3": 0.25,
-            # "relu4_2": 0.25,
-            "pool1": 0.2,
-            "pool2": 0.2,
-            "pool3": 0.2,
-            "pool4": 0.2,
-            "pool5": 0.2,
+            "relu1_2": 0.25,
+            "relu2_2": 0.25,
+            "relu3_3": 0.25,
+            "relu4_2": 0.25,
+            # "pool1": 0.2,
+            # "pool2": 0.2,
+            # "pool3": 0.2,
+            # "pool4": 0.2,
+            # "pool5": 0.2,
         },
         enable_wfm_loss: bool = False,
         wfm_loss_weight: dict[int, float] = {
@@ -189,6 +191,9 @@ class Trainer:
         self.net_g = net_g.to(self.device).train()
         self.net_d = net_d.to(self.device).train()
 
+        self.net_g_ema = copy.deepcopy(self.net_g)
+        self.net_g_ema.eval().requires_grad_(False)
+
         # ========================= Optim =========================
         self.optim_g = optim.AdamW(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
         self.optim_d = optim.AdamW(self.net_d.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
@@ -205,7 +210,7 @@ class Trainer:
         self.id_loss = IDLoss(weight=id_loss_weight, provider=id_encode_provider).to(self.device)
         self.rec_loss = l1_loss_fn(weight=rec_loss, reduction="none")
 
-        self.perceptual_loss = PerceptualLoss(layer_weights=perceptual_loss_weight, reduction="none").to(self.device)
+        self.perceptual_loss = PerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
 
         if self.enable_ifsr_loss:
             self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight).to(self.device)
@@ -237,6 +242,7 @@ class Trainer:
             resize=self.img_resolution,
             src=src,
             dst=dst,
+            identity_root=identity_root,
             same_image_prob=same_image_prob,
         )
 
@@ -263,11 +269,20 @@ class Trainer:
         return src, dst, is_same
 
     @torch.no_grad()
+    def update_ema(self, decay=0.999):
+
+        decay = min(decay, (1 + self.iter) / (2 + 1000))
+        alpha = 1.0 - decay
+
+        for p_ema, p_train in zip(self.net_g_ema.parameters(), self.net_g.parameters()):
+            p_ema.lerp_(p_train, alpha)
+
+    @torch.no_grad()
     def save_ckpt(self):
 
         net_g = {
-            "network_cfg": self.net_g.network_cfg,
-            "state_dict": self.net_g.state_dict(),
+            "network_cfg": self.net_g_ema.network_cfg,
+            "state_dict": self.net_g_ema.state_dict(),
         }
 
         net_d = {
@@ -363,7 +378,7 @@ class Trainer:
 
                 # perceptual_loss
                 perceptual_loss = self.perceptual_loss(fake, dst)
-                perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                # perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
                 self.log("perceptual_loss", perceptual_loss)
                 loss += perceptual_loss
 
@@ -387,12 +402,16 @@ class Trainer:
                 self.lr_scheduler_g.step()
                 self.lr_scheduler_d.step()
 
+            self.update_ema()
+
             if self.iter % self.weight_save_every == 0:
                 self.save_ckpt()
 
             if self.iter % self.sample_save_every == 0:
                 with torch.inference_mode():
-                    attn_map: list[Tensor] = self.net_g.get_attention_maps()
+                    src_id_feats = self.id_loss.get_id_feats(src)
+                    fake: Tensor = self.net_g_ema(dst, src_id_feats)
+                    attn_map: list[Tensor] = self.net_g_ema.get_attention_maps()
                     grid = [src, dst, fake]
 
                     if len(attn_map) > 0:
@@ -435,36 +454,13 @@ if __name__ == "__main__":
         # ("/opt/share/deepfake/dataset_1/youtube/4k_Face_Close_Up_HDR_Video_Vivid_Colors_Ambient_Sound_-_Relaxing_align_results", 0.0),
         # ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
     ]
+    identity_root = ["dataset"]
 
-    def_config = {"src": src, "dst": dst}
-
-    def_config.update(
-        {
-            "ckpt": "train_log/256_BLENDFACE_ADAIN/ckpt/549824.pth",
-            "net_g_cfg": {
-                "img_resolution": 256,
-                "img_channels": 3,
-                "num_encoder": 5,
-                "base_ch": 64,
-                "max_ch": 512,
-                "id_dim": 512,
-                "w_dim": 256,
-                "mapping_num": 4,
-                "skip_index": 2,
-            },
-            "net_d_cfg": {
-                "img_resolution": 256,
-                "img_channels": 3,
-                "num_encoder": 5,
-                "base_ch": 64,
-                "max_ch": 512,
-            },
-            "log_path": "train_log/256_BLENDFACE_ADAIN_WFM_PixelNorm",
-        }
-    )
+    def_config = {"src": src, "dst": dst, "identity_root": identity_root}
 
     # def_config.update(
     #     {
+    #         "ckpt": "train_log/256_BLENDFACE_ADAIN_WFM_Same0.0/ckpt/1296007.pth",
     #         "net_g_cfg": {
     #             "img_resolution": 256,
     #             "img_channels": 3,
@@ -479,16 +475,65 @@ if __name__ == "__main__":
     #         "net_d_cfg": {
     #             "img_resolution": 256,
     #             "img_channels": 3,
+    #             "num_encoder": 5,
     #             "base_ch": 64,
     #             "max_ch": 512,
-    #             "group_size": 5,
     #         },
-    #         "log_path": "train_log/256_BLENDFACE_ADAIN_ALPHAFACE_DISC_WFM",
-    #         "discriminator_typt": DISCRIMINATOR_TYPT.ALPHAFACE,
-    #         "ckpt": "train_log/256_BLENDFACE_ADAIN_ALPHAFACE_DISC/ckpt/569563.pth",
-    #         "r1_reg_step": 16,
+    #         "log_path": "train_log/256_BLENDFACE_ADAIN_WFM_Same0.0",
+    #         "enable_wfm_loss": True,
+    #         "wfm_loss_weight": {
+    #             0: 2.0,
+    #             1: 1.0,
+    #         },
+    #         "same_image_prob": 0.3,
+    #         "enable_color_loss": True,
     #     }
     # )
+
+    def_config.update(
+        {
+            "net_g_cfg": {
+                "img_resolution": 256,
+                "img_channels": 3,
+                "num_encoder": 5,
+                "base_ch": 64,
+                "max_ch": 512,
+                "id_dim": 512,
+                "w_dim": 256,
+                "mapping_num": 4,
+                "skip_index": 2,
+            },
+            "net_d_cfg": {
+                "img_resolution": 256,
+                "img_channels": 3,
+                "base_ch": 64,
+                "max_ch": 512,
+                "group_size": 5,
+            },
+            "log_path": "train_log/256_BLENDFACE_New_Arch",
+            "enable_wfm_loss": True,
+            "wfm_loss_weight": {
+                0: 2.0,
+                1: 1.0,
+            },
+            "same_image_prob": 0.2,
+            "discriminator_typt": DISCRIMINATOR_TYPT.ALPHAFACE,
+            "r1_reg_step": 16,
+            "perceptual_loss_weight": {
+                # vgg16
+                "relu1_2": 1.0,
+                "relu2_2": 1.0,
+                "relu3_3": 0.5,
+                "relu4_2": 0.5,
+                # "pool1": 0.2,
+                # "pool2": 0.2,
+                # "pool3": 0.2,
+                # "pool4": 0.2,
+                # "pool5": 0.2,
+            },
+            "enable_color_loss": True,
+        }
+    )
 
     trainer = Trainer(**def_config)
 

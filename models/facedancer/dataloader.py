@@ -1,3 +1,4 @@
+from pathlib import Path
 import random
 from typing import List, Tuple, Union
 import numpy as np
@@ -82,41 +83,72 @@ class RndWarpPars(object):
         return mapx.astype(np.float32), mapy.astype(np.float32), transform_matrix.astype(np.float32)
 
 
+class IdentityPairReader:
+    """
+    从多层目录结构中读取“同一身份的两张不同图片”。
+
+    目录结构要求：
+
+        root/
+            group1/
+                id_0000/
+                    img1.jpg
+                    img2.jpg
+                id_0001/
+                    ...
+            group2/
+                id_xxxx/
+                    ...
+
+    设计说明：
+
+    1. identity 定义
+        每个 id_xxxx 文件夹视为一个 identity
+
+    2. 最小样本数
+        仅保留图片数量 >= 2 的 identity
+
+    3. 采样策略
+        - 先按 identity 权重采样一个文件夹
+        - 再从该 identity 中采样两张不同图片
+    """
+
+    def __init__(self, roots: list[str], random_sampling: bool = True):
+        self.random_sampling = random_sampling
+        self.folders: list[ImageFolder] = []
+
+        for root in roots:
+            root = Path(root)
+            for group in root.iterdir():
+                if not group.is_dir():
+                    continue
+                for identity in group.iterdir():
+                    if not identity.is_dir():
+                        continue
+                    reader = ImageFolder(folder=identity, random_sampling=self.random_sampling)
+                    if len(reader) >= 2:  # 至少两张
+                        self.folders.append(reader)
+
+        if len(self.folders) == 0:
+            raise ValueError("没有有效 identity 数据")
+
+        counts = [len(x) for x in self.folders]
+        weights = [c**0.5 for c in counts]
+        s = sum(weights)
+        self.weights = [w / s for w in weights]
+
+    def __call__(self, sample_info) -> tuple[ndarray, ndarray]:
+        _ = sample_info
+
+        folder = random.choices(self.folders, weights=self.weights, k=1)[0]
+
+        x = np.fromfile(folder.sample(), dtype=np.uint8)
+        x1 = np.fromfile(folder.sample(), dtype=np.uint8)
+
+        return x, x1
+
+
 class SampleReader(object):
-    """
-    DALI external_source 数据提供器。
-
-    负责从多个源域(src)与目标域(dst)文件夹中按权重随机采样图像文件，
-    并返回原始字节流（未解码）。
-
-    设计目标：
-        - 支持多文件夹加权采样（用于域平衡 / 数据集规模不均衡问题）
-        - 支持随机采样或顺序采样（由 ImageFolder 控制）
-        - 通过 sqrt(count) 权重缩放，降低超大数据集的主导效应
-        - 提供额外指数权重调整 (2**adj)，用于人为增强某些域
-
-    Args:
-        src:
-            List[str] 或 List[(folder, adj_weight)]
-            源域图像文件夹列表。
-        dst:
-            List[str] 或 List[(folder, adj_weight)]
-            目标域图像文件夹列表。
-        random_sampling:
-            是否在文件夹内部随机采样文件。
-            False 时使用 ImageFolder 内部顺序采样策略。
-
-    Returns:
-        __call__ 返回:
-            src: ndarray(uint8)  源图像原始字节流
-            dst: ndarray(uint8)  目标图像原始字节流
-
-    注意:
-        - 返回的是 bytes buffer，不是解码后的图像。
-        - 解码由 DALI GPU mixed decoder 完成。
-        - 多线程安全依赖 ImageFolder.sample() 实现。
-    """
-
     def __init__(
         self,
         src: Union[List[str], List[Tuple[str, float]]],
@@ -141,33 +173,8 @@ class SampleReader(object):
 
         return src, dst
 
-    def collect_folder(self, folder_weight_list: Union[List[str], List[Tuple[str, float]]]):
-        """
-        构建 ImageFolder 列表并计算采样权重。
+    def collect_folder(self, folder_weight_list: Union[List[str], List[Tuple[str, float]]]) -> tuple[list[ImageFolder], list[float]]:
 
-        权重策略:
-            1. 基础权重 = sqrt(file_count) / sum(sqrt(file_count))
-               → 防止大数据集垄断采样概率。
-            2. 调整权重 = base_weight * 2**adj
-               → adj 为人工调节因子（指数缩放）。
-            3. 归一化得到最终采样权重。
-
-        Args:
-            folder_weight_list:
-                List[str]  → 无额外权重调整
-                List[(folder, adj)] → adj 为 log2 scale 调整量
-
-        Returns:
-            readers: List[ImageFolder]
-            weights: List[float] 归一化采样概率
-
-        Raises:
-            ValueError: 当所有文件夹为空时抛出。
-
-        设计动机:
-            - sqrt scaling 常用于 dataset balancing（类似 CLIP / diffusion dataset sampling）
-            - adj 提供人为 domain emphasis capability
-        """
         readers: List[ImageFolder] = []
         file_counts: List[int] = []
         adjustments: List[float] = []
@@ -236,8 +243,9 @@ class SampleReader(object):
 @pipeline_def(enable_conditionals=True)
 def datasetloader(
     resize: int,
-    src: List[Tuple[str, float]],
-    dst: List[Tuple[str, float]],
+    src: list[tuple[str, float]],
+    dst: list[tuple[str, float]],
+    identity_root: list[str],
     brightness: float = 0.2,
     contrast: float = 0.2,
     saturation: float = 0.2,
@@ -246,51 +254,6 @@ def datasetloader(
     random_sampling: bool = True,
     rndwarp: bool = False,
 ):
-    """
-    Face Swapping 数据加载 DALI Pipeline。
-
-    Pipeline stages:
-        1. external_source → CPU 读取原始字节
-        2. mixed decoder → GPU 硬件 JPEG decode
-        3. resize → GPU Lanczos3
-        4. random flip → source & target independently
-        5. color augmentation → target only
-        6. clamp + normalize → [-1, 1]
-        7. transpose → CHW
-        8. same-image sampling (identity training trick)
-
-    Args:
-        resize:
-            输出分辨率 (H=W=resize)
-        src / dst:
-            [(folder, adj_weight)] 列表
-        brightness / contrast / saturation:
-            ColorJitter 幅度，均匀采样 [1-x, 1+x]
-        flip_prob:
-            水平翻转概率
-        same_image_prob:
-            以 dst 覆盖 src 的概率，用于 identity reconstruction loss
-        random_sampling:
-            是否随机采样文件
-
-    Returns:
-        src: Tensor [3, H, W] float32 in [-1, 1]
-        dst: Tensor [3, H, W] float32 in [-1, 1]
-        is_same: Tensor[1] float32
-            1.0 → src == dst (identity case)
-            0.0 → normal swap case
-
-    关键设计点:
-        - mixed decoder 减少 CPU bottleneck
-        - color jitter 仅作用于 dst（模拟真实视频 domain shift）
-        - same_image_prob 用于稳定 GAN identity preservation
-        - enable_conditionals=True 允许 pipeline-level if 分支
-
-    性能注意:
-        - hw_decoder_load=0.75 避免 GPU decode 饱和
-        - no_copy=True 避免 CPU→GPU redundant memcpy
-        - prefetch_queue_depth=2 提高 pipeline overlap
-    """
 
     external_source = fn.external_source(
         source=SampleReader(src, dst, random_sampling),
@@ -302,10 +265,29 @@ def datasetloader(
         dtype=DALIDataType.UINT8,
         batch=False,
     )
+
+    identity_sampler = fn.external_source(
+        source=IdentityPairReader(identity_root, random_sampling),
+        num_outputs=2,
+        device="cpu",
+        no_copy=True,
+        parallel=True,
+        prefetch_queue_depth=2,
+        dtype=DALIDataType.UINT8,
+        batch=False,
+    )
+
     if rndwarp:
         random_warp_params = fn.external_source(source=RndWarpPars(resize), num_outputs=3, device="gpu", no_copy=False, parallel=False, dtype=DALIDataType.FLOAT, batch=False)
 
-    src_raw, dst_raw = external_source
+    # 是否采样同一身份
+    if fn.random.coin_flip(probability=same_image_prob, dtype=DALIDataType.BOOL):
+        is_same = Constant(value=1.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])
+        src_raw, dst_raw = identity_sampler
+
+    else:
+        is_same = Constant(value=0.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])
+        src_raw, dst_raw = external_source
 
     src = fn.decoders.image(src_raw, device="mixed", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
     src = fn.resize(src, device="gpu", size=resize, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
@@ -317,6 +299,12 @@ def datasetloader(
     if fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.BOOL):
         dst = fn.flip(dst, device="gpu")
 
+    if rndwarp:
+        mapx, mapy, transform_matrix = random_warp_params[0:]
+        dst = fn.experimental.remap(dst, mapx, mapy)
+        dst = fn.reinterpret(dst, layout="HWC")
+        dst = fn.warp_affine(dst, transform_matrix)
+
     dst = fn.color_twist(
         dst,
         device="gpu",
@@ -324,17 +312,6 @@ def datasetloader(
         contrast=fn.random.uniform(range=[1.0 - contrast, 1.0 + contrast]),
         saturation=fn.random.uniform(range=[1.0 - saturation, 1.0 + saturation]),
     )
-
-    if fn.random.coin_flip(probability=same_image_prob, dtype=DALIDataType.BOOL):
-        is_same = Constant(value=1.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])
-        src = fn.copy(dst, device="gpu")
-        if rndwarp:
-            mapx, mapy, transform_matrix = random_warp_params[0:]
-            dst = fn.experimental.remap(dst, mapx, mapy)
-            dst = fn.reinterpret(dst, layout="HWC")
-            dst = fn.warp_affine(dst, transform_matrix)
-    else:
-        is_same = Constant(value=0.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])
 
     src = clamp(src, lo=0.0, hi=255.0)
     src = fn.normalize(src, device="gpu", mean=127.5, stddev=127.5)

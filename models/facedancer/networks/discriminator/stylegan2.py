@@ -60,7 +60,10 @@ class DiscriminatorBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
 
-        self.residual = nn.Sequential(DownSample(), EqualizedConv2d(in_ch, out_ch, kernel_size=1))
+        self.residual = nn.Sequential(
+            DownSample(),
+            EqualizedConv2d(in_ch, out_ch, kernel_size=1),
+        )
 
         self.block = nn.Sequential(
             EqualizedConv2d(in_ch, in_ch, kernel_size=3, padding=1),
@@ -147,7 +150,8 @@ class Stylegan2DiscriminatorLite(nn.Module):
 
         self.conv = EqualizedConv2d(final_features, final_features, 3)
 
-        self.final = EqualizedLinear(2 * 2 * final_features, 1)
+        final_res = img_resolution // (2 ** len(features))
+        self.final = EqualizedLinear(final_res * final_res * final_features, 1)
 
     def forward(self, x: Tensor, return_feats: bool = False) -> Tensor | tuple[Tensor, list[Tensor]]:
 

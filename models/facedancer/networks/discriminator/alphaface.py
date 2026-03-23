@@ -1,6 +1,7 @@
 import math
 import torch
 from torch import nn, Tensor
+# from torch.nn import functional as F
 
 
 class MinibatchStdLayer(nn.Module):
@@ -33,16 +34,14 @@ class DownRB(nn.Module):
         super().__init__()
 
         self.shortcut = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 1, 1, 0, bias=False),
-            nn.AvgPool2d(2),
+            nn.Conv2d(in_ch, out_ch, 1, 2, 0, bias=False),
         )
 
         self.residual = nn.Sequential(
+            nn.LeakyReLU(0.2),
             nn.Conv2d(in_ch, in_ch, 3, 1, 1),
             nn.LeakyReLU(0.2),
-            nn.AvgPool2d(2),
-            nn.Conv2d(in_ch, out_ch, 3, 1, 1),
-            nn.LeakyReLU(0.2),
+            nn.Conv2d(in_ch, out_ch, 3, 2, 1),
         )
 
         self.scale = 1.0 / math.sqrt(2)
@@ -63,26 +62,20 @@ class AlphaFaceDiscriminator(nn.Module):
             "group_size": group_size,
         }
 
-        self.from_rgb = nn.Sequential(
-            nn.Conv2d(img_channels, base_ch, 3, 1, 1),
-            nn.LeakyReLU(0.2),
-        )
+        self.from_rgb = nn.Conv2d(img_channels, base_ch, 3, 1, 1)
 
         features = [min(max_ch, base_ch * (2**i)) for i in range(int(math.log2(img_resolution)) - 1)]
         n_blocks = len(features) - 1
 
         self.down_blocks = nn.ModuleList([DownRB(features[i], features[i + 1]) for i in range(n_blocks)])
 
-        self.mini_batch_std = MinibatchStdLayer(group_size)
-
         final_features = features[-1] + 1
+        final_res = img_resolution // (2 ** len(features))
         self.final_conv = nn.Sequential(
+            MinibatchStdLayer(group_size),
             nn.Conv2d(final_features, final_features, 3),
-            nn.LeakyReLU(0.2),
             nn.Flatten(),
-            nn.Linear(2 * 2 * final_features, final_features),
-            nn.LeakyReLU(0.2),
-            nn.Linear(final_features, 1),
+            nn.Linear(final_res * final_res * final_features, 1),
         )
 
     def get_feats(self, x: Tensor) -> list[Tensor]:
@@ -106,7 +99,6 @@ class AlphaFaceDiscriminator(nn.Module):
             if return_feats:
                 feats.append(x)
 
-        x = self.mini_batch_std(x)
         x = self.final_conv(x)
 
         return (x, feats) if feats is not None else x

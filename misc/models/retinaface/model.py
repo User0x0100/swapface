@@ -54,7 +54,7 @@ CFG_R50 = {
 
 class RetinaFace(nn.Module):
     # https://github.com/biubug6/Pytorch_Retinaface
-    def __init__(self, use_mobile_net: bool = False, from_normalized: bool = False, from_unit_range: bool = False, swap_rb_ch: bool = True) -> None:
+    def __init__(self, use_mobile_net: bool = False, from_normalized: bool = False, from_unit_range: bool = False, from_rgb: bool = True) -> None:
         """
         Args:
             from_normalized: 输入值域是否为 [-1, 1]
@@ -67,7 +67,7 @@ class RetinaFace(nn.Module):
 
         self.from_normalized = from_normalized
         self.from_unit_range = from_unit_range
-        self.swap_rb_ch = swap_rb_ch
+        self.from_rgb = from_rgb
 
         self.register_buffer("mean", torch.tensor([104.0, 117.0, 123.0], dtype=torch.float).view(1, 3, 1, 1), persistent=False)  # bgr order
 
@@ -129,6 +129,7 @@ class RetinaFace(nn.Module):
             landmarkhead.append(LandmarkHead(inchannels, anchor_num))
         return landmarkhead
 
+    @torch.inference_mode()
     def detector(
         self, images: list[Tensor] | tuple[Tensor] | Tensor, conf_thresh: float = 0.9, iou_thresh: float = 0.5, min_box_size: tuple[int, int] = (0, 0)
     ) -> tuple[Tensor, list[int]]:
@@ -181,7 +182,7 @@ class RetinaFace(nn.Module):
         elif self.from_unit_range:
             images.mul_(255.0)
 
-        if self.swap_rb_ch:
+        if self.from_rgb:
             images = images[:, [2, 1, 0], :, :]
 
         images = images.sub_(self.mean)
@@ -275,9 +276,9 @@ class RetinaFace(nn.Module):
 
             keep = ops.nms(boxes_b, scores_b, iou_thresh)
 
-            boxes_b = boxes_b[keep]
-            landms_b = landms_b[keep]
-            scores_b = scores_b[keep].unsqueeze(1)  # [K] -> [K, 1]
+            boxes_b = boxes_b[keep].clone()
+            landms_b = landms_b[keep].clone()
+            scores_b = scores_b[keep].unsqueeze(1).clone()  # [K] -> [K, 1]
 
             detection = torch.cat([scores_b, boxes_b, landms_b], dim=1)  # [K, 15]
             detected.append(detection)
@@ -356,7 +357,6 @@ def batch_resize_and_pad_varsize(imgs: tuple[Tensor] | list[Tensor], out_h: int,
     scales = torch.zeros((N, 1), device=device, dtype=dtype)
 
     for i, img in enumerate(imgs):
-
         H_i, W_i = img.shape[-2:]
         scale = min(out_h / H_i, out_w / W_i)
         scales[i] = scale
@@ -446,7 +446,6 @@ def draw_boxes_batch(images: Tensor | tuple[Tensor] | list[Tensor], detected: Te
         color_tensor = torch.tensor(color, device=new_images[0].device).view(3, 1, 1)
 
     for boxes, image in zip(iter_detections(detected, offset), new_images):
-
         if boxes.size(0) == 0:
             continue
         H, W = image.shape[-2:]

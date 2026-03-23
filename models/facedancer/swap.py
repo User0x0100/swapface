@@ -126,14 +126,14 @@ class Swap:
 if __name__ == "__main__":
     video = "/opt/share/deepfake/linshi/录屏素材/2023-04-14(李云帆 陈雨)/20230414-163616614陈雨(电脑录屏).mp4"
     # id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
-    id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
-    # id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
+    # id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
+    id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
 
     # video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
     # id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
     # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
     # id = "/home/liaohaixun/swap/IDAssets/2025-06-15 18_19_50小树🌿人间体验卡限时掉落✨ _3.jpg"
 
-    swapper = Swap("train_log/256_BLENDFACE_ADAIN_ALPHAFACE_DISC/ckpt/540000.pth", PROVIDER.MS1MV3_ARCFACE_R50_FP16)
+    swapper = Swap("train_log/256_BLENDFACE_ADAIN_WFM_Same0.0_ALPHAFACE_T/ckpt/1210000.pth", PROVIDER.BLENDFACE)
 
     swapper.swap_video(video, id)
