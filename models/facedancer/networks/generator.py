@@ -16,23 +16,26 @@ class ResBlockBase(nn.Module):
 
         match sampling:
             case RBSampleMode.UP:
-                out_ch = out_ch * 4
                 self.residual = nn.Sequential(
                     nn.LeakyReLU(0.2),
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.PixelShuffle(2),
+                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
                 )
                 self.shortcut = nn.Sequential(
                     nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
-                    nn.PixelShuffle(2),
+                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
                 )
 
             case RBSampleMode.DOWN:
                 self.residual = nn.Sequential(
                     nn.LeakyReLU(0.2),
-                    nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1),
+                    nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
+                    nn.AvgPool2d(2),
                 )
-                self.shortcut = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=2, padding=0, bias=shortcut_bias)
+                self.shortcut = nn.Sequential(
+                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=2, padding=0, bias=shortcut_bias),
+                    nn.AvgPool2d(1),
+                )
 
             case RBSampleMode.NONE:
                 self.residual = nn.Sequential(
