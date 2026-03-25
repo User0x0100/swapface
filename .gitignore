@@ -1,3 +1,6 @@
+.vscode
 *.pyc
 train_log
+.clang-format
 *.png
+*.onnx

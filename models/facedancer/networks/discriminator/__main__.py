@@ -20,6 +20,10 @@ model.eval()
 x = torch.randn(batch_size, 3, img_resolution, img_resolution, device=device)
 model(x)
 
+compile_model = torch.compile(model, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
+with torch.autocast(device_type="cuda",dtype=torch.bfloat16):
+    compile_model(x)
+
 with torch.inference_mode():
     y, feats = model(x, return_feats=True)
 print("各层输出特征形状:")

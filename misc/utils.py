@@ -140,8 +140,10 @@ class ImageFolder:
             fp = self[i]
             image = decode_image(fp, ImageReadMode.RGB)
             image = to_dtype(inpt=image, dtype=torch.uint8, scale=True)
-
-            yield image, fp.name if label else image
+            if label:
+                yield image, fp.name
+            else:
+                yield image
 
     def iter_batch_tensor(self, batch_size: int, label: bool = False):
         """

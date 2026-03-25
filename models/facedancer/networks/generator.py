@@ -33,8 +33,8 @@ class ResBlockBase(nn.Module):
                     nn.AvgPool2d(2),
                 )
                 self.shortcut = nn.Sequential(
-                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=2, padding=0, bias=shortcut_bias),
-                    nn.AvgPool2d(1),
+                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
+                    nn.AvgPool2d(2),
                 )
 
             case RBSampleMode.NONE:

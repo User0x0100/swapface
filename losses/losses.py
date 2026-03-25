@@ -394,7 +394,8 @@ class StyleLossLabChroma(nn.Module):
 
 
 def r1_reg_loss(real_score: Tensor, real_img: Tensor, gamma: float = 10.0) -> Tensor:
-
+    if not real_img.requires_grad:
+        raise ValueError("real_img must have requires_grad=True for R1 regularization. Call real_img.requires_grad_(True) before the discriminator forward pass.")
     r1_grads = torch.autograd.grad(outputs=[real_score.sum()], inputs=[real_img], create_graph=True, only_inputs=True)[0]
     r1_penalty = r1_grads.square().sum([1, 2, 3])
     r1_loss = r1_penalty * (gamma / 2)

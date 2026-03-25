@@ -19,3 +19,4 @@ segmentation-models-pytorch
 fvcore
 xformers
 torchinfo
+ninja

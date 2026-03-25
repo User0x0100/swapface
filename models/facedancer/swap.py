@@ -12,6 +12,7 @@ from misc.models.face_parsing import FaceParsing
 from .networks import Generator
 from torchvision.io import decode_image
 from tqdm import tqdm
+
 import cv2
 
 
@@ -106,7 +107,7 @@ class Swap:
             faces.div_(127.5).sub_(1.0)
 
             with torch.autocast(device_type="cuda"):
-                swap_face: Tensor = self.net_g(faces, id_emb.expand(N, -1))
+                swap_face: Tensor = self.net_g(faces, id_emb)
                 mask = self.face_mask(faces)
                 mask = F.gaussian_blur(mask, 7, 13)
                 swap_face = faces * (1.0 - mask) + swap_face * mask
@@ -124,16 +125,16 @@ class Swap:
 
 
 if __name__ == "__main__":
-    video = "/opt/share/deepfake/linshi/录屏素材/2023-04-14(李云帆 陈雨)/20230414-163616614陈雨(电脑录屏).mp4"
+    # video = "/opt/share/deepfake/linshi/录屏素材/2023-04-14(李云帆 陈雨)/20230414-163616614陈雨(电脑录屏).mp4"
     # id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
     # id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
-    id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
+    # id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
 
-    # video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
+    video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
     # id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
-    # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
+    id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
     # id = "/home/liaohaixun/swap/IDAssets/2025-06-15 18_19_50小树🌿人间体验卡限时掉落✨ _3.jpg"
 
-    swapper = Swap("train_log/256_BLENDFACE_ADAIN_WFM_Same0.0_ALPHAFACE_T/ckpt/1210000.pth", PROVIDER.BLENDFACE)
+    swapper = Swap("train_log/256_BLENDFACE_AlphaDise_New/ckpt/110000.pth", PROVIDER.BLENDFACE)
 
     swapper.swap_video(video, id)

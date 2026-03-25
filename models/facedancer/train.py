@@ -172,16 +172,10 @@ class Trainer:
 
             self.img_resolution = ckpt["net_g"]["network_cfg"]["img_resolution"]
 
-            # ckpt["net_g"]["network_cfg"]["skip_index"] = ckpt["net_g"]["network_cfg"].pop("skip_free_depth")
-            # ckpt["net_g"]["network_cfg"]["encode_norm"] = ckpt["net_g"]["network_cfg"].pop("encoder_norm")
-            # ckpt["net_g"]["network_cfg"]["id_inject_mode"] = ckpt["net_g"]["network_cfg"].pop("id_inject_mod")
-            # ckpt["net_g"]["network_cfg"]["bottleneck"] = ckpt["net_g"]["network_cfg"].pop("bottleneck_out")
-            # ckpt["net_g"]["network_cfg"]["id_inject_index"] = 2
-
             net_g = Generator(**ckpt["net_g"]["network_cfg"])
             net_d = discriminator_typt.value(**ckpt["net_d"]["network_cfg"])
             net_g.load_state_dict(ckpt["net_g"]["state_dict"])
-            net_d.load_state_dict(ckpt["net_d"]["state_dict"])
+            net_d.load_state_dict(ckpt["net_d"]["state_dict"], strict=False)
 
         else:
             self.iter, self.img_resolution = 0, net_g_cfg["img_resolution"]
@@ -271,7 +265,7 @@ class Trainer:
     @torch.no_grad()
     def update_ema(self, decay=0.999):
 
-        decay = min(decay, (1 + self.iter) / (2 + 1000))
+        decay = min(decay, 1 - 1 / (self.iter + 1))
         alpha = 1.0 - decay
 
         for p_ema, p_train in zip(self.net_g_ema.parameters(), self.net_g.parameters()):
@@ -492,6 +486,7 @@ if __name__ == "__main__":
 
     def_config.update(
         {
+            # "ckpt": "train_log/256_BLENDFACE_AlphaDise/ckpt/1731200.pth",
             "net_g_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
@@ -508,15 +503,15 @@ if __name__ == "__main__":
                 "img_channels": 3,
                 "base_ch": 64,
                 "max_ch": 512,
-                "group_size": 5,
+                "group_size": 4,
             },
-            "log_path": "train_log/256_BLENDFACE_New_Arch",
+            "log_path": "train_log/256_BLENDFACE_AlphaDise_New",
             "enable_wfm_loss": True,
             "wfm_loss_weight": {
                 0: 2.0,
                 1: 1.0,
             },
-            "same_image_prob": 0.2,
+            "same_image_prob": 0.0,
             "discriminator_typt": DISCRIMINATOR_TYPT.ALPHAFACE,
             "r1_reg_step": 16,
             "perceptual_loss_weight": {
@@ -532,6 +527,8 @@ if __name__ == "__main__":
                 # "pool5": 0.2,
             },
             "enable_color_loss": True,
+            "batch_size": 12,
+            "d_train_setp": 2,
         }
     )
 
