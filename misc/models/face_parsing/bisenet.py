@@ -1,5 +1,3 @@
-from typing import Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,7 +28,7 @@ class ConvBNReLU(nn.Module):
         for ly in self.children():
             if isinstance(ly, nn.Conv2d):
                 nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None:
+                if ly.bias is not None:
                     nn.init.constant_(ly.bias, 0)
 
 
@@ -50,7 +48,7 @@ class BiSeNetOutput(nn.Module):
         for ly in self.children():
             if isinstance(ly, nn.Conv2d):
                 nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None:
+                if ly.bias is not None:
                     nn.init.constant_(ly.bias, 0)
 
     def get_params(self):
@@ -58,7 +56,7 @@ class BiSeNetOutput(nn.Module):
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
                 wd_params.append(module.weight)
-                if not module.bias is None:
+                if module.bias is not None:
                     nowd_params.append(module.bias)
             elif isinstance(module, nn.BatchNorm2d):
                 nowd_params += list(module.parameters())
@@ -87,7 +85,7 @@ class AttentionRefinementModule(nn.Module):
         for ly in self.children():
             if isinstance(ly, nn.Conv2d):
                 nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None:
+                if ly.bias is not None:
                     nn.init.constant_(ly.bias, 0)
 
 
@@ -130,7 +128,7 @@ class ContextPath(nn.Module):
         for ly in self.children():
             if isinstance(ly, nn.Conv2d):
                 nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None:
+                if ly.bias is not None:
                     nn.init.constant_(ly.bias, 0)
 
     def get_params(self):
@@ -138,7 +136,7 @@ class ContextPath(nn.Module):
         for name, module in self.named_modules():
             if isinstance(module, (nn.Linear, nn.Conv2d)):
                 wd_params.append(module.weight)
-                if not module.bias is None:
+                if module.bias is not None:
                     nowd_params.append(module.bias)
             elif isinstance(module, nn.BatchNorm2d):
                 nowd_params += list(module.parameters())
@@ -166,7 +164,7 @@ class SpatialPath(nn.Module):
         for ly in self.children():
             if isinstance(ly, nn.Conv2d):
                 nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None:
+                if ly.bias is not None:
                     nn.init.constant_(ly.bias, 0)
 
     def get_params(self):
@@ -174,7 +172,7 @@ class SpatialPath(nn.Module):
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
                 wd_params.append(module.weight)
-                if not module.bias is None:
+                if module.bias is not None:
                     nowd_params.append(module.bias)
             elif isinstance(module, nn.BatchNorm2d):
                 nowd_params += list(module.parameters())
@@ -207,7 +205,7 @@ class FeatureFusionModule(nn.Module):
         for ly in self.children():
             if isinstance(ly, nn.Conv2d):
                 nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None:
+                if ly.bias is not None:
                     nn.init.constant_(ly.bias, 0)
 
     def get_params(self):
@@ -215,7 +213,7 @@ class FeatureFusionModule(nn.Module):
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
                 wd_params.append(module.weight)
-                if not module.bias is None:
+                if module.bias is not None:
                     nowd_params.append(module.bias)
             elif isinstance(module, nn.BatchNorm2d):
                 nowd_params += list(module.parameters())
@@ -260,7 +258,7 @@ class BiSeNet(nn.Module):
         for ly in self.children():
             if isinstance(ly, nn.Conv2d):
                 nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None:
+                if ly.bias is not None:
                     nn.init.constant_(ly.bias, 0)
 
     def get_params(self):

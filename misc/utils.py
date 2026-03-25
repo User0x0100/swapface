@@ -3,7 +3,7 @@ import random
 import time
 from functools import wraps
 from pathlib import Path
-from typing import Iterator, List, Sequence, Tuple
+from typing import Iterator, Sequence
 
 import torch
 from torch import Tensor
@@ -108,7 +108,7 @@ class ImageFolder:
 
         return fp
 
-    def sample_tensor(self, label: bool = False, loop: bool = True) -> Tensor | Tuple[Tensor, str]:
+    def sample_tensor(self, label: bool = False, loop: bool = True) -> Tensor | tuple[Tensor, str]:
         """
         :param label: 是否返回对应的文件名
         :return: 位于cpu的 CHW RGB [0 ~ 255] torch.uint8
@@ -124,7 +124,7 @@ class ImageFolder:
 
         return image
 
-    def iter_tensor(self, label: bool = False) -> Iterator[Tensor] | Iterator[Tuple[Tensor, str]]:
+    def iter_tensor(self, label: bool = False) -> Iterator[Tensor] | Iterator[tuple[Tensor, str]]:
         """
         顺序迭代返回tensor
 
@@ -160,9 +160,9 @@ class ImageFolder:
 
         for start in range(0, self.len, batch_size):
             batch_indices = indices[start : start + batch_size]
-            images: List[torch.Tensor] = []
+            images: list[torch.Tensor] = []
             if label:
-                labels: List[str] = []
+                labels: list[str] = []
 
             for i in batch_indices:
                 fp = self[i]

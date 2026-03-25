@@ -1,6 +1,5 @@
 from pathlib import Path
 import random
-from typing import List, Tuple, Union
 import numpy as np
 from numpy import ndarray
 from scipy.stats import norm
@@ -151,8 +150,8 @@ class IdentityPairReader:
 class SampleReader(object):
     def __init__(
         self,
-        src: Union[List[str], List[Tuple[str, float]]],
-        dst: Union[List[str], List[Tuple[str, float]]],
+        src: list[str] | list[tuple[str, float]],
+        dst: list[str] | list[tuple[str, float]],
         random_sampling: bool = True,
     ):
         self.random_sampling = random_sampling
@@ -173,11 +172,11 @@ class SampleReader(object):
 
         return src, dst
 
-    def collect_folder(self, folder_weight_list: Union[List[str], List[Tuple[str, float]]]) -> tuple[list[ImageFolder], list[float]]:
+    def collect_folder(self, folder_weight_list: list[str] | list[tuple[str, float]]) -> tuple[list[ImageFolder], list[float]]:
 
-        readers: List[ImageFolder] = []
-        file_counts: List[int] = []
-        adjustments: List[float] = []
+        readers: list[ImageFolder] = []
+        file_counts: list[int] = []
+        adjustments: list[float] = []
 
         if isinstance(folder_weight_list[0], str):
             for folder in folder_weight_list:
@@ -221,7 +220,7 @@ class SampleReader(object):
         使用 ANSI 绿色高亮文件夹路径。
         """
 
-        def dump(title, folders: List[ImageFolder] | None, weights: list[float]):
+        def dump(title, folders: list[ImageFolder] | None, weights: list[float]):
 
             count_w = 7
             GREEN = "\033[32m"
