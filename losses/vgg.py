@@ -1,4 +1,3 @@
-import torch
 from torch import Tensor, nn
 from torchvision.models import vgg
 

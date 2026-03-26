@@ -1,14 +1,8 @@
-import multiprocessing as mp
-from pathlib import Path
-from typing import Generator
-import cv2
-import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.utils as utils
-from torch import autocast, nn, Tensor
+from torch import Tensor
 from torchcodec.decoders import VideoDecoder
-from tqdm import tqdm
 
 
 from .models.idencoder import get_align_landmarks
@@ -349,7 +343,7 @@ if __name__ == "__main__":
     from .models.idencoder import get_align_landmarks
     from .models.retinaface import get_pts, batch_resize_and_pad_varsize
 
-    from misc.utils import ImageFolder, Timer
+    from misc.utils import ImageFolder
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 32
