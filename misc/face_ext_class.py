@@ -8,7 +8,7 @@ from torch import Tensor
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from .facealign import extract_alignface_from_video
+from .facealign import AlignFaceExtractor
 from .models.idencoder import IDEncoder, PROVIDER
 
 
@@ -56,7 +56,7 @@ def exp(
     # I/O线程池
     executor = ThreadPoolExecutor(max_workers=4)
     pbar = tqdm(total=total_frames, desc="Processing")
-    for faces, _, _ in extract_alignface_from_video(vfp, batch_size, align_size, device, conf_thresh=conf_thresh, iou_thresh=iou_thresh, min_box_size=min_box_size):
+    for faces, _, _ in AlignFaceExtractor(vfp, batch_size, align_size, device, conf_thresh=conf_thresh, iou_thresh=iou_thresh, min_box_size=min_box_size):
         with torch.inference_mode():
             id_feats = ID_Encoder((faces / 127.5) - 1.0)  # (B, C)
 

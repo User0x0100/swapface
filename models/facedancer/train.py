@@ -20,7 +20,7 @@ from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 from losses import (
     IDLoss,
     l1_loss_fn,
-    PerceptualLoss,
+    VGGPerceptualLoss,
     DLoss,
     GANLoss,
     StyleLossLabChroma,
@@ -175,7 +175,7 @@ class Trainer:
             net_g = Generator(**ckpt["net_g"]["network_cfg"])
             net_d = discriminator_typt.value(**ckpt["net_d"]["network_cfg"])
             net_g.load_state_dict(ckpt["net_g"]["state_dict"])
-            net_d.load_state_dict(ckpt["net_d"]["state_dict"], strict=False)
+            net_d.load_state_dict(ckpt["net_d"]["state_dict"])
 
         else:
             self.iter, self.img_resolution = 0, net_g_cfg["img_resolution"]
@@ -204,7 +204,7 @@ class Trainer:
         self.id_loss = IDLoss(weight=id_loss_weight, provider=id_encode_provider).to(self.device)
         self.rec_loss = l1_loss_fn(weight=rec_loss, reduction="none")
 
-        self.perceptual_loss = PerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
+        self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
 
         if self.enable_ifsr_loss:
             self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight).to(self.device)
@@ -486,7 +486,7 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            # "ckpt": "train_log/256_BLENDFACE_AlphaDise/ckpt/1731200.pth",
+            "ckpt": "train_log/256_BLENDFACE_AlphaDise_New/ckpt/300000.pth",
             "net_g_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
@@ -505,7 +505,7 @@ if __name__ == "__main__":
                 "max_ch": 512,
                 "group_size": 4,
             },
-            "log_path": "train_log/256_BLENDFACE_AlphaDise_New",
+            "log_path": "train_log/256_BLENDFACE_AlphaDise_New_ID_8",
             "enable_wfm_loss": True,
             "wfm_loss_weight": {
                 0: 2.0,
@@ -529,6 +529,7 @@ if __name__ == "__main__":
             "enable_color_loss": True,
             "batch_size": 12,
             "d_train_setp": 2,
+            "id_loss_weight": 8,
         }
     )
 
