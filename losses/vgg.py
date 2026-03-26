@@ -137,7 +137,7 @@ def get_vgg_layer_name(vgg_type: str):
 
 
 class VGGFeatureExtractor(nn.Module):
-    def __init__(self, layer_names: list[str], vgg_type: str, use_input_norm: bool, range_norm: bool):
+    def __init__(self, layer_names: list[str], vgg_type: str):
         super().__init__()
 
         create_vgg_fn = getattr(vgg, vgg_type)
@@ -148,25 +148,14 @@ class VGGFeatureExtractor(nn.Module):
         vgg_features.eval()
         vgg_features.requires_grad_(False)
 
-        self.use_input_norm = use_input_norm
-        if self.use_input_norm:
-            self.register_buffer("mean", torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-            self.register_buffer("std", torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-
-        self.range_norm = range_norm
-
         Layer_Name = VGG_Layer_Name[vgg_type]
-        self.selected_layers = [Layer_Name.index(l) for l in layer_names]
+        self.selected_layers = [Layer_Name.index(i) for i in layer_names]
         self.selected_layers.sort()
 
         max_idx = self.selected_layers[-1] + 1
         self.features = vgg_features[: max_idx + 1]
 
     def forward(self, x: Tensor) -> list[Tensor]:
-        if self.range_norm:
-            x = (x + 1) / 2
-        if self.use_input_norm:
-            x = (x - self.mean) / self.std
 
         features: list[Tensor] = []
 

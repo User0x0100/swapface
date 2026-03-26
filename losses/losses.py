@@ -109,6 +109,7 @@ class DINOv2PerceptualLoss(nn.Module):
         self,
         layer_weights: Mapping[int, float],
         criterion: Literal["l1", "mse", "charbonnier", "cosine"] = "cosine",
+        reduction: Literal["mean", "sum", "none"] = "mean",
         dino_type="dinov2_vitb14_reg",
         use_input_norm: bool = True,
         range_norm: bool = True,
@@ -128,9 +129,9 @@ class DINOv2PerceptualLoss(nn.Module):
             "mse": F.mse_loss,
             "charbonnier": charbonnier_loss,
             "cosine": self._cosine_distance,
-        }.get(criterion)
-        if self.criterion is None:
-            raise NotImplementedError(f"{criterion} criterion has not been supported. Only 'l1' 'mse' 'charbonnier' 'cosine' are supported.")
+        }[criterion]
+
+        self.reduction = reduction
         self.layer_weights = layer_weights
 
         self.dino = torch.hub.load("facebookresearch/dinov2", dino_type)
@@ -147,10 +148,17 @@ class DINOv2PerceptualLoss(nn.Module):
         self.range_norm = range_norm
 
     @staticmethod
-    def _cosine_distance(x: Tensor, y: Tensor) -> Tensor:
+    def _cosine_distance(x: Tensor, y: Tensor, reduction: Literal["mean", "sum", "none"] = "mean") -> Tensor:
 
         x_norm, y_norm = F.normalize(x, p=2, dim=-1), F.normalize(y, p=2, dim=-1)
-        return 1.0 - F.cosine_similarity(x_norm, y_norm, dim=-1).mean()
+        loss = 1.0 - F.cosine_similarity(x_norm, y_norm, dim=-1)
+        match reduction:
+            case "mean":
+                return loss.mean()
+            case "sum":
+                return loss.sum()
+            case "none":
+                return loss
 
     # @torch.compile(fullgraph=True, dynamic=False, options={"epilogue_fusion": True, "max_autotune": True})
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
@@ -166,17 +174,24 @@ class DINOv2PerceptualLoss(nn.Module):
             y = (y - self.mean) / self.std
 
         x_patch = self.dino.get_intermediate_layers(x, n=self.n_blocks)
-        y_patch = self.dino.get_intermediate_layers(y, n=self.n_blocks)
+
+        with torch.inference_mode():
+            if self.range_norm:
+                y = (y + 1) * 0.5
+            if self.use_input_norm:
+                y = (y - self.mean) / self.std
+
+            y_patch = self.dino.get_intermediate_layers(y, n=self.n_blocks)
 
         loss = torch.tensor(0.0, dtype=x.dtype, device=x.device)
         for idx, weight in self.layer_weights.items():
             x_feat, y_feat = x_patch[idx], y_patch[idx]
-            loss += self.criterion(x_feat, y_feat) * weight
+            loss += self.criterion(x_feat, y_feat, reduction=self.reduction) * weight
 
         return loss
 
 
-class PerceptualLoss(nn.Module):
+class VGGPerceptualLoss(nn.Module):
     def __init__(
         self,
         layer_weights: Mapping[str, float],
@@ -228,12 +243,7 @@ class PerceptualLoss(nn.Module):
         """
         super().__init__()
 
-        self.vgg = VGGFeatureExtractor(
-            layer_names=list(layer_weights.keys()),
-            vgg_type=vgg_type,
-            use_input_norm=use_input_norm,
-            range_norm=range_norm,
-        )
+        self.vgg = VGGFeatureExtractor(layer_names=list(layer_weights.keys()), vgg_type=vgg_type)
         self.vgg.eval()
         self.vgg.requires_grad_(False)
 
@@ -241,18 +251,33 @@ class PerceptualLoss(nn.Module):
             "l1": F.l1_loss,
             "mse": F.mse_loss,
             "charbonnier": charbonnier_loss,
-        }.get(criterion)
-        if self.criterion is None:
-            raise NotImplementedError(f"{criterion} criterion has not been supported. Only 'l1' 'mse' 'charbonnier' are supported.")
+        }[criterion]
 
         self.weights = list(layer_weights.values())
         self.reduction = reduction
 
+        self.use_input_norm = use_input_norm
+        if self.use_input_norm:
+            self.register_buffer("mean", torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+            self.register_buffer("std", torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+        self.range_norm = range_norm
+
     @torch.compile(fullgraph=True, dynamic=False, options={"epilogue_fusion": True, "max_autotune": True})
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
+
+        if self.range_norm:
+            x = (x + 1) * 0.5
+        if self.use_input_norm:
+            x = (x - self.mean) / self.std
+
         fx: list[Tensor] = self.vgg(x)
 
         with torch.inference_mode():
+            if self.range_norm:
+                y = (y + 1) * 0.5
+            if self.use_input_norm:
+                y = (y - self.mean) / self.std
             fy: list[Tensor] = self.vgg(y)
 
         loss = 0.0
@@ -588,7 +613,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 32
 
-    losses = PerceptualLoss(
+    losses = VGGPerceptualLoss(
         layer_weights={
             "relu2_2": 1.0,
             "relu3_3": 1.0,

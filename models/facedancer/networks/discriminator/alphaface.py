@@ -2,7 +2,6 @@ import math
 import torch
 from torch import nn, Tensor
 from ..upfirdn2d import DownFIRDn2d
-from ..layers import BlurPool
 
 
 class MinibatchStdLayer(nn.Module):
@@ -35,7 +34,6 @@ class DownRB(nn.Module):
         super().__init__()
 
         self.shortcut = nn.Sequential(
-            # BlurPool(in_ch),
             DownFIRDn2d(),
             nn.Conv2d(in_ch, out_ch, 1, 1, 0, bias=False),
         )
@@ -45,7 +43,6 @@ class DownRB(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Conv2d(in_ch, out_ch, 3, 1, 1),
             nn.LeakyReLU(0.2),
-            # BlurPool(out_ch),
             DownFIRDn2d(),
         )
 
