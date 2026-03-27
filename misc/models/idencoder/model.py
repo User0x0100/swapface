@@ -74,8 +74,7 @@ class IDEncoder(nn.Module):
         if x.shape[2:] != INPUT_SIZE:
             x = F.interpolate(x, INPUT_SIZE, mode="bilinear", align_corners=False)
         id = self.backbone(x)
-        if isinstance(self.backbone, VisionTransformer):
-            id = id[0]
+
         return F.normalize(id, p=2, dim=1)
 
 

@@ -431,11 +431,12 @@ class VisionTransformer(nn.Module):
         return torch.reshape(out, (B, self.num_patches * self.embed_dim)), out_softmax
 
     def forward(self, x):
-        x, weight = self.forward_features(x)
-        out_x = torch.reshape(x, (x.shape[0], self.num_patches, self.embed_dim))
+        x, _ = self.forward_features(x)
+        # out_x = torch.reshape(x, (x.shape[0], self.num_patches, self.embed_dim))
         # for numerical stability
-        patch_std = torch.std(out_x, dim=2)
+        # patch_std = torch.std(out_x, dim=2)
         # patch_entropy = torch.log(patch_std) + 0.5 + 0.5*torch.log( torch.tensor(2*math.pi) )  ## Entropy
-        patch_entropy = patch_std
+        # patch_entropy = patch_std
         x = self.feature(x)
-        return x, weight, patch_entropy
+        # return x, weight, patch_entropy
+        return x
