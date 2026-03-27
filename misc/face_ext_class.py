@@ -1,3 +1,4 @@
+import argparse
 from pathlib import Path
 import shutil
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +11,28 @@ from tqdm import tqdm
 
 from .facealign import AlignFaceExtractor, zoom_in
 from .models.idencoder import IDEncoder, PROVIDER
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("vfp", type=str)
+
+    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--align_size", type=int, default=512)
+    parser.add_argument("--use_mobile_net_backbone", action="store_true")
+
+    parser.add_argument("--id_feat_similarity_thres", type=float, default=0.3)
+    parser.add_argument("--conf_thresh", type=float, default=0.99)
+    parser.add_argument("--iou_thresh", type=float, default=0.3)
+
+    parser.add_argument("--mini_id_nb", type=int, default=50)
+    parser.add_argument("--min_box_size", type=int, nargs=2, default=(256, 256))
+
+    parser.add_argument("--device", type=str, default="cuda")
+
+    return parser.parse_args()
 
 
 class Identity:
@@ -49,7 +72,10 @@ def exp(
     min_box_size: tuple[int, int] = (256, 256),
     device: str = "cuda",
 ):
-    vfn = Path(vfp).stem
+    vfp = Path(vfp)
+    if not vfp.exists():
+        raise FileNotFoundError(vfp)
+    vfn = vfp.stem
     output_dir = Path(vfp).parent if output_dir is None else Path(output_dir)
 
     output_dir = output_dir / f"{vfn}_class_result"
@@ -138,4 +164,18 @@ def exp(
 
 
 if __name__ == "__main__":
-    exp("dataset/L1u7IeuNqQo.webm", output_dir="/opt/share/deepfake/dataset_1/youtube")
+    args = parse_args()
+
+    exp(
+        vfp=args.vfp,
+        output_dir=args.output_dir,
+        batch_size=args.batch_size,
+        align_size=args.align_size,
+        use_mobile_net_backbone=args.use_mobile_net_backbone,
+        id_feat_similarity_thres=args.id_feat_similarity_thres,
+        conf_thresh=args.conf_thresh,
+        iou_thresh=args.iou_thresh,
+        mini_id_nb=args.mini_id_nb,
+        min_box_size=tuple(args.min_box_size),
+        device=args.device,
+    )
