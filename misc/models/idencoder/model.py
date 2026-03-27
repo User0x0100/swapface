@@ -6,7 +6,8 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 
-from ..iresnet import iresnet50, iresnet100
+from .iresnet import iresnet50, iresnet100
+from .vit import vit_s, vit_b, vit_l, VisionTransformer
 from ...models import REPO_ID
 
 
@@ -30,6 +31,9 @@ class PROVIDER(Enum):
     BLENDFACE = {"backbone": iresnet100, "weight": "blendface.pth"}
     MS1MV3_ARCFACE_R50_FP16 = {"backbone": iresnet50, "weight": "ms1mv3_arcface_r50_fp16.pth"}
     MS1MV3_ARCFACE_R100_FP16 = {"backbone": iresnet100, "weight": "ms1mv3_arcface_r100_fp16.pth"}
+    MS1MV2_TRANSFACE_S = {"backbone": vit_s, "weight": "ms1mv2_model_TransFace_S.pt"}
+    MS1MV2_TRANSFACE_B = {"backbone": vit_b, "weight": "ms1mv2_model_TransFace_B.pt"}
+    MS1MV2_TRANSFACE_L = {"backbone": vit_l, "weight": "ms1mv2_model_TransFace_L.pt"}
 
 
 class IDEncoder(nn.Module):
@@ -70,9 +74,17 @@ class IDEncoder(nn.Module):
         if x.shape[2:] != INPUT_SIZE:
             x = F.interpolate(x, INPUT_SIZE, mode="bilinear", align_corners=False)
         id = self.backbone(x)
+        if isinstance(self.backbone, VisionTransformer):
+            id = id[0]
         return F.normalize(id, p=2, dim=1)
 
 
 if __name__ == "__main__":
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    idencoder = IDEncoder().to(device)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    idencoder = IDEncoder(PROVIDER.MS1MV2_TRANSFACE_S).to(device)
+
+    idencoder = torch.compile(idencoder, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
+
+    x = torch.randn((2, 3, 112, 112), device=device, dtype=torch.float)
+    feat = idencoder(x)
+    print(feat.shape)

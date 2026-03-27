@@ -244,7 +244,7 @@ def datasetloader(
     resize: int,
     src: list[tuple[str, float]],
     dst: list[tuple[str, float]],
-    identity_root: list[str],
+    identity_root: list[str] | None = None,
     brightness: float = 0.2,
     contrast: float = 0.2,
     saturation: float = 0.2,
@@ -265,16 +265,20 @@ def datasetloader(
         batch=False,
     )
 
-    identity_sampler = fn.external_source(
-        source=IdentityPairReader(identity_root, random_sampling),
-        num_outputs=2,
-        device="cpu",
-        no_copy=True,
-        parallel=True,
-        prefetch_queue_depth=2,
-        dtype=DALIDataType.UINT8,
-        batch=False,
-    )
+    if identity_root is not None:
+        identity_sampler = fn.external_source(
+            source=IdentityPairReader(identity_root, random_sampling),
+            num_outputs=2,
+            device="cpu",
+            no_copy=True,
+            parallel=True,
+            prefetch_queue_depth=2,
+            dtype=DALIDataType.UINT8,
+            batch=False,
+        )
+    else:
+        same_image_prob = 0.0
+        identity_sampler = external_source
 
     if rndwarp:
         random_warp_params = fn.external_source(source=RndWarpPars(resize), num_outputs=3, device="gpu", no_copy=False, parallel=False, dtype=DALIDataType.FLOAT, batch=False)

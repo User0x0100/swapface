@@ -1,6 +1,7 @@
-.vscode
+__pycache__/
 *.pyc
-train_log
+.vscode
+train_log/
+datasets/
 .clang-format
-*.png
 *.onnx

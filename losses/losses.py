@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn, autocast
-from kornia.color import rgb_to_lab
 from typing import Literal, Callable, Mapping
 
 from .vgg import VGGFeatureExtractor
@@ -374,6 +373,121 @@ class DSSIMLoss(nn.Module):
                 return dssim.mean()
             case "sum":
                 return dssim.sum()
+
+
+def rgb_to_linear_rgb(image: Tensor) -> Tensor:
+    r"""Convert an sRGB image to linear RGB. Used in colorspace conversions.
+
+    .. image:: _static/img/rgb_to_linear_rgb.png
+
+    Args:
+        image: sRGB Image to be converted to linear RGB of shape :math:`(*,3,H,W)`.
+
+    Returns:
+        linear RGB version of the image with shape of :math:`(*,3,H,W)`.
+
+    Example:
+        >>> input = torch.rand(2, 3, 4, 5)
+        >>> output = rgb_to_linear_rgb(input) # 2x3x4x5
+
+    """
+    if not isinstance(image, Tensor):
+        raise TypeError(f"Input type is not a Tensor. Got {type(image)}")
+
+    if len(image.shape) < 3 or image.shape[-3] != 3:
+        raise ValueError(f"Input size must have a shape of (*, 3, H, W).Got {image.shape}")
+
+    lin_rgb: Tensor = torch.where(image > 0.04045, torch.pow(((image + 0.055) / 1.055), 2.4), image / 12.92)
+
+    return lin_rgb
+
+
+def rgb_to_xyz(image: Tensor) -> Tensor:
+    r"""Convert a RGB image to XYZ.
+
+    .. image:: _static/img/rgb_to_xyz.png
+
+    Args:
+        image: RGB Image to be converted to XYZ with shape :math:`(*, 3, H, W)`.
+
+    Returns:
+         XYZ version of the image with shape :math:`(*, 3, H, W)`.
+
+    Example:
+        >>> input = torch.rand(2, 3, 4, 5)
+        >>> output = rgb_to_xyz(input)  # 2x3x4x5
+
+    """
+    if not isinstance(image, Tensor):
+        raise TypeError(f"Input type is not a Tensor. Got {type(image)}")
+
+    if len(image.shape) < 3 or image.shape[-3] != 3:
+        raise ValueError(f"Input size must have a shape of (*, 3, H, W). Got {image.shape}")
+
+    r: Tensor = image[..., 0, :, :]
+    g: Tensor = image[..., 1, :, :]
+    b: Tensor = image[..., 2, :, :]
+
+    x: Tensor = 0.412453 * r + 0.357580 * g + 0.180423 * b
+    y: Tensor = 0.212671 * r + 0.715160 * g + 0.072169 * b
+    z: Tensor = 0.019334 * r + 0.119193 * g + 0.950227 * b
+
+    out: Tensor = torch.stack([x, y, z], -3)
+
+    return out
+
+
+def rgb_to_lab(image: torch.Tensor) -> torch.Tensor:
+    r"""Convert a RGB image to Lab.
+
+    .. image:: _static/img/rgb_to_lab.png
+
+    The input RGB image is assumed to be in the range of :math:`[0, 1]`. Lab
+    color is computed using the D65 illuminant and Observer 2.
+
+    Args:
+        image: RGB Image to be converted to Lab with shape :math:`(*, 3, H, W)`.
+
+    Returns:
+        Lab version of the image with shape :math:`(*, 3, H, W)`.
+        The L channel values are in the range 0..100. a and b are in the range -128..127.
+
+    Example:
+        >>> input = torch.rand(2, 3, 4, 5)
+        >>> output = rgb_to_lab(input)  # 2x3x4x5
+
+    """
+    if not isinstance(image, torch.Tensor):
+        raise TypeError(f"Input type is not a torch.Tensor. Got {type(image)}")
+
+    if len(image.shape) < 3 or image.shape[-3] != 3:
+        raise ValueError(f"Input size must have a shape of (*, 3, H, W). Got {image.shape}")
+
+    # Convert from sRGB to Linear RGB
+    lin_rgb = rgb_to_linear_rgb(image)
+
+    xyz_im: torch.Tensor = rgb_to_xyz(lin_rgb)
+
+    # normalize for D65 white point
+    xyz_ref_white = torch.tensor([0.95047, 1.0, 1.08883], device=xyz_im.device, dtype=xyz_im.dtype)[..., :, None, None]
+    xyz_normalized = torch.div(xyz_im, xyz_ref_white)
+
+    threshold = 0.008856
+    power = torch.pow(xyz_normalized.clamp(min=threshold), 1 / 3.0)
+    scale = 7.787 * xyz_normalized + 4.0 / 29.0
+    xyz_int = torch.where(xyz_normalized > threshold, power, scale)
+
+    x: torch.Tensor = xyz_int[..., 0, :, :]
+    y: torch.Tensor = xyz_int[..., 1, :, :]
+    z: torch.Tensor = xyz_int[..., 2, :, :]
+
+    L: torch.Tensor = (116.0 * y) - 16.0
+    a: torch.Tensor = 500.0 * (x - y)
+    _b: torch.Tensor = 200.0 * (y - z)
+
+    out: torch.Tensor = torch.stack([L, a, _b], dim=-3)
+
+    return out
 
 
 class StyleLossLabChroma(nn.Module):

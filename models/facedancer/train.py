@@ -68,7 +68,7 @@ class Trainer:
         self,
         src: list[tuple[str, float]],
         dst: list[tuple[str, float]],
-        identity_root: list[str],
+        identity_root: list[str] | None = None,
         batch_size: int = 10,
         lr: float = 1e-4,
         lr_scheduler_t_max: int = 0,
@@ -450,7 +450,7 @@ if __name__ == "__main__":
     ]
     identity_root = ["dataset"]
 
-    def_config = {"src": src, "dst": dst, "identity_root": identity_root}
+    def_config = {"src": src, "dst": dst}
 
     # def_config.update(
     #     {
@@ -486,7 +486,7 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            "ckpt": "train_log/256_BLENDFACE_AlphaDise_New/ckpt/300000.pth",
+            # "ckpt": "train_log/256_BLENDFACE_AlphaDise_New_ID_8/ckpt/630000.pth",
             "net_g_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
@@ -505,7 +505,7 @@ if __name__ == "__main__":
                 "max_ch": 512,
                 "group_size": 4,
             },
-            "log_path": "train_log/256_BLENDFACE_AlphaDise_New_ID_8",
+            "log_path": "train_log/256_BLENDFACE_AlphaDise_New_ID_8_Injection_2",
             "enable_wfm_loss": True,
             "wfm_loss_weight": {
                 0: 2.0,

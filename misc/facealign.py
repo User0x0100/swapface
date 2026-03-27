@@ -13,6 +13,20 @@ from .models.retinaface import (
 )
 
 
+def zoom_in(img: torch.Tensor, zoom: float = 0.2) -> torch.Tensor:
+    """
+    img  : [B, C, H, W]
+    zoom : 裁掉的比例，0.2 表示四周各裁 10%
+    """
+    _, _, H, W = img.shape
+    ch = int(H * zoom / 2)
+    cw = int(W * zoom / 2)
+
+    cropped = img[:, :, ch : H - ch, cw : W - cw]
+
+    return F.interpolate(cropped, size=(H, W), mode="bilinear", align_corners=False)
+
+
 def compute_similarity_transform(points_x: torch.Tensor, points_y: torch.Tensor) -> torch.Tensor:
     """
     计算两组点之间的相似变换 (similarity transform)
@@ -65,7 +79,7 @@ def normalize_theta(affine_src2dst, in_hw, out_hw, align_corners=True):
     dtype = affine_src2dst.dtype
 
     H_in, W_in = in_hw
-    H_out, W_out = out_hw
+    H_out, W_out = out_hw, out_hw
 
     # 预计算缩放和偏移参数
     if align_corners:
@@ -289,6 +303,7 @@ class AlignFaceExtractor:
         vfp: str,
         batch_size: int,
         align_size: int,
+        use_mobile_net_backbone: bool = False,
         device: torch.device | str = "cuda",
         conf_thresh: float = 0.9,
         iou_thresh: float = 0.5,
@@ -304,7 +319,7 @@ class AlignFaceExtractor:
         self.iou_thresh = iou_thresh
         self.min_box_size = min_box_size
 
-        self.detector = RetinaFace().to(device=device).eval()
+        self.detector = RetinaFace(use_mobile_net=use_mobile_net_backbone).to(device=device).eval()
 
         dst_pts = get_align_landmarks(align_size)
         self.dst_pts = torch.tensor(dst_pts, device=device)

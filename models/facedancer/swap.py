@@ -40,13 +40,13 @@ class Swap:
 
         self.img_resolution = ckpt["net_g"]["network_cfg"]["img_resolution"]
 
-        self.net_g = Generator(**ckpt["net_g"]["network_cfg"]).to(device=self.device)
-        self.net_g.load_state_dict(ckpt["net_g"]["state_dict"], strict=False)
-        self.net_g.eval()
+        net_g = Generator(**ckpt["net_g"]["network_cfg"])
+        net_g.load_state_dict(ckpt["net_g"]["state_dict"])
+        self.net_g = net_g.to(device=self.device).eval()
 
         self.facedetch = RetinaFace(from_normalized=True).to(device=self.device).eval()
         self.idencoder = IDEncoder(provider=idencoder_provider).to(device=self.device).eval()
-        self.face_mask = FaceParsing(range_norm=True, occ=True).to(device=self.device)
+        self.face_mask = FaceParsing(range_norm=True, occ=True).to(device=self.device)  # occ模型在eval模式下无法正常推理
 
         self.dst_pts = torch.tensor(get_align_landmarks(self.img_resolution), device=self.device)
 
@@ -62,7 +62,7 @@ class Swap:
         src_pts = get_pts(detected)
         dst_pts = get_align_landmarks(self.img_resolution)
         dst_pts = torch.tensor(dst_pts, device=self.device)
-        align_face, _ = face_align_batch(image, src_pts, offset, dst_pts, (self.img_resolution, self.img_resolution))
+        align_face, _ = face_align_batch(image, src_pts, offset, dst_pts, self.img_resolution)
 
         N = align_face.size(0)
 
@@ -126,15 +126,15 @@ class Swap:
 
 if __name__ == "__main__":
     video = "/opt/share/deepfake/linshi/录屏素材/2023-04-14(李云帆 陈雨)/20230414-163616614陈雨(电脑录屏).mp4"
-    # id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
+    id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
     # id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
-    id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
+    # id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
 
     # video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
     # id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
     # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
     # id = "/home/liaohaixun/swap/IDAssets/2025-06-15 18_19_50小树🌿人间体验卡限时掉落✨ _3.jpg"
 
-    swapper = Swap("train_log/256_BLENDFACE_AlphaDise_New_ID_8/ckpt/540000.pth", PROVIDER.BLENDFACE)
+    swapper = Swap("train_log/256_BLENDFACE_AlphaDise_New_ID_8_Injection_2/ckpt/590000.pth", PROVIDER.BLENDFACE)
 
     swapper.swap_video(video, id)
