@@ -128,13 +128,14 @@ class Atten(nn.Module):
 
         self.last_attn_mask = None
 
-    def forward(self, x_target: Tensor, x_source: Tensor) -> Tensor:
+    def forward(self, x_target: Tensor, x_source: Tensor) -> tuple[Tensor, Tensor]:
 
         m = self.attn_mask_proj(torch.cat((x_target, x_source), dim=1))
 
         self.last_attn_mask = m.detach()
 
-        return x_target + m * (x_source - x_target)
+        # return x_target + m * (x_source - x_target)
+        return m * x_source + (1.0 - m) * x_target, m
 
     def get_attention_maps(self) -> Tensor | None:
         return self.last_attn_mask
@@ -166,10 +167,12 @@ class SkipFusionAdaIN(nn.Module):
 
         match self.fusion_mode:
             case SkipFusionModule.ATTEN:
-                x = self.adain(x_target, w)
-                x = self.fusion(x, x_source)
-                skip = self.resblock.shortcut(x_source)
+                x, m = self.fusion(x_target, x_source)
+                skip = self.resblock.shortcut(x)
+                x = self.adain(x, w)
+                x = m * x + (1.0 - m) * x_target
                 x = self.resblock.residual(x)
+
             case SkipFusionModule.CONCAT:
                 x = self.fusion(x_target, x_source)
                 skip = self.resblock.shortcut(x)
@@ -223,16 +226,16 @@ class Generator(nn.Module):
         final_ch = features[-1]
 
         self.bottleneck_encode = NormRB(final_ch, final_ch, RBSampleMode.NONE)
-        # self.bottleneck_decode = AdaINRB(final_ch, final_ch, w_dim, RBSampleMode.NONE)
-        self.bottleneck_decode = NormRB(final_ch, final_ch, RBSampleMode.NONE)
+        self.bottleneck_decode = AdaINRB(final_ch, final_ch, w_dim, RBSampleMode.NONE)
+        # self.bottleneck_decode = NormRB(final_ch, final_ch, RBSampleMode.NONE)
 
         self.decoder = nn.ModuleList()
         for i in range(num_encoder):
             in_ch, out_ch = features[-(i + 1)], features[-(i + 2)]
 
             if i < skip_index:
-                # decoder_layer = AdaINRB(in_ch, out_ch, w_dim, RBSampleMode.UP)
-                decoder_layer = NormRB(in_ch, out_ch, RBSampleMode.UP)
+                decoder_layer = AdaINRB(in_ch, out_ch, w_dim, RBSampleMode.UP)
+                # decoder_layer = NormRB(in_ch, out_ch, RBSampleMode.UP)
             else:
                 decoder_layer = SkipFusionAdaIN(in_ch, out_ch, w_dim, RBSampleMode.UP, SkipFusionModule.ATTEN)
 
@@ -257,15 +260,15 @@ class Generator(nn.Module):
             feats.append(x)
 
         x = self.bottleneck_encode(x)
-        # x = self.bottleneck_decode(x, w)
-        x = self.bottleneck_decode(x)
+        x = self.bottleneck_decode(x, w)
+        # x = self.bottleneck_decode(x)
 
         for i, decoder_block in enumerate(self.decoder):
             if isinstance(decoder_block, SkipFusionAdaIN):
                 x = decoder_block(feats[-(i + 1)], x, w)
             else:
-                # x = decoder_block(x, w)
-                x = decoder_block(x)
+                x = decoder_block(x, w)
+                # x = decoder_block(x)
 
         x = self.to_rgb(feats[0], x, w)
 

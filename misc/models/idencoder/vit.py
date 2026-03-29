@@ -8,19 +8,46 @@ import collections.abc
 
 
 def vit_l():
-
     return VisionTransformer(
-        img_size=112, patch_size=9, num_classes=512, embed_dim=768, depth=24, num_heads=8, drop_path_rate=0.05, norm_layer="ln", mask_ratio=0.05, using_checkpoint=True
+        img_size=112,
+        patch_size=9,
+        num_classes=512,
+        embed_dim=768,
+        depth=24,
+        num_heads=8,
+        drop_path_rate=0.05,
+        norm_layer="ln",
+        mask_ratio=0.05,
+        using_checkpoint=True,
     )
 
 
 def vit_s():
-    return VisionTransformer(img_size=112, patch_size=9, num_classes=512, embed_dim=512, depth=12, num_heads=8, drop_path_rate=0.1, norm_layer="ln", mask_ratio=0.1)
+    return VisionTransformer(
+        img_size=112,
+        patch_size=9,
+        num_classes=512,
+        embed_dim=512,
+        depth=12,
+        num_heads=8,
+        drop_path_rate=0.1,
+        norm_layer="ln",
+        mask_ratio=0.1,
+    )
 
 
 def vit_b():
     return VisionTransformer(
-        img_size=112, patch_size=9, num_classes=512, embed_dim=512, depth=24, num_heads=8, drop_path_rate=0.1, norm_layer="ln", mask_ratio=0.1, using_checkpoint=True
+        img_size=112,
+        patch_size=9,
+        num_classes=512,
+        embed_dim=512,
+        depth=24,
+        num_heads=8,
+        drop_path_rate=0.1,
+        norm_layer="ln",
+        mask_ratio=0.1,
+        using_checkpoint=True,
     )
 
 

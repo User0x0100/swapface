@@ -436,21 +436,17 @@ if __name__ == "__main__":
     src = [
         ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
         ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
-        # ("/opt/share/deepfake/dataset_1/vggface2_hq512", 0.0),
     ]
 
     dst = [
         ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
         ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
-        # ("/opt/share/deepfake/dataset_1/vggface2_hq512", 0.0),
         # ("/opt/share/deepfake/dataset_1/RealOcc/image/realign_arcface_dst", 1.0),
-        # ("/opt/share/deepfake/dataset_1/youtube/What_s_considered_tall_in_South_Korea_Street_Interview_align_results", 0.0),
-        # ("/opt/share/deepfake/dataset_1/youtube/4k_Face_Close_Up_HDR_Video_Vivid_Colors_Ambient_Sound_-_Relaxing_align_results", 0.0),
         # ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
     ]
-    identity_root = ["dataset"]
+    identity_root = ["/opt/share/deepfake/dataset_1/youtube"]
 
-    def_config = {"src": src, "dst": dst}
+    def_config = {"src": src, "dst": dst, "identity_root": identity_root}
 
     # def_config.update(
     #     {
@@ -486,7 +482,7 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            # "ckpt": "train_log/256_BLENDFACE_AlphaDise_New_ID_8/ckpt/630000.pth",
+            # "ckpt": "train_log/256_BLENDFACE_AlphaDise_New_ID_5_Injection_2_Same0.2/ckpt/1943120.pth",
             "net_g_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
@@ -505,13 +501,13 @@ if __name__ == "__main__":
                 "max_ch": 512,
                 "group_size": 4,
             },
-            "log_path": "train_log/256_BLENDFACE_AlphaDise_New_ID_8_Injection_2",
+            "log_path": "train_log/256_BLENDFACE",
             "enable_wfm_loss": True,
             "wfm_loss_weight": {
                 0: 2.0,
                 1: 1.0,
             },
-            "same_image_prob": 0.0,
+            "same_image_prob": 0.2,
             "discriminator_typt": DISCRIMINATOR_TYPT.ALPHAFACE,
             "r1_reg_step": 16,
             "perceptual_loss_weight": {
@@ -527,9 +523,9 @@ if __name__ == "__main__":
                 # "pool5": 0.2,
             },
             "enable_color_loss": True,
-            "batch_size": 12,
-            "d_train_setp": 2,
-            "id_loss_weight": 8,
+            "batch_size": 16,
+            "d_train_setp": 1,
+            "id_loss_weight": 5,
         }
     )
 

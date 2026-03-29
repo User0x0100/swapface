@@ -268,7 +268,7 @@ class UpFIRDn2d(nn.Module):
             7: [1.0, 6.0, 15.0, 20.0, 15.0, 6.0, 1.0],
         }[filt_size]
 
-        resample_filter = setup_filter(resample_filter, flip_filter=flip_filter, gain=gain)
+        resample_filter = setup_filter(resample_filter, flip_filter=flip_filter)
         self.register_buffer("f", resample_filter, persistent=False)
         fw, fh = _get_filter_size(resample_filter)
 
@@ -282,7 +282,7 @@ class UpFIRDn2d(nn.Module):
         self.pady1 = pady1 + (fh - self.upy) // 2
 
         self.flip_filter = flip_filter
-        self.gain = gain
+        self.gain = gain * self.upx * self.upy
 
     def forward(self, x: Tensor) -> Tensor:
         r"""
@@ -344,7 +344,7 @@ class DownFIRDn2d(nn.Module):
             7: [1.0, 6.0, 15.0, 20.0, 15.0, 6.0, 1.0],
         }[filt_size]
 
-        resample_filter = setup_filter(resample_filter, flip_filter=flip_filter, gain=gain)
+        resample_filter = setup_filter(resample_filter, flip_filter=flip_filter)
         self.register_buffer("f", resample_filter, persistent=False)
         fw, fh = _get_filter_size(resample_filter)
         self.scale_factor = scale_factor

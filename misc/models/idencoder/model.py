@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 
 from .iresnet import iresnet50, iresnet100
-from .vit import vit_s, vit_b, vit_l, VisionTransformer
+from .vit import vit_s, vit_b, vit_l
 from ...models import REPO_ID
 
 
@@ -42,7 +42,7 @@ class IDEncoder(nn.Module):
     使用预训练的 IResNet 模型提取面部身份特征向量。
 
     Args:
-        provider: 模型提供者，支持 ArcFace 和 BlendFace
+        provider: 模型提供者，支持 ArcFace BlendFace TransFace
 
     Example:
         >>> encoder = IDEncoder(PROVIDER.BLENDFACE)

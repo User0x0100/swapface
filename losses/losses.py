@@ -11,11 +11,39 @@ EPS = 1e-8
 LossFn = Callable[[Tensor, Tensor], Tensor]
 
 
-def create_weighted_loss(loss_fn, weight=1.0, reduction="mean"):
-    return lambda *args, **kw: weight * loss_fn(*args, reduction=reduction, **kw)
+def create_weighted_loss(loss_fn, weight=1.0, reduction="mean") -> LossFn:
+    """将任意损失函数包装为带权重的版本。
+
+    Args:
+        loss_fn: 签名为 ``(pred, target, reduction=...) -> Tensor`` 的损失函数。
+        weight (float): 标量权重，结果乘以该值。默认 ``1.0``。
+        reduction (str): 传递给 ``loss_fn`` 的 reduction 模式。默认 ``"mean"``。
+
+    Returns:
+        LossFn: 签名为 ``(pred, target) -> Tensor`` 的包装函数。
+    """
+
+    def wrapper(pred, target):
+        return weight * loss_fn(pred, target, reduction=reduction)
+
+    return wrapper
 
 
 def charbonnier_loss(pred: Tensor, target: Tensor, reduction: Literal["none", "mean", "sum"] = "mean") -> Tensor:
+    """Charbonnier 损失（pseudo-Huber / L1 平滑近似）。
+
+    计算公式：``loss = sqrt((pred - target)^2 + eps)``，
+    相比 L1 在零点附近可微，相比 MSE 对离群值更鲁棒。
+
+    Args:
+        pred (Tensor):   预测张量，任意形状。
+        target (Tensor): 目标张量，与 ``pred`` 形状相同。
+        reduction (str): ``"none"`` / ``"mean"`` / ``"sum"``。默认 ``"mean"``。
+
+    Returns:
+        Tensor: 标量（``mean``/``sum``）或与输入同形张量（``none``）。
+    """
+
     loss = torch.sqrt((pred - target).pow(2).add_(EPS))
 
     match reduction:
@@ -30,6 +58,20 @@ def charbonnier_loss(pred: Tensor, target: Tensor, reduction: Literal["none", "m
 
 
 def orthogonal_loss(x: Tensor, y: Tensor, reduction: Literal["none", "mean", "sum"] = "mean") -> Tensor:
+    """正交损失：惩罚两组特征向量之间的余弦相似度。
+
+    先对输入沿 ``dim=1`` 做 L2 归一化，再计算逐样本点积绝对值，
+    鼓励 ``x`` 与 ``y`` 在特征空间中相互正交（解耦）。
+
+    Args:
+        x (Tensor): 形状 ``(N, C)`` 的特征张量。
+        y (Tensor): 形状 ``(N, C)`` 的特征张量。
+        reduction (str): ``"none"`` / ``"mean"`` / ``"sum"``。默认 ``"mean"``。
+
+    Returns:
+        Tensor: 标量或形状 ``(N,)`` 的逐样本损失。
+    """
+
     x = F.normalize(x, dim=1)
     y = F.normalize(y, dim=1)
 
@@ -45,18 +87,26 @@ def orthogonal_loss(x: Tensor, y: Tensor, reduction: Literal["none", "mean", "su
 
 
 def l1_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
+    """工厂函数：返回带权重的 L1 损失。"""
     return create_weighted_loss(F.l1_loss, weight, reduction)
 
 
 def mse_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
+    """工厂函数：返回带权重的 MSE（L2）损失。"""
     return create_weighted_loss(F.mse_loss, weight, reduction)
 
 
 def charbonnier_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
+    """工厂函数：返回带权重的 Charbonnier 损失。"""
     return create_weighted_loss(charbonnier_loss, weight, reduction)
 
 
 def bce_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
+    """工厂函数：返回带权重的 BCE 损失（强制禁用 AMP）。
+
+    ``binary_cross_entropy`` 要求输入已经过 sigmoid，数值范围 ``[0, 1]``。
+    内部通过 ``autocast(enabled=False)`` 规避混合精度溢出。
+    """
     f = create_weighted_loss(F.binary_cross_entropy, weight, reduction)
 
     def disable_amp(*args, **kwargs):
@@ -67,6 +117,11 @@ def bce_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] =
 
 
 def bce_with_logits_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
+    """工厂函数：返回带权重的 BCE-with-logits 损失（强制禁用 AMP）。
+
+    接受未经 sigmoid 的 logits，内部数值更稳定。
+    同样通过 ``autocast(enabled=False)`` 禁用混合精度。
+    """
     f = create_weighted_loss(F.binary_cross_entropy_with_logits, weight, reduction)
 
     def disable_amp(*args, **kwargs):
@@ -77,28 +132,38 @@ def bce_with_logits_loss_fn(weight: float = 1.0, reduction: Literal["none", "mea
 
 
 def orthogonal_loss_fn(weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean") -> LossFn:
+    """工厂函数：返回带权重的正交损失。"""
     return create_weighted_loss(orthogonal_loss, weight, reduction)
 
 
 class WFMLoss(nn.Module):
-    def __init__(self, layer_weights: Mapping[int, float], criterion: Literal["l1", "mse", "charbonnier"] = "l1"):
+    def __init__(
+        self,
+        layer_weights: Mapping[int, float],
+        criterion: Literal["l1", "mse", "charbonnier"] = "l1",
+        reduction: Literal["mean", "sum", "none"] = "mean",
+    ):
         super().__init__()
 
         self.criterion = {
             "l1": F.l1_loss,
             "mse": F.mse_loss,
             "charbonnier": charbonnier_loss,
-        }.get(criterion)
-        if self.criterion is None:
-            raise NotImplementedError(f"{criterion} criterion has not been supported. Only 'l1' 'mse' 'charbonnier' are supported.")
+        }[criterion]
 
+        self.reduction = reduction
         self.layer_weights = layer_weights
 
     def forward(self, x_feats: list[Tensor], y_feats: list[Tensor]) -> Tensor:
 
         loss = x_feats[0].new_tensor(0.0)
         for idx, weight in self.layer_weights.items():
-            loss += self.criterion(x_feats[idx], y_feats[idx]) * weight
+            match self.reduction:
+                case "mean" | "sum":
+                    loss += self.criterion(x_feats[idx], y_feats[idx], reduction=self.reduction) * weight
+                case "none":
+                    diff = self.criterion(x_feats[idx], y_feats[idx], reduction="none")
+                    loss += diff.mean(dim=tuple(range(1, diff.dim()))) * weight
 
         return loss
 
@@ -175,17 +240,17 @@ class DINOv2PerceptualLoss(nn.Module):
         x_patch = self.dino.get_intermediate_layers(x, n=self.n_blocks)
 
         with torch.inference_mode():
-            if self.range_norm:
-                y = (y + 1) * 0.5
-            if self.use_input_norm:
-                y = (y - self.mean) / self.std
-
             y_patch = self.dino.get_intermediate_layers(y, n=self.n_blocks)
 
-        loss = torch.tensor(0.0, dtype=x.dtype, device=x.device)
+        loss = x.new_tensor(0.0)
         for idx, weight in self.layer_weights.items():
             x_feat, y_feat = x_patch[idx], y_patch[idx]
-            loss += self.criterion(x_feat, y_feat, reduction=self.reduction) * weight
+            match self.reduction:
+                case "mean" | "sum":
+                    loss += self.criterion(x_feat, y_feat, reduction=self.reduction) * weight
+                case "none":
+                    diff = self.criterion(x_feat, y_feat, reduction="none")
+                    loss += diff.mean(dim=tuple(range(1, diff.dim()))) * weight
 
         return loss
 
@@ -279,26 +344,31 @@ class VGGPerceptualLoss(nn.Module):
                 y = (y - self.mean) / self.std
             fy: list[Tensor] = self.vgg(y)
 
-        loss = 0.0
+        loss = x.new_tensor(0.0)
         for weight, a, b in zip(self.weights, fx, fy):
             match self.reduction:
-                case "mean":
-                    loss += self.criterion(a, b, reduction="mean") * weight
-                case "sum":
-                    loss += self.criterion(a, b, reduction="sum") * weight
+                case "mean" | "sum":
+                    loss += self.criterion(a, b, reduction=self.reduction) * weight
                 case "none":
                     diff = self.criterion(a, b, reduction="none")
-                    loss += diff.mean(dim=(1, 2, 3)) * weight
+                    loss += diff.mean(dim=tuple(range(1, diff.dim()))) * weight
 
         return loss
 
 
 class DSSIMLoss(nn.Module):
-    def __init__(self, weight: float = 1.0, window_size: int = 11, sigma: float = 1.5, reduction: Literal["none", "mean", "sum"] = "none"):
+    def __init__(
+        self,
+        weight: float = 1.0,
+        window_size: int = 11,
+        sigma: float = 1.5,
+        reduction: Literal["none", "mean", "sum"] = "none",
+        range_norm: bool = True,
+    ):
         super().__init__()
 
         assert window_size % 2 == 1, "window_size must be odd"
-
+        self.range_norm = range_norm
         self.C = 3
 
         self.weight = weight
@@ -359,9 +429,10 @@ class DSSIMLoss(nn.Module):
 
     @torch.compile(fullgraph=True, dynamic=False, options={"epilogue_fusion": True, "max_autotune": True})
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
-        """
-        x, y: (N,3,H,W), float in [0,1]
-        """
+
+        if self.range_norm:
+            x = x.add(1.0).mul(0.5)
+            y = y.add(1.0).mul(0.5)
 
         ssim = self._ssim(x, y)  # (N,1,H,W)
         dssim = (1.0 - ssim) * 0.5 * self.weight  # (N,1,H,W)
@@ -666,10 +737,8 @@ class IFSRLoss(nn.Module):
 
         idencoder = IDEncoder(provider=idencoder_provider)
         self.feature_layer_indices: dict[int, str] = {}
-        self.ifsr_weight = ifsr_weight
 
-        for key, (margin, weight) in self.ifsr_weight.items():
-            ifsr_weight[key] = (margin * ifsr_scale, weight)
+        self.ifsr_weight = {k: (m * ifsr_scale, w) for k, (m, w) in ifsr_weight.items()}
 
         net = nn.ModuleList()
 

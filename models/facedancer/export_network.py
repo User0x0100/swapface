@@ -7,9 +7,10 @@ from torch import nn, Tensor
 import onnx
 from onnx.checker import check_model
 from .networks import Generator
+from misc.models.idencoder import IDEncoder, PROVIDER
 
 
-class NHWCWrapper(nn.Module):
+class FaceSwapNHWCWrapper(nn.Module):
     def __init__(self, model: Generator) -> None:
         super().__init__()
         self.model = model
@@ -22,58 +23,29 @@ class NHWCWrapper(nn.Module):
         return x
 
 
-def exp(ckpt: str | None = None, batch_size=1, opset_version: int | None = None, nhwc: bool = True, export_folder: str = "onnx_export", device: str = "cuda"):
+class IDEncoderNHWCWrapper(nn.Module):
+    def __init__(self, model: IDEncoder) -> None:
+        super().__init__()
+        self.model = model
 
-    time_str = datetime.now().strftime("%Y%m%d%H%M%S")
-    device = torch.device(device)
-    dtype = torch.float32
+    def forward(self, nhwc: Tensor) -> Tensor:
+        nchw = nhwc.permute(0, 3, 1, 2)
 
-    if ckpt is not None:
-        print(f"Loading ckpt from {ckpt}")
-        ckpt: dict[str, Any] = torch.load(ckpt, map_location=device, weights_only=False)
+        return self.model(nchw)
 
-        print(f"ckpt Info:\n  {'iter':25}: {ckpt['iter']}")
-        print("net_g:")
-        for k, v in ckpt["net_g"]["network_cfg"].items():
-            print(f"  {k:25}: {v}")
-        print("net_d:")
-        for k, v in ckpt["net_d"]["network_cfg"].items():
-            print(f"  {k:25}: {v}")
-        model = Generator(**ckpt["net_g"]["network_cfg"])
-        model.load_state_dict(ckpt["net_g"]["state_dict"])
-    else:
-        model = Generator()
 
-    # def stat(t: torch.Tensor):
-    #     return f"shape={tuple(t.shape)}, mean={t.mean().item():.4f}, std={t.std().item():.4f}"
-
-    # for name, module in model.named_modules():
-    #     if module.__class__.__name__ == "AdaIN":
-    #         print(f"\n[AdaIN] {name}")
-    #         print("  gamma.weight:", stat(module.fc_gamma.weight))
-    #         print("  gamma.bias  :", stat(module.fc_gamma.bias))
-    #         print("  beta.weight :", stat(module.fc_beta.weight))
-    #         print("  beta.bias   :", stat(module.fc_beta.bias))
-
-    img_resolution = model.network_cfg["img_resolution"]
-    img_channels = model.network_cfg["img_channels"]
-    id_feat_dim = model.network_cfg["id_dim"]
-
-    if nhwc:
-        model = NHWCWrapper(model).to(device=device, dtype=dtype).eval()
-        x = torch.randn((batch_size, img_resolution, img_resolution, img_channels), device=device, dtype=dtype)
-    else:
-        model = model.to(device=device).eval()
-        x = torch.randn((batch_size, img_channels, img_resolution, img_resolution), device=device, dtype=dtype)
-
-    id_feat = torch.randn((batch_size, id_feat_dim), device=device, dtype=dtype)
+def torch2onnx(
+    model: torch.nn.Module | torch.export.ExportedProgram | torch.jit.ScriptModule | torch.jit.ScriptFunction,
+    args: tuple[Any, ...] = (),
+    export_folder: str = "onnx_export",
+    f_prefix: str | None = None,
+):
 
     f = io.BytesIO()
     torch.onnx.export(
         model,
-        (x, id_feat),
+        args,
         f,
-        opset_version=opset_version,
         export_params=True,
         dynamo=True,
         fallback=False,
@@ -91,10 +63,66 @@ def exp(ckpt: str | None = None, batch_size=1, opset_version: int | None = None,
 
     fp = Path(export_folder)
     fp.mkdir(exist_ok=True, parents=True)
-    fp = fp / f"model_{time_str}.onnx"
+
+    f_prefix = "" if f_prefix is None else (f_prefix if f_prefix.endswith("_") else f_prefix + "_")
+    time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    fp = fp / f"{f_prefix}{time_str}.onnx"
     onnx.save(onnx_model, fp)
     print(f"模型成功导出到: {fp}")
 
 
+def export_FaceSwap(ckpt: str | None = None, batch_size=1, nhwc: bool = True, device: str = "cuda"):
+
+    device = torch.device(device)
+
+    if ckpt is not None:
+        print(f"Loading ckpt from {ckpt}")
+        ckpt: dict[str, Any] = torch.load(ckpt, map_location=device, weights_only=False)
+
+        print(f"ckpt Info:\n  {'iter':25}: {ckpt['iter']}")
+        print("net_g:")
+        for k, v in ckpt["net_g"]["network_cfg"].items():
+            print(f"  {k:25}: {v}")
+        print("net_d:")
+        for k, v in ckpt["net_d"]["network_cfg"].items():
+            print(f"  {k:25}: {v}")
+        model = Generator(**ckpt["net_g"]["network_cfg"])
+        model.load_state_dict(ckpt["net_g"]["state_dict"])
+    else:
+        model = Generator()
+
+    img_resolution = model.network_cfg["img_resolution"]
+    img_channels = model.network_cfg["img_channels"]
+    id_feat_dim = model.network_cfg["id_dim"]
+
+    if nhwc:
+        model = FaceSwapNHWCWrapper(model).to(device=device).eval()
+        x = torch.randn((batch_size, img_resolution, img_resolution, img_channels), device=device, dtype=torch.float32)
+    else:
+        model = model.to(device=device).eval()
+        x = torch.randn((batch_size, img_channels, img_resolution, img_resolution), device=device, dtype=torch.float32)
+
+    id_feat = torch.randn((batch_size, id_feat_dim), device=device, dtype=torch.float32)
+
+    torch2onnx(model, (x, id_feat), f_prefix="faceswap")
+
+
+def export_IDEncoder(provider: PROVIDER = PROVIDER.BLENDFACE, batch_size=1, nhwc: bool = True, device: str = "cuda"):
+
+    device = torch.device(device)
+    ID_Encoder = IDEncoder(provider)
+
+    if nhwc:
+        model = IDEncoderNHWCWrapper(ID_Encoder).to(device=device).eval()
+        x = torch.randn((batch_size, 112, 112, 3), device=device, dtype=torch.float32)
+    else:
+        model = ID_Encoder.to(device=device).eval()
+        x = torch.randn((batch_size, 3, 112, 112), device=device, dtype=torch.float32)
+
+    torch2onnx(model, (x,), f_prefix="idencoder")
+
+
 if __name__ == "__main__":
-    exp("train_log/256_BLENDFACE_ADAIN_WFM_Same0.0/ckpt/1490169.pth")
+    export_FaceSwap("train_log/256_BLENDFACE_AlphaDise_New_ID_5_Injection_2_Same0.2/ckpt/1943120.pth")
+    # export_IDEncoder(PROVIDER.BLENDFACE)
