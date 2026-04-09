@@ -5,3 +5,7 @@ train_log/
 datasets/
 .clang-format
 *.onnx
+*.pth
+*.jpg
+*.jpge
+*.engine

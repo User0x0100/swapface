@@ -1,31 +1,13 @@
 import torch
 from torch.autograd import gradcheck
-from . import UpFIRDn2d, DownFIRDn2d, upfirdn2d_fn
 from torch.library import opcheck
+from . import UpFIRDn2d, DownFIRDn2d
 
 if __name__ == "__main__":
     device = torch.device("cuda")
 
     x = torch.randn([1, 3, 16, 16], device=device, dtype=torch.double, requires_grad=True)
     y = torch.randn([1, 3, 16, 16], device=device, dtype=torch.double, requires_grad=True)
-
-    examples = (
-        x,
-        torch.randn(4, 4, device=device, dtype=torch.float32),
-        1,
-        1,
-        2,
-        2,
-        0,
-        0,
-        0,
-        0,
-        False,
-        1.0,
-    )
-
-    opcheck_result = opcheck(upfirdn2d_fn, examples)
-    print(f"Opcheck result: {opcheck_result}\n")
 
     up_op = UpFIRDn2d().to(device)
     down_op = DownFIRDn2d().to(device)
@@ -45,3 +27,21 @@ if __name__ == "__main__":
 
     test_grad(up_op, x)
     test_grad(down_op, x)
+
+    examples = (
+        x,
+        torch.randn(4, 4, device=device, dtype=torch.float32),
+        1,
+        1,
+        2,
+        2,
+        0,
+        0,
+        0,
+        0,
+        False,
+        1.0,
+    )
+
+    opcheck_result = opcheck(torch.ops.upfirdn2d.upfirdn2d, examples)
+    print(f"Opcheck result: {opcheck_result}\n")

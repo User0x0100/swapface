@@ -599,7 +599,7 @@ if __name__ == "__main__":
     dataset = ImageFolder("/home/liaohaixun/swap/IDAssets")
     # dataset = ImageFolder("/opt/share/deepfake/dataset_1/ffhq_1024")
 
-    images_org = [dataset.sample_tensor().float().to(device=device) for _ in range(batch_size)]
+    images_org = [dataset.sample2tensor().float().to(device=device) for _ in range(batch_size)]
 
     # images_org = torch.stack(images_org)
 

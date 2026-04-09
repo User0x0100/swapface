@@ -1,5 +1,6 @@
+import os
 from pathlib import Path
-import random
+
 import numpy as np
 from numpy import ndarray
 from scipy.stats import norm
@@ -124,7 +125,7 @@ class IdentityPairReader:
                 for identity in group.iterdir():
                     if not identity.is_dir():
                         continue
-                    reader = ImageFolder(folder=identity, random_sampling=self.random_sampling)
+                    reader = ImageFolder(identity)
                     if len(reader) >= 2:  # 至少两张
                         self.folders.append(reader)
 
@@ -136,10 +137,23 @@ class IdentityPairReader:
         s = sum(weights)
         self.weights = [w / s for w in weights]
 
+        self.rng = np.random.default_rng(int.from_bytes(os.urandom(8), "little"))
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state["rng"]
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        seed = int.from_bytes(os.urandom(8), "little")
+        self.rng = np.random.default_rng(seed)
+
     def __call__(self, sample_info) -> tuple[ndarray, ndarray]:
         _ = sample_info
 
-        folder = random.choices(self.folders, weights=self.weights, k=1)[0]
+        folder_idx = self.rng.choice(len(self.folders), p=self.weights)
+        folder = self.folders[folder_idx]
 
         x = np.fromfile(folder.sample(), dtype=np.uint8)
         x1 = np.fromfile(folder.sample(), dtype=np.uint8)
@@ -159,14 +173,28 @@ class SampleReader(object):
         self.dst_folders, self.dst_weight = self.collect_folder(dst)
         self.print_folders_info()
 
+        self.rng = np.random.default_rng(int.from_bytes(os.urandom(8), "little"))
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state["rng"]
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        seed = int.from_bytes(os.urandom(8), "little")
+        self.rng = np.random.default_rng(seed)
+
     def __call__(self, sample_info) -> tuple[ndarray, ndarray]:
         _ = sample_info
 
-        dst_folder = random.choices(self.dst_folders, weights=self.dst_weight, k=1)[0]
+        dst_idx = self.rng.choice(len(self.dst_folders), p=self.dst_weight)
+        dst_folder = self.dst_folders[dst_idx]
         dst_file_path = dst_folder.sample()
         dst = np.fromfile(dst_file_path, dtype=np.uint8)
 
-        src_folder = random.choices(self.src_folders, weights=self.src_weight, k=1)[0]
+        src_idx = self.rng.choice(len(self.src_folders), p=self.src_weight)
+        src_folder = self.src_folders[src_idx]
         src_file_path = src_folder.sample()
         src = np.fromfile(src_file_path, dtype=np.uint8)
 
@@ -180,13 +208,13 @@ class SampleReader(object):
 
         if isinstance(folder_weight_list[0], str):
             for folder in folder_weight_list:
-                reader = ImageFolder(folder=folder, random_sampling=self.random_sampling)
+                reader = ImageFolder(folder)
                 readers.append(reader)
                 file_counts.append(len(reader))
                 adjustments.append(0.0)
         else:
             for folder, adj in folder_weight_list:
-                reader = ImageFolder(folder=folder, random_sampling=self.random_sampling)
+                reader = ImageFolder(folder)
                 readers.append(reader)
                 file_counts.append(len(reader))
                 adjustments.append(adj)
@@ -232,7 +260,7 @@ class SampleReader(object):
             else:
                 for f, w in zip(folders, weights):
                     lines.append(f"    {GREEN}{f.folder}{RESET}")
-                    lines.append(f"        count: {f.len:<{count_w}d} weight: {w:<6.3f}")
+                    lines.append(f"        count: {len(f):<{count_w}d} weight: {w:<6.3f}")
             print("\n".join(lines))
 
         dump("SRC Folders", self.src_folders, self.src_weight)

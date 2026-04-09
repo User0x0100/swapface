@@ -9,9 +9,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 batch_size = 1
 img_resolution = 256
 
-# model = Discriminator(img_resolution).to(device)
+model = Discriminator(img_resolution).to(device)
 # model = Stylegan2DiscriminatorLite(img_resolution, group_size=1).to(device)
-model = AlphaFaceDiscriminator(img_resolution).to(device)
+# model = AlphaFaceDiscriminator(img_resolution).to(device)
 # model = UNetDiscriminatorSN().to(device)
 # model = StyleGAN2Discriminator(img_size).to(device)
 

@@ -156,7 +156,7 @@ class WFMLoss(nn.Module):
 
     def forward(self, x_feats: list[Tensor], y_feats: list[Tensor]) -> Tensor:
 
-        loss = x_feats[0].new_tensor(0.0)
+        loss = 0.0
         for idx, weight in self.layer_weights.items():
             match self.reduction:
                 case "mean" | "sum":
@@ -242,7 +242,7 @@ class DINOv2PerceptualLoss(nn.Module):
         with torch.inference_mode():
             y_patch = self.dino.get_intermediate_layers(y, n=self.n_blocks)
 
-        loss = x.new_tensor(0.0)
+        loss = 0.0
         for idx, weight in self.layer_weights.items():
             x_feat, y_feat = x_patch[idx], y_patch[idx]
             match self.reduction:
@@ -344,7 +344,7 @@ class VGGPerceptualLoss(nn.Module):
                 y = (y - self.mean) / self.std
             fy: list[Tensor] = self.vgg(y)
 
-        loss = x.new_tensor(0.0)
+        loss = 0.0
         for weight, a, b in zip(self.weights, fx, fy):
             match self.reduction:
                 case "mean" | "sum":

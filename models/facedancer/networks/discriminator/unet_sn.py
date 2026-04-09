@@ -39,7 +39,7 @@ class UNetDiscriminatorSN(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
 
-        inplace = True
+        inplace = False
 
         # downsample
         x0 = F.leaky_relu(self.conv0(x), negative_slope=0.2, inplace=inplace)
@@ -68,3 +68,5 @@ class UNetDiscriminatorSN(nn.Module):
         out = F.leaky_relu(self.conv7(x6), negative_slope=0.2, inplace=inplace)
         out = F.leaky_relu(self.conv8(out), negative_slope=0.2, inplace=inplace)
         out = self.conv9(out)
+
+        return out

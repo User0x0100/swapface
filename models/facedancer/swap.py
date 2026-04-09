@@ -5,44 +5,113 @@ import multiprocessing as mp
 import torch
 from torch import Tensor
 import torchvision.transforms.functional as F
-from misc.facealign import face_align_batch, AlignFaceExtractor
+from misc.facealign import face_align_batch, FaceExtractorVideo, restore_faces_to_original, AffineSmoother, FaceAligner
 from misc.models.retinaface import get_pts, RetinaFace
 from misc.models.idencoder import IDEncoder, get_align_landmarks, PROVIDER
 from misc.models.face_parsing import FaceParsing
 from .networks import Generator
 from torchvision.io import decode_image
 from tqdm import tqdm
+from misc.utils import ImageFolder
 
 import cv2
+import numpy as np
 
 
 class Swap:
-    def __init__(self, ckpt: str, idencoder_provider: PROVIDER, device: str = "cuda") -> None:
+    def __init__(self, model_path: str, idencoder_provider: PROVIDER, device: str = "cuda") -> None:
         super().__init__()
 
-        if not Path(ckpt).exists():
-            raise FileNotFoundError(f"ckpt file: {ckpt} Not found")
+        if not Path(model_path).exists():
+            raise FileNotFoundError(f"ckpt file: {model_path} Not found")
 
         self.device = torch.device(device)
 
-        print(f"Loading ckpt from {ckpt}")
-        ckpt: dict[str, Any] = torch.load(ckpt, map_location=torch.device("cpu"), weights_only=False)
+        self.is_onnx = str(model_path).lower().endswith(".onnx")
 
-        self.iter = ckpt["iter"]
+        if self.is_onnx:
+            import tensorrt as trt
+            import onnxruntime as ort
 
-        print(f"ckpt Info:\n  {'iter':25}: {self.iter}")
-        print("net_g:")
-        for k, v in ckpt["net_g"]["network_cfg"].items():
-            print(f"  {k:25}: {v}")
-        print("net_d:")
-        for k, v in ckpt["net_d"]["network_cfg"].items():
-            print(f"  {k:25}: {v}")
+            print(trt.__version__)
+            assert trt.Builder(trt.Logger())
 
-        self.img_resolution = ckpt["net_g"]["network_cfg"]["img_resolution"]
+            TRT_ENGINE_CACHE_PATH = "./trt_cache"
+            Path(TRT_ENGINE_CACHE_PATH).mkdir(exist_ok=True, parents=True)
 
-        net_g = Generator(**ckpt["net_g"]["network_cfg"])
-        net_g.load_state_dict(ckpt["net_g"]["state_dict"])
-        self.net_g = net_g.to(device=self.device).eval()
+            sess_options = ort.SessionOptions()
+            sess_options.log_severity_level = 0
+
+            print(f"Loading ONNX model from {model_path}")
+
+            providers = (
+                [
+                    (
+                        "TensorrtExecutionProvider",
+                        {
+                            "device_id": 0,
+                            "trt_fp16_enable": True,
+                            "trt_engine_cache_enable": True,
+                            "trt_engine_cache_path": "./trt_cache",
+                        },
+                    ),
+                    (
+                        "CUDAExecutionProvider",
+                        {
+                            "device_id": 0,
+                        },
+                    ),
+                    "CPUExecutionProvider",
+                ]
+                if self.device.type == "cuda"
+                else ["CPUExecutionProvider"]
+            )
+            self.ort_session = ort.InferenceSession(model_path, providers=providers, sess_options=sess_options)
+
+            inputs = self.ort_session.get_inputs()
+
+            self.ort_input_faces = None
+            self.ort_input_id = None
+
+            for inp in inputs:
+                shape = inp.shape  # e.g. [1, H, W, C] or [1, N]
+
+                if len(shape) == 4:
+                    # 图像输入
+                    self.ort_input_faces = inp.name
+                    _, h, w, c = shape
+                    if c != 3:
+                        raise ValueError(f"Unexpected image channel: {c}")
+                    if h != w:
+                        raise ValueError("Only support square input")
+                    self.img_resolution = h
+
+                elif len(shape) == 2:
+                    self.ort_input_id = inp.name
+
+            if self.ort_input_faces is None or self.ort_input_id is None:
+                raise RuntimeError("Failed to parse ONNX inputs")
+
+            self.ort_output = self.ort_session.get_outputs()[0].name
+        else:
+            print(f"Loading ckpt from {model_path}")
+            model_path: dict[str, Any] = torch.load(model_path, map_location=torch.device("cpu"), weights_only=False)
+
+            self.iter = model_path["iter"]
+
+            print(f"ckpt Info:\n  {'iter':25}: {self.iter}")
+            print("net_g:")
+            for k, v in model_path["net_g"]["network_cfg"].items():
+                print(f"  {k:25}: {v}")
+            print("net_d:")
+            for k, v in model_path["net_d"]["network_cfg"].items():
+                print(f"  {k:25}: {v}")
+
+            self.img_resolution = model_path["net_g"]["network_cfg"]["img_resolution"]
+
+            net_g = Generator(**model_path["net_g"]["network_cfg"])
+            net_g.load_state_dict(model_path["net_g"]["state_dict"])
+            self.net_g = net_g.to(device=self.device).eval()
 
         self.facedetch = RetinaFace(from_normalized=True).to(device=self.device).eval()
         self.idencoder = IDEncoder(provider=idencoder_provider).to(device=self.device).eval()
@@ -72,7 +141,8 @@ class Swap:
             print("Warning: 检测到多张面部，仅使用第一张")
             align_face = align_face[:1]
 
-        id_emb = self.idencoder(align_face)
+        with torch.inference_mode():
+            id_emb = self.idencoder(align_face)
 
         return id_emb
 
@@ -88,6 +158,8 @@ class Swap:
                 cv2.imshow("swaped", frame)
                 cv2.waitKey(delay)
 
+    # def swap_image_folder(self, fp: str, id_fp: str):
+
     @torch.inference_mode()
     def swap_video(self, vfp: str, id_fp: str):
 
@@ -100,23 +172,49 @@ class Swap:
 
         id_emb = self.extract_id_feats_from_image(id_fp)
 
-        for faces, norm_theta, offset in AlignFaceExtractor(vfp, batch_size=batch_size, align_size=self.img_resolution, device=self.device):
+        for org_frames, faces, norm_theta, offset, nb in FaceExtractorVideo(vfp, batch_size=batch_size, align_size=self.img_resolution, device=self.device):
             N = faces.size(0)
             if N == 0:
                 continue
+            org_frames.div_(127.5).sub_(1.0)
             faces.div_(127.5).sub_(1.0)
 
-            with torch.autocast(device_type="cuda"):
-                swap_face: Tensor = self.net_g(faces, id_emb)
-                mask = self.face_mask(faces)
-                mask = F.gaussian_blur(mask, 7, 13)
-                swap_face = faces * (1.0 - mask) + swap_face * mask
-                mask = mask * 2.0 - 1.0
+            if self.is_onnx:
+                # onnx输入为1HWC,RGB,输出为1HWC,RGB
+                faces_np = faces.permute(0, 2, 3, 1).detach().cpu().numpy()  # NCHW -> NHWC
+                id_np = id_emb.detach().cpu().numpy()
 
-            swap_face = torch.cat((faces, swap_face, mask.expand(N, 3, -1, -1)), dim=3)
-            swap_face = swap_face.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)[:, [2, 1, 0], :, :]  # RGB -> BGR
-            swap_face = swap_face.permute(0, 2, 3, 1)  # NCHW -> NHWC
-            frames = swap_face.to(device="cpu", dtype=torch.uint8).numpy()
+                faces = np.split(faces_np, faces_np.shape[0], axis=0)
+
+                outputs = []
+                for face in faces:
+                    output = self.ort_session.run(
+                        [self.ort_output],
+                        {self.ort_input_faces: face, self.ort_input_id: id_np},
+                    )[0]
+
+                    output = output[..., ::-1]  # RGB -> BGR
+                    outputs.append(output)
+
+                frames = np.concatenate(outputs, axis=0)
+
+                frames = np.concatenate([faces_np[..., ::-1], frames], axis=2)
+
+                frames = ((frames + 1.0) * 127.5).astype(np.uint8)
+            else:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    swap_face: Tensor = self.net_g(faces, id_emb)
+                    mask = self.face_mask(faces)
+                    mask = F.gaussian_blur(mask, 7, 13)
+                    swap_face = faces * (1.0 - mask) + swap_face * mask
+                    mask = mask * 2.0 - 1.0
+
+                swap_face = restore_faces_to_original(org_frames, swap_face, norm_theta, offset)
+                swap_face = torch.nn.functional.interpolate(swap_face, scale_factor=0.25, mode="bilinear", align_corners=False)
+                # swap_face = torch.cat((faces, swap_face, mask.expand(N, 3, -1, -1)), dim=3)
+                swap_face = swap_face.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)[:, [2, 1, 0], :, :]  # RGB -> BGR
+                swap_face = swap_face.permute(0, 2, 3, 1)  # NCHW -> NHWC
+                frames = swap_face.to(device="cpu", dtype=torch.uint8).numpy()
 
             q.put(frames)
 
@@ -134,7 +232,8 @@ if __name__ == "__main__":
     id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
     # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
     # id = "/home/liaohaixun/swap/IDAssets/2025-06-15 18_19_50小树🌿人间体验卡限时掉落✨ _3.jpg"
+    # id = "w700d1q75cms.jpg"
 
-    swapper = Swap("train_log/256_BLENDFACE_AlphaDise_New_ID_5_Injection_2_Same0.2/ckpt/1940000.pth", PROVIDER.BLENDFACE)
+    swapper = Swap("train_log/256_WFM/ckpt/640000.pth", PROVIDER.BLENDFACE)
 
     swapper.swap_video(video, id)

@@ -128,14 +128,13 @@ class Atten(nn.Module):
 
         self.last_attn_mask = None
 
-    def forward(self, x_target: Tensor, x_source: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, x_target: Tensor, x_source: Tensor) -> Tensor:
 
         m = self.attn_mask_proj(torch.cat((x_target, x_source), dim=1))
 
         self.last_attn_mask = m.detach()
 
-        # return x_target + m * (x_source - x_target)
-        return m * x_source + (1.0 - m) * x_target, m
+        return (1.0 - m) * x_target + m * x_source
 
     def get_attention_maps(self) -> Tensor | None:
         return self.last_attn_mask
@@ -167,10 +166,9 @@ class SkipFusionAdaIN(nn.Module):
 
         match self.fusion_mode:
             case SkipFusionModule.ATTEN:
-                x, m = self.fusion(x_target, x_source)
-                skip = self.resblock.shortcut(x)
-                x = self.adain(x, w)
-                x = m * x + (1.0 - m) * x_target
+                skip = self.resblock.shortcut(x_source)
+                x = self.adain(x_target, w)
+                x = self.fusion(x, x_source)
                 x = self.resblock.residual(x)
 
             case SkipFusionModule.CONCAT:
