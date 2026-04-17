@@ -17,25 +17,12 @@ import cv2
 from tqdm import tqdm
 from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 
-from losses import (
-    IDLoss,
-    l1_loss_fn,
-    VGGPerceptualLoss,
-    DLoss,
-    GANLoss,
-    StyleLossLabChroma,
-    r1_reg_loss,
-    WFMLoss,
-    IFSRLoss,
-)
+from losses import IDLoss, l1_loss_fn, VGGPerceptualLoss, DLoss, GANLoss, StyleLossLabChroma, r1_reg_loss, WFMLoss, IFSRLoss
 
 from .dataloader import datasetloader
-from .networks import (
-    Generator,
-    Discriminator,
-    Stylegan2DiscriminatorLite,
-    AlphaFaceDiscriminator,
-)
+from .networks import Generator, Discriminator, Stylegan2DiscriminatorLite, AlphaFaceDiscriminator
+
+from misc.facealign import zoom_in
 
 
 EPS = 1e-8
@@ -46,6 +33,15 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
+
+torch.manual_seed(0)
+random.seed(0)
+
+# torch.backends.cuda.matmul.allow_tf32 = False
+# torch.backends.cudnn.allow_tf32 = False
+# torch.backends.cudnn.benchmark = False
+# torch.backends.cudnn.deterministic = True
+torch.set_float32_matmul_precision("high")
 
 
 class DISCRIMINATOR_TYPT(Enum):
@@ -76,7 +72,7 @@ class Trainer:
         d_train_setp: int = 1,
         r1_reg_step: int = 1,
         bf16: bool = True,
-        device: str = "cuda:0",
+        device: str = "cuda",
         compile_module: bool = True,
         ckpt: str | None = None,
         log_path: str = "train_log/exper_0",
@@ -149,7 +145,7 @@ class Trainer:
         self.sample_save_every = sample_save_every
         self.weight_save_every = weight_save_every
         self.log_interval = log_interval
-        self.enable_lr_scheduler = lr_scheduler_t_max > 0
+        self.use_cosine_lr = lr_scheduler_t_max > 0
 
         # ========================= Init Model =========================
 
@@ -189,10 +185,10 @@ class Trainer:
         self.net_g_ema.eval().requires_grad_(False)
 
         # ========================= Optim =========================
-        self.optim_g = optim.AdamW(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
-        self.optim_d = optim.AdamW(self.net_d.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
+        self.optim_g = optim.AdamW(self.net_g.parameters(), lr=lr, betas=(0.5, 0.99), fused=True)
+        self.optim_d = optim.AdamW(self.net_d.parameters(), lr=lr, betas=(0.5, 0.99), fused=True)
 
-        if self.enable_lr_scheduler:
+        if self.use_cosine_lr:
             self.lr_scheduler_g = CosineAnnealingLR(self.optim_g, T_max=lr_scheduler_t_max, eta_min=lr * 0.1)
             self.lr_scheduler_d = CosineAnnealingLR(self.optim_d, T_max=lr_scheduler_t_max, eta_min=lr * 0.1)
 
@@ -204,7 +200,7 @@ class Trainer:
         self.id_loss = IDLoss(weight=id_loss_weight, provider=id_encode_provider).to(self.device)
         self.rec_loss = l1_loss_fn(weight=rec_loss, reduction="none")
 
-        self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
+        self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="none").to(self.device)
 
         if self.enable_ifsr_loss:
             self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight).to(self.device)
@@ -305,7 +301,7 @@ class Trainer:
             torch.compiler.cudagraph_mark_step_begin()
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
                 with torch.inference_mode():
-                    src_id_feats = self.id_loss.get_id_feats(src)
+                    src_id_feats = self.id_loss.get_id_feats(zoom_in(src, 0.102))
                     if self.enable_ifsr_loss:
                         dst_ifsr_feats = self.ifsr_loss.get_ifsr_feats(dst)
 
@@ -329,9 +325,10 @@ class Trainer:
                     d_loss += global_d_loss
 
                     if is_r1_reg_step:
-                        r1_loss = r1_reg_loss(real_global_score, real_img)
-                        self.log("r1_loss", r1_loss)
-                        d_loss += r1_loss
+                        with autocast(device_type="cuda", enabled=False):
+                            r1_loss = r1_reg_loss(real_global_score, real_img)
+                            self.log("r1_loss", r1_loss)
+                            d_loss += r1_loss
 
                     d_loss.backward()
                     self.optim_d.step()
@@ -358,7 +355,7 @@ class Trainer:
                     loss += wfm_loss
 
                 # loss_id
-                fake_id_feats = self.id_loss.get_id_feats(fake)
+                fake_id_feats = self.id_loss.get_id_feats(zoom_in(fake, 0.102))
                 id_loss = self.id_loss(fake_id_feats, src_id_feats)
                 self.log("id_loss", id_loss)
                 loss += id_loss
@@ -370,16 +367,18 @@ class Trainer:
                     self.log("ifsr_loss", ifsr_loss)
                     loss += ifsr_loss
 
+                same_reduced = is_same.sum().clamp_min(1.0)
+
                 # perceptual_loss
                 perceptual_loss = self.perceptual_loss(fake, dst)
-                # perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                perceptual_loss = (perceptual_loss * is_same).sum() / same_reduced
                 self.log("perceptual_loss", perceptual_loss)
                 loss += perceptual_loss
 
                 # rec_loss
                 rec_loss = self.rec_loss(fake, dst)  # BCHW
                 rec_loss = rec_loss.mean(dim=[1, 2, 3])
-                rec_loss = (rec_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                rec_loss = (rec_loss * is_same).sum() / same_reduced
                 self.log("rec_loss", rec_loss)
                 loss += rec_loss
 
@@ -392,7 +391,7 @@ class Trainer:
             loss.backward()
             self.optim_g.step()
 
-            if self.enable_lr_scheduler:
+            if self.use_cosine_lr:
                 self.lr_scheduler_g.step()
                 self.lr_scheduler_d.step()
 
@@ -403,7 +402,7 @@ class Trainer:
 
             if self.iter % self.sample_save_every == 0:
                 with torch.inference_mode():
-                    src_id_feats = self.id_loss.get_id_feats(src)
+                    src_id_feats = self.id_loss.get_id_feats(zoom_in(src, 0.102))
                     fake: Tensor = self.net_g_ema(dst, src_id_feats)
                     attn_map: list[Tensor] = self.net_g_ema.get_attention_maps()
                     grid = [src, dst, fake]
@@ -436,11 +435,13 @@ if __name__ == "__main__":
     src = [
         ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
         ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
+        # ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
     ]
 
     dst = [
         ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
         ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
+        # ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
         # ("/opt/share/deepfake/dataset_1/RealOcc/image/realign_arcface_dst", 1.0),
         # ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
     ]
@@ -448,41 +449,9 @@ if __name__ == "__main__":
 
     def_config = {"src": src, "dst": dst, "identity_root": identity_root}
 
-    # def_config.update(
-    #     {
-    #         "ckpt": "train_log/256_BLENDFACE_ADAIN_WFM_Same0.0/ckpt/1296007.pth",
-    #         "net_g_cfg": {
-    #             "img_resolution": 256,
-    #             "img_channels": 3,
-    #             "num_encoder": 5,
-    #             "base_ch": 64,
-    #             "max_ch": 512,
-    #             "id_dim": 512,
-    #             "w_dim": 256,
-    #             "mapping_num": 4,
-    #             "skip_index": 2,
-    #         },
-    #         "net_d_cfg": {
-    #             "img_resolution": 256,
-    #             "img_channels": 3,
-    #             "num_encoder": 5,
-    #             "base_ch": 64,
-    #             "max_ch": 512,
-    #         },
-    #         "log_path": "train_log/256_BLENDFACE_ADAIN_WFM_Same0.0",
-    #         "enable_wfm_loss": True,
-    #         "wfm_loss_weight": {
-    #             0: 2.0,
-    #             1: 1.0,
-    #         },
-    #         "same_image_prob": 0.3,
-    #         "enable_color_loss": True,
-    #     }
-    # )
-
     def_config.update(
         {
-            # "ckpt": "train_log/256_BLENDFACE_AlphaDise_New_ID_5_Injection_2_Same0.2/ckpt/1943120.pth",
+            # "ckpt": "train_log/256_WFM_SKIPSPADE_1/ckpt/1330000.pth",
             "net_g_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
@@ -497,35 +466,41 @@ if __name__ == "__main__":
             "net_d_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
+                "num_encoder": 6,
                 "base_ch": 64,
                 "max_ch": 512,
-                "group_size": 4,
+                # "group_size": 4,
             },
-            "log_path": "train_log/256_BLENDFACE",
+            "log_path": "train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch",
+            "enable_ifsr_loss": False,
             "enable_wfm_loss": True,
             "wfm_loss_weight": {
-                0: 2.0,
+                # 0: 1.0,
                 1: 1.0,
+                2: 1.0,
+                3: 1.0,
+                4: 1.0,
+                # 5: 1.0,
             },
-            "same_image_prob": 0.2,
-            "discriminator_typt": DISCRIMINATOR_TYPT.ALPHAFACE,
-            "r1_reg_step": 16,
+            "same_image_prob": 0.1,
+            "discriminator_typt": DISCRIMINATOR_TYPT.ORIGIN,
+            "r1_reg_step": 1,
             "perceptual_loss_weight": {
                 # vgg16
-                "relu1_2": 1.0,
-                "relu2_2": 1.0,
-                "relu3_3": 0.5,
-                "relu4_2": 0.5,
-                # "pool1": 0.2,
-                # "pool2": 0.2,
-                # "pool3": 0.2,
-                # "pool4": 0.2,
-                # "pool5": 0.2,
+                # "relu1_2": 1.0,
+                # "relu2_2": 1.0,
+                # "relu3_3": 1.0,
+                # "relu4_2": 1.0,
+                "pool1": 0.2,
+                "pool2": 0.2,
+                "pool3": 0.2,
+                "pool4": 0.2,
+                "pool5": 0.2,
             },
             "enable_color_loss": True,
-            "batch_size": 16,
-            "d_train_setp": 1,
-            "id_loss_weight": 5,
+            "batch_size": 10,
+            "id_loss_weight": 10,
+            "id_encode_provider": IDLoss.Provider.MS1MV2_TRANSFACE_B,
         }
     )
 

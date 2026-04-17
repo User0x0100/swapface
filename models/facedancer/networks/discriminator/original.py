@@ -24,12 +24,13 @@ class DownBlock(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, img_resolution: int = 256, img_channels: int = 3, num_encoder: int = 5, base_ch: int = 64, max_ch: int = 512) -> None:
+    def __init__(self, img_resolution: int = 256, img_channels: int = 3, num_encoder: int = 6, base_ch: int = 64, max_ch: int = 512) -> None:
         super().__init__()
 
         self.network_cfg = {
             "img_resolution": img_resolution,
             "img_channels": img_channels,
+            "num_encoder": num_encoder,
             "base_ch": base_ch,
             "max_ch": max_ch,
         }

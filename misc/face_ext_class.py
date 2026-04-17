@@ -93,7 +93,7 @@ def exp(
     pbar = tqdm(FaceExtractorVideo(vfp, batch_size, align_size, device=device, conf_thresh=conf_thresh, iou_thresh=iou_thresh, min_box_size=min_box_size), desc="Processing")
     for _, faces, _, _, nb in pbar:
         with torch.inference_mode():
-            id_feats = ID_Encoder(zoom_in((faces / 127.5) - 1.0, 0.3))  # (B, C)
+            id_feats = ID_Encoder(zoom_in((faces / 127.5) - 1.0, 0.102))  # (B, C)
 
         B = id_feats.size(0)
 

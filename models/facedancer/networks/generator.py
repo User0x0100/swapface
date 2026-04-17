@@ -17,9 +17,11 @@ class ResBlockBase(nn.Module):
         match sampling:
             case RBSampleMode.UP:
                 self.residual = nn.Sequential(
-                    nn.LeakyReLU(0.2),
-                    nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
+                    nn.SiLU(),
+                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0),
+                    nn.SiLU(),
                     nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                    nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
                 )
                 self.shortcut = nn.Sequential(
                     nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
@@ -28,9 +30,11 @@ class ResBlockBase(nn.Module):
 
             case RBSampleMode.DOWN:
                 self.residual = nn.Sequential(
-                    nn.LeakyReLU(0.2),
-                    nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
+                    nn.SiLU(),
+                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0),
+                    nn.SiLU(),
                     nn.AvgPool2d(2),
+                    nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
                 )
                 self.shortcut = nn.Sequential(
                     nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
@@ -39,8 +43,10 @@ class ResBlockBase(nn.Module):
 
             case RBSampleMode.NONE:
                 self.residual = nn.Sequential(
-                    nn.LeakyReLU(0.2),
-                    nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
+                    nn.SiLU(),
+                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0),
+                    nn.SiLU(),
+                    nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
                 )
                 self.shortcut = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, 1, stride=1, padding=0, bias=shortcut_bias)
 
@@ -94,7 +100,7 @@ class NormRB(nn.Module):
         super().__init__()
 
         self.norm = nn.InstanceNorm2d(in_ch, affine=True)
-        self.resblock = ResBlockBase(in_ch, out_ch, sampling, shortcut_bias=True)
+        self.resblock = ResBlockBase(in_ch, out_ch, sampling)
 
     def forward(self, x: Tensor) -> Tensor:
 
@@ -110,8 +116,8 @@ class Concat(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, x_target: Tensor, x_source: Tensor) -> Tensor:
-        return torch.cat((x_target, x_source), dim=1)
+    def forward(self, x_encoder: Tensor, x_decoder: Tensor) -> Tensor:
+        return torch.cat((x_encoder, x_decoder), dim=1)
 
 
 class Atten(nn.Module):
@@ -121,28 +127,52 @@ class Atten(nn.Module):
         self.attn_mask_proj = nn.Sequential(
             nn.Conv2d(channels * 2, channels // 4, 3, padding=1),
             nn.InstanceNorm2d(channels // 4, affine=True),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
             nn.Conv2d(channels // 4, channels, 1, padding=0),
             nn.Sigmoid(),
         )
 
         self.last_attn_mask = None
 
-    def forward(self, x_target: Tensor, x_source: Tensor) -> Tensor:
+    def forward(self, x_encoder: Tensor, x_decoder: Tensor) -> Tensor:
 
-        m = self.attn_mask_proj(torch.cat((x_target, x_source), dim=1))
+        m = self.attn_mask_proj(torch.cat((x_encoder, x_decoder), dim=1))
 
         self.last_attn_mask = m.detach()
 
-        return (1.0 - m) * x_target + m * x_source
+        return (1.0 - m) * x_encoder + m * x_decoder
 
     def get_attention_maps(self) -> Tensor | None:
         return self.last_attn_mask
 
 
+class SkipSPADE(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+
+        # self.norm = nn.InstanceNorm2d(channels, affine=False)
+
+        self.to_gamma = nn.Conv2d(channels, channels, 3, padding=1)
+        self.to_beta = nn.Conv2d(channels, channels, 3, padding=1)
+
+        nn.init.zeros_(self.to_gamma.weight)
+        nn.init.ones_(self.to_gamma.bias)
+        nn.init.zeros_(self.to_beta.weight)
+        nn.init.zeros_(self.to_beta.bias)
+
+    def forward(self, x_decoder, x_encoder):
+        # x_encoder = self.norm(x_encoder)
+
+        gamma = self.to_gamma(x_encoder)
+        beta = self.to_beta(x_encoder)
+
+        return x_decoder * gamma + beta
+
+
 class SkipFusionModule(Enum):
     ATTEN = "Atten"
     CONCAT = "Concat"
+    SKIPSPADE = "SkipSPADE"
 
 
 class SkipFusionAdaIN(nn.Module):
@@ -154,6 +184,7 @@ class SkipFusionAdaIN(nn.Module):
         self.fusion = {
             SkipFusionModule.CONCAT: Concat,
             SkipFusionModule.ATTEN: lambda: Atten(in_ch),
+            SkipFusionModule.SKIPSPADE: lambda: SkipSPADE(in_ch),
         }[fusion_mode]()
 
         if isinstance(self.fusion, Concat):
@@ -162,19 +193,26 @@ class SkipFusionAdaIN(nn.Module):
         self.adain = AdaIN(in_ch, w_dim)
         self.resblock = ResBlockBase(in_ch, out_ch, resample_mode)
 
-    def forward(self, x_target: Tensor, x_source: Tensor, w: Tensor) -> Tensor:
+    def forward(self, x_encoder: Tensor, x_decoder: Tensor, w: Tensor) -> Tensor:
 
         match self.fusion_mode:
             case SkipFusionModule.ATTEN:
-                skip = self.resblock.shortcut(x_source)
-                x = self.adain(x_target, w)
-                x = self.fusion(x, x_source)
+                skip = self.resblock.shortcut(x_decoder)
+                x = self.adain(x_encoder, w)
+                x = self.fusion(x, x_decoder)
                 x = self.resblock.residual(x)
 
             case SkipFusionModule.CONCAT:
-                x = self.fusion(x_target, x_source)
+                x = self.fusion(x_encoder, x_decoder)
                 skip = self.resblock.shortcut(x)
                 x = self.adain(x, w)
+                x = self.resblock.residual(x)
+
+            case SkipFusionModule.SKIPSPADE:
+                skip = self.resblock.shortcut(x_decoder)
+
+                x = x_decoder + self.adain(x_decoder, w)
+                x = self.fusion(x, x_encoder)
                 x = self.resblock.residual(x)
 
         return x + skip
@@ -209,9 +247,9 @@ class Generator(nn.Module):
             "skip_index": skip_index,
         }
 
-        mapping_layers = [nn.Linear(id_dim, w_dim), nn.LeakyReLU(0.2)]
+        mapping_layers = [nn.Linear(id_dim, w_dim), nn.SiLU()]
         for _ in range(mapping_num - 2):
-            mapping_layers += [nn.Linear(w_dim, w_dim), nn.LeakyReLU(0.2)]
+            mapping_layers += [nn.Linear(w_dim, w_dim), nn.SiLU()]
         mapping_layers += [nn.Linear(w_dim, w_dim)]
         self.mapping = nn.Sequential(*mapping_layers)
 
@@ -235,11 +273,11 @@ class Generator(nn.Module):
                 decoder_layer = AdaINRB(in_ch, out_ch, w_dim, RBSampleMode.UP)
                 # decoder_layer = NormRB(in_ch, out_ch, RBSampleMode.UP)
             else:
-                decoder_layer = SkipFusionAdaIN(in_ch, out_ch, w_dim, RBSampleMode.UP, SkipFusionModule.ATTEN)
+                decoder_layer = SkipFusionAdaIN(in_ch, out_ch, w_dim, RBSampleMode.UP, SkipFusionModule.SKIPSPADE)
 
             self.decoder.append(decoder_layer)
 
-        self.to_rgb = SkipFusionAdaIN(base_ch, img_channels, w_dim, RBSampleMode.NONE, SkipFusionModule.CONCAT)
+        self.to_rgb = SkipFusionAdaIN(base_ch, img_channels, w_dim, RBSampleMode.NONE, SkipFusionModule.SKIPSPADE)
 
     def get_attention_maps(self) -> list[Tensor]:
         return [maps for module in self.decoder.modules() if isinstance(module, Atten) if (maps := module.get_attention_maps()) is not None]
@@ -299,7 +337,7 @@ if __name__ == "__main__":
 
     x_target = torch.randn((batch_size, network_cfg["img_channels"], network_cfg["img_resolution"], network_cfg["img_resolution"]), device=device)
     id_feat = torch.randn((batch_size, network_cfg["id_dim"]), device=device)
-    summary(model, input_data=(x_target, id_feat), depth=3, col_names=("input_size", "output_size", "num_params", "kernel_size", "mult_adds"), row_settings=("var_names",))
+    summary(model, input_data=(x_target, id_feat), depth=2, col_names=("input_size", "output_size", "num_params", "kernel_size", "mult_adds"), row_settings=("var_names",))
 
     print("NetWork_Info:")
     for k, v in network_cfg.items():

@@ -5,7 +5,7 @@ import multiprocessing as mp
 import torch
 from torch import Tensor
 import torchvision.transforms.functional as F
-from misc.facealign import face_align_batch, FaceExtractorVideo, restore_faces_to_original, AffineSmoother, FaceAligner
+from misc.facealign import face_align_batch, FaceExtractorVideo, restore_faces_to_original, AffineSmoother, FaceAligner, zoom_in
 from misc.models.retinaface import get_pts, RetinaFace
 from misc.models.idencoder import IDEncoder, get_align_landmarks, PROVIDER
 from misc.models.face_parsing import FaceParsing
@@ -142,7 +142,7 @@ class Swap:
             align_face = align_face[:1]
 
         with torch.inference_mode():
-            id_emb = self.idencoder(align_face)
+            id_emb = self.idencoder(zoom_in(align_face, 0.102))
 
         return id_emb
 
@@ -229,11 +229,11 @@ if __name__ == "__main__":
     # id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
 
     video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
-    id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
-    # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
+    # id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
+    id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
     # id = "/home/liaohaixun/swap/IDAssets/2025-06-15 18_19_50小树🌿人间体验卡限时掉落✨ _3.jpg"
     # id = "w700d1q75cms.jpg"
 
-    swapper = Swap("train_log/256_WFM/ckpt/640000.pth", PROVIDER.BLENDFACE)
+    swapper = Swap("train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch_Patch/ckpt/330000.pth", PROVIDER.MS1MV2_TRANSFACE_B)
 
     swapper.swap_video(video, id)

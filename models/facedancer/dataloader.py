@@ -188,15 +188,15 @@ class SampleReader(object):
     def __call__(self, sample_info) -> tuple[ndarray, ndarray]:
         _ = sample_info
 
-        dst_idx = self.rng.choice(len(self.dst_folders), p=self.dst_weight)
-        dst_folder = self.dst_folders[dst_idx]
-        dst_file_path = dst_folder.sample()
-        dst = np.fromfile(dst_file_path, dtype=np.uint8)
-
         src_idx = self.rng.choice(len(self.src_folders), p=self.src_weight)
         src_folder = self.src_folders[src_idx]
         src_file_path = src_folder.sample()
         src = np.fromfile(src_file_path, dtype=np.uint8)
+
+        dst_idx = self.rng.choice(len(self.dst_folders), p=self.dst_weight)
+        dst_folder = self.dst_folders[dst_idx]
+        dst_file_path = dst_folder.sample()
+        dst = np.fromfile(dst_file_path, dtype=np.uint8)
 
         return src, dst
 

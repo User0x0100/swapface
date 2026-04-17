@@ -10,99 +10,7 @@
 
 import torch
 import numpy as np
-from pathlib import Path
 from torch import Tensor, nn
-
-
-def get_current_cuda_arch() -> list[str]:
-    if not torch.cuda.is_available():
-        return []
-
-    device = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device)
-    arch = f"{major}{minor}"
-
-    return [f"-arch=sm_{arch}"]
-
-
-def setup_context(
-    ctx,
-    inputs: tuple[Tensor, Tensor, int, int, int, int, int, int, int, int, bool, float],
-    output: Tensor,
-):
-    x, f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain = inputs
-    ctx.save_for_backward(f)
-    ctx.x_shape = x.shape
-
-    ctx.padx0, ctx.pady0 = padx0, pady0
-    ctx.upx, ctx.upy, ctx.downx, ctx.downy = upx, upy, downx, downy
-    ctx.flip_filter = flip_filter
-    ctx.gain = gain
-
-
-def backward(ctx, dy: Tensor):
-    f = ctx.saved_tensors[0]
-    _, _, ih, iw = ctx.x_shape
-    _, _, oh, ow = dy.shape
-    fw, fh = f.shape
-    padx0, pady0 = ctx.padx0, ctx.pady0
-    upx, upy, downx, downy = ctx.upx, ctx.upy, ctx.downx, ctx.downy
-    flip_filter = ctx.flip_filter
-    gain = ctx.gain
-
-    px0 = fw - padx0 - 1
-    px1 = iw * upx - ow * downx + padx0 - upx + 1
-    py0 = fh - pady0 - 1
-    py1 = ih * upy - oh * downy + pady0 - upy + 1
-
-    dx = None
-    df = None
-
-    if ctx.needs_input_grad[0]:
-        dx = upfirdn2d(dy, f, downx, downy, upx, upy, px0, px1, py0, py1, not flip_filter, gain)
-
-    assert not ctx.needs_input_grad[1]
-    return dx, df, None, None, None, None, None, None, None, None, None, None
-
-
-def load_kernel_fn():
-
-    from torch.utils.cpp_extension import load
-    from torch.library import register_autograd
-
-    cuda_arch_flags = get_current_cuda_arch()
-
-    BASE_DIR = Path(__file__).resolve().parent
-    load(
-        "upfirdn2d",
-        sources=[BASE_DIR / "upfirdn2d.cpp", BASE_DIR / "upfirdn2d.cu"],
-        is_python_module=False,
-        verbose=True,
-        extra_cuda_cflags=[
-            "-O3",
-            "-use_fast_math",
-            "--expt-relaxed-constexpr",
-            *cuda_arch_flags,
-        ],
-        extra_cflags=["-O3"],
-    )
-
-    """
-    Autograd support:
-
-    The backward pass of upfirdn2d is implemented by applying the same operator
-    with swapped up/down factors and adjusted padding.
-
-    This ensures:
-        - Exact gradient propagation
-        - No numerical approximation
-        - Full compatibility with PyTorch autograd
-
-    Key idea:
-        Forward:  up → filter → down
-        Backward: down → filter → up
-    """
-    register_autograd("upfirdn2d::upfirdn2d", backward, setup_context=setup_context)
 
 
 def _assert_shape(tensor, ref_shape):
@@ -268,8 +176,6 @@ def upfirdn2d(
         - This operator is fully differentiable (custom backward registered)
         - Critical for preventing aliasing in downsampling
     """
-    if not hasattr(torch.ops.upfirdn2d, "upfirdn2d"):
-        load_kernel_fn()
 
     if f.ndim == 2:
         x = torch.ops.upfirdn2d.upfirdn2d(x, f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain)
@@ -435,3 +341,85 @@ class DownFIRDn2d(nn.Module):
             Tensor of the shape `[batch_size, num_channels, out_height, out_width]`.
         """
         return upfirdn2d(x, self.f, self.upx, self.upy, self.downx, self.downy, self.padx0, self.padx1, self.pady0, self.pady1, self.flip_filter, self.gain)
+
+
+def setup_context(
+    ctx,
+    inputs: tuple[Tensor, Tensor, int, int, int, int, int, int, int, int, bool, float],
+    output: Tensor,
+):
+    x, f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain = inputs
+    ctx.save_for_backward(f)
+    ctx.x_shape = x.shape
+
+    ctx.padx0, ctx.pady0 = padx0, pady0
+    ctx.upx, ctx.upy, ctx.downx, ctx.downy = upx, upy, downx, downy
+    ctx.flip_filter = flip_filter
+    ctx.gain = gain
+
+
+def backward(ctx, dy: Tensor):
+    f = ctx.saved_tensors[0]
+    _, _, ih, iw = ctx.x_shape
+    _, _, oh, ow = dy.shape
+    fw, fh = f.shape
+    padx0, pady0 = ctx.padx0, ctx.pady0
+    upx, upy, downx, downy = ctx.upx, ctx.upy, ctx.downx, ctx.downy
+    flip_filter = ctx.flip_filter
+    gain = ctx.gain
+
+    px0 = fw - padx0 - 1
+    px1 = iw * upx - ow * downx + padx0 - upx + 1
+    py0 = fh - pady0 - 1
+    py1 = ih * upy - oh * downy + pady0 - upy + 1
+
+    dx = None
+    df = None
+
+    if ctx.needs_input_grad[0]:
+        dx = upfirdn2d(dy, f, downx, downy, upx, upy, px0, px1, py0, py1, not flip_filter, gain)
+
+    assert not ctx.needs_input_grad[1]
+    return dx, df, None, None, None, None, None, None, None, None, None, None
+
+
+def load_kernel_fn():
+
+    from pathlib import Path
+    from torch.utils.cpp_extension import load
+    from torch.library import register_autograd
+
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+
+    cuda_arch_flags = f"-arch=sm_{major}{minor}"
+
+    BASE_DIR = Path(__file__).resolve().parent
+    load(
+        "upfirdn2d",
+        sources=[BASE_DIR / "upfirdn2d.cpp", BASE_DIR / "upfirdn2d.cu"],
+        is_python_module=False,
+        verbose=True,
+        extra_cuda_cflags=["-O3", "-use_fast_math", "--expt-relaxed-constexpr", cuda_arch_flags],
+        extra_cflags=["-O3"],
+    )
+
+    """
+    Autograd support:
+
+    The backward pass of upfirdn2d is implemented by applying the same operator
+    with swapped up/down factors and adjusted padding.
+
+    This ensures:
+        - Exact gradient propagation
+        - No numerical approximation
+        - Full compatibility with PyTorch autograd
+
+    Key idea:
+        Forward:  up → filter → down
+        Backward: down → filter → up
+    """
+    register_autograd("upfirdn2d::upfirdn2d", backward, setup_context=setup_context)
+
+
+load_kernel_fn()

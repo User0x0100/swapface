@@ -44,21 +44,21 @@ class AffineSmoother:
             self.state.pop(face_id, None)
 
 
-def zoom_in(img: torch.Tensor, zoom: float = 0.2) -> torch.Tensor:
+def zoom_in(img: Tensor, zoom: float = 0.102) -> Tensor:
     """
     img  : [B, C, H, W]
-    zoom : 裁掉的比例，0.2 表示四周各裁 10%
+    zoom : 裁掉的比例，0.102 表示四周各裁 0.102%
     """
     _, _, H, W = img.shape
-    ch = int(H * zoom / 2)
-    cw = int(W * zoom / 2)
+    ch = int(H * zoom)
+    cw = int(W * zoom)
 
     cropped = img[:, :, ch : H - ch, cw : W - cw]
 
     return F.interpolate(cropped, size=(H, W), mode="bilinear", align_corners=False)
 
 
-def compute_similarity_transform(points_x: torch.Tensor, points_y: torch.Tensor) -> torch.Tensor:
+def compute_similarity_transform(points_x: Tensor, points_y: Tensor) -> Tensor:
     """
     计算两组点之间的相似变换 (similarity transform)
 
@@ -156,7 +156,7 @@ def normalize_theta(affine_src2dst, in_hw, out_hw, align_corners=True):
     return theta
 
 
-def invert_normalized_theta(theta: torch.Tensor) -> torch.Tensor:
+def invert_normalized_theta(theta: Tensor) -> Tensor:
     """
     计算 normalized_theta 的逆变换
 
@@ -398,7 +398,7 @@ class FaceAlignBase:
         self.batch_size = batch_size
         self.align_size = align_size
 
-        self.aligner = FaceAligner(0.5)
+        self.aligner = FaceAligner(0.75)
 
     def align(self, images: Tensor | list[Tensor]) -> tuple[Tensor, Tensor, list[int]]:
         detected, offset = self.FaceDetector.detector(images, conf_thresh=self.conf_thresh, iou_thresh=self.iou_thresh, min_box_size=self.min_box_size)
