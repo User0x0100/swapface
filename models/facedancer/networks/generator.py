@@ -64,18 +64,21 @@ class AdaIN(nn.Module):
         self.fc_beta = nn.Linear(w_dim, channels)
 
         nn.init.zeros_(self.fc_gamma.weight)
-        nn.init.ones_(self.fc_gamma.bias)
+        nn.init.zeros_(self.fc_gamma.bias)
         nn.init.zeros_(self.fc_beta.weight)
         nn.init.zeros_(self.fc_beta.bias)
 
-    def forward(self, x: Tensor, w: Tensor) -> Tensor:
+        self.alpha = nn.Parameter(torch.zeros(1))
 
-        x = self.norm(x)
+    def forward(self, x: Tensor, w: Tensor) -> Tensor:
+        x_norm = self.norm(x)
 
         gamma = self.fc_gamma(w).view(w.size(0), -1, 1, 1)
         beta = self.fc_beta(w).view(w.size(0), -1, 1, 1)
 
-        return x * gamma + beta
+        mod = x_norm * (1.0 + gamma) + beta
+
+        return x + self.alpha * (mod - x)
 
 
 class AdaINRB(nn.Module):
@@ -147,31 +150,29 @@ class Atten(nn.Module):
 
 
 class SkipSPADE(nn.Module):
-    def __init__(self, channels: int):
+    def __init__(self, channels: int) -> None:
         super().__init__()
-
-        # self.norm = nn.InstanceNorm2d(channels, affine=False)
 
         self.to_gamma = nn.Conv2d(channels, channels, 3, padding=1)
         self.to_beta = nn.Conv2d(channels, channels, 3, padding=1)
 
         nn.init.zeros_(self.to_gamma.weight)
-        nn.init.ones_(self.to_gamma.bias)
+        nn.init.zeros_(self.to_gamma.bias)
         nn.init.zeros_(self.to_beta.weight)
         nn.init.zeros_(self.to_beta.bias)
 
-    def forward(self, x_decoder, x_encoder):
-        # x_encoder = self.norm(x_encoder)
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x_encoder: Tensor, x_decoder: Tensor) -> Tensor:
 
         gamma = self.to_gamma(x_encoder)
         beta = self.to_beta(x_encoder)
 
-        return x_decoder * gamma + beta
+        return x_decoder + self.alpha * (x_decoder * gamma + beta)
 
 
 class SkipFusionModule(Enum):
     ATTEN = "Atten"
-    CONCAT = "Concat"
     SKIPSPADE = "SkipSPADE"
 
 
@@ -182,39 +183,19 @@ class SkipFusionAdaIN(nn.Module):
         self.fusion_mode = fusion_mode
 
         self.fusion = {
-            SkipFusionModule.CONCAT: Concat,
             SkipFusionModule.ATTEN: lambda: Atten(in_ch),
             SkipFusionModule.SKIPSPADE: lambda: SkipSPADE(in_ch),
         }[fusion_mode]()
-
-        if isinstance(self.fusion, Concat):
-            in_ch = in_ch * 2
 
         self.adain = AdaIN(in_ch, w_dim)
         self.resblock = ResBlockBase(in_ch, out_ch, resample_mode)
 
     def forward(self, x_encoder: Tensor, x_decoder: Tensor, w: Tensor) -> Tensor:
 
-        match self.fusion_mode:
-            case SkipFusionModule.ATTEN:
-                skip = self.resblock.shortcut(x_decoder)
-                x = self.adain(x_encoder, w)
-                x = self.fusion(x, x_decoder)
-                x = self.resblock.residual(x)
-
-            case SkipFusionModule.CONCAT:
-                x = self.fusion(x_encoder, x_decoder)
-                skip = self.resblock.shortcut(x)
-                x = self.adain(x, w)
-                x = self.resblock.residual(x)
-
-            case SkipFusionModule.SKIPSPADE:
-                skip = self.resblock.shortcut(x_decoder)
-
-                x = x_decoder + self.adain(x_decoder, w)
-                x = self.fusion(x, x_encoder)
-                x = self.resblock.residual(x)
-
+        skip = self.resblock.shortcut(x_decoder)
+        x = self.adain(x_decoder, w)
+        x = self.fusion(x_encoder, x)
+        x = self.resblock.residual(x)
         return x + skip
 
 
@@ -233,19 +214,9 @@ class Generator(nn.Module):
     ) -> None:
         super().__init__()
 
-        assert 0 < skip_index <= num_encoder, f"skip_conn_start_with must be in (0, {num_encoder}]"
+        self.network_cfg = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
 
-        self.network_cfg = {
-            "img_resolution": img_resolution,
-            "img_channels": img_channels,
-            "num_encoder": num_encoder,
-            "base_ch": base_ch,
-            "max_ch": max_ch,
-            "id_dim": id_dim,
-            "w_dim": w_dim,
-            "mapping_num": mapping_num,
-            "skip_index": skip_index,
-        }
+        assert 0 < skip_index <= num_encoder, f"skip_conn_start_with must be in (0, {num_encoder}]"
 
         mapping_layers = [nn.Linear(id_dim, w_dim), nn.SiLU()]
         for _ in range(mapping_num - 2):
@@ -277,7 +248,8 @@ class Generator(nn.Module):
 
             self.decoder.append(decoder_layer)
 
-        self.to_rgb = SkipFusionAdaIN(base_ch, img_channels, w_dim, RBSampleMode.NONE, SkipFusionModule.SKIPSPADE)
+        # self.to_rgb = SkipFusionAdaIN(base_ch, img_channels, w_dim, RBSampleMode.NONE, SkipFusionModule.SKIPSPADE)
+        self.to_rgb = nn.Conv2d(base_ch, img_channels, kernel_size=3, stride=1, padding=1)
 
     def get_attention_maps(self) -> list[Tensor]:
         return [maps for module in self.decoder.modules() if isinstance(module, Atten) if (maps := module.get_attention_maps()) is not None]
@@ -306,7 +278,8 @@ class Generator(nn.Module):
                 x = decoder_block(x, w)
                 # x = decoder_block(x)
 
-        x = self.to_rgb(feats[0], x, w)
+        # x = self.to_rgb(feats[0], x, w)
+        x = self.to_rgb(x)
 
         x = torch.tanh(x)
 
