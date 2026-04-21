@@ -192,10 +192,12 @@ class SkipFusionAdaIN(nn.Module):
 
     def forward(self, x_encoder: Tensor, x_decoder: Tensor, w: Tensor) -> Tensor:
 
-        skip = self.resblock.shortcut(x_decoder)
         x = self.adain(x_decoder, w)
         x = self.fusion(x_encoder, x)
+
+        skip = self.resblock.shortcut(x)
         x = self.resblock.residual(x)
+
         return x + skip
 
 
@@ -248,8 +250,8 @@ class Generator(nn.Module):
 
             self.decoder.append(decoder_layer)
 
-        # self.to_rgb = SkipFusionAdaIN(base_ch, img_channels, w_dim, RBSampleMode.NONE, SkipFusionModule.SKIPSPADE)
-        self.to_rgb = nn.Conv2d(base_ch, img_channels, kernel_size=3, stride=1, padding=1)
+        self.to_rgb = SkipFusionAdaIN(base_ch, img_channels, w_dim, RBSampleMode.NONE, SkipFusionModule.SKIPSPADE)
+        # self.to_rgb = nn.Conv2d(base_ch, img_channels, kernel_size=3, stride=1, padding=1)
 
     def get_attention_maps(self) -> list[Tensor]:
         return [maps for module in self.decoder.modules() if isinstance(module, Atten) if (maps := module.get_attention_maps()) is not None]
@@ -278,8 +280,8 @@ class Generator(nn.Module):
                 x = decoder_block(x, w)
                 # x = decoder_block(x)
 
-        # x = self.to_rgb(feats[0], x, w)
-        x = self.to_rgb(x)
+        x = self.to_rgb(feats[0], x, w)
+        # x = self.to_rgb(x)
 
         x = torch.tanh(x)
 

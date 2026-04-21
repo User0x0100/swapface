@@ -278,6 +278,7 @@ def datasetloader(
     saturation: float = 0.2,
     flip_prob: float = 0.5,
     same_image_prob: float = 0.2,
+    same_use_src_dst: bool = True,
     random_sampling: bool = True,
     rndwarp: bool = False,
 ):
@@ -293,7 +294,7 @@ def datasetloader(
         batch=False,
     )
 
-    if identity_root is not None:
+    if identity_root is not None and not same_use_src_dst:
         identity_sampler = fn.external_source(
             source=IdentityPairReader(identity_root, random_sampling),
             num_outputs=2,
@@ -305,7 +306,6 @@ def datasetloader(
             batch=False,
         )
     else:
-        same_image_prob = 0.0
         identity_sampler = external_source
 
     if rndwarp:
@@ -314,7 +314,14 @@ def datasetloader(
     # 是否采样同一身份
     if fn.random.coin_flip(probability=same_image_prob, dtype=DALIDataType.BOOL):
         is_same = Constant(value=1.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])
-        src_raw, dst_raw = identity_sampler
+        if same_use_src_dst:
+            src_raw, dst_raw = identity_sampler
+            if fn.random.coin_flip(probability=0.5, dtype=DALIDataType.BOOL):
+                dst_raw = src_raw
+            else:
+                src_raw = dst_raw
+        else:
+            src_raw, dst_raw = identity_sampler
 
     else:
         is_same = Constant(value=0.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])

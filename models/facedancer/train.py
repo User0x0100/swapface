@@ -85,7 +85,7 @@ class Trainer:
         net_d_cfg: dict[str, int] | None = None,
         id_encode_provider: IDLoss.Provider = IDLoss.Provider.BLENDFACE,
         id_loss_weight: float = 10.0,
-        rec_loss: float = 5.0,
+        rec_loss: float = 50.0,
         perceptual_loss_weight: dict[str, float] = {
             # vgg16
             "relu1_2": 0.25,
@@ -234,6 +234,7 @@ class Trainer:
             dst=dst,
             identity_root=identity_root,
             same_image_prob=same_image_prob,
+            same_use_src_dst=True,
         )
 
         self.dataset = DALIGenericIterator(pipelines=pipe, output_map=["src", "dst", "is_same"], auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
@@ -435,13 +436,13 @@ if __name__ == "__main__":
     src = [
         ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
         ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
-        # ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
+        ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
     ]
 
     dst = [
         ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
         ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
-        # ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
+        ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
         # ("/opt/share/deepfake/dataset_1/RealOcc/image/realign_arcface_dst", 1.0),
         # ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
     ]
@@ -451,7 +452,7 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            # "ckpt": "train_log/256_WFM_SKIPSPADE_1/ckpt/1330000.pth",
+            "ckpt": "train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch_1/ckpt/975034.pth",
             "net_g_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
@@ -471,18 +472,18 @@ if __name__ == "__main__":
                 "max_ch": 512,
                 # "group_size": 4,
             },
-            "log_path": "train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch",
+            "log_path": "train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch_1_Same1.0",
             "enable_ifsr_loss": False,
             "enable_wfm_loss": True,
             "wfm_loss_weight": {
-                # 0: 1.0,
+                0: 1.0,
                 1: 1.0,
                 2: 1.0,
                 3: 1.0,
                 4: 1.0,
-                # 5: 1.0,
+                5: 1.0,
             },
-            "same_image_prob": 0.1,
+            "same_image_prob": 1.0,
             "discriminator_typt": DISCRIMINATOR_TYPT.ORIGIN,
             "r1_reg_step": 1,
             "perceptual_loss_weight": {

@@ -18,6 +18,19 @@ import cv2
 import numpy as np
 
 
+def add_black_border_batch(imgs: Tensor, border: int = 1):
+    """
+    imgs: [N, C, H, W]
+    """
+    assert imgs.ndim == 4, f"expected [N, C, H, W], got {imgs.shape}"
+    _, _, h, w = imgs.shape
+    assert 0 <= border <= min(h, w) // 2, "border 太大了"
+
+    imgs[:, :, :border, :] = -1
+    imgs[:, :, -border:, :] = -1
+    imgs[:, :, :, :border] = -1
+    imgs[:, :, :, -border:] = -1
+
 class Swap:
     def __init__(self, model_path: str, idencoder_provider: PROVIDER, device: str = "cuda") -> None:
         super().__init__()
@@ -208,7 +221,8 @@ class Swap:
                     mask = F.gaussian_blur(mask, 7, 13)
                     swap_face = faces * (1.0 - mask) + swap_face * mask
                     mask = mask * 2.0 - 1.0
-
+                # swap_face = faces
+                add_black_border_batch(swap_face)
                 swap_face = restore_faces_to_original(org_frames, swap_face, norm_theta, offset)
                 swap_face = torch.nn.functional.interpolate(swap_face, scale_factor=0.25, mode="bilinear", align_corners=False)
                 # swap_face = torch.cat((faces, swap_face, mask.expand(N, 3, -1, -1)), dim=3)
@@ -229,11 +243,11 @@ if __name__ == "__main__":
     # id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
 
     video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
-    # id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
-    id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
+    id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
+    # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
     # id = "/home/liaohaixun/swap/IDAssets/2025-06-15 18_19_50小树🌿人间体验卡限时掉落✨ _3.jpg"
     # id = "w700d1q75cms.jpg"
 
-    swapper = Swap("train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch_Patch/ckpt/330000.pth", PROVIDER.MS1MV2_TRANSFACE_B)
+    swapper = Swap("train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch_1/ckpt/975034.pth", PROVIDER.MS1MV2_TRANSFACE_B)
 
     swapper.swap_video(video, id)

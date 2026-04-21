@@ -2,11 +2,11 @@ import torch
 
 
 class IdentityEncoderBlock(torch.nn.Module):
-    def __init__(self, num_channels, embedding_size):
+    def __init__(self, num_channels, id_dim):
         super().__init__()
         self.normalize = torch.nn.BatchNorm2d(num_channels, affine=False, track_running_stats=True)
-        self.fc_mean = torch.nn.Linear(embedding_size, num_channels)
-        self.fc_var = torch.nn.Linear(embedding_size, num_channels)
+        self.fc_mean = torch.nn.Linear(id_dim, num_channels)
+        self.fc_var = torch.nn.Linear(id_dim, num_channels)
         self.nonlinear1 = torch.nn.LeakyReLU()
         self.conv1x1 = torch.nn.Conv2d(num_channels, num_channels, 1, 1, 0)
         self.nonlinear2 = torch.nn.LeakyReLU()
@@ -129,36 +129,36 @@ class AttributeEncoderBody(torch.nn.Module):
 
 
 class IdentityEncoderBody(torch.nn.Module):
-    def __init__(self, num_channels, embedding_size):
+    def __init__(self, num_channels, id_dim):
         super().__init__()
         """down"""
         # 256x256
-        self.b256_down = IdentityEncoderBlock(num_channels, embedding_size)
+        self.b256_down = IdentityEncoderBlock(num_channels, id_dim)
         # 128x128
         self.down128 = Downsample(num_channels)
-        self.b128_down = IdentityEncoderBlock(num_channels, embedding_size)
+        self.b128_down = IdentityEncoderBlock(num_channels, id_dim)
         # 64x64
         self.down64 = Downsample(num_channels)
-        self.b64_down = IdentityEncoderBlock(num_channels, embedding_size)
+        self.b64_down = IdentityEncoderBlock(num_channels, id_dim)
         # 32x32
         self.down32 = Downsample(num_channels)
-        self.b32_down = IdentityEncoderBlock(num_channels, embedding_size)
+        self.b32_down = IdentityEncoderBlock(num_channels, id_dim)
         # 16x16
         self.down16 = Downsample(num_channels)
-        self.b16_down = IdentityEncoderBlock(num_channels, embedding_size)
+        self.b16_down = IdentityEncoderBlock(num_channels, id_dim)
         # 8x8
         self.down8 = Downsample(num_channels)
-        self.b8_down = IdentityEncoderBlock(num_channels, embedding_size)
+        self.b8_down = IdentityEncoderBlock(num_channels, id_dim)
         """up"""
         # 16x16
         self.up16 = Upsample(num_channels)
-        self.b16_up = IdentityEncoderBlock(num_channels, embedding_size)
+        self.b16_up = IdentityEncoderBlock(num_channels, id_dim)
         # 32x32
         self.up32 = Upsample(num_channels)
-        self.b32_up = IdentityEncoderBlock(num_channels, embedding_size)
+        self.b32_up = IdentityEncoderBlock(num_channels, id_dim)
         # 64x64
         self.up64 = Upsample(num_channels)
-        self.b64_up = IdentityEncoderBlock(num_channels, embedding_size)
+        self.b64_up = IdentityEncoderBlock(num_channels, id_dim)
 
     def forward(self, x256_0, embeddings):
         # down
@@ -215,13 +215,11 @@ class Decoder(torch.nn.Module):
         self.b64_2 = DecoderBlock(num_channels)
         self.b64_1 = DecoderBlock(num_channels)
         self.b64_0 = DecoderBlock(num_channels)
-        self.image64_output = DecoderImageOutput(num_channels)
         self.up128 = Upsample(num_channels)
         self.b128_3 = DecoderBlock(num_channels)
         self.b128_2 = DecoderBlock(num_channels)
         self.b128_1 = DecoderBlock(num_channels)
         self.b128_0 = DecoderBlock(num_channels)
-        self.image128_output = DecoderImageOutput(num_channels)
         self.up256 = Upsample(num_channels)
         self.b256_2 = DecoderBlock(num_channels)
         self.b256_1 = DecoderBlock(num_channels)
@@ -240,55 +238,39 @@ class Decoder(torch.nn.Module):
         x = self.b64_2(x, x64_2) + x
         x = self.b64_1(x, x64_1) + x
         x = self.b64_0(x, x64_0) + x
-        images64 = self.image64_output(x)
+
         x = self.up128(x)
         x = self.b128_3(x, x128_3) + x
         x = self.b128_2(x, x128_2) + x
         x = self.b128_1(x, x128_1) + x
         x = self.b128_0(x, x128_0) + x
-        images128 = self.image128_output(x)
+
         x = self.up256(x)
         x = self.b256_2(x, x256_2) + x
         x = self.b256_1(x, x256_1) + x
         x = self.b256_0(x, x256_0) + x
         images256 = self.image256_output(x)
-        return images256, images128, images64
-
-
-"""
-import cv2
-import numpy as np
-
-ellipse = np.zeros([256, 256, 3])
-ellipse = cv2.ellipse(ellipse, (128, 194), (20, 6), 0, 0, 360, (255, 255, 255), -1)
-ellipse = cv2.blur(ellipse, (2, 2))
-mask = (ellipse / 255.0).transpose([2, 0, 1])
-mask = np.expand_dims(mask, 0)[:, 0, :, :]
-mask = torch.from_numpy(mask).to(torch.float32)
-"""
+        return images256
 
 
 class Generator(torch.nn.Module):
-    def __init__(self, num_channels: int = 64, embedding_size: int = 512):
+    def __init__(self, img_resolution: int = 256, num_channels: int = 64, id_dim: int = 512):
         super().__init__()
+        self.network_cfg = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
         self.encoder_head = EncoderHead(num_channels)
-        self.identity_encoder = IdentityEncoderBody(num_channels, embedding_size)
+        self.identity_encoder = IdentityEncoderBody(num_channels, id_dim)
         self.attribute_encoder = AttributeEncoderBody(num_channels)
         self.decoder = Decoder(num_channels)
-        ##self.register_buffer("mask", mask)
 
-    def forward(self, targets, embeddings):
+    def forward(self, targets, id_feat):
         identity_x, attribute_x = self.encoder_head(targets)
         attributes = self.attribute_encoder(attribute_x)
-        identity = self.identity_encoder(identity_x, embeddings)
-        images256, images128, images64 = self.decoder(identity, attributes)
-        # merged_images = images256 * (1.0 - self.mask) + targets * self.mask
-        return images256, images128, images64, attributes
+        identity = self.identity_encoder(identity_x, id_feat)
+        images256 = self.decoder(identity, attributes)
+        return images256
 
-    def cal_attributes(self, targets):
-        _, attribute_x = self.encoder_head(targets)
-        attributes = self.attribute_encoder(attribute_x)
-        return attributes
+    def get_attention_maps(self) -> list[torch.Tensor]:
+        return []
 
 
 if __name__ == "__main__":
@@ -299,13 +281,13 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 1
     img_resolution = 256
-    embedding_size = 512
+    id_dim = 512
 
     model = Generator().to(device)
     model.eval()
 
     x_target = torch.randn((batch_size, 3, img_resolution, img_resolution), device=device)
-    id_feat = torch.randn((batch_size, embedding_size), device=device)
+    id_feat = torch.randn((batch_size, id_dim), device=device)
     summary(model, input_data=(x_target, id_feat), depth=3, col_names=("input_size", "output_size", "num_params", "kernel_size", "mult_adds"), row_settings=("var_names",))
 
     flops = FlopCountAnalysis(model, (x_target, id_feat))
