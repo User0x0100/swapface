@@ -27,13 +27,7 @@ class Discriminator(nn.Module):
     def __init__(self, img_resolution: int = 256, img_channels: int = 3, num_encoder: int = 6, base_ch: int = 64, max_ch: int = 512) -> None:
         super().__init__()
 
-        self.network_cfg = {
-            "img_resolution": img_resolution,
-            "img_channels": img_channels,
-            "num_encoder": num_encoder,
-            "base_ch": base_ch,
-            "max_ch": max_ch,
-        }
+        self.network_cfg = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
 
         self.from_rgb = nn.Conv2d(img_channels, base_ch, 3, 1, padding=1)
 

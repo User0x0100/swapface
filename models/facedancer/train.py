@@ -17,13 +17,12 @@ import cv2
 from tqdm import tqdm
 from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 
-from losses import IDLoss, l1_loss_fn, VGGPerceptualLoss, DLoss, GANLoss, StyleLossLabChroma, r1_reg_loss, WFMLoss, IFSRLoss
+from losses import IDLoss, l1_loss_fn, VGGPerceptualLoss, DLoss, GANLoss, StyleLossLabChroma, r1_reg_loss, WFMLoss, IFSRLoss, DSSIMLoss
 
 from .dataloader import datasetloader
-from .networks import Generator, Discriminator, Stylegan2DiscriminatorLite, AlphaFaceDiscriminator
+from .networks import Generator, Discriminator, Stylegan2DiscriminatorLite, AlphaFaceDiscriminator, UNetDiscriminatorSN
 
-from misc.facealign import zoom_in
-
+from misc.models.face_parsing import FaceParsing
 
 EPS = 1e-8
 
@@ -33,21 +32,17 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
-
-torch.manual_seed(0)
-random.seed(0)
-
-# torch.backends.cuda.matmul.allow_tf32 = False
-# torch.backends.cudnn.allow_tf32 = False
-# torch.backends.cudnn.benchmark = False
-# torch.backends.cudnn.deterministic = True
 torch.set_float32_matmul_precision("high")
+
+torch.manual_seed(42)
+random.seed(42)
 
 
 class DISCRIMINATOR_TYPT(Enum):
     ORIGIN = Discriminator
     ALPHAFACE = AlphaFaceDiscriminator
     STYLEGAN2 = Stylegan2DiscriminatorLite
+    UNET = UNetDiscriminatorSN
 
 
 def print_dict(d: dict, indent=0):
@@ -83,26 +78,37 @@ class Trainer:
         # 模型配置
         net_g_cfg: dict[str, int] | None = None,
         net_d_cfg: dict[str, int] | None = None,
+        # 身份损失
         id_encode_provider: IDLoss.Provider = IDLoss.Provider.BLENDFACE,
         id_loss_weight: float = 10.0,
-        rec_loss: float = 50.0,
+        # 自重建损失
+        enable_rec_loss: bool = False,
+        rec_loss_weight: float = 5.0,
+        # VGG特征匹配
+        enable_perceptual_loss: bool = False,
         perceptual_loss_weight: dict[str, float] = {
             # vgg16
-            "relu1_2": 0.25,
-            "relu2_2": 0.25,
-            "relu3_3": 0.25,
-            "relu4_2": 0.25,
-            # "pool1": 0.2,
-            # "pool2": 0.2,
-            # "pool3": 0.2,
-            # "pool4": 0.2,
-            # "pool5": 0.2,
+            # "relu1_2": 0.25,
+            # "relu2_2": 0.25,
+            # "relu3_3": 0.25,
+            # "relu4_2": 0.25,
+            # "pool1": 0.25,
+            "pool2": 0.25,
+            "pool3": 0.25,
+            # "pool4": 0.25,
+            # "pool5": 0.25,
         },
+        # 判别器中间特征得弱特征匹配
         enable_wfm_loss: bool = False,
         wfm_loss_weight: dict[int, float] = {
+            # 0: 1.0,
             1: 1.0,
             2: 1.0,
+            3: 1.0,
+            # 4: 1.0,
+            # 5: 0.5,
         },
+        # arcfaceid编码器前几层特征的带边界特征匹配
         enable_ifsr_loss: bool = False,
         ifsr_scale: float = 1.2,
         ifsr_weight: dict[str, tuple[float, float]] = {
@@ -118,8 +124,12 @@ class Trainer:
             "layer2.0": (0.047970, 1.0),
             "layer1.2": (0.035144, 1.0),
         },
+        # 色彩一致损失
         enable_color_loss: bool = False,
-        color_loss_weight: float = 0.5,
+        color_loss_weight: float = 0.1,
+        # 结构损失
+        enable_dssim_loss: bool = False,
+        dssim_loss_weight: float = 2.5,
     ):
 
         args = locals().copy()
@@ -134,9 +144,12 @@ class Trainer:
         self.batch_size = batch_size
         self.d_train_setp = d_train_setp
         self.r1_reg_step = r1_reg_step
+        self.enable_rec_loss = enable_rec_loss
+        self.enable_perceptual_loss = enable_perceptual_loss
         self.enable_wfm_loss = enable_wfm_loss
         self.enable_ifsr_loss = enable_ifsr_loss
         self.enable_color_loss = enable_color_loss
+        self.enable_dssim_loss = enable_dssim_loss
 
         self.bf16 = bool(bf16 and torch.cuda.is_bf16_supported())
         if bf16 and not self.bf16:
@@ -198,17 +211,24 @@ class Trainer:
         self.gan_loss = GANLoss(weight=1.0, reduction="mean").to(self.device)
 
         self.id_loss = IDLoss(weight=id_loss_weight, provider=id_encode_provider).to(self.device)
-        self.rec_loss = l1_loss_fn(weight=rec_loss, reduction="none")
 
-        self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="none").to(self.device)
+        if self.enable_rec_loss:
+            self.rec_loss = l1_loss_fn(weight=rec_loss_weight, reduction="none")
+
+        if self.enable_perceptual_loss:
+            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="none").to(self.device)
 
         if self.enable_ifsr_loss:
             self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight).to(self.device)
 
         if self.enable_wfm_loss:
             self.wfm_loss = WFMLoss(layer_weights=wfm_loss_weight, criterion="l1").to(self.device)
+
         if self.enable_color_loss:
             self.color_loss = StyleLossLabChroma(weight=color_loss_weight, range_norm=True).to(self.device)
+
+        if self.enable_dssim_loss:
+            self.dssim_loss = DSSIMLoss(weight=dssim_loss_weight, reduction="none").to(self.device)
 
         # ========================= LOG =========================
         base_log_path = Path(log_path)
@@ -237,14 +257,27 @@ class Trainer:
             same_use_src_dst=True,
         )
 
-        self.dataset = DALIGenericIterator(pipelines=pipe, output_map=["src", "dst", "is_same"], auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
+        self.sample_output_map = ["src", "dst", "is_same"]
+        self.dataset = DALIGenericIterator(pipelines=pipe, output_map=self.sample_output_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
 
         # ========================= compile_module =========================
         self.train_module: dict[str, nn.Module] = {}
 
         for net_name in ["net_g", "net_d"]:
             net: nn.Module = getattr(self, net_name)
+
+            if isinstance(net, UNetDiscriminatorSN):
+                self.train_module[net_name] = net
+                continue
+
             self.train_module[net_name] = torch.compile(net, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True}) if compile_module else net
+
+        self.face_mask = torch.compile(
+            FaceParsing(range_norm=True, occ=True).to(self.device),
+            fullgraph=True,
+            dynamic=False,
+            options={"max_autotune": True, "epilogue_fusion": True},
+        )
 
     @torch.no_grad()
     def log(self, k: str, v: Tensor, right_now: bool = False) -> None:
@@ -252,12 +285,12 @@ class Trainer:
             self.log_writer.add_scalar(f"Loss/{k}", v.detach().mean().item(), self.iter)
 
     @torch.no_grad()
-    def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor]:
+    def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         data: dict[str, Tensor] = self.dataset.next()[0]
-        src, dst, is_same = (data[k] for k in ("src", "dst", "is_same"))
+        src, dst, is_same = (data[k] for k in self.sample_output_map)
         is_same = is_same.squeeze_(-1)
-
-        return src, dst, is_same
+        dst_mask = self.face_mask(dst)
+        return src, dst, dst_mask, is_same
 
     @torch.no_grad()
     def update_ema(self, decay=0.999):
@@ -297,12 +330,12 @@ class Trainer:
         net_d, net_g = (self.train_module[module_name] for module_name in ("net_d", "net_g"))
 
         for self.iter in tqdm(itertools.count(start=self.iter), initial=self.iter, mininterval=1.0, bar_format="{n_fmt:7} | speed {rate_fmt:3} | train time {elapsed}"):
-            src, dst, is_same = self.fetch_sample()
+            src, dst, dst_mask, is_same = self.fetch_sample()
 
             torch.compiler.cudagraph_mark_step_begin()
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
-                with torch.inference_mode():
-                    src_id_feats = self.id_loss.get_id_feats(zoom_in(src, 0.102))
+                with torch.no_grad():
+                    src_id_feats = self.id_loss.get_id_feats(src)
                     if self.enable_ifsr_loss:
                         dst_ifsr_feats = self.ifsr_loss.get_ifsr_feats(dst)
 
@@ -311,90 +344,99 @@ class Trainer:
                 # ========================= train d =========================
                 if self.iter % self.d_train_setp == 0:
                     self.optim_d.zero_grad()
-                    d_loss: Tensor = torch.tensor(0.0, device=self.device)
 
-                    d_step = self.iter // self.d_train_setp
-                    is_r1_reg_step = d_step % self.r1_reg_step == 0
+                    is_r1_reg_step = (self.iter // self.d_train_setp) % self.r1_reg_step == 0
 
                     real_img = dst.detach().requires_grad_(is_r1_reg_step)
 
-                    fake_global_score = net_d(fake.detach())
-                    real_global_score = net_d(real_img)
+                    fake_score = net_d(fake.detach())
+                    real_score = net_d(real_img)
 
-                    global_d_loss = self.d_loss(fake_global_score, real_global_score)
-                    self.log("global_d_loss", global_d_loss, True)
-                    d_loss += global_d_loss
+                    d_loss = self.d_loss(fake_score, real_score)
+                    self.log("d_loss", d_loss, True)
 
-                    if is_r1_reg_step:
-                        with autocast(device_type="cuda", enabled=False):
-                            r1_loss = r1_reg_loss(real_global_score, real_img)
+                    with autocast(device_type="cuda", enabled=False):
+                        if is_r1_reg_step:
+                            r1_loss = r1_reg_loss(real_score, real_img)
                             self.log("r1_loss", r1_loss)
                             d_loss += r1_loss
 
-                    d_loss.backward()
-                    self.optim_d.step()
+                        d_loss.backward()
+                        self.optim_d.step()
+
+                    if self.use_cosine_lr:
+                        self.lr_scheduler_d.step()
 
                 # ========================= train g =========================
                 self.optim_g.zero_grad()
-                loss: Tensor = torch.tensor(0.0, device=self.device)
+                g_loss: Tensor = torch.tensor(0.0, device=self.device)
 
                 # gan_loss
                 if self.enable_wfm_loss:
-                    fake_global_score, fake_feats = net_d(fake, True)
+                    fake_score, fake_feats = net_d(fake, True)
                 else:
-                    fake_global_score = net_d(fake)
-                global_gan_loss = self.gan_loss(fake_global_score)
-                self.log("global_gan_loss", global_gan_loss)
-                loss += global_gan_loss
+                    fake_score = net_d(fake)
+
+                gan_loss = self.gan_loss(fake_score)
+                self.log("gan_loss", gan_loss)
+                g_loss += gan_loss
 
                 # wfm_loss
                 if self.enable_wfm_loss:
-                    with torch.inference_mode():
+                    with torch.no_grad():
                         _, real_feats = net_d(dst, True)
                     wfm_loss = self.wfm_loss(fake_feats, real_feats)
                     self.log("wfm_loss", wfm_loss)
-                    loss += wfm_loss
+                    g_loss += wfm_loss
 
-                # loss_id
-                fake_id_feats = self.id_loss.get_id_feats(zoom_in(fake, 0.102))
+                # id_loss
+                fake_id_feats = self.id_loss.get_id_feats(fake)
                 id_loss = self.id_loss(fake_id_feats, src_id_feats)
                 self.log("id_loss", id_loss)
-                loss += id_loss
+                g_loss += id_loss
 
                 # ifsr_loss
                 if self.enable_ifsr_loss:
                     fake_ifsr_feats = self.ifsr_loss.get_ifsr_feats(fake)
                     ifsr_loss = self.ifsr_loss(fake_ifsr_feats, dst_ifsr_feats)
                     self.log("ifsr_loss", ifsr_loss)
-                    loss += ifsr_loss
-
-                same_reduced = is_same.sum().clamp_min(1.0)
+                    g_loss += ifsr_loss
 
                 # perceptual_loss
-                perceptual_loss = self.perceptual_loss(fake, dst)
-                perceptual_loss = (perceptual_loss * is_same).sum() / same_reduced
-                self.log("perceptual_loss", perceptual_loss)
-                loss += perceptual_loss
+                if self.enable_perceptual_loss:
+                    perceptual_loss = self.perceptual_loss(fake, dst)
+                    perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                    self.log("perceptual_loss", perceptual_loss)
+                    g_loss += perceptual_loss
 
                 # rec_loss
-                rec_loss = self.rec_loss(fake, dst)  # BCHW
-                rec_loss = rec_loss.mean(dim=[1, 2, 3])
-                rec_loss = (rec_loss * is_same).sum() / same_reduced
-                self.log("rec_loss", rec_loss)
-                loss += rec_loss
+                if self.enable_rec_loss:
+                    rec_loss = self.rec_loss(fake, dst)  # BCHW
+                    rec_loss *= dst_mask
+                    rec_loss = rec_loss.mean(dim=[1, 2, 3])
+                    rec_loss = (rec_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                    self.log("rec_loss", rec_loss)
+                    g_loss += rec_loss
 
                 # color_loss
                 if self.enable_color_loss:
                     color_loss = self.color_loss(fake, dst)
                     self.log("color_loss", color_loss)
-                    loss += color_loss
+                    g_loss += color_loss
 
-            loss.backward()
+                # dssim_loss
+                if self.enable_dssim_loss:
+                    dssim_loss = self.dssim_loss(fake, dst)
+                    dssim_loss *= dst_mask
+                    dssim_loss = dssim_loss.sum() / (dst_mask.sum() + EPS)
+                    self.log("dssim_loss", dssim_loss)
+                    g_loss += dssim_loss
+
+            g_loss.backward()
             self.optim_g.step()
 
             if self.use_cosine_lr:
                 self.lr_scheduler_g.step()
-                self.lr_scheduler_d.step()
 
             self.update_ema()
 
@@ -403,7 +445,7 @@ class Trainer:
 
             if self.iter % self.sample_save_every == 0:
                 with torch.inference_mode():
-                    src_id_feats = self.id_loss.get_id_feats(zoom_in(src, 0.102))
+                    src_id_feats = self.id_loss.get_id_feats(src)
                     fake: Tensor = self.net_g_ema(dst, src_id_feats)
                     attn_map: list[Tensor] = self.net_g_ema.get_attention_maps()
                     grid = [src, dst, fake]
@@ -424,12 +466,8 @@ class Trainer:
                     grid.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)
                     grid = make_grid(grid, nrow=self.batch_size)[[2, 1, 0], :, :]  # RGB -> BGR
                     grid = grid.permute(1, 2, 0)  # CHW -> HWC
-                grid_cpu = grid.to(device="cpu", dtype=torch.uint8).numpy()
-                cv2.imwrite(
-                    self.sample_dir / f"{self.iter}.png",
-                    grid_cpu,
-                    [cv2.IMWRITE_PNG_COMPRESSION, 3],
-                )
+                    grid_cpu = grid.to(device="cpu", dtype=torch.uint8).numpy()
+                cv2.imwrite(self.sample_dir / f"{self.iter}.png", grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3])
 
 
 if __name__ == "__main__":
@@ -452,7 +490,9 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            "ckpt": "train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch_1/ckpt/975034.pth",
+            # "ckpt": "train_log/256_MS1MV2_TRANSFACE_B/ckpt/476210.pth",
+            "log_path": "train_log/256_1_PixelShuffle_1_AlphaFaceDisec",
+            "id_encode_provider": IDLoss.Provider.MS1MV2_TRANSFACE_B,
             "net_g_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
@@ -462,46 +502,23 @@ if __name__ == "__main__":
                 "id_dim": 512,
                 "w_dim": 256,
                 "mapping_num": 4,
-                "skip_index": 2,
+                "skip_index": (0, 1, 2, 3, 4),
             },
+            "discriminator_typt": DISCRIMINATOR_TYPT.ORIGIN,
             "net_d_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
-                "num_encoder": 6,
+                # "num_encoder": 6,
                 "base_ch": 64,
                 "max_ch": 512,
-                # "group_size": 4,
+                # "group_size": 5,
             },
-            "log_path": "train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch_1_Same1.0",
-            "enable_ifsr_loss": False,
-            "enable_wfm_loss": True,
-            "wfm_loss_weight": {
-                0: 1.0,
-                1: 1.0,
-                2: 1.0,
-                3: 1.0,
-                4: 1.0,
-                5: 1.0,
-            },
-            "same_image_prob": 1.0,
-            "discriminator_typt": DISCRIMINATOR_TYPT.ORIGIN,
             "r1_reg_step": 1,
-            "perceptual_loss_weight": {
-                # vgg16
-                # "relu1_2": 1.0,
-                # "relu2_2": 1.0,
-                # "relu3_3": 1.0,
-                # "relu4_2": 1.0,
-                "pool1": 0.2,
-                "pool2": 0.2,
-                "pool3": 0.2,
-                "pool4": 0.2,
-                "pool5": 0.2,
-            },
-            "enable_color_loss": True,
-            "batch_size": 10,
-            "id_loss_weight": 10,
-            "id_encode_provider": IDLoss.Provider.MS1MV2_TRANSFACE_B,
+            "enable_wfm_loss": True,
+            "enable_rec_loss": True,
+            "enable_perceptual_loss": True,
+            "enable_dssim_loss": True,
+            # "enable_color_loss": True,
         }
     )
 

@@ -238,9 +238,7 @@ class DINOv2PerceptualLoss(nn.Module):
             y = (y - self.mean) / self.std
 
         x_patch = self.dino.get_intermediate_layers(x, n=self.n_blocks)
-
-        with torch.inference_mode():
-            y_patch = self.dino.get_intermediate_layers(y, n=self.n_blocks)
+        y_patch = self.dino.get_intermediate_layers(y, n=self.n_blocks)
 
         loss = 0.0
         for idx, weight in self.layer_weights.items():
@@ -332,17 +330,13 @@ class VGGPerceptualLoss(nn.Module):
 
         if self.range_norm:
             x = (x + 1) * 0.5
+            y = (y + 1) * 0.5
         if self.use_input_norm:
             x = (x - self.mean) / self.std
+            y = (y - self.mean) / self.std
 
         fx: list[Tensor] = self.vgg(x)
-
-        with torch.inference_mode():
-            if self.range_norm:
-                y = (y + 1) * 0.5
-            if self.use_input_norm:
-                y = (y - self.mean) / self.std
-            fy: list[Tensor] = self.vgg(y)
+        fy: list[Tensor] = self.vgg(y)
 
         loss = 0.0
         for weight, a, b in zip(self.weights, fx, fy):

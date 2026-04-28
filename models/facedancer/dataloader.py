@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 from numpy import ndarray
-from scipy.stats import norm
+from scipy.stats import truncnorm
 import cv2
 import nvidia.dali.fn as fn
 from nvidia.dali import pipeline_def
@@ -13,7 +13,15 @@ from misc.utils import ImageFolder
 
 
 class RndWarpPars(object):
-    def __init__(self, size: int, rotation_range=[-1.0, 1.0], scale_range=[-0.0, 0.0], tx_range=[-0.05, 0.05], ty_range=[-0.05, 0.05], trunc_val=2.5):
+    def __init__(
+        self,
+        size: int,
+        rotation_range=[-10.0, 10.0],
+        scale_range=[-0.25, 0.25],
+        tx_range=[-0.05, 0.05],
+        ty_range=[-0.05, 0.05],
+        trunc_val=2.5,
+    ):
 
         self.size = size
         self.rotation_range = rotation_range
@@ -24,28 +32,10 @@ class RndWarpPars(object):
         self.rng = np.random.default_rng(None)
 
     def random_normal(self, shape):
+        samples = truncnorm.rvs(-self.trunc_val, self.trunc_val, loc=0.0, scale=1.0, size=shape, random_state=self.rng)
+        return (samples / self.trunc_val).astype(np.float32)
 
-        size = np.prod(shape)
-        out = np.empty(size, dtype=np.float32)
-
-        accept_prob = norm.cdf(self.trunc_val) - norm.cdf(-self.trunc_val)
-
-        filled = 0
-        while filled < size:
-            remaining = size - filled
-            batch_size = int(remaining / accept_prob * 1.2) + 100
-
-            samples = self.rng.normal(size=batch_size)
-            valid_mask = np.abs(samples) <= self.trunc_val
-            valid_samples = samples[valid_mask] / self.trunc_val
-
-            n_valid = min(len(valid_samples), remaining)
-            out[filled : filled + n_valid] = valid_samples[:n_valid]
-            filled += n_valid
-
-        return out.reshape(shape).astype(np.float32)
-
-    def __call__(self, sample_info):
+    def __call__(self, sample_info) -> tuple[ndarray, ndarray, ndarray]:
         _ = sample_info
 
         w = self.size
@@ -280,7 +270,6 @@ def datasetloader(
     same_image_prob: float = 0.2,
     same_use_src_dst: bool = True,
     random_sampling: bool = True,
-    rndwarp: bool = False,
 ):
 
     external_source = fn.external_source(
@@ -308,9 +297,6 @@ def datasetloader(
     else:
         identity_sampler = external_source
 
-    if rndwarp:
-        random_warp_params = fn.external_source(source=RndWarpPars(resize), num_outputs=3, device="gpu", no_copy=False, parallel=False, dtype=DALIDataType.FLOAT, batch=False)
-
     # 是否采样同一身份
     if fn.random.coin_flip(probability=same_image_prob, dtype=DALIDataType.BOOL):
         is_same = Constant(value=1.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])
@@ -336,12 +322,6 @@ def datasetloader(
     dst = fn.resize(dst, device="gpu", size=resize, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
     if fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.BOOL):
         dst = fn.flip(dst, device="gpu")
-
-    if rndwarp:
-        mapx, mapy, transform_matrix = random_warp_params[0:]
-        dst = fn.experimental.remap(dst, mapx, mapy)
-        dst = fn.reinterpret(dst, layout="HWC")
-        dst = fn.warp_affine(dst, transform_matrix)
 
     dst = fn.color_twist(
         dst,

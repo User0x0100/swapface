@@ -74,10 +74,10 @@ class AlphaFaceDiscriminator(nn.Module):
 
         self.down_blocks = nn.ModuleList([DownRB(features[i], features[i + 1]) for i in range(n_blocks)])
 
-        final_features = features[-1] + 1
+        final_features = features[-1]
         final_res = img_resolution // (2 ** len(features))
         self.final_conv = nn.Sequential(
-            MinibatchStdLayer(group_size),
+            # MinibatchStdLayer(group_size),
             nn.Conv2d(final_features, final_features, 3),
             nn.Flatten(),
             nn.Linear(final_res**2 * final_features, 1),

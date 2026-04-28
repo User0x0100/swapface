@@ -14,13 +14,9 @@ class UNetDiscriminatorSN(nn.Module):
     def __init__(self, num_in_ch: int = 3, num_feat: int = 64, skip_connection: bool = True) -> None:
         super().__init__()
 
-        self.skip_connection = skip_connection
+        self.network_cfg = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
 
-        self.network_cfg = {
-            "num_in_ch": num_in_ch,
-            "num_feat": num_feat,
-            "skip_connection": skip_connection,
-        }
+        self.skip_connection = skip_connection
 
         # the first convolution
         self.conv0 = nn.Conv2d(num_in_ch, num_feat, kernel_size=3, stride=1, padding=1)
@@ -37,9 +33,11 @@ class UNetDiscriminatorSN(nn.Module):
         self.conv8 = spectral_norm(nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=False))
         self.conv9 = nn.Conv2d(num_feat, 1, 3, 1, 1)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, return_feats: bool = False) -> Tensor | tuple[Tensor, list[Tensor]]:
 
         inplace = False
+
+        feats = [] if return_feats else None
 
         # downsample
         x0 = F.leaky_relu(self.conv0(x), negative_slope=0.2, inplace=inplace)
@@ -47,9 +45,15 @@ class UNetDiscriminatorSN(nn.Module):
         x2 = F.leaky_relu(self.conv2(x1), negative_slope=0.2, inplace=inplace)
         x3 = F.leaky_relu(self.conv3(x2), negative_slope=0.2, inplace=inplace)
 
+        if return_feats:
+            for v in [x0, x1, x2, x3]:
+                feats.append(v)
+
         # upsample
         x3 = F.interpolate(x3, scale_factor=2, mode="bilinear", align_corners=False)
         x4 = F.leaky_relu(self.conv4(x3), negative_slope=0.2, inplace=inplace)
+        if return_feats:
+            feats.append(x4)
 
         if self.skip_connection:
             x4 = x4 + x2
@@ -69,4 +73,4 @@ class UNetDiscriminatorSN(nn.Module):
         out = F.leaky_relu(self.conv8(out), negative_slope=0.2, inplace=inplace)
         out = self.conv9(out)
 
-        return out
+        return (out, feats) if feats is not None else out
