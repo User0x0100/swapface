@@ -80,7 +80,7 @@ class Trainer:
         net_d_cfg: dict[str, int] | None = None,
         # 身份损失
         id_encode_provider: IDLoss.Provider = IDLoss.Provider.BLENDFACE,
-        id_loss_weight: float = 10.0,
+        id_loss_weight: float = 5.0,
         # 自重建损失
         enable_rec_loss: bool = False,
         rec_loss_weight: float = 5.0,
@@ -88,20 +88,20 @@ class Trainer:
         enable_perceptual_loss: bool = False,
         perceptual_loss_weight: dict[str, float] = {
             # vgg16
-            # "relu1_2": 0.25,
-            # "relu2_2": 0.25,
-            # "relu3_3": 0.25,
-            # "relu4_2": 0.25,
+            "relu1_2": 0.25,
+            "relu2_2": 0.25,
+            "relu3_3": 0.25,
+            "relu4_2": 0.25,
             # "pool1": 0.25,
-            "pool2": 0.25,
-            "pool3": 0.25,
+            # "pool2": 0.25,
+            # "pool3": 0.25,
             # "pool4": 0.25,
             # "pool5": 0.25,
         },
         # 判别器中间特征得弱特征匹配
         enable_wfm_loss: bool = False,
         wfm_loss_weight: dict[int, float] = {
-            # 0: 1.0,
+            0: 1.0,
             1: 1.0,
             2: 1.0,
             3: 1.0,
@@ -129,7 +129,7 @@ class Trainer:
         color_loss_weight: float = 0.1,
         # 结构损失
         enable_dssim_loss: bool = False,
-        dssim_loss_weight: float = 2.5,
+        dssim_loss_weight: float = 10.0,
     ):
 
         args = locals().copy()
@@ -216,7 +216,7 @@ class Trainer:
             self.rec_loss = l1_loss_fn(weight=rec_loss_weight, reduction="none")
 
         if self.enable_perceptual_loss:
-            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="none").to(self.device)
+            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
 
         if self.enable_ifsr_loss:
             self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight).to(self.device)
@@ -405,7 +405,7 @@ class Trainer:
                 # perceptual_loss
                 if self.enable_perceptual_loss:
                     perceptual_loss = self.perceptual_loss(fake, dst)
-                    perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                    # perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
                     self.log("perceptual_loss", perceptual_loss)
                     g_loss += perceptual_loss
 
@@ -490,8 +490,8 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            # "ckpt": "train_log/256_MS1MV2_TRANSFACE_B/ckpt/476210.pth",
-            "log_path": "train_log/256_1_PixelShuffle_1_AlphaFaceDisec",
+            "ckpt": "train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch_1/ckpt/975034.pth",
+            "log_path": "train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch_1_1",
             "id_encode_provider": IDLoss.Provider.MS1MV2_TRANSFACE_B,
             "net_g_cfg": {
                 "img_resolution": 256,
@@ -502,13 +502,13 @@ if __name__ == "__main__":
                 "id_dim": 512,
                 "w_dim": 256,
                 "mapping_num": 4,
-                "skip_index": (0, 1, 2, 3, 4),
+                "skip_index": 2,
             },
             "discriminator_typt": DISCRIMINATOR_TYPT.ORIGIN,
             "net_d_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
-                # "num_encoder": 6,
+                "num_encoder": 6,
                 "base_ch": 64,
                 "max_ch": 512,
                 # "group_size": 5,
@@ -518,7 +518,7 @@ if __name__ == "__main__":
             "enable_rec_loss": True,
             "enable_perceptual_loss": True,
             "enable_dssim_loss": True,
-            # "enable_color_loss": True,
+            "enable_color_loss": True,
         }
     )
 
