@@ -8,6 +8,7 @@ from huggingface_hub import hf_hub_download
 
 from .iresnet import iresnet50, iresnet100
 from .vit import vit_s, vit_b, vit_l
+from .adaface import IR_101
 from ...models import REPO_ID
 
 
@@ -34,6 +35,8 @@ class PROVIDER(Enum):
     MS1MV2_TRANSFACE_S = {"backbone": vit_s, "weight": "ms1mv2_model_TransFace_S.pt"}
     MS1MV2_TRANSFACE_B = {"backbone": vit_b, "weight": "ms1mv2_model_TransFace_B.pt"}
     MS1MV2_TRANSFACE_L = {"backbone": vit_l, "weight": "ms1mv2_model_TransFace_L.pt"}
+    MS1MV2_AdaFace_R100 = {"backbone": IR_101, "weight": "adaface_ir101_ms1mv2.ckpt"}
+    MS1MV3_AdaFace_R100 = {"backbone": IR_101, "weight": "adaface_ir101_ms1mv3.ckpt"}
 
 
 class IDEncoder(nn.Module):
@@ -80,7 +83,7 @@ class IDEncoder(nn.Module):
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    idencoder = IDEncoder(PROVIDER.MS1MV2_TRANSFACE_S).to(device)
+    idencoder = IDEncoder(PROVIDER.MS1MV3_AdaFace_R100).to(device)
 
     idencoder = torch.compile(idencoder, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
 
