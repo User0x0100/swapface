@@ -81,23 +81,6 @@ class AdaIN(nn.Module):
         return x + self.alpha * (mod - x)
 
 
-class AdaINRB(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, w_dim: int, sampling: RBSampleMode) -> None:
-        super().__init__()
-
-        self.adain = AdaIN(in_ch, w_dim)
-        self.resblock = ResBlockBase(in_ch, out_ch, sampling)
-
-    def forward(self, x: Tensor, w: Tensor) -> Tensor:
-
-        skip = self.resblock.shortcut(x)
-
-        x = self.adain(x, w)
-        x = self.resblock.residual(x)
-
-        return x + skip
-
-
 class IDInjection(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample_mode: RBSampleMode) -> None:
         super().__init__()
@@ -188,56 +171,11 @@ if __name__ == "__main__":
         "id_dim": 512,
         "w_dim": 256,
         "mapping_num": 4,
-        "skip_index": 2,
     }
 
     model = Generator(**network_cfg).to(device)
-    # ckpt = torch.load("train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch_1/ckpt/975034.pth", map_location=torch.device("cpu"), weights_only=False)
-    # model = Generator(**ckpt["net_g"]["network_cfg"])
-    # model.load_state_dict(ckpt["net_g"]["state_dict"])
     model.eval()
 
-    # for name, m in model.named_modules():
-    #     if isinstance(m, SkipSPADE):
-    #         print(
-    #             name,
-    #             "alpha =",
-    #             m.alpha.item(),
-    #             "gamma_w =",
-    #             m.to_gamma.weight.abs().mean().item(),
-    #             "gamma_b =",
-    #             m.to_gamma.bias.abs().mean().item(),
-    #             "beta_w =",
-    #             m.to_beta.weight.abs().mean().item(),
-    #             "beta_b =",
-    #             m.to_beta.bias.abs().mean().item(),
-    #         )
-
-    # for name, m in model.named_modules():
-    #     if isinstance(m, AdaIN):
-    #         alpha = m.alpha.detach().float().item()
-
-    #         gamma_w = m.fc_gamma.weight.detach().float().abs().mean().item()
-    #         gamma_b = m.fc_gamma.bias.detach().float().abs().mean().item()
-    #         beta_w = m.fc_beta.weight.detach().float().abs().mean().item()
-    #         beta_b = m.fc_beta.bias.detach().float().abs().mean().item()
-
-    #         alpha_grad = None if m.alpha.grad is None else m.alpha.grad.detach().float().item()
-    #         gamma_w_grad = None if m.fc_gamma.weight.grad is None else m.fc_gamma.weight.grad.detach().float().abs().mean().item()
-    #         gamma_b_grad = None if m.fc_gamma.bias.grad is None else m.fc_gamma.bias.grad.detach().float().abs().mean().item()
-    #         beta_w_grad = None if m.fc_beta.weight.grad is None else m.fc_beta.weight.grad.detach().float().abs().mean().item()
-    #         beta_b_grad = None if m.fc_beta.bias.grad is None else m.fc_beta.bias.grad.detach().float().abs().mean().item()
-
-    #         print(
-    #             f"{name:45s} | "
-    #             f"alpha={alpha:+.6e} grad={alpha_grad} | "
-    #             f"gamma_w={gamma_w:.3e} grad={gamma_w_grad} | "
-    #             f"gamma_b={gamma_b:.3e} grad={gamma_b_grad} | "
-    #             f"beta_w={beta_w:.3e} grad={beta_w_grad} | "
-    #             f"beta_b={beta_b:.3e} grad={beta_b_grad}"
-    #         )
-
-    # exit()
     x_target = torch.randn((batch_size, network_cfg["img_channels"], network_cfg["img_resolution"], network_cfg["img_resolution"]), device=device)
     id_feat = torch.randn((batch_size, network_cfg["id_dim"]), device=device)
     summary(model, input_data=(x_target, id_feat), depth=2, col_names=("input_size", "output_size", "num_params", "kernel_size", "mult_adds"), row_settings=("var_names",))
