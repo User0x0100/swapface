@@ -166,19 +166,19 @@ class Decoder(nn.Module):
 
         x = self.upscale0(inp)
         x = self.res0(x)
-        self.syle_delta0(x, w)
+        x = self.syle_delta0(x, w)
 
         x = self.upscale1(x)
         x = self.res1(x)
-        self.syle_delta1(x, w)
+        x = self.syle_delta1(x, w)
 
         x = self.upscale2(x)
         x = self.res2(x)
-        self.syle_delta2(x, w)
+        x = self.syle_delta2(x, w)
 
         x = self.upscale3(x)
         x = self.res3(x)
-        self.syle_delta3(x, w)
+        x = self.syle_delta3(x, w)
 
         x0 = self.out_conv(x)
         x1 = self.out_conv1(x)
