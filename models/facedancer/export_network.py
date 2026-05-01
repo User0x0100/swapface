@@ -66,7 +66,6 @@ def torch2onnx(
         f,
         export_params=True,
         dynamo=True,
-        fallback=False,
         optimize=optimize,
         verify=True,
         external_data=False,

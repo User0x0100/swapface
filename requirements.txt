@@ -18,3 +18,5 @@ fvcore
 xformers
 torchinfo
 ninja
+scipy
+tensorrt-cu12==10.9.0.34
