@@ -270,6 +270,7 @@ def datasetloader(
     same_image_prob: float = 0.2,
     same_use_src_dst: bool = True,
     random_sampling: bool = True,
+    use_gpu_decode: bool = True,
 ):
 
     external_source = fn.external_source(
@@ -313,12 +314,22 @@ def datasetloader(
         is_same = Constant(value=0.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])
         src_raw, dst_raw = external_source
 
-    src = fn.decoders.image(src_raw, device="mixed", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
+    if use_gpu_decode:
+        src = fn.decoders.image(src_raw, device="mixed", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
+    else:
+        src = fn.decoders.image(src_raw, device="cpu", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
+        src = fn.copy(src, device="gpu")
+
     src = fn.resize(src, device="gpu", size=resize, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
     if fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.BOOL):
         src = fn.flip(src, device="gpu")
 
-    dst = fn.decoders.image(dst_raw, device="mixed", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
+    if use_gpu_decode:
+        dst = fn.decoders.image(dst_raw, device="mixed", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
+    else:
+        dst = fn.decoders.image(dst_raw, device="cpu", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
+        dst = fn.copy(dst, device="gpu")
+
     dst = fn.resize(dst, device="gpu", size=resize, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
     if fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.BOOL):
         dst = fn.flip(dst, device="gpu")

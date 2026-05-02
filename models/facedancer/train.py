@@ -242,6 +242,9 @@ class Trainer:
         self.log_writer = SummaryWriter(self.tensorboard_dir)
 
         # ========================= Sample =========================
+
+        major, _minor = torch.cuda.get_device_capability(device)
+        use_gpu_decode = major >= 8
         pipe = datasetloader(
             batch_size=self.batch_size,
             num_threads=2,
@@ -255,7 +258,10 @@ class Trainer:
             identity_root=identity_root,
             same_image_prob=same_image_prob,
             same_use_src_dst=True,
+            use_gpu_decode=use_gpu_decode,
         )
+
+        print(f"use_gpu_decode={use_gpu_decode}")
 
         self.sample_output_map = ["src", "dst", "is_same"]
         self.dataset = DALIGenericIterator(pipelines=pipe, output_map=self.sample_output_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
