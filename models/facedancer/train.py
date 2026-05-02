@@ -80,7 +80,7 @@ class Trainer:
         net_d_cfg: dict[str, int] | None = None,
         # 身份损失
         id_encode_provider: IDLoss.Provider = IDLoss.Provider.BLENDFACE,
-        id_loss_weight: float = 5.0,
+        id_loss_weight: float = 10.0,
         # 自重建损失
         enable_rec_loss: bool = False,
         rec_loss_weight: float = 5.0,
@@ -101,7 +101,7 @@ class Trainer:
         # 判别器中间特征得弱特征匹配
         enable_wfm_loss: bool = False,
         wfm_loss_weight: dict[int, float] = {
-            0: 1.0,
+            # 0: 1.0,
             1: 1.0,
             2: 1.0,
             3: 1.0,
@@ -198,8 +198,8 @@ class Trainer:
         self.net_g_ema.eval().requires_grad_(False)
 
         # ========================= Optim =========================
-        self.optim_g = optim.AdamW(self.net_g.parameters(), lr=lr, betas=(0.5, 0.99), fused=True)
-        self.optim_d = optim.AdamW(self.net_d.parameters(), lr=lr, betas=(0.5, 0.99), fused=True)
+        self.optim_g = optim.Adam(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
+        self.optim_d = optim.Adam(self.net_d.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
 
         if self.use_cosine_lr:
             self.lr_scheduler_g = CosineAnnealingLR(self.optim_g, T_max=lr_scheduler_t_max, eta_min=lr * 0.1)
@@ -216,7 +216,7 @@ class Trainer:
             self.rec_loss = l1_loss_fn(weight=rec_loss_weight, reduction="none")
 
         if self.enable_perceptual_loss:
-            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
+            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="none").to(self.device)
 
         if self.enable_ifsr_loss:
             self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight).to(self.device)
@@ -246,7 +246,7 @@ class Trainer:
             batch_size=self.batch_size,
             num_threads=2,
             prefetch_queue_depth=5,
-            py_num_workers=3,
+            py_num_workers=10,
             py_start_method="spawn",
             device_id=self.device.index,
             resize=self.img_resolution,
@@ -343,13 +343,13 @@ class Trainer:
 
                 # ========================= train d =========================
                 if self.iter % self.d_train_setp == 0:
+                    net_d.requires_grad_(True)
                     self.optim_d.zero_grad()
 
                     is_r1_reg_step = (self.iter // self.d_train_setp) % self.r1_reg_step == 0
 
-                    real_img = dst.detach().requires_grad_(is_r1_reg_step)
-
                     fake_score = net_d(fake.detach())
+                    real_img = dst.detach().requires_grad_(is_r1_reg_step)
                     real_score = net_d(real_img)
 
                     d_loss = self.d_loss(fake_score, real_score)
@@ -358,6 +358,7 @@ class Trainer:
                     with autocast(device_type="cuda", enabled=False):
                         if is_r1_reg_step:
                             r1_loss = r1_reg_loss(real_score, real_img)
+                            r1_loss *= self.r1_reg_step
                             self.log("r1_loss", r1_loss)
                             d_loss += r1_loss
 
@@ -368,6 +369,7 @@ class Trainer:
                         self.lr_scheduler_d.step()
 
                 # ========================= train g =========================
+                net_d.requires_grad_(False)
                 self.optim_g.zero_grad()
                 g_loss: Tensor = torch.tensor(0.0, device=self.device)
 
@@ -405,15 +407,15 @@ class Trainer:
                 # perceptual_loss
                 if self.enable_perceptual_loss:
                     perceptual_loss = self.perceptual_loss(fake, dst)
-                    # perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                    perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
                     self.log("perceptual_loss", perceptual_loss)
                     g_loss += perceptual_loss
 
                 # rec_loss
                 if self.enable_rec_loss:
-                    rec_loss = self.rec_loss(fake, dst)  # BCHW
-                    rec_loss *= dst_mask
-                    rec_loss = rec_loss.mean(dim=[1, 2, 3])
+                    rec_map = self.rec_loss(fake, dst)  # B,C,H,W
+                    rec_map = rec_map * dst_mask
+                    rec_loss = rec_map.sum(dim=[1, 2, 3]) / (dst_mask.sum(dim=[1, 2, 3]).clamp_min(1.0) * fake.shape[1])
                     rec_loss = (rec_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
                     self.log("rec_loss", rec_loss)
                     g_loss += rec_loss
@@ -490,11 +492,11 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            "ckpt": "train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch_1/ckpt/975034.pth",
-            "log_path": "train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch_1_1",
-            "id_encode_provider": IDLoss.Provider.MS1MV2_TRANSFACE_B,
+            # "ckpt": "train_log/128_AEArch_1/ckpt/441250.pth",
+            "log_path": "train_log/128_Org",
+            "id_encode_provider": IDLoss.Provider.MS1MV3_ADAFACE_R100,
             "net_g_cfg": {
-                "img_resolution": 256,
+                "img_resolution": 128,
                 "img_channels": 3,
                 "num_encoder": 5,
                 "base_ch": 64,
@@ -502,11 +504,10 @@ if __name__ == "__main__":
                 "id_dim": 512,
                 "w_dim": 256,
                 "mapping_num": 4,
-                "skip_index": 2,
             },
             "discriminator_typt": DISCRIMINATOR_TYPT.ORIGIN,
             "net_d_cfg": {
-                "img_resolution": 256,
+                "img_resolution": 128,
                 "img_channels": 3,
                 "num_encoder": 6,
                 "base_ch": 64,

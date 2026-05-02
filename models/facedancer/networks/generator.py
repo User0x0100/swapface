@@ -106,8 +106,8 @@ class Concat(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, x_target: Tensor, x_source: Tensor) -> Tensor:
-        return torch.cat((x_target, x_source), dim=1)
+    def forward(self, x_encode: Tensor, x_decode: Tensor) -> Tensor:
+        return torch.cat((x_encode, x_decode), dim=1)
 
 
 class Atten(nn.Module):
@@ -124,13 +124,13 @@ class Atten(nn.Module):
 
         self.last_attn_mask = None
 
-    def forward(self, x_target: Tensor, x_source: Tensor) -> Tensor:
+    def forward(self, x_encode: Tensor, x_decode: Tensor) -> Tensor:
 
-        m = self.attn_mask_proj(torch.cat((x_target, x_source), dim=1))
+        m = self.attn_mask_proj(torch.cat((x_encode, x_decode), dim=1))
 
         self.last_attn_mask = m.detach()
 
-        return (1.0 - m) * x_target + m * x_source
+        return (1.0 - m) * x_encode + m * x_decode
 
     def get_attention_maps(self) -> Tensor | None:
         return self.last_attn_mask
