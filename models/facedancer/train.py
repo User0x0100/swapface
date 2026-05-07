@@ -412,7 +412,7 @@ class Trainer:
 
                 # perceptual_loss
                 if self.enable_perceptual_loss:
-                    perceptual_loss = self.perceptual_loss(fake, dst)
+                    perceptual_loss = self.perceptual_loss(fake, dst)  # B
                     perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
                     self.log("perceptual_loss", perceptual_loss)
                     g_loss += perceptual_loss
@@ -434,9 +434,10 @@ class Trainer:
 
                 # dssim_loss
                 if self.enable_dssim_loss:
-                    dssim_loss = self.dssim_loss(fake, dst)
-                    dssim_loss *= dst_mask
-                    dssim_loss = dssim_loss.sum() / (dst_mask.sum() + EPS)
+                    dssim_map = self.dssim_loss(fake, dst)  # B,1,H,W
+                    dssim_map *= dst_mask
+                    dssim_loss = dssim_map.sum(dim=[1, 2, 3]) / dst_mask.sum(dim=[1, 2, 3]).clamp_min(1.0)
+                    dssim_loss = dssim_loss.mean()
                     self.log("dssim_loss", dssim_loss)
                     g_loss += dssim_loss
 
@@ -499,17 +500,18 @@ if __name__ == "__main__":
     def_config.update(
         {
             # "ckpt": "train_log/128_Org/ckpt/268530.pth",
-            "log_path": "train_log/256_Org_1_1",
+            "log_path": "train_log/256_Org_ae",
             "id_encode_provider": IDLoss.Provider.MS1MV3_ADAFACE_R100,
             "net_g_cfg": {
-                "img_resolution": 256,
+                "img_resolution": 128,
                 "img_channels": 3,
-                "num_encoder": 5,
+                "num_depth": 5,
                 "base_ch": 64,
                 "max_ch": 512,
                 "id_dim": 512,
                 "w_dim": 256,
                 "mapping_num": 4,
+                "skip_idx": (),
             },
             "discriminator_typt": DISCRIMINATOR_TYPT.ORIGIN,
             "net_d_cfg": {

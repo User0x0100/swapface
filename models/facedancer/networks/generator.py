@@ -17,10 +17,10 @@ class ResBlockBase(nn.Module):
         match sampling:
             case RBSampleMode.UP:
                 self.residual = nn.Sequential(
-                    nn.LeakyReLU(0.2),
+                    nn.SiLU(),
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
                     nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                    nn.LeakyReLU(0.2),
+                    nn.SiLU(),
                     nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
                 )
                 self.shortcut = nn.Sequential(
@@ -30,10 +30,11 @@ class ResBlockBase(nn.Module):
 
             case RBSampleMode.DOWN:
                 self.residual = nn.Sequential(
-                    nn.LeakyReLU(0.2),
+                    nn.SiLU(),
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.AvgPool2d(2),
-                    nn.LeakyReLU(0.2),
+                    nn.SiLU(),
+                    nn.Conv2d(out_ch, out_ch, 1, stride=2, padding=0),
+                    nn.SiLU(),
                     nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
                 )
                 self.shortcut = nn.Sequential(
@@ -43,9 +44,9 @@ class ResBlockBase(nn.Module):
 
             case RBSampleMode.NONE:
                 self.residual = nn.Sequential(
-                    nn.LeakyReLU(0.2),
+                    nn.SiLU(),
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.LeakyReLU(0.2),
+                    nn.SiLU(),
                     nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
                 )
                 self.shortcut = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, 1, stride=1, padding=0, bias=shortcut_bias)
@@ -84,6 +85,11 @@ class AdaIN(nn.Module):
         nn.init.ones_(self.fc_gamma.bias)
         nn.init.normal_(self.fc_beta.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.fc_beta.bias)
+
+        # nn.init.zeros_(self.fc_gamma.weight)
+        # nn.init.ones_(self.fc_gamma.bias)
+        # nn.init.zeros_(self.fc_beta.weight)
+        # nn.init.zeros_(self.fc_beta.bias)
 
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
         x = self.norm(x)
@@ -126,7 +132,7 @@ class Atten(nn.Module):
         self.attn_mask_proj = nn.Sequential(
             nn.Conv2d(channels * 2, channels // 4, 3, padding=1),
             nn.InstanceNorm2d(channels // 4, affine=False),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
             nn.Conv2d(channels // 4, channels, 1, padding=0),
             nn.Sigmoid(),
         )
@@ -174,10 +180,40 @@ class SkipFusion(nn.Module):
                 x = self.resblock.residual(x)
             case SkipFusionModule.CONCAT:
                 x = self.fusion(x_encoder, x_decoder)
-                skip = self.resblock.shortcut(x)
                 x = self.adain(x, w)
+                skip = self.resblock.shortcut(x)
                 x = self.resblock.residual(x)
         return x + skip
+
+
+class FromRGB(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 5, stride=1, padding=2),
+            nn.SiLU(),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.conv(x)
+
+
+class ToRGB(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            nn.SiLU(),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(out_ch, out_ch, 1),
+            nn.Tanh(),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.conv(x)
 
 
 class Generator(nn.Module):
@@ -185,28 +221,29 @@ class Generator(nn.Module):
         self,
         img_resolution: int = 256,
         img_channels: int = 3,
-        num_encoder: int = 5,
+        num_depth: int = 5,
         base_ch: int = 64,
         max_ch: int = 512,
         id_dim: int = 512,
         w_dim: int = 256,
         mapping_num: int = 4,
+        skip_idx: tuple[int, ...] = (),
     ) -> None:
         super().__init__()
 
         self.network_cfg = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
 
-        self.mapping = nn.Sequential(nn.Linear(id_dim, id_dim), nn.LeakyReLU(0.2))
+        self.mapping = nn.Sequential(nn.Linear(id_dim, id_dim), nn.SiLU())
         for _ in range(mapping_num - 2):
             self.mapping.append(nn.Linear(id_dim, id_dim))
-            self.mapping.append(nn.LeakyReLU(0.2))
+            self.mapping.append(nn.SiLU())
         self.mapping.append(nn.Linear(id_dim, w_dim))
 
-        self.from_rgb = nn.Conv2d(img_channels, base_ch, 3, padding=1)
+        self.from_rgb = FromRGB(img_channels, base_ch)
 
-        features = [min(max_ch, base_ch * (2**i)) for i in range(num_encoder + 1)]
+        features = [min(max_ch, base_ch * (2**i)) for i in range(num_depth + 1)]
 
-        self.encoder = nn.Sequential(*[NormRB(features[i], features[i + 1], RBSampleMode.DOWN) for i in range(num_encoder)])
+        self.encoder = nn.Sequential(*[NormRB(features[i], features[i + 1], RBSampleMode.DOWN) for i in range(num_depth)])
 
         final_ch = features[-1]
 
@@ -214,14 +251,14 @@ class Generator(nn.Module):
         self.bottleneck_decode = AdaINRB(final_ch, final_ch, w_dim, RBSampleMode.NONE)
 
         self.decoder = nn.Sequential()
-        for i in range(num_encoder):
+        for i in range(num_depth):
             in_ch, out_ch = features[-(i + 1)], features[-(i + 2)]
-            if i < 2:
-                self.decoder.append(AdaINRB(in_ch, out_ch, w_dim, RBSampleMode.UP))
+            if i in skip_idx:
+                self.decoder.append(SkipFusion(in_ch, out_ch, w_dim, RBSampleMode.UP, SkipFusionModule.ATTEN))
             else:
-                self.decoder.append(SkipFusion(features[-(i + 1)], features[-(i + 2)], w_dim, RBSampleMode.UP, SkipFusionModule.ATTEN))
+                self.decoder.append(AdaINRB(in_ch, out_ch, w_dim, RBSampleMode.UP))
 
-        self.to_rgb = SkipFusion(base_ch, img_channels, w_dim, RBSampleMode.NONE, SkipFusionModule.CONCAT)
+        self.to_rgb = ToRGB(base_ch, img_channels)
 
     def get_attention_maps(self) -> list[Tensor]:
         return [maps for module in self.modules() if isinstance(module, Atten) if (maps := module.get_attention_maps()) is not None]
@@ -247,9 +284,9 @@ class Generator(nn.Module):
             else:
                 x = decode_layer(x, w)
 
-        x = self.to_rgb(from_rgb, x, w)
+        x = self.to_rgb(x)
 
-        return torch.tanh(x)
+        return x
 
 
 if __name__ == "__main__":
@@ -262,12 +299,13 @@ if __name__ == "__main__":
     network_cfg = {
         "img_resolution": 256,
         "img_channels": 3,
-        "num_encoder": 5,
+        "num_depth": 5,
         "base_ch": 64,
         "max_ch": 512,
         "id_dim": 512,
         "w_dim": 256,
         "mapping_num": 4,
+        "skip_idx": (),
     }
 
     model = Generator(**network_cfg).to(device)
