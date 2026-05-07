@@ -20,6 +20,8 @@ class ResBlockBase(nn.Module):
                     nn.LeakyReLU(0.2),
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
                     nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                    nn.LeakyReLU(0.2),
+                    nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
                 )
                 self.shortcut = nn.Sequential(
                     nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
@@ -31,6 +33,8 @@ class ResBlockBase(nn.Module):
                     nn.LeakyReLU(0.2),
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
                     nn.AvgPool2d(2),
+                    nn.LeakyReLU(0.2),
+                    nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
                 )
                 self.shortcut = nn.Sequential(
                     nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
@@ -40,7 +44,7 @@ class ResBlockBase(nn.Module):
             case RBSampleMode.NONE:
                 self.residual = nn.Sequential(
                     nn.LeakyReLU(0.2),
-                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0),
+                    nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
                     nn.LeakyReLU(0.2),
                     nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
                 )
@@ -75,6 +79,11 @@ class AdaIN(nn.Module):
 
         self.fc_gamma = nn.Linear(w_dim, channels)
         self.fc_beta = nn.Linear(w_dim, channels)
+
+        nn.init.normal_(self.fc_gamma.weight, mean=0.0, std=0.02)
+        nn.init.ones_(self.fc_gamma.bias)
+        nn.init.normal_(self.fc_beta.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.fc_beta.bias)
 
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
         x = self.norm(x)
@@ -116,8 +125,8 @@ class Atten(nn.Module):
 
         self.attn_mask_proj = nn.Sequential(
             nn.Conv2d(channels * 2, channels // 4, 3, padding=1),
-            nn.LeakyReLU(0.2),
             nn.InstanceNorm2d(channels // 4, affine=False),
+            nn.LeakyReLU(0.2),
             nn.Conv2d(channels // 4, channels, 1, padding=0),
             nn.Sigmoid(),
         )
@@ -145,10 +154,9 @@ class SkipFusion(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, w_dim: int, resample_mode: RBSampleMode, fusion_mode: SkipFusionModule) -> None:
         super().__init__()
 
-        self.fusion = {
-            SkipFusionModule.CONCAT: Concat,
-            SkipFusionModule.ATTEN: lambda: Atten(in_ch),
-        }[fusion_mode]()
+        self.fusion = {SkipFusionModule.CONCAT: Concat, SkipFusionModule.ATTEN: lambda: Atten(in_ch)}[fusion_mode]()
+
+        self.fusion_mode = fusion_mode
 
         if fusion_mode is SkipFusionModule.CONCAT:
             in_ch *= 2
@@ -157,11 +165,18 @@ class SkipFusion(nn.Module):
         self.resblock = ResBlockBase(in_ch, out_ch, resample_mode)
 
     def forward(self, x_encoder: Tensor, x_decoder: Tensor, w: Tensor) -> Tensor:
-        x = self.fusion(x_encoder, x_decoder)
 
-        skip = self.resblock.shortcut(x)
-        x = self.adain(x, w)
-        x = self.resblock.residual(x)
+        match self.fusion_mode:
+            case SkipFusionModule.ATTEN:
+                skip = self.resblock.shortcut(x_decoder)
+                x = self.adain(x_encoder, w)
+                x = self.fusion(x, x_decoder)
+                x = self.resblock.residual(x)
+            case SkipFusionModule.CONCAT:
+                x = self.fusion(x_encoder, x_decoder)
+                skip = self.resblock.shortcut(x)
+                x = self.adain(x, w)
+                x = self.resblock.residual(x)
         return x + skip
 
 
@@ -209,7 +224,7 @@ class Generator(nn.Module):
         self.to_rgb = SkipFusion(base_ch, img_channels, w_dim, RBSampleMode.NONE, SkipFusionModule.CONCAT)
 
     def get_attention_maps(self) -> list[Tensor]:
-        return [maps for module in self.decoder.modules() if isinstance(module, Atten) if (maps := module.get_attention_maps()) is not None]
+        return [maps for module in self.modules() if isinstance(module, Atten) if (maps := module.get_attention_maps()) is not None]
 
     def forward(self, x_target: Tensor, id_feat: Tensor) -> Tensor:
 
@@ -234,7 +249,7 @@ class Generator(nn.Module):
 
         x = self.to_rgb(from_rgb, x, w)
 
-        return x
+        return torch.tanh(x)
 
 
 if __name__ == "__main__":
@@ -245,7 +260,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 1
     network_cfg = {
-        "img_resolution": 128,
+        "img_resolution": 256,
         "img_channels": 3,
         "num_encoder": 5,
         "base_ch": 64,

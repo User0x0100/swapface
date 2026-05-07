@@ -498,11 +498,11 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            # "ckpt": "train_log/128_AEArch_1/ckpt/441250.pth",
-            "log_path": "train_log/128_Org",
+            # "ckpt": "train_log/128_Org/ckpt/268530.pth",
+            "log_path": "train_log/256_Org_1_1",
             "id_encode_provider": IDLoss.Provider.MS1MV3_ADAFACE_R100,
             "net_g_cfg": {
-                "img_resolution": 128,
+                "img_resolution": 256,
                 "img_channels": 3,
                 "num_encoder": 5,
                 "base_ch": 64,
