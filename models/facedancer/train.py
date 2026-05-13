@@ -66,6 +66,7 @@ class Trainer:
         discriminator_typt: DISCRIMINATOR_TYPT = DISCRIMINATOR_TYPT.ORIGIN,
         d_train_setp: int = 1,
         r1_reg_step: int = 1,
+        r1_gamma: float = 10.0,
         bf16: bool = True,
         device: str = "cuda",
         compile_module: bool = True,
@@ -75,6 +76,7 @@ class Trainer:
         sample_save_every: int = 1000,
         weight_save_every: int = 10000,
         same_image_prob: float = 0.2,
+        same_use_src_dst: bool = True,
         # 模型配置
         net_g_cfg: dict[str, int] | None = None,
         net_d_cfg: dict[str, int] | None = None,
@@ -83,7 +85,7 @@ class Trainer:
         id_loss_weight: float = 10.0,
         # 自重建损失
         enable_rec_loss: bool = False,
-        rec_loss_weight: float = 5.0,
+        rec_loss_weight: float = 10.0,
         # VGG特征匹配
         enable_perceptual_loss: bool = False,
         perceptual_loss_weight: dict[str, float] = {
@@ -129,7 +131,7 @@ class Trainer:
         color_loss_weight: float = 0.1,
         # 结构损失
         enable_dssim_loss: bool = False,
-        dssim_loss_weight: float = 10.0,
+        dssim_loss_weight: float = 5.0,
     ):
 
         args = locals().copy()
@@ -144,6 +146,7 @@ class Trainer:
         self.batch_size = batch_size
         self.d_train_setp = d_train_setp
         self.r1_reg_step = r1_reg_step
+        self.r1_gamma = r1_gamma
         self.enable_rec_loss = enable_rec_loss
         self.enable_perceptual_loss = enable_perceptual_loss
         self.enable_wfm_loss = enable_wfm_loss
@@ -183,7 +186,7 @@ class Trainer:
 
             net_g = Generator(**ckpt["net_g"]["network_cfg"])
             net_d = discriminator_typt.value(**ckpt["net_d"]["network_cfg"])
-            net_g.load_state_dict(ckpt["net_g"]["state_dict"])
+            net_g.load_state_dict(ckpt["net_g"]["state_dict"], strict=False)
             net_d.load_state_dict(ckpt["net_d"]["state_dict"])
 
         else:
@@ -199,11 +202,11 @@ class Trainer:
 
         # ========================= Optim =========================
         self.optim_g = optim.Adam(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
-        self.optim_d = optim.Adam(self.net_d.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
+        self.optim_d = optim.Adam(self.net_d.parameters(), lr=lr * 0.5, betas=(0.0, 0.99), fused=True)
 
         if self.use_cosine_lr:
             self.lr_scheduler_g = CosineAnnealingLR(self.optim_g, T_max=lr_scheduler_t_max, eta_min=lr * 0.1)
-            self.lr_scheduler_d = CosineAnnealingLR(self.optim_d, T_max=lr_scheduler_t_max, eta_min=lr * 0.1)
+            self.lr_scheduler_d = CosineAnnealingLR(self.optim_d, T_max=lr_scheduler_t_max, eta_min=lr * 0.1 * 0.5)
 
         # ========================= LOSS =========================
 
@@ -247,9 +250,9 @@ class Trainer:
         use_gpu_decode = major >= 8
         pipe = datasetloader(
             batch_size=self.batch_size,
-            num_threads=2,
-            prefetch_queue_depth=5,
-            py_num_workers=10,
+            num_threads=16,
+            prefetch_queue_depth=20,
+            py_num_workers=8,
             py_start_method="spawn",
             device_id=self.device.index,
             resize=self.img_resolution,
@@ -257,7 +260,7 @@ class Trainer:
             dst=dst,
             identity_root=identity_root,
             same_image_prob=same_image_prob,
-            same_use_src_dst=True,
+            same_use_src_dst=same_use_src_dst,
             use_gpu_decode=use_gpu_decode,
         )
 
@@ -334,6 +337,7 @@ class Trainer:
     def train(self):
 
         net_d, net_g = (self.train_module[module_name] for module_name in ("net_d", "net_g"))
+        sample_src, sample_dst, _, _ = self.fetch_sample()
 
         for self.iter in tqdm(itertools.count(start=self.iter), initial=self.iter, mininterval=1.0, bar_format="{n_fmt:7} | speed {rate_fmt:3} | train time {elapsed}"):
             src, dst, dst_mask, is_same = self.fetch_sample()
@@ -363,7 +367,7 @@ class Trainer:
 
                     with autocast(device_type="cuda", enabled=False):
                         if is_r1_reg_step:
-                            r1_loss = r1_reg_loss(real_score, real_img)
+                            r1_loss = r1_reg_loss(real_score, real_img, gamma=self.r1_gamma)
                             r1_loss *= self.r1_reg_step
                             self.log("r1_loss", r1_loss)
                             d_loss += r1_loss
@@ -454,9 +458,19 @@ class Trainer:
 
             if self.iter % self.sample_save_every == 0:
                 with torch.inference_mode():
+                    half = self.batch_size // 2
+                    src = torch.cat((sample_src[:half], src[: self.batch_size - half]), dim=0)
+                    dst = torch.cat((sample_dst[:half], dst[: self.batch_size - half]), dim=0)
+
                     src_id_feats = self.id_loss.get_id_feats(src)
                     fake: Tensor = self.net_g_ema(dst, src_id_feats)
-                    attn_map: list[Tensor] = self.net_g_ema.get_attention_maps()
+
+                    attn_map: list[Tensor] = []
+
+                    get_attention_maps = getattr(self.net_g_ema, "get_attention_maps", None)
+                    if callable(get_attention_maps):
+                        attn_map = get_attention_maps() or []
+
                     grid = [src, dst, fake]
 
                     if len(attn_map) > 0:
@@ -495,35 +509,53 @@ if __name__ == "__main__":
     ]
     identity_root = ["/opt/share/deepfake/dataset_1/youtube"]
 
-    def_config = {"src": src, "dst": dst, "identity_root": identity_root}
+    def_config = {"src": src, "dst": dst, "identity_root": identity_root, "same_use_src_dst": False}
 
     def_config.update(
         {
-            # "ckpt": "train_log/128_Org/ckpt/268530.pth",
-            "log_path": "train_log/256_Org_ae",
-            "id_encode_provider": IDLoss.Provider.MS1MV3_ADAFACE_R100,
+            # "ckpt": "train_log/128_inswap_adainrb1x1_wp2layer/ckpt/8240.pth",
+            "log_path": "train_log/256_inswap_adainrb1x1_wp2layer_hidden_ratio0.5",
+            "batch_size": 32,
+            "id_encode_provider": IDLoss.Provider.MS1MV3_ARCFACE_R50_FP16,
             "net_g_cfg": {
+                # "img_resolution": 128,
+                # "img_channels": 3,
+                # "num_depth": 3,
+                # "base_ch": 64,
+                # "max_ch": 512,
+                # "id_dim": 512,
+                # "w_dim": 512,
+                # "mapping_num": 4,
+                # "skip_idx": (),
+                # ========== inswap ============
+                # lite
                 "img_resolution": 128,
                 "img_channels": 3,
-                "num_depth": 5,
+                "num_depth": 3,
+                "num_bottleneck": 8,
                 "base_ch": 64,
                 "max_ch": 512,
                 "id_dim": 512,
-                "w_dim": 256,
-                "mapping_num": 4,
-                "skip_idx": (),
+                # ========== new ============
+                # "img_resolution": 128,
+                # "img_channels": 3,
+                # "num_depth": 3,
+                # "base_ch": 64,
+                # "max_ch": 512,
+                # "id_dim": 512,
             },
-            "discriminator_typt": DISCRIMINATOR_TYPT.ORIGIN,
+            "discriminator_typt": DISCRIMINATOR_TYPT.ALPHAFACE,
             "net_d_cfg": {
                 "img_resolution": 128,
                 "img_channels": 3,
-                "num_encoder": 6,
+                # "num_encoder": 6,
                 "base_ch": 64,
                 "max_ch": 512,
-                # "group_size": 5,
+                "group_size": 4,
             },
-            "r1_reg_step": 1,
-            "enable_wfm_loss": True,
+            "r1_reg_step": 16,
+            "r1_gamma": 1.0,
+            # "enable_wfm_loss": True,
             "enable_rec_loss": True,
             "enable_perceptual_loss": True,
             "enable_dssim_loss": True,

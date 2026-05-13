@@ -370,10 +370,7 @@ class DSSIMLoss(nn.Module):
         self.sigma = sigma
         self.reduction = reduction
 
-        self.register_buffer(
-            "window",
-            self._create_window(window_size, sigma).expand(self.C, 1, self.window_size, self.window_size),
-        )
+        self.register_buffer("window", self._create_window(window_size, sigma).expand(self.C, 1, self.window_size, self.window_size))
 
     @staticmethod
     def _gaussian_1d(window_size: int, sigma: float) -> Tensor:
@@ -456,8 +453,6 @@ def rgb_to_linear_rgb(image: Tensor) -> Tensor:
         >>> output = rgb_to_linear_rgb(input) # 2x3x4x5
 
     """
-    if not isinstance(image, Tensor):
-        raise TypeError(f"Input type is not a Tensor. Got {type(image)}")
 
     if len(image.shape) < 3 or image.shape[-3] != 3:
         raise ValueError(f"Input size must have a shape of (*, 3, H, W).Got {image.shape}")

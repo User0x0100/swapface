@@ -32,14 +32,13 @@ class ResBlockBase(nn.Module):
                 self.residual = nn.Sequential(
                     nn.SiLU(),
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.SiLU(),
-                    nn.Conv2d(out_ch, out_ch, 1, stride=2, padding=0),
+                    nn.AvgPool2d(2),
                     nn.SiLU(),
                     nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
                 )
                 self.shortcut = nn.Sequential(
-                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
                     nn.AvgPool2d(2),
+                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=shortcut_bias),
                 )
 
             case RBSampleMode.NONE:
@@ -59,7 +58,7 @@ class NormRB(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, sampling: RBSampleMode) -> None:
         super().__init__()
 
-        self.norm = nn.InstanceNorm2d(in_ch, affine=False)
+        self.norm = nn.InstanceNorm2d(in_ch, affine=True)
         self.resblock = ResBlockBase(in_ch, out_ch, sampling)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -81,15 +80,10 @@ class AdaIN(nn.Module):
         self.fc_gamma = nn.Linear(w_dim, channels)
         self.fc_beta = nn.Linear(w_dim, channels)
 
-        nn.init.normal_(self.fc_gamma.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.fc_gamma.weight)
         nn.init.ones_(self.fc_gamma.bias)
-        nn.init.normal_(self.fc_beta.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.fc_beta.weight)
         nn.init.zeros_(self.fc_beta.bias)
-
-        # nn.init.zeros_(self.fc_gamma.weight)
-        # nn.init.ones_(self.fc_gamma.bias)
-        # nn.init.zeros_(self.fc_beta.weight)
-        # nn.init.zeros_(self.fc_beta.bias)
 
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
         x = self.norm(x)
@@ -180,40 +174,34 @@ class SkipFusion(nn.Module):
                 x = self.resblock.residual(x)
             case SkipFusionModule.CONCAT:
                 x = self.fusion(x_encoder, x_decoder)
-                x = self.adain(x, w)
                 skip = self.resblock.shortcut(x)
+                x = self.adain(x, w)
                 x = self.resblock.residual(x)
         return x + skip
 
 
-class FromRGB(nn.Module):
+class FromRGB(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 5, stride=1, padding=2),
-            nn.SiLU(),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+        super().__init__(
+            *[
+                nn.Conv2d(in_ch, out_ch, 5, stride=1, padding=2),
+                nn.SiLU(),
+                nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            ]
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.conv(x)
 
-
-class ToRGB(nn.Module):
+class ToRGB(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-
-        self.conv = nn.Sequential(
-            nn.SiLU(),
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(out_ch, out_ch, 1),
-            nn.Tanh(),
+        super().__init__(
+            *[
+                nn.SiLU(),
+                nn.Conv2d(in_ch, out_ch, 3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(out_ch, out_ch, 1),
+                nn.Tanh(),
+            ]
         )
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.conv(x)
 
 
 class Generator(nn.Module):
@@ -227,7 +215,7 @@ class Generator(nn.Module):
         id_dim: int = 512,
         w_dim: int = 256,
         mapping_num: int = 4,
-        skip_idx: tuple[int, ...] = (),
+        skip_idx: tuple[int, ...] = (0, 1),
     ) -> None:
         super().__init__()
 
@@ -254,7 +242,7 @@ class Generator(nn.Module):
         for i in range(num_depth):
             in_ch, out_ch = features[-(i + 1)], features[-(i + 2)]
             if i in skip_idx:
-                self.decoder.append(SkipFusion(in_ch, out_ch, w_dim, RBSampleMode.UP, SkipFusionModule.ATTEN))
+                self.decoder.append(SkipFusion(in_ch, out_ch, w_dim, RBSampleMode.UP, SkipFusionModule.CONCAT))
             else:
                 self.decoder.append(AdaINRB(in_ch, out_ch, w_dim, RBSampleMode.UP))
 
@@ -297,13 +285,13 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 1
     network_cfg = {
-        "img_resolution": 256,
+        "img_resolution": 128,
         "img_channels": 3,
-        "num_depth": 5,
+        "num_depth": 3,
         "base_ch": 64,
         "max_ch": 512,
         "id_dim": 512,
-        "w_dim": 256,
+        "w_dim": 512,
         "mapping_num": 4,
         "skip_idx": (),
     }

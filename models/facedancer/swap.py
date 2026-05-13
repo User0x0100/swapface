@@ -244,11 +244,11 @@ if __name__ == "__main__":
     # id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
 
     video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
-    id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
-    # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
+    # id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
+    id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
     # id = "/home/liaohaixun/swap/IDAssets/2025-06-15 18_19_50小树🌿人间体验卡限时掉落✨ _3.jpg"
     # id = "w700d1q75cms.jpg"
 
-    swapper = Swap("train_log/256_WFM_SKIPSPADE_2_MS1MV2_TRANSFACE_B_NewArch_1_1/ckpt/1040000.pth", PROVIDER.MS1MV2_TRANSFACE_B)
+    swapper = Swap("train_log/256_inswap_adainrb1x1_wp2layer_hidden_ratio0.5/ckpt/80000.pth", PROVIDER.MS1MV3_ARCFACE_R50_FP16)
 
     swapper.swap_video(video, id)
