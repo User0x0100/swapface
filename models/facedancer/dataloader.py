@@ -3,74 +3,11 @@ from pathlib import Path
 
 import numpy as np
 from numpy import ndarray
-from scipy.stats import truncnorm
-import cv2
 import nvidia.dali.fn as fn
 from nvidia.dali import pipeline_def
 from nvidia.dali.types import Constant, DALIDataType, DALIImageType, DALIInterpType
 from nvidia.dali.math import clamp
 from misc.utils import ImageFolder
-
-
-class RndWarpPars(object):
-    def __init__(
-        self,
-        size: int,
-        rotation_range=[-10.0, 10.0],
-        scale_range=[-0.25, 0.25],
-        tx_range=[-0.05, 0.05],
-        ty_range=[-0.05, 0.05],
-        trunc_val=2.5,
-    ):
-
-        self.size = size
-        self.rotation_range = rotation_range
-        self.tx_range = tx_range
-        self.ty_range = ty_range
-        self.scale_range = scale_range
-        self.trunc_val = trunc_val
-        self.rng = np.random.default_rng(None)
-
-    def random_normal(self, shape):
-        samples = truncnorm.rvs(-self.trunc_val, self.trunc_val, loc=0.0, scale=1.0, size=shape, random_state=self.rng)
-        return (samples / self.trunc_val).astype(np.float32)
-
-    def __call__(self, sample_info) -> tuple[ndarray, ndarray, ndarray]:
-        _ = sample_info
-
-        w = self.size
-
-        cell_size = [w // 2, w // 4, w // 8][self.rng.integers(0, 3)]
-        cell_count = w // cell_size + 1
-
-        grid = np.linspace(0, w, cell_count)
-        mapx = np.broadcast_to(grid, (cell_count, cell_count)).copy()
-        mapy = mapx.T.copy()
-
-        noise = self.random_normal((cell_count - 2, cell_count - 2))
-        mapx[1:-1, 1:-1] += noise * (cell_size * 0.24)
-
-        noise = self.random_normal((cell_count - 2, cell_count - 2))
-        mapy[1:-1, 1:-1] += noise * (cell_size * 0.24)
-
-        half = cell_size // 2
-
-        dsize = (w + cell_size,) * 2
-        mapx = cv2.resize(mapx, dsize)
-        mapy = cv2.resize(mapy, dsize)
-
-        mapx = mapx[half:-half, half:-half]
-        mapy = mapy[half:-half, half:-half]
-
-        rotation = np.random.uniform(self.rotation_range[0], self.rotation_range[1])
-        scale = np.random.uniform(1 / (1 - self.scale_range[0]), 1 + self.scale_range[1])
-        tx = np.random.uniform(self.tx_range[0], self.tx_range[1])
-        ty = np.random.uniform(self.ty_range[0], self.ty_range[1])
-
-        transform_matrix = cv2.getRotationMatrix2D((w // 2, w // 2), rotation, scale)
-        transform_matrix[:, 2] += (tx * w, ty * w)
-
-        return mapx.astype(np.float32), mapy.astype(np.float32), transform_matrix.astype(np.float32)
 
 
 class IdentityPairReader:

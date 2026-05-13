@@ -3,6 +3,49 @@ from torch import Tensor
 import torch.nn as nn
 
 
+class Linear2d(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, bias: bool = True) -> None:
+        super().__init__()
+        self.linear = nn.Linear(in_ch, out_ch, bias=bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # [B, C, H, W] -> [B, H, W, C]
+        x = x.movedim(1, -1)
+        x = self.linear(x)
+        # [B, H, W, C] -> [B, C, H, W]
+        return x.movedim(-1, 1).contiguous()
+
+
+class AdaINMLPRB(nn.Module):
+    def __init__(self, channels: int, w_dim: int, hidden_ratio: float = 1.0) -> None:
+        super().__init__()
+
+        hidden_ch = max(16, int(channels * hidden_ratio))
+
+        self.adain0 = AdaIN(channels, w_dim)
+        self.act0 = nn.SiLU()
+        self.fc0 = Linear2d(channels, hidden_ch)
+
+        self.adain1 = AdaIN(hidden_ch, w_dim)
+        self.act1 = nn.SiLU()
+        self.fc1 = Linear2d(hidden_ch, channels)
+
+        # 让 block 初始接近恒等映射，训练更稳
+        nn.init.zeros_(self.fc1.linear.weight)
+        nn.init.zeros_(self.fc1.linear.bias)
+
+    def forward(self, x: Tensor, w: Tensor) -> Tensor:
+        y = self.adain0(x, w)
+        y = self.act0(y)
+        y = self.fc0(y)
+
+        y = self.adain1(y, w)
+        y = self.act1(y)
+        y = self.fc1(y)
+
+        return x + y
+
+
 class AdaIN(nn.Module):
     def __init__(self, channels: int, w_dim: int) -> None:
         super().__init__()
@@ -187,7 +230,7 @@ class Generator(nn.Module):
 
         self.encoder = nn.Sequential(*[DownSample(features[i], features[i + 1]) for i in range(num_depth)])
 
-        self.bottleneck = nn.ModuleList([AdainRB(features[-1], id_dim) for _ in range(num_bottleneck)])
+        self.bottleneck = nn.ModuleList([AdaINMLPRB(features[-1], id_dim) for _ in range(num_bottleneck)])
 
         self.decoder = nn.Sequential(*[UpSample(features[-(i + 1)], features[-(i + 2)]) for i in range(num_depth)])
 
@@ -220,7 +263,7 @@ if __name__ == "__main__":
         "img_resolution": 128,
         "img_channels": 3,
         "num_depth": 2,
-        "num_bottleneck": 8,
+        "num_bottleneck": 6,
         "base_ch": 64,
         "max_ch": 512,
         "id_dim": 512,

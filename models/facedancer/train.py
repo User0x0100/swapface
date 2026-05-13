@@ -22,7 +22,6 @@ from losses import IDLoss, l1_loss_fn, VGGPerceptualLoss, DLoss, GANLoss, StyleL
 from .dataloader import datasetloader
 from .networks import Generator, Discriminator, Stylegan2DiscriminatorLite, AlphaFaceDiscriminator, UNetDiscriminatorSN
 
-from misc.models.face_parsing import FaceParsing
 
 EPS = 1e-8
 
@@ -94,16 +93,16 @@ class Trainer:
             "relu2_2": 0.25,
             "relu3_3": 0.25,
             "relu4_2": 0.25,
-            # "pool1": 0.25,
-            # "pool2": 0.25,
-            # "pool3": 0.25,
-            # "pool4": 0.25,
-            # "pool5": 0.25,
+            # "pool1": 1.0,
+            # "pool2": 1.0,
+            # "pool3": 1.0,
+            # "pool4": 1.0,
+            # "pool5": 1.0,
         },
         # 判别器中间特征得弱特征匹配
         enable_wfm_loss: bool = False,
         wfm_loss_weight: dict[int, float] = {
-            # 0: 1.0,
+            0: 1.0,
             1: 1.0,
             2: 1.0,
             3: 1.0,
@@ -216,10 +215,10 @@ class Trainer:
         self.id_loss = IDLoss(weight=id_loss_weight, provider=id_encode_provider).to(self.device)
 
         if self.enable_rec_loss:
-            self.rec_loss = l1_loss_fn(weight=rec_loss_weight, reduction="none")
+            self.rec_loss = l1_loss_fn(weight=rec_loss_weight, reduction="mean")
 
         if self.enable_perceptual_loss:
-            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="none").to(self.device)
+            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
 
         if self.enable_ifsr_loss:
             self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight).to(self.device)
@@ -231,7 +230,7 @@ class Trainer:
             self.color_loss = StyleLossLabChroma(weight=color_loss_weight, range_norm=True).to(self.device)
 
         if self.enable_dssim_loss:
-            self.dssim_loss = DSSIMLoss(weight=dssim_loss_weight, reduction="none").to(self.device)
+            self.dssim_loss = DSSIMLoss(weight=dssim_loss_weight, reduction="mean").to(self.device)
 
         # ========================= LOG =========================
         base_log_path = Path(log_path)
@@ -281,25 +280,17 @@ class Trainer:
 
             self.train_module[net_name] = torch.compile(net, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True}) if compile_module else net
 
-        self.face_mask = torch.compile(
-            FaceParsing(range_norm=True, occ=True).to(self.device),
-            fullgraph=True,
-            dynamic=False,
-            options={"max_autotune": True, "epilogue_fusion": True},
-        )
-
     @torch.no_grad()
     def log(self, k: str, v: Tensor, right_now: bool = False) -> None:
         if self.iter % self.log_interval == 0 or right_now:
             self.log_writer.add_scalar(f"Loss/{k}", v.detach().mean().item(), self.iter)
 
     @torch.no_grad()
-    def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor]:
         data: dict[str, Tensor] = self.dataset.next()[0]
         src, dst, is_same = (data[k] for k in self.sample_output_map)
         is_same = is_same.squeeze_(-1)
-        dst_mask = self.face_mask(dst)
-        return src, dst, dst_mask, is_same
+        return src, dst, is_same
 
     @torch.no_grad()
     def update_ema(self, decay=0.999):
@@ -334,13 +325,26 @@ class Trainer:
         except Exception as e:
             print(f"Failed to save ckpt: {e}")
 
+    def loss_grad_map(self, loss: Tensor, x: Tensor) -> Tensor:
+        (grad,) = torch.autograd.grad(outputs=loss.sum(), inputs=x, retain_graph=False, create_graph=False)
+
+        h = grad.detach().float().abs().mean(dim=1, keepdim=True)  # [B, 1, H, W]
+
+        h = torch.log1p(h)
+        h = h / h.amax(dim=(2, 3), keepdim=True).clamp_min(1e-8)
+
+        h = h.mul(2.0).sub(1.0)  # [0,1] -> [-1,1]
+        h = h.expand(-1, 3, -1, -1).contiguous()
+
+        return h
+
     def train(self):
 
         net_d, net_g = (self.train_module[module_name] for module_name in ("net_d", "net_g"))
-        sample_src, sample_dst, _, _ = self.fetch_sample()
+        sample_src, sample_dst, _ = self.fetch_sample()
 
         for self.iter in tqdm(itertools.count(start=self.iter), initial=self.iter, mininterval=1.0, bar_format="{n_fmt:7} | speed {rate_fmt:3} | train time {elapsed}"):
-            src, dst, dst_mask, is_same = self.fetch_sample()
+            src, dst, is_same = self.fetch_sample()
 
             torch.compiler.cudagraph_mark_step_begin()
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
@@ -416,17 +420,13 @@ class Trainer:
 
                 # perceptual_loss
                 if self.enable_perceptual_loss:
-                    perceptual_loss = self.perceptual_loss(fake, dst)  # B
-                    perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                    perceptual_loss = self.perceptual_loss(fake, dst)
                     self.log("perceptual_loss", perceptual_loss)
                     g_loss += perceptual_loss
 
                 # rec_loss
                 if self.enable_rec_loss:
-                    rec_map = self.rec_loss(fake, dst)  # B,C,H,W
-                    rec_map = rec_map * dst_mask
-                    rec_loss = rec_map.sum(dim=[1, 2, 3]) / (dst_mask.sum(dim=[1, 2, 3]).clamp_min(1.0) * fake.shape[1])
-                    rec_loss = (rec_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                    rec_loss = self.rec_loss(fake, dst)
                     self.log("rec_loss", rec_loss)
                     g_loss += rec_loss
 
@@ -438,10 +438,7 @@ class Trainer:
 
                 # dssim_loss
                 if self.enable_dssim_loss:
-                    dssim_map = self.dssim_loss(fake, dst)  # B,1,H,W
-                    dssim_map *= dst_mask
-                    dssim_loss = dssim_map.sum(dim=[1, 2, 3]) / dst_mask.sum(dim=[1, 2, 3]).clamp_min(1.0)
-                    dssim_loss = dssim_loss.mean()
+                    dssim_loss = self.dssim_loss(fake, dst)
                     self.log("dssim_loss", dssim_loss)
                     g_loss += dssim_loss
 
@@ -457,21 +454,28 @@ class Trainer:
                 self.save_ckpt()
 
             if self.iter % self.sample_save_every == 0:
-                with torch.inference_mode():
+                with torch.no_grad():
                     half = self.batch_size // 2
-                    src = torch.cat((sample_src[:half], src[: self.batch_size - half]), dim=0)
-                    dst = torch.cat((sample_dst[:half], dst[: self.batch_size - half]), dim=0)
+                    src_vis = torch.cat((sample_src[:half], src[: self.batch_size - half]), dim=0)
+                    dst_vis = torch.cat((sample_dst[:half], dst[: self.batch_size - half]), dim=0)
 
-                    src_id_feats = self.id_loss.get_id_feats(src)
-                    fake: Tensor = self.net_g_ema(dst, src_id_feats)
+                    src_id_feats_vis = self.id_loss.get_id_feats(src_vis)
+                    fake_vis: Tensor = self.net_g_ema(dst_vis, src_id_feats_vis)
+
+                    grid = [src_vis, dst_vis, fake_vis]
+                    fake_for_grad = fake_vis.detach().requires_grad_(True)
+
+                    with torch.enable_grad():
+                        fake_score_vis = net_d(fake_for_grad)
+                        gan_loss_vis = self.gan_loss(fake_score_vis)
+                        gan_grad_map = self.loss_grad_map(gan_loss_vis, fake_for_grad)
+                        grid.append(gan_grad_map)
 
                     attn_map: list[Tensor] = []
 
                     get_attention_maps = getattr(self.net_g_ema, "get_attention_maps", None)
                     if callable(get_attention_maps):
                         attn_map = get_attention_maps() or []
-
-                    grid = [src, dst, fake]
 
                     if len(attn_map) > 0:
                         for m in attn_map:
@@ -513,10 +517,11 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            # "ckpt": "train_log/128_inswap_adainrb1x1_wp2layer/ckpt/8240.pth",
-            "log_path": "train_log/256_inswap_adainrb1x1_wp2layer_hidden_ratio0.5",
+            # "ckpt": "train_log/256_inswap_T/ckpt/30700.pth",
+            "log_path": "train_log/256_inswap_T_BLENDFACE_AdaINMLPRB",
             "batch_size": 32,
-            "id_encode_provider": IDLoss.Provider.MS1MV3_ARCFACE_R50_FP16,
+            "same_image_prob": 0.0,
+            "id_encode_provider": IDLoss.Provider.BLENDFACE,
             "net_g_cfg": {
                 # "img_resolution": 128,
                 # "img_channels": 3,
@@ -531,8 +536,8 @@ if __name__ == "__main__":
                 # lite
                 "img_resolution": 128,
                 "img_channels": 3,
-                "num_depth": 3,
-                "num_bottleneck": 8,
+                "num_depth": 2,
+                "num_bottleneck": 6,
                 "base_ch": 64,
                 "max_ch": 512,
                 "id_dim": 512,
@@ -555,11 +560,12 @@ if __name__ == "__main__":
             },
             "r1_reg_step": 16,
             "r1_gamma": 1.0,
+            # "enable_ifsr_loss": True,
             # "enable_wfm_loss": True,
-            "enable_rec_loss": True,
-            "enable_perceptual_loss": True,
-            "enable_dssim_loss": True,
-            "enable_color_loss": True,
+            # "enable_rec_loss": True,
+            # "enable_perceptual_loss": True,
+            # "enable_dssim_loss": True,
+            # "enable_color_loss": True,
         }
     )
 
