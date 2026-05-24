@@ -14,36 +14,6 @@ from .models.retinaface import RetinaFace, get_pts
 from misc.utils import ImageFolder
 
 
-class AffineSmoother:
-    """
-    对 [sR | t] 形式的仿射矩阵做 EMA 平滑。
-    支持多人脸追踪（按 face_id 维护独立状态）。
-    """
-
-    def __init__(self, alpha: float = 0.7):
-        # alpha 越大越跟随当前帧，越小越平滑
-        self.alpha = alpha
-        self.state: dict[int, Tensor] = {}  # face_id -> [2, 3]
-
-    def update(self, face_id: int, M: Tensor) -> Tensor:
-        """
-        M: [2, 3]
-        返回平滑后的 [2, 3]
-        """
-        if face_id not in self.state:
-            self.state[face_id] = M.clone()
-            return M
-        smoothed = self.alpha * M + (1 - self.alpha) * self.state[face_id]
-        self.state[face_id] = smoothed
-        return smoothed
-
-    def reset(self, face_id: int | None = None):
-        if face_id is None:
-            self.state.clear()
-        else:
-            self.state.pop(face_id, None)
-
-
 def zoom_in(img: Tensor, zoom: float = 0.102) -> Tensor:
     """
     img  : [B, C, H, W]
@@ -100,7 +70,7 @@ def compute_similarity_transform(points_x: Tensor, points_y: Tensor) -> Tensor:
     return affine
 
 
-def normalize_theta(affine_src2dst, in_hw, out_hw, align_corners=True):
+def normalize_theta(affine_src2dst, in_hw, out_hw, align_corners=False):
 
     if affine_src2dst.dim() == 2:
         affine_src2dst = affine_src2dst.unsqueeze(0)
@@ -190,17 +160,7 @@ def invert_normalized_theta(theta: Tensor) -> Tensor:
 
 
 class FaceAligner:
-    def __init__(self, smooth_alpha: float = 0.5):
-        self.smoother = AffineSmoother(alpha=smooth_alpha)
-
-    def __call__(
-        self,
-        images: tuple[Tensor] | list[Tensor] | Tensor,
-        src_pts: Tensor,
-        src_pts_offset: list[int],
-        dst_pts: Tensor,
-        out_size: int,
-    ):
+    def __call__(self, images: tuple[Tensor] | list[Tensor] | Tensor, src_pts: Tensor, src_pts_offset: list[int], dst_pts: Tensor, out_size: int):
         """
         对输入图片进行人脸对齐（仿射变换），输出对齐后的图片和仿射矩阵。
 
@@ -234,13 +194,10 @@ class FaceAligner:
             image = image.unsqueeze(0).expand(N, -1, -1, -1)
 
             mats = compute_similarity_transform(src_point, dst_pts.unsqueeze(0).expand(N, -1, -1))
-            mats = normalize_theta(mats, (H, W), out_size, align_corners=True)
+            mats = normalize_theta(mats, (H, W), out_size, align_corners=False)
 
-            for idx in range(N):
-                mats[idx : idx + 1] = self.smoother.update(idx, mats[idx : idx + 1])
-
-            grid = F.affine_grid(mats, (N, C, out_size, out_size), align_corners=True)
-            faces = F.grid_sample(image, grid, align_corners=True, mode="bilinear")
+            grid = F.affine_grid(mats, (N, C, out_size, out_size), align_corners=False)
+            faces = F.grid_sample(image, grid, align_corners=False, mode="bilinear")
 
             aligned.append(faces)
             norm_theta.append(mats)
@@ -296,10 +253,10 @@ def face_align_batch(
         image = image.unsqueeze(0).expand(N, -1, -1, -1)
 
         mats = compute_similarity_transform(src_point, dst_pts.unsqueeze(0).expand(N, -1, -1))
-        mats = normalize_theta(mats, (H, W), out_size, align_corners=True)
+        mats = normalize_theta(mats, (H, W), out_size, align_corners=False)
 
-        grid = F.affine_grid(mats, (N, C, out_size, out_size), align_corners=True)
-        faces = F.grid_sample(image, grid, align_corners=True, mode="bilinear")
+        grid = F.affine_grid(mats, (N, C, out_size, out_size), align_corners=False)
+        faces = F.grid_sample(image, grid, align_corners=False, mode="bilinear")
 
         aligned.append(faces)
         norm_theta.append(mats)
@@ -390,7 +347,7 @@ class FaceAlignBase:
         self.FaceDetector = RetinaFace().to(device=device)
 
         dst_pts = get_align_landmarks(align_size)
-        self.dst_pts = torch.tensor(dst_pts, device=device)
+        self.dst_pts = torch.tensor(dst_pts, device=device, dtype=torch.float32)
 
         self.conf_thresh = conf_thresh
         self.iou_thresh = iou_thresh
@@ -398,7 +355,7 @@ class FaceAlignBase:
         self.batch_size = batch_size
         self.align_size = align_size
 
-        self.aligner = FaceAligner(0.75)
+        self.aligner = FaceAligner()
 
     def align(self, images: Tensor | list[Tensor]) -> tuple[Tensor, Tensor, list[int]]:
         detected, offset = self.FaceDetector.detector(images, conf_thresh=self.conf_thresh, iou_thresh=self.iou_thresh, min_box_size=self.min_box_size)

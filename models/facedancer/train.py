@@ -130,7 +130,7 @@ class Trainer:
         color_loss_weight: float = 0.1,
         # 结构损失
         enable_dssim_loss: bool = False,
-        dssim_loss_weight: float = 5.0,
+        dssim_loss_weight: float = 10.0,
     ):
 
         args = locals().copy()
@@ -185,7 +185,7 @@ class Trainer:
 
             net_g = Generator(**ckpt["net_g"]["network_cfg"])
             net_d = discriminator_typt.value(**ckpt["net_d"]["network_cfg"])
-            net_g.load_state_dict(ckpt["net_g"]["state_dict"], strict=False)
+            net_g.load_state_dict(ckpt["net_g"]["state_dict"])
             net_d.load_state_dict(ckpt["net_d"]["state_dict"])
 
         else:
@@ -215,7 +215,7 @@ class Trainer:
         self.id_loss = IDLoss(weight=id_loss_weight, provider=id_encode_provider).to(self.device)
 
         if self.enable_rec_loss:
-            self.rec_loss = l1_loss_fn(weight=rec_loss_weight, reduction="mean")
+            self.rec_loss = l1_loss_fn(weight=rec_loss_weight, reduction="none")
 
         if self.enable_perceptual_loss:
             self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
@@ -369,15 +369,14 @@ class Trainer:
                     d_loss = self.d_loss(fake_score, real_score)
                     self.log("d_loss", d_loss, True)
 
-                    with autocast(device_type="cuda", enabled=False):
-                        if is_r1_reg_step:
-                            r1_loss = r1_reg_loss(real_score, real_img, gamma=self.r1_gamma)
-                            r1_loss *= self.r1_reg_step
-                            self.log("r1_loss", r1_loss)
-                            d_loss += r1_loss
+                    if is_r1_reg_step:
+                        r1_loss = r1_reg_loss(real_score, real_img, gamma=self.r1_gamma)
+                        r1_loss *= self.r1_reg_step
+                        self.log("r1_loss", r1_loss)
+                        d_loss += r1_loss
 
-                        d_loss.backward()
-                        self.optim_d.step()
+                    d_loss.backward()
+                    self.optim_d.step()
 
                     if self.use_cosine_lr:
                         self.lr_scheduler_d.step()
@@ -426,7 +425,9 @@ class Trainer:
 
                 # rec_loss
                 if self.enable_rec_loss:
-                    rec_loss = self.rec_loss(fake, dst)
+                    rec_loss = self.rec_loss(fake, dst)  # B C H W
+                    rec_loss = rec_loss.mean(dim=[1, 2, 3])
+                    rec_loss = (rec_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
                     self.log("rec_loss", rec_loss)
                     g_loss += rec_loss
 
@@ -463,13 +464,23 @@ class Trainer:
                     fake_vis: Tensor = self.net_g_ema(dst_vis, src_id_feats_vis)
 
                     grid = [src_vis, dst_vis, fake_vis]
-                    fake_for_grad = fake_vis.detach().requires_grad_(True)
 
+                    # ========================= GAN loss grad map =========================
+                    fake_for_gan_grad = fake_vis.detach().requires_grad_(True)
                     with torch.enable_grad():
-                        fake_score_vis = net_d(fake_for_grad)
+                        fake_score_vis = net_d(fake_for_gan_grad)
                         gan_loss_vis = self.gan_loss(fake_score_vis)
-                        gan_grad_map = self.loss_grad_map(gan_loss_vis, fake_for_grad)
-                        grid.append(gan_grad_map)
+                        gan_grad_map = self.loss_grad_map(gan_loss_vis, fake_for_gan_grad)
+                    grid.append(gan_grad_map)
+
+                    # ========================= ID loss grad map =========================
+                    fake_for_id_grad = fake_vis.detach().requires_grad_(True)
+                    with torch.enable_grad():
+                        fake_id_feats_vis = self.id_loss.get_id_feats(fake_for_id_grad)
+                        id_loss_vis = self.id_loss(fake_id_feats_vis, src_id_feats_vis.detach())
+                        id_grad_map = self.loss_grad_map(id_loss_vis, fake_for_id_grad)
+
+                    grid.append(id_grad_map)
 
                     attn_map: list[Tensor] = []
 
@@ -517,11 +528,11 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            # "ckpt": "train_log/256_inswap_T/ckpt/30700.pth",
-            "log_path": "train_log/256_inswap_T_BLENDFACE_AdaINMLPRB",
+            "log_path": "train_log/256_UNET_T_T",
             "batch_size": 32,
-            "same_image_prob": 0.0,
-            "id_encode_provider": IDLoss.Provider.BLENDFACE,
+            "same_image_prob": 0.2,
+            "id_loss_weight": 5.0,
+            "id_encode_provider": IDLoss.Provider.MS1MV3_ARCFACE_R50_FP16,
             "net_g_cfg": {
                 # "img_resolution": 128,
                 # "img_channels": 3,
@@ -534,11 +545,18 @@ if __name__ == "__main__":
                 # "skip_idx": (),
                 # ========== inswap ============
                 # lite
-                "img_resolution": 128,
+                # "img_resolution": 256,
+                # "img_channels": 3,
+                # "num_depth": 2,
+                # "num_bottleneck": 6,
+                # "base_ch": 64,
+                # "max_ch": 512,
+                # "id_dim": 512,
+                "img_resolution": 256,
                 "img_channels": 3,
-                "num_depth": 2,
+                "num_depth": 4,
                 "num_bottleneck": 6,
-                "base_ch": 64,
+                "base_ch": 32,
                 "max_ch": 512,
                 "id_dim": 512,
                 # ========== new ============
@@ -548,10 +566,17 @@ if __name__ == "__main__":
                 # "base_ch": 64,
                 # "max_ch": 512,
                 # "id_dim": 512,
+                # ========== stylegan2_base ============
+                # "img_resolution": 128,
+                # "img_channels": 3,
+                # "num_depth": 2,
+                # "base_ch": 64,
+                # "max_ch": 512,
+                # "id_dim": 512,
             },
             "discriminator_typt": DISCRIMINATOR_TYPT.ALPHAFACE,
             "net_d_cfg": {
-                "img_resolution": 128,
+                "img_resolution": 256,
                 "img_channels": 3,
                 # "num_encoder": 6,
                 "base_ch": 64,
@@ -559,13 +584,13 @@ if __name__ == "__main__":
                 "group_size": 4,
             },
             "r1_reg_step": 16,
-            "r1_gamma": 1.0,
+            "r1_gamma": 10.0,
             # "enable_ifsr_loss": True,
             # "enable_wfm_loss": True,
-            # "enable_rec_loss": True,
-            # "enable_perceptual_loss": True,
+            "enable_rec_loss": True,
+            "enable_perceptual_loss": True,
             # "enable_dssim_loss": True,
-            # "enable_color_loss": True,
+            "enable_color_loss": True,
         }
     )
 

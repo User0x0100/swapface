@@ -56,13 +56,7 @@ class AlphaFaceDiscriminator(nn.Module):
     def __init__(self, img_resolution: int = 256, img_channels: int = 3, base_ch: int = 64, max_ch: int = 512, group_size: int = 5):
         super().__init__()
 
-        self.network_cfg = {
-            "img_resolution": img_resolution,
-            "img_channels": img_channels,
-            "base_ch": base_ch,
-            "max_ch": max_ch,
-            "group_size": group_size,
-        }
+        self.network_cfg = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
 
         self.from_rgb = nn.Sequential(
             nn.Conv2d(img_channels, base_ch, 1),

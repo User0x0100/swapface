@@ -5,7 +5,7 @@ import multiprocessing as mp
 import torch
 from torch import Tensor
 import torchvision.transforms.functional as F
-from misc.facealign import face_align_batch, FaceExtractorVideo, restore_faces_to_original, AffineSmoother, FaceAligner, zoom_in
+from misc.facealign import face_align_batch, FaceExtractorVideo, restore_faces_to_original, FaceAligner, zoom_in
 from misc.models.retinaface import get_pts, RetinaFace
 from misc.models.idencoder import IDEncoder, get_align_landmarks, PROVIDER
 from misc.models.face_parsing import FaceParsing
@@ -224,9 +224,9 @@ class Swap:
                     # mask = mask * 2.0 - 1.0
                     # swap_face = faces
                     add_black_border_batch(swap_face)
-                    swap_face = restore_faces_to_original(org_frames, swap_face, norm_theta, offset)
-                    swap_face = torch.nn.functional.interpolate(swap_face, scale_factor=0.25, mode="bilinear", align_corners=False)
-                    # swap_face = torch.cat((faces, swap_face), dim=3)
+                    # swap_face = restore_faces_to_original(org_frames, swap_face, norm_theta, offset)
+                    # swap_face = torch.nn.functional.interpolate(swap_face, scale_factor=0.25, mode="bilinear", align_corners=False)
+                    swap_face = torch.cat((faces, swap_face), dim=3)
                     swap_face = swap_face.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)[:, [2, 1, 0], :, :]  # RGB -> BGR
                     swap_face = swap_face.permute(0, 2, 3, 1)  # NCHW -> NHWC
                     frames = swap_face.to(device="cpu", dtype=torch.uint8).numpy()
@@ -238,17 +238,21 @@ class Swap:
 
 
 if __name__ == "__main__":
-    video = "/opt/share/deepfake/linshi/录屏素材/2023-04-14(李云帆 陈雨)/20230414-163616614陈雨(电脑录屏).mp4"
-    id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
-    # id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
-    # id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
-
     # video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
+    video = "/opt/share/deepfake/linshi/录屏素材/2023-04-14(李云帆 陈雨)/20230414-163616614陈雨(电脑录屏).mp4"
+    # video = "/opt/share/deepfake/linshi/录屏素材/2023-02-17(袁忠 曹属馨)/20230217-160724910曹属馨(电脑录屏).mp4"
+    # video = "/opt/share/deepfake/linshi/录屏素材/2023-06-20(邓叮玲 许馨文)/20230620-155807793邓叮玲(电脑录屏).mp4"
+    # video = "/opt/share/deepfake/linshi/录屏素材/2023-08-28(李小姐 邱小姐)/20230828-122302李小姐(电脑录屏).mp4"
+    # video = "/opt/share/deepfake/linshi/录屏素材/2025-07-03(蒋女士 林嘉惠 王钰 符媛媛 石星儿)/王钰(电脑录屏).mp4"
+
+    # id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
+    # id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
+    id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
     # id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
     # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
     # id = "/home/liaohaixun/swap/IDAssets/2025-06-15 18_19_50小树🌿人间体验卡限时掉落✨ _3.jpg"
     # id = "w700d1q75cms.jpg"
 
-    swapper = Swap("train_log/256_inswap_T_BLENDFACE/ckpt/95923.pth", PROVIDER.BLENDFACE)
+    swapper = Swap("train_log/256_same0.2_MS1MV2_TRANSFACE_B_num_depth3_base_ch32_r1_gamma10.0_id_loss_weight5.0/ckpt/10000.pth", PROVIDER.MS1MV2_TRANSFACE_B)
 
     swapper.swap_video(video, id)

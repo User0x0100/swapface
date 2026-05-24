@@ -305,9 +305,7 @@ class VGGPerceptualLoss(nn.Module):
         """
         super().__init__()
 
-        self.vgg = VGGFeatureExtractor(layer_names=list(layer_weights.keys()), vgg_type=vgg_type)
-        self.vgg.eval()
-        self.vgg.requires_grad_(False)
+        self.vgg = VGGFeatureExtractor(layer_names=list(layer_weights.keys()), vgg_type=vgg_type).eval().requires_grad_(False)
 
         self.criterion = {
             "l1": F.l1_loss,
@@ -750,7 +748,7 @@ class IFSRLoss(nn.Module):
 
                 idx += 1
 
-        self.net = net[: max_layer_idx + 1]
+        self.net = net[: max_layer_idx + 1].eval().requires_grad_(False)
 
     @torch.compile(
         fullgraph=True,

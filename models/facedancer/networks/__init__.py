@@ -1,6 +1,7 @@
 # from .generator import Generator
 from .inswap import Generator
 # from .generator_new import Generator
+# from .stylegan2_base import Generator
 from .discriminator import AlphaFaceDiscriminator, Discriminator, Stylegan2DiscriminatorLite, UNetDiscriminatorSN
 
 

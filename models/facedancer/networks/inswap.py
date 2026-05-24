@@ -1,49 +1,7 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
-
-
-class Linear2d(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, bias: bool = True) -> None:
-        super().__init__()
-        self.linear = nn.Linear(in_ch, out_ch, bias=bias)
-
-    def forward(self, x: Tensor) -> Tensor:
-        # [B, C, H, W] -> [B, H, W, C]
-        x = x.movedim(1, -1)
-        x = self.linear(x)
-        # [B, H, W, C] -> [B, C, H, W]
-        return x.movedim(-1, 1).contiguous()
-
-
-class AdaINMLPRB(nn.Module):
-    def __init__(self, channels: int, w_dim: int, hidden_ratio: float = 1.0) -> None:
-        super().__init__()
-
-        hidden_ch = max(16, int(channels * hidden_ratio))
-
-        self.adain0 = AdaIN(channels, w_dim)
-        self.act0 = nn.SiLU()
-        self.fc0 = Linear2d(channels, hidden_ch)
-
-        self.adain1 = AdaIN(hidden_ch, w_dim)
-        self.act1 = nn.SiLU()
-        self.fc1 = Linear2d(hidden_ch, channels)
-
-        # 让 block 初始接近恒等映射，训练更稳
-        nn.init.zeros_(self.fc1.linear.weight)
-        nn.init.zeros_(self.fc1.linear.bias)
-
-    def forward(self, x: Tensor, w: Tensor) -> Tensor:
-        y = self.adain0(x, w)
-        y = self.act0(y)
-        y = self.fc0(y)
-
-        y = self.adain1(y, w)
-        y = self.act1(y)
-        y = self.fc1(y)
-
-        return x + y
+import torch.nn.functional as F
 
 
 class AdaIN(nn.Module):
@@ -63,75 +21,27 @@ class AdaIN(nn.Module):
         return self.norm(x) * gamma + beta
 
 
-class AdainRB(nn.Module):
-    def __init__(self, channels: int, w_dim: int, hidden_ratio: float = 0.5) -> None:
+class IDInject(nn.Module):
+    def __init__(self, channels: int, w_dim: int) -> None:
         super().__init__()
 
-        hidden_ch = int(channels * hidden_ratio)
-
         self.adain0 = AdaIN(channels, w_dim)
-        self.act0 = nn.SiLU()
-        self.conv0 = nn.Conv2d(channels, hidden_ch, kernel_size=1, stride=1, padding=0)
+        self.conv0 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
 
-        self.adain1 = AdaIN(hidden_ch, w_dim)
-        self.act1 = nn.SiLU()
-        self.conv1 = nn.Conv2d(hidden_ch, channels, kernel_size=3, stride=1, padding=1)
+        self.adain1 = AdaIN(channels, w_dim)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
 
         residual = self.adain0(x, w)
-        residual = self.act0(residual)
+        residual = F.silu(residual)
         residual = self.conv0(residual)
 
         residual = self.adain1(residual, w)
-        residual = self.act1(residual)
+        residual = F.silu(residual)
         residual = self.conv1(residual)
 
         return x + residual
-
-
-# class LowRankConv3x3(nn.Module):
-#     def __init__(self, in_ch: int, out_ch: int, group_size: int = 32) -> None:
-#         super().__init__()
-
-#         assert out_ch % group_size == 0, f"out_ch={out_ch} must be divisible by group_size={group_size}"
-
-#         groups = out_ch // group_size
-
-#         self.proj = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0)
-
-#         self.spatial = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, groups=groups)
-
-#     def forward(self, x: Tensor) -> Tensor:
-#         x = self.proj(x)
-#         x = self.spatial(x)
-#         return x
-
-
-# class AdainRB(nn.Module):
-#     def __init__(self, channels: int, w_dim: int, hidden_ratio: float = 0.5, group_size0: int = 32, group_size1: int = 32) -> None:
-#         super().__init__()
-
-#         hidden_ch = int(channels * hidden_ratio)
-
-#         self.adain0 = AdaIN(channels, w_dim)
-#         self.act0 = nn.SiLU()
-#         self.conv0 = LowRankConv3x3(channels, hidden_ch, group_size=group_size0)
-
-#         self.adain1 = AdaIN(hidden_ch, w_dim)
-#         self.act1 = nn.SiLU()
-#         self.conv1 = LowRankConv3x3(hidden_ch, channels, group_size=group_size1)
-
-#     def forward(self, x: Tensor, w: Tensor) -> Tensor:
-#         residual = self.adain0(x, w)
-#         residual = self.act0(residual)
-#         residual = self.conv0(residual)
-
-#         residual = self.adain1(residual, w)
-#         residual = self.act1(residual)
-#         residual = self.conv1(residual)
-
-#         return x + residual
 
 
 class FromRGB(nn.Sequential):
@@ -206,6 +116,22 @@ class WPMappings(nn.Module):
         return w_p_all.unbind(dim=1)
 
 
+class BottleneckLayer(nn.Module):
+    def __init__(self, channels: int, w_dim: int, num_layers: int) -> None:
+        super().__init__()
+
+        self.layers = nn.ModuleList([IDInject(channels, w_dim) for _ in range(num_layers)])
+
+    def forward(self, x: Tensor, w_p_all: tuple[Tensor, ...]) -> Tensor:
+
+        assert len(w_p_all) == len(self.layers), f"w_p_all length {len(w_p_all)} != layers length {len(self.layers)}"
+
+        for layer, w_p in zip(self.layers, w_p_all):
+            x = layer(x, w_p)
+
+        return x
+
+
 class Generator(nn.Module):
     def __init__(
         self,
@@ -220,19 +146,19 @@ class Generator(nn.Module):
         super().__init__()
 
         self.network_cfg = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
-
-        self.w_p_mapping = WPMappings(id_dim, num_bottleneck)
+        self.num_bottleneck = num_bottleneck
+        self.w_p_mapping = WPMappings(id_dim, num_bottleneck + num_depth)
 
         self.from_rgb = FromRGB(img_channels, base_ch)
 
         features = [min(max_ch, base_ch * (2**i)) for i in range(num_depth + 1)]
-        features[-1] = max(features[-1], max_ch)
 
-        self.encoder = nn.Sequential(*[DownSample(features[i], features[i + 1]) for i in range(num_depth)])
+        self.encoder = nn.ModuleList([DownSample(features[i], features[i + 1]) for i in range(num_depth)])
 
-        self.bottleneck = nn.ModuleList([AdaINMLPRB(features[-1], id_dim) for _ in range(num_bottleneck)])
+        self.bottleneck = BottleneckLayer(features[-1], id_dim, num_bottleneck)
 
-        self.decoder = nn.Sequential(*[UpSample(features[-(i + 1)], features[-(i + 2)]) for i in range(num_depth)])
+        self.decoder_inject = nn.ModuleList([IDInject(features[-(i + 1)], id_dim) for i in range(num_depth)])
+        self.decoder = nn.ModuleList([UpSample(features[-(i + 1)], features[-(i + 2)]) for i in range(num_depth)])
 
         self.to_rgb = ToRGB(base_ch, img_channels)
 
@@ -241,12 +167,21 @@ class Generator(nn.Module):
         w_p_all = self.w_p_mapping(id_feat)
 
         x = self.from_rgb(x)
-        x = self.encoder(x)
 
-        for blk, w_p in zip(self.bottleneck, w_p_all):
-            x = blk(x, w_p)
+        encode_feats = []
+        for encode_layer in self.encoder:
+            x = encode_layer(x)
+            encode_feats.append(x)
 
-        x = self.decoder(x)
+        # x = self.encoder(x)
+
+        x = self.bottleneck(x, w_p_all[0 : self.num_bottleneck])
+
+        for decode_layer, encode_inject, w_p, encode_feat in zip(self.decoder, self.decoder_inject, w_p_all[self.num_bottleneck :], reversed(encode_feats)):
+            x = x + encode_inject(encode_feat, w_p)
+            x = decode_layer(x)
+
+        # x = self.decoder(x)
         x = self.to_rgb(x)
 
         return x
@@ -260,11 +195,11 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 1
     network_cfg = {
-        "img_resolution": 128,
+        "img_resolution": 256,
         "img_channels": 3,
-        "num_depth": 2,
+        "num_depth": 4,
         "num_bottleneck": 6,
-        "base_ch": 64,
+        "base_ch": 32,
         "max_ch": 512,
         "id_dim": 512,
     }
