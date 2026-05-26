@@ -217,7 +217,7 @@ class Swap:
                 frames = ((frames + 1.0) * 127.5).astype(np.uint8)
             else:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    swap_face: Tensor = self.net_g(faces, id_emb)
+                    swap_face: Tensor = self.net_g(faces, id_emb.expand(N, -1))
                     mask = self.face_mask(faces)
                     mask = F.gaussian_blur(mask, 7, 13)
                     swap_face = faces * (1.0 - mask) + swap_face * mask
@@ -253,6 +253,6 @@ if __name__ == "__main__":
     # id = "/home/liaohaixun/swap/IDAssets/2025-06-15 18_19_50小树🌿人间体验卡限时掉落✨ _3.jpg"
     # id = "w700d1q75cms.jpg"
 
-    swapper = Swap("train_log/256_same0.2_MS1MV2_TRANSFACE_B_num_depth3_base_ch32_r1_gamma10.0_id_loss_weight5.0/ckpt/10000.pth", PROVIDER.MS1MV2_TRANSFACE_B)
+    swapper = Swap("train_log/256_Base/ckpt/230000.pth", PROVIDER.MS1MV3_ARCFACE_R50_FP16)
 
     swapper.swap_video(video, id)

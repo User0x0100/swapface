@@ -102,11 +102,11 @@ class Trainer:
         # 判别器中间特征得弱特征匹配
         enable_wfm_loss: bool = False,
         wfm_loss_weight: dict[int, float] = {
-            0: 1.0,
-            1: 1.0,
-            2: 1.0,
+            # 0: 1.0,
+            # 1: 1.0,
+            # 2: 1.0,
             3: 1.0,
-            # 4: 1.0,
+            4: 1.0,
             # 5: 0.5,
         },
         # arcfaceid编码器前几层特征的带边界特征匹配
@@ -528,10 +528,10 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            "log_path": "train_log/256_UNET_T_T",
+            "log_path": "train_log/256_Base_T",
             "batch_size": 32,
             "same_image_prob": 0.2,
-            "id_loss_weight": 5.0,
+            "id_loss_weight": 6.0,
             "id_encode_provider": IDLoss.Provider.MS1MV3_ARCFACE_R50_FP16,
             "net_g_cfg": {
                 # "img_resolution": 128,
@@ -545,19 +545,12 @@ if __name__ == "__main__":
                 # "skip_idx": (),
                 # ========== inswap ============
                 # lite
-                # "img_resolution": 256,
-                # "img_channels": 3,
-                # "num_depth": 2,
-                # "num_bottleneck": 6,
-                # "base_ch": 64,
-                # "max_ch": 512,
-                # "id_dim": 512,
                 "img_resolution": 256,
                 "img_channels": 3,
-                "num_depth": 4,
+                "num_depth": 2,
                 "num_bottleneck": 6,
-                "base_ch": 32,
-                "max_ch": 512,
+                "base_ch": 64,
+                "max_ch": 1024,
                 "id_dim": 512,
                 # ========== new ============
                 # "img_resolution": 128,
@@ -584,12 +577,12 @@ if __name__ == "__main__":
                 "group_size": 4,
             },
             "r1_reg_step": 16,
-            "r1_gamma": 10.0,
+            "r1_gamma": 4.0,
             # "enable_ifsr_loss": True,
             # "enable_wfm_loss": True,
             "enable_rec_loss": True,
             "enable_perceptual_loss": True,
-            # "enable_dssim_loss": True,
+            "enable_dssim_loss": True,
             "enable_color_loss": True,
         }
     )
