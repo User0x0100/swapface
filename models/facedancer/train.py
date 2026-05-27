@@ -63,8 +63,7 @@ class Trainer:
         lr: float = 1e-4,
         lr_scheduler_t_max: int = 0,
         discriminator_typt: DISCRIMINATOR_TYPT = DISCRIMINATOR_TYPT.ORIGIN,
-        d_train_setp: int = 1,
-        r1_reg_step: int = 1,
+        r1_reg_step: int = 16,
         r1_gamma: float = 10.0,
         bf16: bool = True,
         device: str = "cuda",
@@ -105,9 +104,8 @@ class Trainer:
             # 0: 1.0,
             # 1: 1.0,
             # 2: 1.0,
-            3: 1.0,
-            4: 1.0,
-            # 5: 0.5,
+            3: 5.0,
+            4: 5.0,
         },
         # arcfaceid编码器前几层特征的带边界特征匹配
         enable_ifsr_loss: bool = False,
@@ -143,7 +141,6 @@ class Trainer:
         self.rng = random.Random()
         self.device = torch.device(device)
         self.batch_size = batch_size
-        self.d_train_setp = d_train_setp
         self.r1_reg_step = r1_reg_step
         self.r1_gamma = r1_gamma
         self.enable_rec_loss = enable_rec_loss
@@ -201,11 +198,11 @@ class Trainer:
 
         # ========================= Optim =========================
         self.optim_g = optim.Adam(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
-        self.optim_d = optim.Adam(self.net_d.parameters(), lr=lr * 0.5, betas=(0.0, 0.99), fused=True)
+        self.optim_d = optim.Adam(self.net_d.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
 
         if self.use_cosine_lr:
             self.lr_scheduler_g = CosineAnnealingLR(self.optim_g, T_max=lr_scheduler_t_max, eta_min=lr * 0.1)
-            self.lr_scheduler_d = CosineAnnealingLR(self.optim_d, T_max=lr_scheduler_t_max, eta_min=lr * 0.1 * 0.5)
+            self.lr_scheduler_d = CosineAnnealingLR(self.optim_d, T_max=lr_scheduler_t_max, eta_min=lr * 0.1)
 
         # ========================= LOSS =========================
 
@@ -218,7 +215,7 @@ class Trainer:
             self.rec_loss = l1_loss_fn(weight=rec_loss_weight, reduction="none")
 
         if self.enable_perceptual_loss:
-            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
+            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="none").to(self.device)
 
         if self.enable_ifsr_loss:
             self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight).to(self.device)
@@ -347,43 +344,53 @@ class Trainer:
             src, dst, is_same = self.fetch_sample()
 
             torch.compiler.cudagraph_mark_step_begin()
+
+            # ========================= forward g =========================
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
                 with torch.no_grad():
                     src_id_feats = self.id_loss.get_id_feats(src)
-                    if self.enable_ifsr_loss:
-                        dst_ifsr_feats = self.ifsr_loss.get_ifsr_feats(dst)
-
                 fake: Tensor = net_g(dst, src_id_feats)
 
-                # ========================= train d =========================
-                if self.iter % self.d_train_setp == 0:
-                    net_d.requires_grad_(True)
-                    self.optim_d.zero_grad()
+            # ========================= train d =========================
+            net_d.requires_grad_(True)
+            self.optim_d.zero_grad()
+            is_r1_reg_step = self.iter % self.r1_reg_step == 0
 
-                    is_r1_reg_step = (self.iter // self.d_train_setp) % self.r1_reg_step == 0
+            if is_r1_reg_step:
+                with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=False):
+                    fake_img = fake.detach().float()
+                    real_img = dst.detach().float().requires_grad_(True)
 
-                    fake_score = net_d(fake.detach())
-                    real_img = dst.detach().requires_grad_(is_r1_reg_step)
-                    real_score = net_d(real_img)
+                    fake_score = self.net_d(fake_img)
+                    real_score = self.net_d(real_img)
 
                     d_loss = self.d_loss(fake_score, real_score)
                     self.log("d_loss", d_loss, True)
 
-                    if is_r1_reg_step:
-                        r1_loss = r1_reg_loss(real_score, real_img, gamma=self.r1_gamma)
-                        r1_loss *= self.r1_reg_step
-                        self.log("r1_loss", r1_loss)
-                        d_loss += r1_loss
+                    r1_loss_raw = r1_reg_loss(real_score, real_img, gamma=self.r1_gamma)
+                    self.log("r1_loss_raw", r1_loss_raw)
+                    r1_loss = r1_loss_raw * self.r1_reg_step
+                    self.log("r1_loss", r1_loss)
+                    d_loss += r1_loss
+            else:
+                with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
+                    fake_score = net_d(fake.detach())
+                    real_score = net_d(dst.detach())
 
-                    d_loss.backward()
-                    self.optim_d.step()
+                    d_loss = self.d_loss(fake_score, real_score)
+                    self.log("d_loss", d_loss, True)
 
-                    if self.use_cosine_lr:
-                        self.lr_scheduler_d.step()
+            d_loss.backward()
+            self.optim_d.step()
 
-                # ========================= train g =========================
-                net_d.requires_grad_(False)
-                self.optim_g.zero_grad()
+            if self.use_cosine_lr:
+                self.lr_scheduler_d.step()
+
+            # ========================= train g =========================
+            net_d.requires_grad_(False)
+            self.optim_g.zero_grad()
+
+            with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
                 g_loss: Tensor = torch.tensor(0.0, device=self.device)
 
                 # gan_loss
@@ -413,13 +420,16 @@ class Trainer:
                 # ifsr_loss
                 if self.enable_ifsr_loss:
                     fake_ifsr_feats = self.ifsr_loss.get_ifsr_feats(fake)
+                    with torch.no_grad():
+                        dst_ifsr_feats = self.ifsr_loss.get_ifsr_feats(dst)
                     ifsr_loss = self.ifsr_loss(fake_ifsr_feats, dst_ifsr_feats)
                     self.log("ifsr_loss", ifsr_loss)
                     g_loss += ifsr_loss
 
                 # perceptual_loss
                 if self.enable_perceptual_loss:
-                    perceptual_loss = self.perceptual_loss(fake, dst)
+                    perceptual_loss = self.perceptual_loss(fake, dst)  # (N,)
+                    perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
                     self.log("perceptual_loss", perceptual_loss)
                     g_loss += perceptual_loss
 
@@ -528,7 +538,8 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            "log_path": "train_log/256_Base_T",
+            "ckpt": "train_log/256_Base_T_MiniMapping/ckpt/247702.pth",
+            "log_path": "train_log/256_Base_T_MiniMapping",
             "batch_size": 32,
             "same_image_prob": 0.2,
             "id_loss_weight": 6.0,
@@ -576,10 +587,8 @@ if __name__ == "__main__":
                 "max_ch": 512,
                 "group_size": 4,
             },
-            "r1_reg_step": 16,
-            "r1_gamma": 4.0,
             # "enable_ifsr_loss": True,
-            # "enable_wfm_loss": True,
+            "enable_wfm_loss": True,
             "enable_rec_loss": True,
             "enable_perceptual_loss": True,
             "enable_dssim_loss": True,

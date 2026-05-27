@@ -53,7 +53,7 @@ class DownRB(nn.Module):
 
 
 class AlphaFaceDiscriminator(nn.Module):
-    def __init__(self, img_resolution: int = 256, img_channels: int = 3, base_ch: int = 64, max_ch: int = 512, group_size: int = 5):
+    def __init__(self, img_resolution: int = 256, img_channels: int = 3, base_ch: int = 64, max_ch: int = 512, group_size: int = 4):
         super().__init__()
 
         self.network_cfg = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
@@ -69,12 +69,14 @@ class AlphaFaceDiscriminator(nn.Module):
         self.down_blocks = nn.ModuleList([DownRB(features[i], features[i + 1]) for i in range(n_blocks)])
 
         final_features = features[-1] + 1
-        final_res = img_resolution // (2 ** len(features))
         self.final_conv = nn.Sequential(
             MinibatchStdLayer(group_size),
-            nn.Conv2d(final_features, final_features, 3),
+            nn.Conv2d(final_features, final_features, 3, 1, 1),
+            nn.LeakyReLU(0.2),
             nn.Flatten(),
-            nn.Linear(final_res**2 * final_features, 1),
+            nn.Linear(4 * 4 * final_features, final_features),
+            nn.LeakyReLU(0.2),
+            nn.Linear(final_features, 1),
         )
 
     def get_feats(self, x: Tensor) -> list[Tensor]:

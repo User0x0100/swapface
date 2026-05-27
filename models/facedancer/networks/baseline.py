@@ -1,7 +1,6 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class AdaIN(nn.Module):
@@ -25,6 +24,8 @@ class IDInject(nn.Module):
     def __init__(self, channels: int, w_dim: int) -> None:
         super().__init__()
 
+        self.act = nn.LeakyReLU(0.2)
+
         self.adain0 = AdaIN(channels, w_dim)
         self.conv0 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
 
@@ -34,11 +35,11 @@ class IDInject(nn.Module):
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
 
         residual = self.adain0(x, w)
-        residual = F.silu(residual)
+        residual = self.act(residual)
         residual = self.conv0(residual)
 
         residual = self.adain1(residual, w)
-        residual = F.silu(residual)
+        residual = self.act(residual)
         residual = self.conv1(residual)
 
         return x + residual
@@ -82,7 +83,7 @@ class DownSample(nn.Sequential):
 
 
 class WPMappings(nn.Module):
-    def __init__(self, id_dim: int = 512, num: int = 4, num_share_layers: int = 4, num_w_p_layers: int = 2) -> None:
+    def __init__(self, id_dim: int, num: int, num_share_layers: int = 2, num_w_p_layers: int = 1) -> None:
         super().__init__()
 
         self.shared_delta = nn.Sequential()
