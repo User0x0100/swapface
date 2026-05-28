@@ -40,8 +40,7 @@ class IdentityPairReader:
         - 再从该 identity 中采样两张不同图片
     """
 
-    def __init__(self, roots: list[str], random_sampling: bool = True):
-        self.random_sampling = random_sampling
+    def __init__(self, roots: list[str]):
         self.folders: list[ImageFolder] = []
 
         for root in roots:
@@ -93,9 +92,8 @@ class SampleReader(object):
         self,
         src: list[str] | list[tuple[str, float]],
         dst: list[str] | list[tuple[str, float]],
-        random_sampling: bool = True,
     ):
-        self.random_sampling = random_sampling
+
         self.src_folders, self.src_weight = self.collect_folder(src)
         self.dst_folders, self.dst_weight = self.collect_folder(dst)
         self.print_folders_info()
@@ -196,7 +194,7 @@ class SampleReader(object):
 
 @pipeline_def(enable_conditionals=True)
 def datasetloader(
-    resize: int,
+    img_resolution: int,
     src: list[tuple[str, float]],
     dst: list[tuple[str, float]],
     identity_root: list[str] | None = None,
@@ -206,12 +204,11 @@ def datasetloader(
     flip_prob: float = 0.5,
     same_image_prob: float = 0.2,
     same_use_src_dst: bool = True,
-    random_sampling: bool = True,
     use_gpu_decode: bool = True,
 ):
 
     external_source = fn.external_source(
-        source=SampleReader(src, dst, random_sampling),
+        source=SampleReader(src, dst),
         num_outputs=2,
         device="cpu",
         no_copy=True,
@@ -223,7 +220,7 @@ def datasetloader(
 
     if identity_root is not None and not same_use_src_dst:
         identity_sampler = fn.external_source(
-            source=IdentityPairReader(identity_root, random_sampling),
+            source=IdentityPairReader(identity_root),
             num_outputs=2,
             device="cpu",
             no_copy=True,
@@ -257,7 +254,7 @@ def datasetloader(
         src = fn.decoders.image(src_raw, device="cpu", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
         src = fn.copy(src, device="gpu")
 
-    src = fn.resize(src, device="gpu", size=resize, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
+    src = fn.resize(src, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
     if fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.BOOL):
         src = fn.flip(src, device="gpu")
 
@@ -267,7 +264,7 @@ def datasetloader(
         dst = fn.decoders.image(dst_raw, device="cpu", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
         dst = fn.copy(dst, device="gpu")
 
-    dst = fn.resize(dst, device="gpu", size=resize, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
+    dst = fn.resize(dst, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
     if fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.BOOL):
         dst = fn.flip(dst, device="gpu")
 
