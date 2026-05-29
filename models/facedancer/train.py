@@ -73,14 +73,13 @@ class Trainer:
         log_interval: int = 10,
         sample_save_every: int = 1000,
         weight_save_every: int = 10000,
-        same_image_prob: float = 0.2,
-        same_use_src_dst: bool = True,
+        same_prob: float = 0.2,
         # 模型配置
         net_g_cfg: dict[str, int] | None = None,
         net_d_cfg: dict[str, int] | None = None,
         # 身份损失
         id_encode_provider: IDLoss.Provider = IDLoss.Provider.BLENDFACE,
-        id_loss_weight: float = 10.0,
+        id_loss_weight: float = 6.725,
         # 自重建损失
         enable_rec_loss: bool = False,
         rec_loss_weight: float = 10.0,
@@ -88,10 +87,10 @@ class Trainer:
         enable_perceptual_loss: bool = False,
         perceptual_loss_weight: dict[str, float] = {
             # vgg16
-            "relu1_2": 0.25,
-            "relu2_2": 0.25,
-            "relu3_3": 0.25,
-            "relu4_2": 0.25,
+            "relu1_2": 2.5,
+            "relu2_2": 2.5,
+            "relu3_3": 2.5,
+            "relu4_2": 2.5,
             # "pool1": 1.0,
             # "pool2": 1.0,
             # "pool3": 1.0,
@@ -101,11 +100,11 @@ class Trainer:
         # 判别器中间特征得弱特征匹配
         enable_wfm_loss: bool = False,
         wfm_loss_weight: dict[int, float] = {
-            # 0: 1.0,
-            # 1: 1.0,
-            # 2: 1.0,
-            3: 5.0,
-            4: 5.0,
+            0: 10.0,
+            1: 10.0,
+            2: 10.0,
+            3: 10.0,
+            # 4: 2.5,
         },
         # arcfaceid编码器前几层特征的带边界特征匹配
         enable_ifsr_loss: bool = False,
@@ -125,7 +124,7 @@ class Trainer:
         },
         # 色彩一致损失
         enable_color_loss: bool = False,
-        color_loss_weight: float = 0.1,
+        color_loss_weight: float = 0.5,
         # 结构损失
         enable_dssim_loss: bool = False,
         dssim_loss_weight: float = 10.0,
@@ -215,7 +214,7 @@ class Trainer:
             self.rec_loss = l1_loss_fn(weight=rec_loss_weight, reduction="none")
 
         if self.enable_perceptual_loss:
-            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="none").to(self.device)
+            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
 
         if self.enable_ifsr_loss:
             self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight).to(self.device)
@@ -243,7 +242,7 @@ class Trainer:
         # ========================= Sample =========================
 
         major, _minor = torch.cuda.get_device_capability(device)
-        use_gpu_decode = major >= 8
+        hw_decoder = major >= 8
         pipe = datasetloader(
             batch_size=self.batch_size,
             num_threads=16,
@@ -251,16 +250,15 @@ class Trainer:
             py_num_workers=8,
             py_start_method="spawn",
             device_id=self.device.index,
-            resize=self.img_resolution,
+            img_resolution=self.img_resolution,
             src=src,
             dst=dst,
             identity_root=identity_root,
-            same_image_prob=same_image_prob,
-            same_use_src_dst=same_use_src_dst,
-            use_gpu_decode=use_gpu_decode,
+            same_prob=same_prob,
+            hw_decoder=hw_decoder,
         )
 
-        print(f"use_gpu_decode={use_gpu_decode}")
+        print(f"hw_decoder={hw_decoder}")
 
         self.sample_output_map = ["src", "dst", "is_same"]
         self.dataset = DALIGenericIterator(pipelines=pipe, output_map=self.sample_output_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
@@ -428,8 +426,8 @@ class Trainer:
 
                 # perceptual_loss
                 if self.enable_perceptual_loss:
-                    perceptual_loss = self.perceptual_loss(fake, dst)  # (N,)
-                    perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
+                    perceptual_loss = self.perceptual_loss(fake, dst)  # (N,) if reduction = "none" else N
+                    # perceptual_loss = (perceptual_loss * is_same).sum() / is_same.sum().clamp_min(1.0)
                     self.log("perceptual_loss", perceptual_loss)
                     g_loss += perceptual_loss
 
@@ -522,28 +520,28 @@ if __name__ == "__main__":
     src = [
         ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
         ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
-        ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
+        # ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
     ]
 
     dst = [
         ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
         ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
-        ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
+        # ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
         # ("/opt/share/deepfake/dataset_1/RealOcc/image/realign_arcface_dst", 1.0),
         # ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
     ]
     identity_root = ["/opt/share/deepfake/dataset_1/youtube"]
+    # identity_root = []
 
-    def_config = {"src": src, "dst": dst, "identity_root": identity_root, "same_use_src_dst": False}
+    def_config = {"src": src, "dst": dst, "identity_root": identity_root}
 
     def_config.update(
         {
-            "ckpt": "train_log/256_Base_T_MiniMapping/ckpt/247702.pth",
-            "log_path": "train_log/256_Base_T_MiniMapping",
-            "batch_size": 32,
-            "same_image_prob": 0.2,
-            "id_loss_weight": 6.0,
-            "id_encode_provider": IDLoss.Provider.MS1MV3_ARCFACE_R50_FP16,
+            # "ckpt": "train_log/256_MS1MV3_ARCFACE_R100_FP16_FFHQ_Depth3_BaseCH32/ckpt/56316.pth",
+            "log_path": "train_log/256_MS1MV2_TRANSFACE_B_FFHQ_Depth3_BaseCH32",
+            "batch_size": 12,
+            "same_prob": 0.2,
+            "id_encode_provider": IDLoss.Provider.MS1MV2_TRANSFACE_B,
             "net_g_cfg": {
                 # "img_resolution": 128,
                 # "img_channels": 3,
@@ -556,11 +554,18 @@ if __name__ == "__main__":
                 # "skip_idx": (),
                 # ========== inswap ============
                 # lite
+                # "img_resolution": 256,
+                # "img_channels": 3,
+                # "num_depth": 2,
+                # "num_bottleneck": 6,
+                # "base_ch": 64,
+                # "max_ch": 1024,
+                # "id_dim": 512,
                 "img_resolution": 256,
                 "img_channels": 3,
-                "num_depth": 2,
+                "num_depth": 3,
                 "num_bottleneck": 6,
-                "base_ch": 64,
+                "base_ch": 32,
                 "max_ch": 1024,
                 "id_dim": 512,
                 # ========== new ============
@@ -590,8 +595,8 @@ if __name__ == "__main__":
             # "enable_ifsr_loss": True,
             "enable_wfm_loss": True,
             "enable_rec_loss": True,
-            "enable_perceptual_loss": True,
-            "enable_dssim_loss": True,
+            # "enable_perceptual_loss": True,
+            # "enable_dssim_loss": True,
             "enable_color_loss": True,
         }
     )

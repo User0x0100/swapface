@@ -24,7 +24,7 @@ class IDInject(nn.Module):
     def __init__(self, channels: int, w_dim: int) -> None:
         super().__init__()
 
-        self.act = nn.LeakyReLU(0.2)
+        self.act = nn.SiLU()
 
         self.adain0 = AdaIN(channels, w_dim)
         self.conv0 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
@@ -49,9 +49,9 @@ class FromRGB(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__(
             nn.Conv2d(in_ch, out_ch // 2, kernel_size=7, stride=1, padding=3),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
             nn.Conv2d(out_ch // 2, out_ch, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
         )
 
 
@@ -59,7 +59,7 @@ class ToRGB(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__(
             nn.Conv2d(in_ch, in_ch // 2, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
             nn.Conv2d(in_ch // 2, out_ch, kernel_size=7, stride=1, padding=3),
             nn.Tanh(),
         )
@@ -70,7 +70,7 @@ class UpSample(nn.Sequential):
         super().__init__(
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
         )
 
 
@@ -78,7 +78,7 @@ class DownSample(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__(
             nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
         )
 
 
@@ -89,12 +89,12 @@ class WPMappings(nn.Module):
         self.shared_delta = nn.Sequential()
         for _ in range(num_share_layers - 1):
             self.shared_delta.append(nn.Linear(id_dim, id_dim))
-            self.shared_delta.append(nn.LeakyReLU(0.2))
+            self.shared_delta.append(nn.SiLU())
         self.shared_delta.append(nn.Linear(id_dim, id_dim))
 
-        self.private_delta = nn.Sequential(nn.LeakyReLU(0.2), nn.Linear(id_dim, id_dim * num))
+        self.private_delta = nn.Sequential(nn.SiLU(), nn.Linear(id_dim, id_dim * num))
         for _ in range(num_w_p_layers - 1):
-            self.private_delta.append(nn.LeakyReLU(0.2))
+            self.private_delta.append(nn.SiLU())
             self.private_delta.append(nn.Linear(id_dim * num, id_dim * num))
 
         self.num = num
@@ -181,9 +181,9 @@ if __name__ == "__main__":
     network_cfg = {
         "img_resolution": 256,
         "img_channels": 3,
-        "num_depth": 2,
+        "num_depth": 3,
         "num_bottleneck": 6,
-        "base_ch": 64,
+        "base_ch": 32,
         "max_ch": 1024,
         "id_dim": 512,
     }

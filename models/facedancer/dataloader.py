@@ -202,9 +202,8 @@ def datasetloader(
     contrast: float = 0.2,
     saturation: float = 0.2,
     flip_prob: float = 0.5,
-    same_image_prob: float = 0.2,
-    same_use_src_dst: bool = True,
-    use_gpu_decode: bool = True,
+    same_prob: float = 0.2,
+    hw_decoder: bool = True,
 ):
 
     external_source = fn.external_source(
@@ -218,7 +217,11 @@ def datasetloader(
         batch=False,
     )
 
-    if identity_root is not None and not same_use_src_dst:
+    if identity_root is None:
+        identity_sampler = external_source
+        same_prob = 0.0
+
+    else:
         identity_sampler = fn.external_source(
             source=IdentityPairReader(identity_root),
             num_outputs=2,
@@ -229,26 +232,16 @@ def datasetloader(
             dtype=DALIDataType.UINT8,
             batch=False,
         )
-    else:
-        identity_sampler = external_source
 
-    # 是否采样同一身份
-    if fn.random.coin_flip(probability=same_image_prob, dtype=DALIDataType.BOOL):
+    if fn.random.coin_flip(probability=same_prob, dtype=DALIDataType.BOOL):
         is_same = Constant(value=1.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])
-        if same_use_src_dst:
-            src_raw, dst_raw = identity_sampler
-            if fn.random.coin_flip(probability=0.5, dtype=DALIDataType.BOOL):
-                dst_raw = src_raw
-            else:
-                src_raw = dst_raw
-        else:
-            src_raw, dst_raw = identity_sampler
+        src_raw, dst_raw = identity_sampler
 
     else:
         is_same = Constant(value=0.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])
         src_raw, dst_raw = external_source
 
-    if use_gpu_decode:
+    if hw_decoder:
         src = fn.decoders.image(src_raw, device="mixed", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
     else:
         src = fn.decoders.image(src_raw, device="cpu", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
@@ -258,7 +251,7 @@ def datasetloader(
     if fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.BOOL):
         src = fn.flip(src, device="gpu")
 
-    if use_gpu_decode:
+    if hw_decoder:
         dst = fn.decoders.image(dst_raw, device="mixed", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
     else:
         dst = fn.decoders.image(dst_raw, device="cpu", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
