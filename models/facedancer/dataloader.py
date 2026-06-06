@@ -3,11 +3,187 @@ from pathlib import Path
 
 import numpy as np
 from numpy import ndarray
+from scipy.stats import truncnorm
+import cv2
 import nvidia.dali.fn as fn
 from nvidia.dali import pipeline_def
 from nvidia.dali.types import Constant, DALIDataType, DALIImageType, DALIInterpType
 from nvidia.dali.math import clamp
 from misc.utils import ImageFolder
+
+
+class RndAffinePars:
+    def __init__(
+        self,
+        img_resolution: int,
+        rotation_range: tuple[int | float, ...] = (-10.0, 10.0),
+        scale_range: tuple[int | float, ...] = (-0.25, 0.25),
+        tx_range: tuple[int | float, ...] = (-0.05, 0.05),
+        ty_range: tuple[int | float, ...] = (-0.05, 0.05),
+    ):
+        self.img_resolution = img_resolution
+        self.rotation_range = rotation_range
+        self.scale_range = scale_range
+        self.tx_range = tx_range
+        self.ty_range = ty_range
+        self.rng = np.random.default_rng(int.from_bytes(os.urandom(8), "little"))
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state["rng"]
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        seed = int.from_bytes(os.urandom(8), "little")
+        self.rng = np.random.default_rng(seed)
+
+    @staticmethod
+    def _to_3x3(m: ndarray) -> ndarray:
+        out = np.eye(3, dtype=np.float64)
+        out[:2, :] = m.astype(np.float64)
+        return out
+
+    @staticmethod
+    def _invert_affine(m: ndarray) -> ndarray:
+        m3 = RndAffinePars._to_3x3(m)
+        return np.linalg.inv(m3)[:2, :].astype(np.float32)
+
+    @staticmethod
+    def _pixel_mtx_to_torch_theta(m: ndarray, h: int, w: int, align_corners: bool = False) -> ndarray:
+        """
+        m: output_pixel -> input_pixel 的 2x3 像素坐标矩阵。
+        返回 PyTorch affine_grid 可直接使用的 2x3 theta。
+        """
+
+        m3 = RndAffinePars._to_3x3(m)
+
+        if align_corners:
+            px_to_norm = np.array(
+                [
+                    [2.0 / (w - 1), 0.0, -1.0],
+                    [0.0, 2.0 / (h - 1), -1.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+
+            norm_to_px = np.array(
+                [
+                    [(w - 1) / 2.0, 0.0, (w - 1) / 2.0],
+                    [0.0, (h - 1) / 2.0, (h - 1) / 2.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+
+        else:
+            px_to_norm = np.array(
+                [
+                    [2.0 / w, 0.0, 1.0 / w - 1.0],
+                    [0.0, 2.0 / h, 1.0 / h - 1.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+
+            norm_to_px = np.array(
+                [
+                    [w / 2.0, 0.0, w / 2.0 - 0.5],
+                    [0.0, h / 2.0, h / 2.0 - 0.5],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+
+        theta = px_to_norm @ m3 @ norm_to_px
+        return theta[:2, :].astype(np.float32)
+
+    def __call__(self, sample_info=None) -> tuple[ndarray, ndarray]:
+        _ = sample_info
+
+        w = self.img_resolution
+        h = self.img_resolution
+
+        rotation = self.rng.uniform(self.rotation_range[0], self.rotation_range[1])
+        scale = self.rng.uniform(1 / (1 - self.scale_range[0]), 1 + self.scale_range[1])
+        tx = self.rng.uniform(self.tx_range[0], self.tx_range[1])
+        ty = self.rng.uniform(self.ty_range[0], self.ty_range[1])
+
+        # OpenCV/DALI source -> destination 像素坐标矩阵
+        src_to_dst = cv2.getRotationMatrix2D((w * 0.5, h * 0.5), rotation, scale)
+        src_to_dst[:, 2] += (tx * w, ty * h)
+        src_to_dst = src_to_dst.astype(np.float32)
+
+        # destination -> source，用于 PyTorch 复现 warp：
+        # warped = grid_sample(base, theta_warp)
+        # dst_to_src = self._invert_affine(src_to_dst)
+
+        # theta_warp = self._pixel_mtx_to_torch_theta(dst_to_src, h=h, w=w, align_corners=False)
+
+        # source -> destination，用于 PyTorch 还原：
+        # restored = grid_sample(warped, theta_restore)
+        theta_restore = self._pixel_mtx_to_torch_theta(src_to_dst, h=h, w=w, align_corners=False)
+
+        dali_mtx = src_to_dst.astype(np.float32)
+
+        return dali_mtx, theta_restore
+
+
+class RndRemapPars:
+    def __init__(
+        self,
+        img_resolution: int,
+        trunc_val: float = 2.5,
+    ):
+        self.img_resolution = img_resolution
+        self.trunc_val = trunc_val
+        self.rng = np.random.default_rng(int.from_bytes(os.urandom(8), "little"))
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state["rng"]
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        seed = int.from_bytes(os.urandom(8), "little")
+        self.rng = np.random.default_rng(seed)
+
+    def random_normal(self, shape) -> ndarray:
+        samples = truncnorm.rvs(-self.trunc_val, self.trunc_val, loc=0.0, scale=1.0, size=shape, random_state=self.rng)
+        return (samples / self.trunc_val).astype(np.float32)
+
+    def __call__(self, sample_info=None) -> tuple[ndarray, ndarray]:
+        _ = sample_info
+
+        w = self.img_resolution
+
+        cell_size = [w // 2, w // 4, w // 8][self.rng.integers(0, 3)]
+        cell_count = w // cell_size + 1
+
+        grid = np.linspace(0, w, cell_count)
+
+        mapx = np.broadcast_to(grid, (cell_count, cell_count)).copy()
+        mapy = mapx.T.copy()
+
+        noise = self.random_normal((cell_count - 2, cell_count - 2))
+        mapx[1:-1, 1:-1] += noise * (cell_size * 0.24)
+
+        noise = self.random_normal((cell_count - 2, cell_count - 2))
+        mapy[1:-1, 1:-1] += noise * (cell_size * 0.24)
+
+        half = cell_size // 2
+
+        dsize = (w + cell_size, w + cell_size)
+
+        mapx = cv2.resize(mapx, dsize)
+        mapy = cv2.resize(mapy, dsize)
+
+        mapx = mapx[half:-half, half:-half]
+        mapy = mapy[half:-half, half:-half]
+
+        return mapx.astype(np.float32), mapy.astype(np.float32)
 
 
 class IdentityPairReader:
@@ -203,6 +379,10 @@ def datasetloader(
     saturation: float = 0.2,
     flip_prob: float = 0.5,
     same_prob: float = 0.2,
+    rotation_range: tuple[int | float, ...] = (-10.0, 10.0),
+    scale_range: tuple[int | float, ...] = (-0.25, 0.25),
+    tx_range: tuple[int | float, ...] = (-0.05, 0.05),
+    ty_range: tuple[int | float, ...] = (-0.05, 0.05),
     hw_decoder: bool = True,
 ):
 
@@ -232,6 +412,22 @@ def datasetloader(
             dtype=DALIDataType.UINT8,
             batch=False,
         )
+
+    rnd_affine_params = fn.external_source(
+        source=RndAffinePars(
+            img_resolution,
+            rotation_range,
+            scale_range,
+            tx_range,
+            ty_range,
+        ),
+        num_outputs=2,
+        device="gpu",
+        no_copy=False,
+        parallel=False,
+        dtype=DALIDataType.FLOAT,
+        batch=False,
+    )
 
     if fn.random.coin_flip(probability=same_prob, dtype=DALIDataType.BOOL):
         is_same = Constant(value=1.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])
@@ -269,6 +465,9 @@ def datasetloader(
         saturation=fn.random.uniform(range=[1.0 - saturation, 1.0 + saturation]),
     )
 
+    dali_mtx, theta_restore = rnd_affine_params
+    dst = fn.warp_affine(dst, dali_mtx, inverse_map=False, fill_value=-1.0)
+
     src = clamp(src, lo=0.0, hi=255.0)
     src = fn.normalize(src, device="gpu", mean=127.5, stddev=127.5)
     src = fn.transpose(src, device="gpu", perm=[2, 0, 1])
@@ -277,4 +476,4 @@ def datasetloader(
     dst = fn.normalize(dst, device="gpu", mean=127.5, stddev=127.5)
     dst = fn.transpose(dst, device="gpu", perm=[2, 0, 1])
 
-    return src, dst, is_same
+    return src, dst, is_same, theta_restore

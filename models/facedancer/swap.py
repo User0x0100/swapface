@@ -223,9 +223,11 @@ class Swap:
                     swap_face = faces * (1.0 - mask) + swap_face * mask
                     # mask = mask * 2.0 - 1.0
                     # swap_face = faces
-                    add_black_border_batch(swap_face)
-                    swap_face = restore_faces_to_original(org_frames, swap_face, norm_theta, offset)
+                    # add_black_border_batch(swap_face)
+                    swap_face = restore_faces_to_original(org_frames.clone(), swap_face, norm_theta, offset)
+                    swap_face = torch.cat((org_frames, swap_face), dim=3)
                     swap_face = torch.nn.functional.interpolate(swap_face, scale_factor=0.25, mode="bilinear", align_corners=False)
+
                     # swap_face = torch.cat((faces, swap_face), dim=3)
                     swap_face = swap_face.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)[:, [2, 1, 0], :, :]  # RGB -> BGR
                     swap_face = swap_face.permute(0, 2, 3, 1)  # NCHW -> NHWC
@@ -246,13 +248,11 @@ if __name__ == "__main__":
     # video = "/opt/share/deepfake/linshi/录屏素材/2025-07-03(蒋女士 林嘉惠 王钰 符媛媛 石星儿)/王钰(电脑录屏).mp4"
 
     # id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
-    id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
-    # id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
+    # id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
+    id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
     # id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
     # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
-    # id = "/home/liaohaixun/swap/IDAssets/2025-06-15 18_19_50小树🌿人间体验卡限时掉落✨ _3.jpg"
-    # id = "w700d1q75cms.jpg"
 
-    swapper = Swap("train_log/256_BLENDFACE_FFHQ/ckpt/260000.pth", PROVIDER.MS1MV3_ARCFACE_R100_FP16)
+    swapper = Swap("train_log/256_MS1MV3_ARCFACE_R100_FP16_BASE_FIX_T_ORGDISEC/ckpt/730000.pth", PROVIDER.MS1MV3_ARCFACE_R100_FP16)
 
     swapper.swap_video(video, id)

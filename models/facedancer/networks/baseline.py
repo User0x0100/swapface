@@ -8,15 +8,19 @@ class AdaIN(nn.Module):
         super().__init__()
 
         self.norm = nn.InstanceNorm2d(channels, affine=False)
-        self.affine = nn.Linear(w_dim, channels * 2)
+        self.gamma_fc = nn.Linear(w_dim, channels)
+        self.beta_fc = nn.Linear(w_dim, channels)
 
-        nn.init.zeros_(self.affine.weight)
-        nn.init.zeros_(self.affine.bias)
-        nn.init.ones_(self.affine.bias[:channels])
+        nn.init.zeros_(self.gamma_fc.weight)
+        nn.init.ones_(self.gamma_fc.bias)
+
+        nn.init.zeros_(self.beta_fc.weight)
+        nn.init.zeros_(self.beta_fc.bias)
 
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
+        gamma = self.gamma_fc(w)[:, :, None, None]
+        beta = self.beta_fc(w)[:, :, None, None]
 
-        gamma, beta = self.affine(w)[:, :, None, None].chunk(2, dim=1)
         return self.norm(x) * gamma + beta
 
 
@@ -34,13 +38,13 @@ class IDInject(nn.Module):
 
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
 
-        residual = self.adain0(x, w)
+        residual = self.conv0(x)
+        residual = self.adain0(residual, w)
         residual = self.act(residual)
-        residual = self.conv0(residual)
 
+        residual = self.conv1(residual)
         residual = self.adain1(residual, w)
         residual = self.act(residual)
-        residual = self.conv1(residual)
 
         return x + residual
 
@@ -82,8 +86,8 @@ class DownSample(nn.Sequential):
         )
 
 
-class WPMappings(nn.Module):
-    def __init__(self, id_dim: int, num: int, num_share_layers: int = 2, num_w_p_layers: int = 1) -> None:
+class WSpaceMap(nn.Module):
+    def __init__(self, id_dim: int, num: int, num_share_layers: int = 4, num_w_p_layers: int = 2) -> None:
         super().__init__()
 
         self.shared_delta = nn.Sequential()
@@ -92,10 +96,13 @@ class WPMappings(nn.Module):
             self.shared_delta.append(nn.SiLU())
         self.shared_delta.append(nn.Linear(id_dim, id_dim))
 
-        self.private_delta = nn.Sequential(nn.SiLU(), nn.Linear(id_dim, id_dim * num))
-        for _ in range(num_w_p_layers - 1):
-            self.private_delta.append(nn.SiLU())
-            self.private_delta.append(nn.Linear(id_dim * num, id_dim * num))
+        self.private_delta = nn.ModuleList()
+        for _ in range(num):
+            layers = nn.Sequential()
+            for _ in range(num_w_p_layers):
+                layers.append(nn.SiLU())
+                layers.append(nn.Linear(id_dim, id_dim))
+            self.private_delta.append(layers)
 
         self.num = num
         self.id_dim = id_dim
@@ -103,31 +110,27 @@ class WPMappings(nn.Module):
         nn.init.zeros_(self.shared_delta[-1].weight)
         nn.init.zeros_(self.shared_delta[-1].bias)
 
-        nn.init.zeros_(self.private_delta[-1].weight)
-        nn.init.zeros_(self.private_delta[-1].bias)
+        for head in self.private_delta:
+            nn.init.zeros_(head[-1].weight)
+            nn.init.zeros_(head[-1].bias)
 
-    def forward(self, id_feat: Tensor) -> tuple[Tensor]:
+    def forward(self, id_feat: Tensor) -> tuple[Tensor, ...]:
         w = id_feat + self.shared_delta(id_feat)
 
-        delta = self.private_delta(w)
-        delta = delta.view(id_feat.size(0), self.num, self.id_dim)
-
-        w_p_all = w[:, None, :] + delta
-
-        return w_p_all.unbind(dim=1)
+        return tuple(w + head(w) for head in self.private_delta)
 
 
-class BottleneckLayer(nn.Module):
+class LatentBlock(nn.Module):
     def __init__(self, channels: int, w_dim: int, num_layers: int) -> None:
         super().__init__()
 
         self.layers = nn.ModuleList([IDInject(channels, w_dim) for _ in range(num_layers)])
 
-    def forward(self, x: Tensor, w_p_all: tuple[Tensor, ...]) -> Tensor:
+    def forward(self, x: Tensor, w_space: tuple[Tensor, ...]) -> Tensor:
 
-        assert len(w_p_all) == len(self.layers), f"w_p_all length {len(w_p_all)} != layers length {len(self.layers)}"
+        assert len(w_space) == len(self.layers), f"w_p_all length {len(w_space)} != layers length {len(self.layers)}"
 
-        for layer, w_p in zip(self.layers, w_p_all):
+        for layer, w_p in zip(self.layers, w_space):
             x = layer(x, w_p)
 
         return x
@@ -136,10 +139,10 @@ class BottleneckLayer(nn.Module):
 class Generator(nn.Module):
     def __init__(
         self,
-        img_resolution: int = 128,
+        img_resolution: int = 256,
         img_channels: int = 3,
-        num_depth: int = 2,
-        num_bottleneck: int = 6,
+        num_depth: int = 3,
+        num_latent: int = 6,
         base_ch: int = 256,
         max_ch: int = 1024,
         id_dim: int = 512,
@@ -147,28 +150,29 @@ class Generator(nn.Module):
         super().__init__()
 
         self.network_cfg = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
-        self.num_bottleneck = num_bottleneck
-        self.w_p_mapping = WPMappings(id_dim, num_bottleneck)
+        assert max_ch >= base_ch, f"max_ch={max_ch} must be >= base_ch={base_ch}"
+
+        self.w_space_map = WSpaceMap(id_dim, num_latent)
 
         features = [min(max_ch, base_ch * (2**i)) for i in range(num_depth + 1)]
 
         self.from_rgb = FromRGB(img_channels, base_ch)
         self.encoder = nn.Sequential(*[DownSample(features[i], features[i + 1]) for i in range(num_depth)])
-        self.bottleneck = BottleneckLayer(features[-1], id_dim, num_bottleneck)
+        self.latent_space = LatentBlock(features[-1], id_dim, num_latent)
         self.decoder = nn.Sequential(*[UpSample(features[-(i + 1)], features[-(i + 2)]) for i in range(num_depth)])
-        self.to_rgb = ToRGB(base_ch, img_channels)
+        self.to_rgb = ToRGB(base_ch * 2, img_channels)
 
     def forward(self, x: Tensor, id_feat: Tensor) -> Tensor:
 
-        w_p_all = self.w_p_mapping(id_feat)
+        w_space = self.w_space_map(id_feat)
 
-        x = self.from_rgb(x)
-        x = self.encoder(x)
-        x = self.bottleneck(x, w_p_all)
-        x = self.decoder(x)
-        x = self.to_rgb(x)
+        skip = self.from_rgb(x)
+        feat = self.encoder(skip)
+        feat = self.latent_space(feat, w_space)
+        feat = self.decoder(feat)
+        feat = self.to_rgb(torch.cat([skip, feat], dim=1))
 
-        return x
+        return feat
 
 
 if __name__ == "__main__":
@@ -182,7 +186,7 @@ if __name__ == "__main__":
         "img_resolution": 256,
         "img_channels": 3,
         "num_depth": 3,
-        "num_bottleneck": 6,
+        "num_latent": 6,
         "base_ch": 32,
         "max_ch": 1024,
         "id_dim": 512,

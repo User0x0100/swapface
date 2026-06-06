@@ -20,8 +20,8 @@ from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 from losses import IDLoss, l1_loss_fn, VGGPerceptualLoss, DLoss, GANLoss, StyleLossLabChroma, r1_reg_loss, WFMLoss, IFSRLoss, DSSIMLoss
 
 from .dataloader import datasetloader
-from .networks import Generator, Discriminator, Stylegan2DiscriminatorLite, AlphaFaceDiscriminator, UNetDiscriminatorSN
-
+from .networks import Generator, Discriminator, Stylegan2DiscriminatorLite, AlphaFaceDiscriminator
+from misc.facealign import zoom_in
 
 EPS = 1e-8
 
@@ -41,7 +41,6 @@ class DISCRIMINATOR_TYPT(Enum):
     ORIGIN = Discriminator
     ALPHAFACE = AlphaFaceDiscriminator
     STYLEGAN2 = Stylegan2DiscriminatorLite
-    UNET = UNetDiscriminatorSN
 
 
 def print_dict(d: dict, indent=0):
@@ -75,36 +74,37 @@ class Trainer:
         weight_save_every: int = 10000,
         same_prob: float = 0.2,
         # 模型配置
-        net_g_cfg: dict[str, int] | None = None,
-        net_d_cfg: dict[str, int] | None = None,
+        net_g_cfg: dict | None = None,
+        net_d_cfg: dict | None = None,
         # 身份损失
         id_encode_provider: IDLoss.Provider = IDLoss.Provider.BLENDFACE,
-        id_loss_weight: float = 6.725,
+        id_loss_weight: float = 10.0,
         # 自重建损失
         enable_rec_loss: bool = False,
-        rec_loss_weight: float = 10.0,
+        rec_loss_weight: float = 5.0,
         # VGG特征匹配
         enable_perceptual_loss: bool = False,
         perceptual_loss_weight: dict[str, float] = {
             # vgg16
-            "relu1_2": 2.5,
-            "relu2_2": 2.5,
-            "relu3_3": 2.5,
-            "relu4_2": 2.5,
+            "relu1_2": 0.5,
+            # "relu2_2": 2.5,
+            # "relu3_3": 2.5,
+            # "relu4_2": 2.5,
             # "pool1": 1.0,
-            # "pool2": 1.0,
-            # "pool3": 1.0,
-            # "pool4": 1.0,
-            # "pool5": 1.0,
+            "pool2": 1.0,
+            "pool3": 1.0,
+            "pool4": 1.0,
+            "pool5": 1.0,
         },
         # 判别器中间特征得弱特征匹配
         enable_wfm_loss: bool = False,
         wfm_loss_weight: dict[int, float] = {
-            0: 10.0,
-            1: 10.0,
-            2: 10.0,
-            3: 10.0,
-            # 4: 2.5,
+            0: 0.5,
+            1: 1.0,
+            2: 1.0,
+            3: 1.0,
+            # 4: 10.0,
+            # 5: 10.0,
         },
         # arcfaceid编码器前几层特征的带边界特征匹配
         enable_ifsr_loss: bool = False,
@@ -180,14 +180,14 @@ class Trainer:
             self.img_resolution = ckpt["net_g"]["network_cfg"]["img_resolution"]
 
             net_g = Generator(**ckpt["net_g"]["network_cfg"])
-            net_d = discriminator_typt.value(**ckpt["net_d"]["network_cfg"])
+            # net_d = discriminator_typt.value(**ckpt["net_d"]["network_cfg"])
             net_g.load_state_dict(ckpt["net_g"]["state_dict"])
-            net_d.load_state_dict(ckpt["net_d"]["state_dict"])
+            # net_d.load_state_dict(ckpt["net_d"]["state_dict"])
 
         else:
             self.iter, self.img_resolution = 0, net_g_cfg["img_resolution"]
             net_g = Generator(**net_g_cfg)
-            net_d = discriminator_typt.value(**net_d_cfg)
+        net_d = discriminator_typt.value(**net_d_cfg)
 
         self.net_g = net_g.to(self.device).train()
         self.net_d = net_d.to(self.device).train()
@@ -255,12 +255,16 @@ class Trainer:
             dst=dst,
             identity_root=identity_root,
             same_prob=same_prob,
+            rotation_range=(-10.0, 10.0),
+            scale_range=(-0.3, 0.25),
+            tx_range=(-0.15, 0.15),
+            ty_range=(-0.15, 0.15),
             hw_decoder=hw_decoder,
         )
 
         print(f"hw_decoder={hw_decoder}")
 
-        self.sample_output_map = ["src", "dst", "is_same"]
+        self.sample_output_map = ["src", "dst", "is_same", "theta_restore"]
         self.dataset = DALIGenericIterator(pipelines=pipe, output_map=self.sample_output_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
 
         # ========================= compile_module =========================
@@ -268,10 +272,6 @@ class Trainer:
 
         for net_name in ["net_g", "net_d"]:
             net: nn.Module = getattr(self, net_name)
-
-            if isinstance(net, UNetDiscriminatorSN):
-                self.train_module[net_name] = net
-                continue
 
             self.train_module[net_name] = torch.compile(net, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True}) if compile_module else net
 
@@ -281,11 +281,11 @@ class Trainer:
             self.log_writer.add_scalar(f"Loss/{k}", v.detach().mean().item(), self.iter)
 
     @torch.no_grad()
-    def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor]:
+    def fetch_sample(self) -> tuple[Tensor, ...]:
         data: dict[str, Tensor] = self.dataset.next()[0]
-        src, dst, is_same = (data[k] for k in self.sample_output_map)
+        src, dst, is_same, theta_restore = (data[k] for k in self.sample_output_map)
         is_same = is_same.squeeze_(-1)
-        return src, dst, is_same
+        return src, dst, is_same, theta_restore
 
     @torch.no_grad()
     def update_ema(self, decay=0.999):
@@ -336,17 +336,17 @@ class Trainer:
     def train(self):
 
         net_d, net_g = (self.train_module[module_name] for module_name in ("net_d", "net_g"))
-        sample_src, sample_dst, _ = self.fetch_sample()
+        sample_src, sample_dst, _, sample_theta_restore = self.fetch_sample()
 
         for self.iter in tqdm(itertools.count(start=self.iter), initial=self.iter, mininterval=1.0, bar_format="{n_fmt:7} | speed {rate_fmt:3} | train time {elapsed}"):
-            src, dst, is_same = self.fetch_sample()
+            src, dst, is_same, theta_restore = self.fetch_sample()
 
             torch.compiler.cudagraph_mark_step_begin()
 
             # ========================= forward g =========================
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
                 with torch.no_grad():
-                    src_id_feats = self.id_loss.get_id_feats(src)
+                    src_id_feats = self.id_loss.get_id_feats(zoom_in(src))
                 fake: Tensor = net_g(dst, src_id_feats)
 
             # ========================= train d =========================
@@ -410,7 +410,9 @@ class Trainer:
                     g_loss += wfm_loss
 
                 # id_loss
-                fake_id_feats = self.id_loss.get_id_feats(fake)
+                grid = F.affine_grid(theta_restore, size=fake.shape, align_corners=False)
+                fake_restored = F.grid_sample(fake, grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+                fake_id_feats = self.id_loss.get_id_feats(zoom_in(fake_restored))
                 id_loss = self.id_loss(fake_id_feats, src_id_feats)
                 self.log("id_loss", id_loss)
                 g_loss += id_loss
@@ -468,10 +470,14 @@ class Trainer:
                     src_vis = torch.cat((sample_src[:half], src[: self.batch_size - half]), dim=0)
                     dst_vis = torch.cat((sample_dst[:half], dst[: self.batch_size - half]), dim=0)
 
-                    src_id_feats_vis = self.id_loss.get_id_feats(src_vis)
+                    theta_restore_vis = torch.cat((sample_theta_restore[:half], theta_restore[: self.batch_size - half]), dim=0)
+                    grid_vis = F.affine_grid(theta_restore_vis, size=fake.shape, align_corners=False)
+                    dst_restored_vis = F.grid_sample(dst_vis, grid_vis, mode="bilinear", padding_mode="reflection", align_corners=False)
+
+                    src_id_feats_vis = self.id_loss.get_id_feats(zoom_in(src_vis))
                     fake_vis: Tensor = self.net_g_ema(dst_vis, src_id_feats_vis)
 
-                    grid = [src_vis, dst_vis, fake_vis]
+                    grid = [src_vis, dst_vis, fake_vis, dst_restored_vis]
 
                     # ========================= GAN loss grad map =========================
                     fake_for_gan_grad = fake_vis.detach().requires_grad_(True)
@@ -484,9 +490,12 @@ class Trainer:
                     # ========================= ID loss grad map =========================
                     fake_for_id_grad = fake_vis.detach().requires_grad_(True)
                     with torch.enable_grad():
-                        fake_id_feats_vis = self.id_loss.get_id_feats(fake_for_id_grad)
+                        grid_id_vis = F.affine_grid(theta_restore_vis, size=fake_for_id_grad.shape, align_corners=False)
+                        fake_for_id_grad_restored = F.grid_sample(fake_for_id_grad, grid_id_vis, mode="bilinear", padding_mode="reflection", align_corners=False)
+
+                        fake_id_feats_vis = self.id_loss.get_id_feats(zoom_in(fake_for_id_grad_restored))
                         id_loss_vis = self.id_loss(fake_id_feats_vis, src_id_feats_vis.detach())
-                        id_grad_map = self.loss_grad_map(id_loss_vis, fake_for_id_grad)
+                        id_grad_map = self.loss_grad_map(id_loss_vis, fake_for_id_grad_restored)
 
                     grid.append(id_grad_map)
 
@@ -524,24 +533,24 @@ if __name__ == "__main__":
     ]
 
     dst = [
-        ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
-        ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
-        # ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
+        # ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
+        # ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
+        ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
         # ("/opt/share/deepfake/dataset_1/RealOcc/image/realign_arcface_dst", 1.0),
         # ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
     ]
-    identity_root = ["/opt/share/deepfake/dataset_1/youtube"]
-    # identity_root = []
+    # identity_root = ["/opt/share/deepfake/dataset_1/youtube"]
+    identity_root = None
 
     def_config = {"src": src, "dst": dst, "identity_root": identity_root}
 
     def_config.update(
         {
-            # "ckpt": "train_log/256_MS1MV3_ARCFACE_R100_FP16_FFHQ_Depth3_BaseCH32/ckpt/56316.pth",
-            "log_path": "train_log/256_MS1MV2_TRANSFACE_B_FFHQ_Depth3_BaseCH32",
-            "batch_size": 12,
-            "same_prob": 0.2,
-            "id_encode_provider": IDLoss.Provider.MS1MV2_TRANSFACE_B,
+            "ckpt": "train_log/256_MS1MV3_ARCFACE_R100_FP16_BASE_FIX/ckpt/702477.pth",
+            "log_path": "train_log/256_MS1MV3_ARCFACE_R100_FP16_BASE_FIX_T_ORGDISEC",
+            "batch_size": 32,
+            "same_prob": 0.0,
+            "id_encode_provider": IDLoss.Provider.MS1MV3_ARCFACE_R100_FP16,
             "net_g_cfg": {
                 # "img_resolution": 128,
                 # "img_channels": 3,
@@ -557,17 +566,24 @@ if __name__ == "__main__":
                 # "img_resolution": 256,
                 # "img_channels": 3,
                 # "num_depth": 2,
-                # "num_bottleneck": 6,
+                # "num_latent": 6,
                 # "base_ch": 64,
                 # "max_ch": 1024,
                 # "id_dim": 512,
                 "img_resolution": 256,
                 "img_channels": 3,
                 "num_depth": 3,
-                "num_bottleneck": 6,
+                "num_latent": 6,
                 "base_ch": 32,
                 "max_ch": 1024,
                 "id_dim": 512,
+                # "img_resolution": 512,
+                # "img_channels": 3,
+                # "num_depth": 4,
+                # "num_latent": 6,
+                # "base_ch": 16,
+                # "max_ch": 1024,
+                # "id_dim": 512,
                 # ========== new ============
                 # "img_resolution": 128,
                 # "img_channels": 3,
@@ -583,18 +599,17 @@ if __name__ == "__main__":
                 # "max_ch": 512,
                 # "id_dim": 512,
             },
-            "discriminator_typt": DISCRIMINATOR_TYPT.ALPHAFACE,
+            "discriminator_typt": DISCRIMINATOR_TYPT.ORIGIN,
             "net_d_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
-                # "num_encoder": 6,
                 "base_ch": 64,
                 "max_ch": 512,
-                "group_size": 4,
+                # "group_size": 4,
             },
             # "enable_ifsr_loss": True,
             "enable_wfm_loss": True,
-            "enable_rec_loss": True,
+            # "enable_rec_loss": True,
             # "enable_perceptual_loss": True,
             # "enable_dssim_loss": True,
             "enable_color_loss": True,
