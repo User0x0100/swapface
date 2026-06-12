@@ -253,6 +253,6 @@ if __name__ == "__main__":
     # id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
     # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
 
-    swapper = Swap("train_log/256_MS1MV3_ARCFACE_R100_FP16_BASE_FIX_T_ORGDISEC/ckpt/730000.pth", PROVIDER.MS1MV3_ARCFACE_R100_FP16)
+    swapper = Swap("train_log/256_MS1MV3_ADAFACE_R100/ckpt/1110000.pth", PROVIDER.MS1MV3_ADAFACE_R100)
 
     swapper.swap_video(video, id)

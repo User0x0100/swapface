@@ -1,11 +1,11 @@
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+
 import cv2
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torchcodec.decoders import VideoDecoder
-from tqdm import tqdm
+
 
 from .models.idencoder import get_align_landmarks
 from .models.retinaface import RetinaFace, get_pts

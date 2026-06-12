@@ -1,14 +1,11 @@
 import os
-from pathlib import Path
-
+import cv2
 import numpy as np
 from numpy import ndarray
-from scipy.stats import truncnorm
-import cv2
 import nvidia.dali.fn as fn
 from nvidia.dali import pipeline_def
-from nvidia.dali.types import Constant, DALIDataType, DALIImageType, DALIInterpType
 from nvidia.dali.math import clamp
+from nvidia.dali.types import DALIDataType, DALIImageType, DALIInterpType
 from misc.utils import ImageFolder
 
 
@@ -130,139 +127,6 @@ class RndAffinePars:
         return dali_mtx, theta_restore
 
 
-class RndRemapPars:
-    def __init__(
-        self,
-        img_resolution: int,
-        trunc_val: float = 2.5,
-    ):
-        self.img_resolution = img_resolution
-        self.trunc_val = trunc_val
-        self.rng = np.random.default_rng(int.from_bytes(os.urandom(8), "little"))
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        del state["rng"]
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        seed = int.from_bytes(os.urandom(8), "little")
-        self.rng = np.random.default_rng(seed)
-
-    def random_normal(self, shape) -> ndarray:
-        samples = truncnorm.rvs(-self.trunc_val, self.trunc_val, loc=0.0, scale=1.0, size=shape, random_state=self.rng)
-        return (samples / self.trunc_val).astype(np.float32)
-
-    def __call__(self, sample_info=None) -> tuple[ndarray, ndarray]:
-        _ = sample_info
-
-        w = self.img_resolution
-
-        cell_size = [w // 2, w // 4, w // 8][self.rng.integers(0, 3)]
-        cell_count = w // cell_size + 1
-
-        grid = np.linspace(0, w, cell_count)
-
-        mapx = np.broadcast_to(grid, (cell_count, cell_count)).copy()
-        mapy = mapx.T.copy()
-
-        noise = self.random_normal((cell_count - 2, cell_count - 2))
-        mapx[1:-1, 1:-1] += noise * (cell_size * 0.24)
-
-        noise = self.random_normal((cell_count - 2, cell_count - 2))
-        mapy[1:-1, 1:-1] += noise * (cell_size * 0.24)
-
-        half = cell_size // 2
-
-        dsize = (w + cell_size, w + cell_size)
-
-        mapx = cv2.resize(mapx, dsize)
-        mapy = cv2.resize(mapy, dsize)
-
-        mapx = mapx[half:-half, half:-half]
-        mapy = mapy[half:-half, half:-half]
-
-        return mapx.astype(np.float32), mapy.astype(np.float32)
-
-
-class IdentityPairReader:
-    """
-    从多层目录结构中读取“同一身份的两张不同图片”。
-
-    目录结构要求：
-
-        root/
-            group1/
-                id_0000/
-                    img1.jpg
-                    img2.jpg
-                id_0001/
-                    ...
-            group2/
-                id_xxxx/
-                    ...
-
-    设计说明：
-
-    1. identity 定义
-        每个 id_xxxx 文件夹视为一个 identity
-
-    2. 最小样本数
-        仅保留图片数量 >= 2 的 identity
-
-    3. 采样策略
-        - 先按 identity 权重采样一个文件夹
-        - 再从该 identity 中采样两张不同图片
-    """
-
-    def __init__(self, roots: list[str]):
-        self.folders: list[ImageFolder] = []
-
-        for root in roots:
-            root = Path(root)
-            for group in root.iterdir():
-                if not group.is_dir():
-                    continue
-                for identity in group.iterdir():
-                    if not identity.is_dir():
-                        continue
-                    reader = ImageFolder(identity)
-                    if len(reader) >= 2:  # 至少两张
-                        self.folders.append(reader)
-
-        if len(self.folders) == 0:
-            raise ValueError("没有有效 identity 数据")
-
-        counts = [len(x) for x in self.folders]
-        weights = [c**0.5 for c in counts]
-        s = sum(weights)
-        self.weights = [w / s for w in weights]
-
-        self.rng = np.random.default_rng(int.from_bytes(os.urandom(8), "little"))
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        del state["rng"]
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        seed = int.from_bytes(os.urandom(8), "little")
-        self.rng = np.random.default_rng(seed)
-
-    def __call__(self, sample_info) -> tuple[ndarray, ndarray]:
-        _ = sample_info
-
-        folder_idx = self.rng.choice(len(self.folders), p=self.weights)
-        folder = self.folders[folder_idx]
-
-        x = np.fromfile(folder.sample(), dtype=np.uint8)
-        x1 = np.fromfile(folder.sample(), dtype=np.uint8)
-
-        return x, x1
-
-
 class SampleReader(object):
     def __init__(
         self,
@@ -373,17 +237,15 @@ def datasetloader(
     img_resolution: int,
     src: list[tuple[str, float]],
     dst: list[tuple[str, float]],
-    identity_root: list[str] | None = None,
+    hw_decoder: bool = True,
     brightness: float = 0.2,
     contrast: float = 0.2,
     saturation: float = 0.2,
     flip_prob: float = 0.5,
-    same_prob: float = 0.2,
     rotation_range: tuple[int | float, ...] = (-10.0, 10.0),
     scale_range: tuple[int | float, ...] = (-0.25, 0.25),
     tx_range: tuple[int | float, ...] = (-0.05, 0.05),
     ty_range: tuple[int | float, ...] = (-0.05, 0.05),
-    hw_decoder: bool = True,
 ):
 
     external_source = fn.external_source(
@@ -397,30 +259,8 @@ def datasetloader(
         batch=False,
     )
 
-    if identity_root is None:
-        identity_sampler = external_source
-        same_prob = 0.0
-
-    else:
-        identity_sampler = fn.external_source(
-            source=IdentityPairReader(identity_root),
-            num_outputs=2,
-            device="cpu",
-            no_copy=True,
-            parallel=True,
-            prefetch_queue_depth=2,
-            dtype=DALIDataType.UINT8,
-            batch=False,
-        )
-
     rnd_affine_params = fn.external_source(
-        source=RndAffinePars(
-            img_resolution,
-            rotation_range,
-            scale_range,
-            tx_range,
-            ty_range,
-        ),
+        source=RndAffinePars(img_resolution, rotation_range, scale_range, tx_range, ty_range),
         num_outputs=2,
         device="gpu",
         no_copy=False,
@@ -429,29 +269,21 @@ def datasetloader(
         batch=False,
     )
 
-    if fn.random.coin_flip(probability=same_prob, dtype=DALIDataType.BOOL):
-        is_same = Constant(value=1.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])
-        src_raw, dst_raw = identity_sampler
+    src_raw, dst_raw = external_source
 
-    else:
-        is_same = Constant(value=0.0, device="gpu", dtype=DALIDataType.FLOAT, shape=[1])
-        src_raw, dst_raw = external_source
+    image_decoders_device = "mixed" if hw_decoder else "cpu"
 
+    src = fn.decoders.image(src_raw, device=image_decoders_device, output_type=DALIImageType.RGB, hw_decoder_load=0.75)
     if hw_decoder:
-        src = fn.decoders.image(src_raw, device="mixed", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
-    else:
-        src = fn.decoders.image(src_raw, device="cpu", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
         src = fn.copy(src, device="gpu")
+
+    dst = fn.decoders.image(dst_raw, device="mixed", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
+    if hw_decoder:
+        dst = fn.copy(dst, device="gpu")
 
     src = fn.resize(src, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
     if fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.BOOL):
         src = fn.flip(src, device="gpu")
-
-    if hw_decoder:
-        dst = fn.decoders.image(dst_raw, device="mixed", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
-    else:
-        dst = fn.decoders.image(dst_raw, device="cpu", output_type=DALIImageType.RGB, hw_decoder_load=0.75)
-        dst = fn.copy(dst, device="gpu")
 
     dst = fn.resize(dst, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
     if fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.BOOL):
@@ -476,4 +308,4 @@ def datasetloader(
     dst = fn.normalize(dst, device="gpu", mean=127.5, stddev=127.5)
     dst = fn.transpose(dst, device="gpu", perm=[2, 0, 1])
 
-    return src, dst, is_same, theta_restore
+    return src, dst, theta_restore
