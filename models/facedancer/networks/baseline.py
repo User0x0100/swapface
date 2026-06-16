@@ -160,17 +160,18 @@ class Generator(nn.Module):
         self.encoder = nn.Sequential(*[DownSample(features[i], features[i + 1]) for i in range(num_depth)])
         self.latent_space = LatentBlock(features[-1], id_dim, num_latent)
         self.decoder = nn.Sequential(*[UpSample(features[-(i + 1)], features[-(i + 2)]) for i in range(num_depth)])
-        self.to_rgb = ToRGB(base_ch * 2, img_channels)
+        self.to_rgb = ToRGB(base_ch, img_channels)
 
     def forward(self, x: Tensor, id_feat: Tensor) -> Tensor:
 
         w_space = self.w_space_map(id_feat)
 
-        skip = self.from_rgb(x)
-        feat = self.encoder(skip)
+        feat = self.from_rgb(x)
+        feat = self.encoder(feat)
         feat = self.latent_space(feat, w_space)
         feat = self.decoder(feat)
-        feat = self.to_rgb(torch.cat([skip, feat], dim=1))
+        # feat = self.to_rgb(torch.cat([skip, feat], dim=1))
+        feat = self.to_rgb(feat)
 
         return feat
 

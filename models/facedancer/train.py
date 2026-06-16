@@ -54,6 +54,7 @@ class Trainer:
         src: list[tuple[str, float]],
         dst: list[tuple[str, float]],
         masked_train: bool = True,
+        occ_mask: bool = False,
         batch_size: int = 10,
         lr: float = 1e-4,
         lr_scheduler_t_max: int = 0,
@@ -259,7 +260,9 @@ class Trainer:
             else:
                 self.train_module[net_name] = net
 
-        face_parser = FaceParsing(range_norm=True, occ=False).to(device=self.device).eval()
+        face_parser = FaceParsing(range_norm=True, occ=occ_mask).to(device=self.device)
+        if not occ_mask:
+            face_parser = face_parser.eval()
         face_parser.requires_grad_(False)
         self.face_parser = torch.compile(face_parser, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
 
@@ -560,12 +563,12 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            "ckpt": "train_log/256_MS1MV3_ADAFACE_R100/ckpt/1130136.pth",
-            "masked_train": False,
-            "lr_scheduler_t_max": 5000,
-            "log_path": "train_log/256_MS1MV3_ADAFACE_R100_lr_scheduler_t_max5000",
+            # "ckpt": "train_log/256_MS1MV3_ADAFACE_R100/ckpt/1130136.pth",
+            "masked_train": True,
+            "occ_mask": True,
+            "log_path": "train_log/256_MS1MV2_TRANSFACE_B_NoSkip_with_blur_occ_mask",
             "batch_size": 32,
-            "id_encode_provider": IDLoss.Provider.MS1MV3_ADAFACE_R100,
+            "id_encode_provider": IDLoss.Provider.MS1MV2_TRANSFACE_B,
             "net_g_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,

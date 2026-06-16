@@ -248,11 +248,11 @@ if __name__ == "__main__":
     # video = "/opt/share/deepfake/linshi/录屏素材/2025-07-03(蒋女士 林嘉惠 王钰 符媛媛 石星儿)/王钰(电脑录屏).mp4"
 
     # id = "/home/liaohaixun/swap/IDAssets/wuyanzu.png"
-    # id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
-    id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
+    id = "/home/liaohaixun/swap/IDAssets/周杰伦.png"
+    # id = "/home/liaohaixun/swap/IDAssets/陈冠希.png"
     # id = "/home/liaohaixun/swap/faceset/ljx/arcface_pts/6000_0.png"
     # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
 
-    swapper = Swap("train_log/256_MS1MV3_ADAFACE_R100/ckpt/1110000.pth", PROVIDER.MS1MV3_ADAFACE_R100)
+    swapper = Swap("train_log/256_MS1MV2_TRANSFACE_B_NoSkip_with_blur_occ_mask/ckpt/240000.pth", PROVIDER.MS1MV2_TRANSFACE_B)
 
     swapper.swap_video(video, id)
