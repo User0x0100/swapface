@@ -259,7 +259,7 @@ class VGGPerceptualLoss(nn.Module):
         layer_weights: Mapping[str, float],
         criterion: Literal["l1", "mse", "charbonnier"] = "l1",
         reduction: Literal["mean", "sum", "none"] = "mean",
-        vgg_type="vgg16",
+        vgg_type="vgg19",
         use_input_norm: bool = True,
         range_norm: bool = True,
     ):

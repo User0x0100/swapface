@@ -24,9 +24,10 @@ from misc.facealign import zoom_in
 from misc.models.face_parsing import FaceParsing
 import torchvision.transforms.functional as TF
 
-EPS = 1e-8
 
 assert torch.cuda.is_available(), "仅支持使用NVIDIA显卡训练"
+
+EPS = 1e-8
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -78,14 +79,13 @@ class Trainer:
         enable_rec_loss: bool = True,
         rec_loss_weight: float = 10.0,
         # VGG特征匹配
-        enable_perceptual_loss: bool = False,
+        enable_perceptual_loss: bool = True,
         perceptual_loss_weight: dict[str, float] = {
             # vgg16
-            "pool1": 1.0,
-            "pool2": 1.0,
-            "pool3": 1.0,
-            "pool4": 1.0,
-            "pool5": 1.0,
+            "conv1_2": 2.5,
+            "conv2_2": 2.5,
+            "conv3_3": 2.5,
+            "conv4_3": 2.5,
         },
         # 判别器中间特征得弱特征匹配
         enable_wfm_loss: bool = True,
@@ -112,8 +112,8 @@ class Trainer:
             "layer1.2": (0.035144, 1.0),
         },
         # 色彩一致损失
-        enable_color_loss: bool = True,
-        color_loss_weight: float = 0.5,
+        enable_color_loss: bool = False,
+        color_loss_weight: float = 0.1,
         # 结构损失
         enable_dssim_loss: bool = False,
         dssim_loss_weight: float = 10.0,
@@ -552,10 +552,10 @@ if __name__ == "__main__":
     ]
 
     dst = [
-        # ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
-        # ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
+        ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
+        ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
         ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
-        # ("/opt/share/deepfake/dataset_1/RealOcc/image/realign_arcface_dst", 1.0),
+        ("/opt/share/deepfake/dataset_1/RealOcc/image/realign_arcface_dst", 1.0),
         # ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
     ]
 
@@ -563,21 +563,21 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            # "ckpt": "train_log/256_MS1MV3_ADAFACE_R100/ckpt/1130136.pth",
-            "masked_train": True,
-            "occ_mask": True,
-            "log_path": "train_log/256_MS1MV2_TRANSFACE_B_NoSkip_with_blur_occ_mask",
-            "batch_size": 32,
-            "id_encode_provider": IDLoss.Provider.MS1MV2_TRANSFACE_B,
+            "ckpt": "train_log/256-MS1MV3_ARCFACE_R50_FP16-NewCFG-SkipFalse/ckpt/546780.pth",
+            "masked_train": False,
+            "occ_mask": False,
+            "log_path": "train_log/256-MS1MV3_ARCFACE_R50_FP16-NewCFG-SkipFalse",
+            "batch_size": 16,
+            "id_encode_provider": IDLoss.Provider.MS1MV3_ARCFACE_R50_FP16,
             "net_g_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
-                "num_depth": 3,
+                "num_depth": 4,
                 "num_latent": 6,
-                "base_ch": 32,
-                "max_ch": 1024,
+                "base_ch": 64,
+                "max_ch": 2048,
                 "id_dim": 512,
-                # "id_dim": 512,
+                "skip": True,
             },
             "net_d_cfg": {
                 "img_resolution": 256,

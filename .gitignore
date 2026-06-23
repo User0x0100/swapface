@@ -3,6 +3,7 @@ __pycache__/
 .vscode
 train_log/
 datasets/
+onnx_export/
 .clang-format
 *.onnx
 *.pth

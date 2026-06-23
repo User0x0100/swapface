@@ -1,4 +1,4 @@
-import io
+import os
 import random
 import argparse
 from pathlib import Path
@@ -7,21 +7,30 @@ from typing import Any
 
 import torch
 from torch import nn, Tensor
-import onnx
-from onnx.checker import check_model
 from .networks import Generator
 from misc.models.idencoder import IDEncoder, PROVIDER
-
+import onnxruntime as ort
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Reproducibility
 # ──────────────────────────────────────────────────────────────────────────────
-torch.manual_seed(0)
-random.seed(0)
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.deterministic = True
+random.seed(42)
+torch.manual_seed(42)
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.deterministic = False
+torch.backends.cuda.matmul.allow_tf32 = True
+
+
+def print_dict(title: str, d: dict, indent: int = 2):
+    print(f"{title}:")
+    for k, v in d.items():
+        if isinstance(v, dict):
+            print(" " * indent + f"{k}:")
+            print_dict("", v, indent + 2)
+        else:
+            print(" " * indent + f"{k:25}: {v}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -53,41 +62,46 @@ class IDEncoderNHWCWrapper(nn.Module):
 # Core export helper
 # ──────────────────────────────────────────────────────────────────────────────
 def torch2onnx(
-    model: torch.nn.Module,
+    model: nn.Module,
     args: tuple[Any, ...],
-    export_folder: str = "onnx_export",
-    f_prefix: str | None = None,
-    optimize: bool = False,
-) -> Path:
-    f = io.BytesIO()
-    torch.onnx.export(
-        model,
-        args,
-        f,
-        export_params=True,
-        dynamo=True,
-        optimize=optimize,
-        verify=True,
-        external_data=False,
-        keep_initializers_as_inputs=True,
-        verbose=True,
-        profile=True,
-    )
-    f.seek(0)
+    output_dir: str | os.PathLike = "onnx_export",
+    file_prefix: str | None = None,
+):
 
-    onnx_model = onnx.load(f)
-    check_model(onnx_model, full_check=True)
-
-    out_dir = Path(export_folder)
+    model = model.eval()
+    out_dir = Path(output_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
 
-    prefix = "" if f_prefix is None else (f_prefix if f_prefix.endswith("_") else f_prefix + "_")
-    time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = out_dir / f"{prefix}{time_str}.onnx"
+    with torch.inference_mode():
+        exported_program = torch.export.export(model, args, strict=True)
+        onnx_program = torch.onnx.export(
+            model=exported_program,
+            opset_version=21,
+            dynamo=True,
+            optimize=False,
+            verify=True,
+            report=True,
+            external_data=False,
+            artifacts_dir=out_dir / "onnx_artifacts",
+            verbose=True,
+            profile=True,
+        )
 
-    onnx.save(onnx_model, out_path)
+    file_prefix = "" if file_prefix is None else file_prefix
+    time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = out_dir / f"{file_prefix}-{time_str}.onnx"
+
+    onnx_program.save(out_path)
     print(f"模型成功导出到: {out_path}")
-    return out_path
+
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    print(f"ONNX Runtime: {ort.__version__}")
+    print(f"ORT providers: {providers}")
+
+    sess_options = ort.SessionOptions()
+    sess_options.log_severity_level = 0
+    ort.InferenceSession(out_path, providers=providers, sess_options=sess_options)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -98,47 +112,45 @@ def export_FaceSwap(
     batch_size: int = 1,
     nhwc: bool = True,
     device: str = "cuda",
-    export_folder: str = "onnx_export",
-    optimize: bool = False,
+    output_dir: str = "onnx_export",
+    file_prefix: str = "faceswap",
 ) -> None:
     dev = torch.device(device)
 
     if ckpt is not None:
         print(f"Loading ckpt from {ckpt}")
         state: dict[str, Any] = torch.load(ckpt, map_location=dev, weights_only=False)
-        print(f"ckpt Info:\n  {'iter':25}: {state['iter']}")
-        print("net_g:")
-        for k, v in state["net_g"]["network_cfg"].items():
-            print(f"  {k:25}: {v}")
-        print("net_d:")
-        for k, v in state["net_d"]["network_cfg"].items():
-            print(f"  {k:25}: {v}")
+        iter = state["iter"]
+        print(f"ckpt info:\n  {'iter':25}: {iter}")
+        print_dict("net_g", state["net_g"]["network_cfg"])
+        print_dict("net_d", state["net_d"]["network_cfg"])
         model = Generator(**state["net_g"]["network_cfg"])
         model.load_state_dict(state["net_g"]["state_dict"])
     else:
+        iter = 0
         model = Generator()
 
     cfg = model.network_cfg
     res, ch, id_dim = cfg["img_resolution"], cfg["img_channels"], cfg["id_dim"]
 
     if nhwc:
-        wrapped = FaceSwapNHWCWrapper(model).to(dev).eval()
+        wrapped = FaceSwapNHWCWrapper(model).to(dev)
         x = torch.randn((batch_size, res, res, ch), device=dev, dtype=torch.float32)
     else:
-        wrapped = model.to(dev).eval()
+        wrapped = model.to(dev)
         x = torch.randn((batch_size, ch, res, res), device=dev, dtype=torch.float32)
 
     id_feat = torch.randn((batch_size, id_dim), device=dev, dtype=torch.float32)
-    torch2onnx(wrapped, (x, id_feat), export_folder=export_folder, f_prefix="faceswap", optimize=optimize)
+    torch2onnx(wrapped, (x, id_feat), output_dir=output_dir, file_prefix=f"{file_prefix}-{iter}")
 
 
 def export_IDEncoder(
-    provider_name: str = "BLENDFACE",
+    provider_name: str = "MS1MV3_ARCFACE_R50_FP16",
     batch_size: int = 1,
     nhwc: bool = True,
     device: str = "cuda",
-    export_folder: str = "onnx_export",
-    optimize: bool = False,
+    output_dir: str = "onnx_export",
+    file_prefix: str = "IDEncoder",
 ) -> None:
     dev = torch.device(device)
     provider = PROVIDER[provider_name]
@@ -151,7 +163,7 @@ def export_IDEncoder(
         wrapped = encoder.to(dev).eval()
         x = torch.randn((batch_size, 3, 112, 112), device=dev, dtype=torch.float32)
 
-    torch2onnx(wrapped, (x,), export_folder=export_folder, f_prefix="idencoder", optimize=optimize)
+    torch2onnx(wrapped, (x,), output_dir=output_dir, file_prefix=file_prefix)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -173,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--nchw", action="store_true", help="使用 NCHW 布局（默认 NHWC）")
         p.add_argument("--device", default="cuda", help="推理设备，如 cuda / cuda:1 / cpu")
         p.add_argument("--output-dir", default="onnx_export", help="ONNX 文件输出目录")
-        p.add_argument("--optimize", action="store_true", help="启用 torch.onnx 导出时的 optimize 选项")
+        p.add_argument("--file-prefix", default="faceswap", help="ONNX 文件名")
 
     # ── faceswap 子命令 ───────────────────────────────────────────────────────
     p_fs = sub.add_parser("faceswap", help="导出 Generator（换脸模型）")
@@ -213,8 +225,8 @@ def main() -> None:
         batch_size=args.batch_size,
         nhwc=nhwc,
         device=args.device,
-        export_folder=args.output_dir,
-        optimize=args.optimize,
+        output_dir=args.output_dir,
+        file_prefix=args.file_prefix,
     )
 
     if args.cmd in ("faceswap", "all"):

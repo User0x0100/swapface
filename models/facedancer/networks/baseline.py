@@ -146,6 +146,7 @@ class Generator(nn.Module):
         base_ch: int = 256,
         max_ch: int = 1024,
         id_dim: int = 512,
+        skip: bool = True,
     ) -> None:
         super().__init__()
 
@@ -160,17 +161,20 @@ class Generator(nn.Module):
         self.encoder = nn.Sequential(*[DownSample(features[i], features[i + 1]) for i in range(num_depth)])
         self.latent_space = LatentBlock(features[-1], id_dim, num_latent)
         self.decoder = nn.Sequential(*[UpSample(features[-(i + 1)], features[-(i + 2)]) for i in range(num_depth)])
-        self.to_rgb = ToRGB(base_ch, img_channels)
+        self.to_rgb = ToRGB(base_ch * 2 if skip else base_ch, img_channels)
 
     def forward(self, x: Tensor, id_feat: Tensor) -> Tensor:
 
         w_space = self.w_space_map(id_feat)
 
-        feat = self.from_rgb(x)
-        feat = self.encoder(feat)
+        skip = self.from_rgb(x)
+        feat = self.encoder(skip)
         feat = self.latent_space(feat, w_space)
         feat = self.decoder(feat)
-        # feat = self.to_rgb(torch.cat([skip, feat], dim=1))
+
+        if self.network_cfg["skip"]:
+            feat = torch.cat([skip, feat], dim=1)
+
         feat = self.to_rgb(feat)
 
         return feat
@@ -186,11 +190,12 @@ if __name__ == "__main__":
     network_cfg = {
         "img_resolution": 256,
         "img_channels": 3,
-        "num_depth": 3,
+        "num_depth": 4,
         "num_latent": 6,
-        "base_ch": 32,
-        "max_ch": 1024,
+        "base_ch": 64,
+        "max_ch": 2048,
         "id_dim": 512,
+        "skip": True,
     }
 
     model = Generator(**network_cfg).to(device)
