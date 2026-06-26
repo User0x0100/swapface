@@ -19,9 +19,10 @@ from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 from losses import IDLoss, l1_loss_fn, VGGPerceptualLoss, DLoss, GANLoss, StyleLossLabChroma, r1_reg_loss, WFMLoss, IFSRLoss, DSSIMLoss
 
 from .dataloader import datasetloader
-from .networks import Generator, AlphaFaceDiscriminator
+from .networks import Generator, AlphaFaceDiscriminator, Discriminator
 from misc.facealign import zoom_in
 from misc.models.face_parsing import FaceParsing
+from misc.models.idencoder import PROVIDER
 import torchvision.transforms.functional as TF
 
 
@@ -81,19 +82,28 @@ class Trainer:
         # VGG特征匹配
         enable_perceptual_loss: bool = True,
         perceptual_loss_weight: dict[str, float] = {
-            # vgg16
-            "conv1_2": 2.5,
-            "conv2_2": 2.5,
-            "conv3_3": 2.5,
-            "conv4_3": 2.5,
+            # vgg19
+            "conv1_2": 4.0,
+            "conv2_2": 2.0,
+            "conv3_3": 2.0,
+            "conv4_3": 2.0,
+            # "pool1": 1.0,
+            # "pool2": 1.0,
+            # "pool3": 1.0,
+            # "pool4": 1.0,
+            # "pool5": 1.0,
         },
         # 判别器中间特征得弱特征匹配
-        enable_wfm_loss: bool = True,
+        enable_wfm_loss: bool = False,
         wfm_loss_weight: dict[int, float] = {
-            0: 10.0,
-            1: 10.0,
-            2: 10.0,
-            3: 10.0,
+            # 0: 10.0,
+            # 1: 10.0,
+            # 2: 10.0,
+            # 3: 10.0,
+            # 0: 1.0,
+            # 1: 1.0,
+            # 2: 1.0,
+            # 3: 1.0,
         },
         # arcfaceid编码器前几层特征的带边界特征匹配
         enable_ifsr_loss: bool = False,
@@ -174,6 +184,7 @@ class Trainer:
             net_g = Generator(**net_g_cfg)
             net_d = AlphaFaceDiscriminator(**net_d_cfg)
 
+        # net_d = Discriminator(**net_d_cfg)
         self.net_g = net_g.to(self.device).train()
         self.net_d = net_d.to(self.device).train()
 
@@ -202,7 +213,7 @@ class Trainer:
             self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
 
         if self.enable_ifsr_loss:
-            self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight).to(self.device)
+            self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight, idencoder_provider=PROVIDER.MS1MV3_ARCFACE_R100_FP16).to(self.device)
 
         if self.enable_wfm_loss:
             self.wfm_loss = WFMLoss(layer_weights=wfm_loss_weight, criterion="l1").to(self.device)
@@ -563,12 +574,12 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            "ckpt": "train_log/256-MS1MV3_ARCFACE_R50_FP16-NewCFG-SkipFalse/ckpt/546780.pth",
+            "ckpt": "train_log/256-MS1MV2_TRANSFACE_B-NewCFG/ckpt/312451.pth",
             "masked_train": False,
             "occ_mask": False,
-            "log_path": "train_log/256-MS1MV3_ARCFACE_R50_FP16-NewCFG-SkipFalse",
+            "log_path": "train_log/256-MS1MV2_TRANSFACE_B-NewCFG_VGG",
             "batch_size": 16,
-            "id_encode_provider": IDLoss.Provider.MS1MV3_ARCFACE_R50_FP16,
+            "id_encode_provider": IDLoss.Provider.MS1MV2_TRANSFACE_B,
             "net_g_cfg": {
                 "img_resolution": 256,
                 "img_channels": 3,
@@ -584,7 +595,7 @@ if __name__ == "__main__":
                 "img_channels": 3,
                 "base_ch": 64,
                 "max_ch": 512,
-                "group_size": 4,
+                # "group_size": 4,
             },
         }
     )

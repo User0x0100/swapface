@@ -73,7 +73,7 @@ def torch2onnx(
     out_dir.mkdir(exist_ok=True, parents=True)
 
     with torch.inference_mode():
-        exported_program = torch.export.export(model, args, strict=True)
+        exported_program = torch.export.export(model, args, strict=False)
         onnx_program = torch.onnx.export(
             model=exported_program,
             opset_version=21,
@@ -152,6 +152,7 @@ def export_IDEncoder(
     output_dir: str = "onnx_export",
     file_prefix: str = "IDEncoder",
 ) -> None:
+    _ = file_prefix
     dev = torch.device(device)
     provider = PROVIDER[provider_name]
     encoder = IDEncoder(provider)
@@ -163,7 +164,7 @@ def export_IDEncoder(
         wrapped = encoder.to(dev).eval()
         x = torch.randn((batch_size, 3, 112, 112), device=dev, dtype=torch.float32)
 
-    torch2onnx(wrapped, (x,), output_dir=output_dir, file_prefix=file_prefix)
+    torch2onnx(wrapped, (x,), output_dir=output_dir, file_prefix=f"IDEncoder-{provider_name}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
