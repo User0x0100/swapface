@@ -19,7 +19,7 @@ from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 from losses import IDLoss, l1_loss_fn, VGGPerceptualLoss, DLoss, GANLoss, StyleLossLabChroma, r1_reg_loss, WFMLoss, IFSRLoss, DSSIMLoss
 
 from .dataloader import datasetloader
-from .networks import Generator, AlphaFaceDiscriminator, Discriminator
+from .networks import Generator, AlphaFaceDiscriminator
 from misc.facealign import zoom_in
 from misc.models.face_parsing import FaceParsing
 from misc.models.idencoder import PROVIDER
@@ -83,10 +83,10 @@ class Trainer:
         enable_perceptual_loss: bool = True,
         perceptual_loss_weight: dict[str, float] = {
             # vgg19
-            "conv1_2": 4.0,
-            "conv2_2": 2.0,
-            "conv3_3": 2.0,
-            "conv4_3": 2.0,
+            "conv1_2": 2.5,
+            "conv2_2": 2.5,
+            "conv3_3": 2.5,
+            "conv4_3": 2.5,
             # "pool1": 1.0,
             # "pool2": 1.0,
             # "pool3": 1.0,
@@ -574,24 +574,32 @@ if __name__ == "__main__":
 
     def_config.update(
         {
-            "ckpt": "train_log/256-MS1MV2_TRANSFACE_B-NewCFG/ckpt/312451.pth",
+            "ckpt": "train_log/512-MS1MV3_ARCFACE_R50_FP16/ckpt/328696.pth",
             "masked_train": False,
             "occ_mask": False,
-            "log_path": "train_log/256-MS1MV2_TRANSFACE_B-NewCFG_VGG",
+            "log_path": "train_log/512-MS1MV3_ARCFACE_R50_FP16",
             "batch_size": 16,
-            "id_encode_provider": IDLoss.Provider.MS1MV2_TRANSFACE_B,
+            "id_encode_provider": IDLoss.Provider.MS1MV3_ARCFACE_R50_FP16,
             "net_g_cfg": {
-                "img_resolution": 256,
+                # "img_resolution": 512,
+                # "img_channels": 3,
+                # "num_depth": 4,
+                # "num_latent": 6,
+                # "base_ch": 64,
+                # "max_ch": 2048,
+                # "id_dim": 512,
+                # "skip": True,
+                "img_resolution": 512,
                 "img_channels": 3,
-                "num_depth": 4,
+                "num_depth": 5,
                 "num_latent": 6,
-                "base_ch": 64,
+                "base_ch": 16,
                 "max_ch": 2048,
                 "id_dim": 512,
                 "skip": True,
             },
             "net_d_cfg": {
-                "img_resolution": 256,
+                "img_resolution": 512,
                 "img_channels": 3,
                 "base_ch": 64,
                 "max_ch": 512,

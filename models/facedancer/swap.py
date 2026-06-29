@@ -231,10 +231,10 @@ class Swap:
 
 
 if __name__ == "__main__":
-    # video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
+    video = "/opt/share/deepfake/dataset_1/oneman/1.mp4"
     # video = "/opt/share/deepfake/linshi/录屏素材/2023-04-14(李云帆 陈雨)/20230414-163616614陈雨(电脑录屏).mp4"
     # video = "/opt/share/deepfake/linshi/录屏素材/2023-02-17(袁忠 曹属馨)/20230217-160724910曹属馨(电脑录屏).mp4"
-    video = "/opt/share/deepfake/linshi/录屏素材/2023-06-20(邓叮玲 许馨文)/20230620-155807793邓叮玲(电脑录屏).mp4"
+    # video = "/opt/share/deepfake/linshi/录屏素材/2023-06-20(邓叮玲 许馨文)/20230620-155807793邓叮玲(电脑录屏).mp4"
     # video = "/opt/share/deepfake/linshi/录屏素材/2023-08-28(李小姐 邱小姐)/20230828-122302李小姐(电脑录屏).mp4"
     # video = "/opt/share/deepfake/linshi/录屏素材/2025-07-03(蒋女士 林嘉惠 王钰 符媛媛 石星儿)/王钰(电脑录屏).mp4"
 
@@ -245,6 +245,6 @@ if __name__ == "__main__":
     # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
     id = "/home/liaohaixun/swap/IDAssets/刘亦菲.jpg"
 
-    swapper = Swap("train_log/256-MS1MV2_TRANSFACE_B-NewCFG/ckpt/300000.pth", PROVIDER.MS1MV2_TRANSFACE_B)
+    swapper = Swap("onnx_export/256-MS1MV3_ARCFACE_R50_FP16-NewCFG-1080000-20260629_153534.onnx", PROVIDER.MS1MV3_ARCFACE_R50_FP16)
 
     swapper.swap_video(video, id)

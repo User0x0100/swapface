@@ -43,7 +43,7 @@ class FaceSwapNHWCWrapper(nn.Module):
 
     def forward(self, nhwc: Tensor, id_feat: Tensor) -> Tensor:
         nhwc = torch.clamp(nhwc, -1.0, 1.0)
-        nchw = nhwc.permute(0, 3, 1, 2)
+        nchw = nhwc.permute(0, 3, 1, 2).contiguous()
         x = self.model(nchw, id_feat)
         return x.permute(0, 2, 3, 1)
 
@@ -55,7 +55,7 @@ class IDEncoderNHWCWrapper(nn.Module):
 
     def forward(self, nhwc: Tensor) -> Tensor:
         nhwc = torch.clamp(nhwc, -1.0, 1.0)
-        return self.model(nhwc.permute(0, 3, 1, 2))
+        return self.model(nhwc.permute(0, 3, 1, 2).contiguous())
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -73,12 +73,12 @@ def torch2onnx(
     out_dir.mkdir(exist_ok=True, parents=True)
 
     with torch.inference_mode():
-        exported_program = torch.export.export(model, args, strict=False)
+        exported_program = torch.export.export(model, args, strict=True)
         onnx_program = torch.onnx.export(
             model=exported_program,
-            opset_version=21,
+            # opset_version=21,
             dynamo=True,
-            optimize=False,
+            optimize=True,
             verify=True,
             report=True,
             external_data=False,
