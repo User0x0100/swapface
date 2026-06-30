@@ -16,11 +16,11 @@ import onnxruntime as ort
 # ──────────────────────────────────────────────────────────────────────────────
 random.seed(42)
 torch.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.deterministic = False
-torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision("highest")
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cudnn.deterministic = True
+torch.backends.cuda.matmul.allow_tf32 = False
 
 
 def print_dict(title: str, d: dict, indent: int = 2):
