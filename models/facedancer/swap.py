@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Any
 import multiprocessing as mp
-
+import random
 import torch
 from torch import Tensor
 import torchvision.transforms.functional as F
@@ -16,6 +16,14 @@ from misc.utils import ImageFolder
 
 import cv2
 import numpy as np
+
+random.seed(42)
+torch.manual_seed(42)
+torch.set_float32_matmul_precision("highest")
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cudnn.deterministic = True
+torch.backends.cuda.matmul.allow_tf32 = False
 
 
 def add_black_border_batch(imgs: Tensor, border: int = 1):
@@ -245,6 +253,6 @@ if __name__ == "__main__":
     # id = "/home/liaohaixun/swap/IDAssets/安妮·海瑟薇.png"
     id = "/home/liaohaixun/swap/IDAssets/刘亦菲.jpg"
 
-    swapper = Swap("onnx_export/256-MS1MV3_ARCFACE_R50_FP16-NewCFG-1080000-20260629_153534.onnx", PROVIDER.MS1MV3_ARCFACE_R50_FP16)
+    swapper = Swap("onnx_export/512-MS1MV3_ARCFACE_R50_FP16-510000-20260630_141426.onnx", PROVIDER.MS1MV3_ARCFACE_R50_FP16)
 
     swapper.swap_video(video, id)
