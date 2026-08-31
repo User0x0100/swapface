@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 from torch import nn, Tensor
-from .networks import Generator
+from models.networks import Generator
 from misc.models.idencoder import IDEncoder, PROVIDER
 import onnxruntime as ort
 

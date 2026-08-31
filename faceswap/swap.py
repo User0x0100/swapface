@@ -9,7 +9,7 @@ from misc.facealign import face_align_batch, FaceExtractorVideo, restore_faces_t
 from misc.models.retinaface import get_pts, RetinaFace
 from misc.models.idencoder import IDEncoder, get_align_landmarks, PROVIDER
 from misc.models.face_parsing import FaceParsing
-from .networks import Generator
+from models.networks import Generator
 from torchvision.io import decode_image
 from tqdm import tqdm
 from misc.utils import ImageFolder
