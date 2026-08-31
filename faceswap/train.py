@@ -1,35 +1,77 @@
 import copy
-import random
 import itertools
-from typing import Any
+import random
 from pathlib import Path
-
-import torch
-from torch.amp import autocast
-import torch.nn.functional as NF
-from torch import Tensor, optim, nn
-from torchvision.utils import make_grid
-from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from typing import Any
 
 import cv2
-from tqdm import tqdm
+import torch
+import torch.nn.functional as NF
+import torchvision.transforms.functional as TF
 from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
+from torch import Tensor, nn, optim
+from torch.amp import autocast
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.tensorboard import SummaryWriter
+from torchvision.utils import make_grid
+from tqdm import tqdm
 
-from losses import IDLoss, l1_loss_fn, VGGPerceptualLoss, DLoss, GANLoss, StyleLossLabChroma, r1_reg_loss, WFMLoss, IFSRLoss, DSSIMLoss
-
-from .dataloader import datasetloader
-from models.networks import Generator
-from models.discriminator import AlphaFaceDiscriminator
+from losses import (
+    DLoss,
+    DSSIMLoss,
+    GANLoss,
+    IDLoss,
+    IFSRLoss,
+    StyleLossLabChroma,
+    VGGPerceptualLoss,
+    WFMLoss,
+    l1_loss_fn,
+    r1_reg_loss,
+)
 from misc.face_alignment import center_crop_and_resize
 from misc.models.face_mask import FaceMasker
 from misc.models.id_encoder import IDEncoderProvider
-import torchvision.transforms.functional as TF
+from models.discriminator import AlphaFaceDiscriminator
+from models.networks import Generator
 
-
-assert torch.cuda.is_available(), "仅支持使用NVIDIA显卡训练"
+from .dataloader import datasetloader
 
 EPS = 1e-8
+
+DEFAULT_DATALOADER_CFG: dict[str, Any] = {
+    "num_threads": 16,
+    "prefetch_queue_depth": 20,
+    "py_num_workers": 8,
+    "py_start_method": "spawn",
+    "rotation_range": (-10.0, 10.0),
+    "scale_range": (-0.3, 0.25),
+    "tx_range": (-0.15, 0.15),
+    "ty_range": (-0.15, 0.15),
+}
+
+DEFAULT_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
+    "conv1_2": 2.5,
+    "conv2_2": 2.5,
+    "conv3_3": 2.5,
+    "conv4_3": 2.5,
+}
+
+DATALOADER_RESERVED_KEYS = frozenset({"batch_size", "device_id", "img_resolution", "src", "dst", "hw_decoder"})
+
+
+DEFAULT_IFSR_WEIGHT: dict[str, tuple[float, float]] = {
+    "layer3.5": (0.121357, 1.0),
+    "layer3.4": (0.128827, 1.0),
+    "layer3.3": (0.117972, 1.0),
+    "layer3.2": (0.109391, 1.0),
+    "layer3.1": (0.097296, 1.0),
+    "layer3.0": (0.089046, 1.0),
+    "layer2.3": (0.044928, 1.0),
+    "layer2.2": (0.048719, 1.0),
+    "layer2.1": (0.047487, 1.0),
+    "layer2.0": (0.047970, 1.0),
+    "layer1.2": (0.035144, 1.0),
+}
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -41,14 +83,14 @@ torch.manual_seed(42)
 random.seed(42)
 
 
-def print_dict(title: str, d: dict, indent: int = 2):
+def print_mapping(title: str, mapping: dict, indent: int = 2) -> None:
     print(f"{title}:")
-    for k, v in d.items():
-        if isinstance(v, dict):
-            print(" " * indent + f"{k}:")
-            print_dict("", v, indent + 2)
+    for key, value in mapping.items():
+        if isinstance(value, dict):
+            print(" " * indent + f"{key}:")
+            print_mapping("", value, indent + 2)
         else:
-            print(" " * indent + f"{k:25}: {v}")
+            print(" " * indent + f"{key:25}: {value}")
 
 
 class Trainer:
@@ -71,9 +113,10 @@ class Trainer:
         log_interval: int = 10,
         sample_save_every: int = 1000,
         weight_save_every: int = 10000,
-        # 模型配置
+        # 模型与数据管线配置
         net_g_cfg: dict | None = None,
         net_d_cfg: dict | None = None,
+        dataloader_cfg: dict[str, Any] | None = None,
         # 身份损失
         id_encoder_provider: IDEncoderProvider = IDEncoderProvider.BLENDFACE,
         id_loss_weight: float = 10.0,
@@ -82,46 +125,14 @@ class Trainer:
         rec_loss_weight: float = 10.0,
         # VGG特征匹配
         enable_perceptual_loss: bool = True,
-        perceptual_loss_weight: dict[str, float] = {
-            # vgg19
-            "conv1_2": 2.5,
-            "conv2_2": 2.5,
-            "conv3_3": 2.5,
-            "conv4_3": 2.5,
-            # "pool1": 1.0,
-            # "pool2": 1.0,
-            # "pool3": 1.0,
-            # "pool4": 1.0,
-            # "pool5": 1.0,
-        },
-        # 判别器中间特征得弱特征匹配
+        perceptual_loss_weight: dict[str, float] | None = None,
+        # 判别器中间特征的弱特征匹配
         enable_wfm_loss: bool = False,
-        wfm_loss_weight: dict[int, float] = {
-            # 0: 10.0,
-            # 1: 10.0,
-            # 2: 10.0,
-            # 3: 10.0,
-            # 0: 1.0,
-            # 1: 1.0,
-            # 2: 1.0,
-            # 3: 1.0,
-        },
-        # arcfaceid编码器前几层特征的带边界特征匹配
+        wfm_loss_weight: dict[int, float] | None = None,
+        # ArcFace ID 编码器中间层特征匹配
         enable_ifsr_loss: bool = False,
         ifsr_scale: float = 1.2,
-        ifsr_weight: dict[str, tuple[float, float]] = {
-            "layer3.5": (0.121357, 1.0),
-            "layer3.4": (0.128827, 1.0),
-            "layer3.3": (0.117972, 1.0),
-            "layer3.2": (0.109391, 1.0),
-            "layer3.1": (0.097296, 1.0),
-            "layer3.0": (0.089046, 1.0),
-            "layer2.3": (0.044928, 1.0),
-            "layer2.2": (0.048719, 1.0),
-            "layer2.1": (0.047487, 1.0),
-            "layer2.0": (0.047970, 1.0),
-            "layer1.2": (0.035144, 1.0),
-        },
+        ifsr_weight: dict[str, tuple[float, float]] | None = None,
         # 色彩一致损失
         enable_color_loss: bool = False,
         color_loss_weight: float = 0.1,
@@ -129,15 +140,33 @@ class Trainer:
         enable_dssim_loss: bool = False,
         dssim_loss_weight: float = 10.0,
     ):
+        if dataloader_cfg is None:
+            dataloader_cfg = dict(DEFAULT_DATALOADER_CFG)
+        else:
+            reserved_keys = DATALOADER_RESERVED_KEYS.intersection(dataloader_cfg)
+            if reserved_keys:
+                names = ", ".join(sorted(reserved_keys))
+                raise ValueError(f"dataloader_cfg cannot override reserved keys: {names}")
+            dataloader_cfg = DEFAULT_DATALOADER_CFG | dataloader_cfg
+
+        if perceptual_loss_weight is None:
+            perceptual_loss_weight = dict(DEFAULT_PERCEPTUAL_LOSS_WEIGHT)
+        if wfm_loss_weight is None:
+            wfm_loss_weight = {}
+        if ifsr_weight is None:
+            ifsr_weight = dict(DEFAULT_IFSR_WEIGHT)
 
         args = locals().copy()
         for k in ["src", "dst", "self"]:
             args.pop(k)
 
-        print_dict("Train_Info", args)
+        print_mapping("Train_Info", args)
 
         self.rng = random.Random()
         self.device = torch.device(device)
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            raise RuntimeError("Trainer 仅支持 NVIDIA CUDA 设备")
+
         self.batch_size = batch_size
         self.masked_train = masked_train
         self.r1_reg_step = r1_reg_step
@@ -170,8 +199,8 @@ class Trainer:
             self.iter = ckpt["iter"]
 
             print(f"ckpt info:\n  {'iter':25}: {self.iter}")
-            print_dict("net_g", ckpt["net_g"]["network_cfg"])
-            print_dict("net_d", ckpt["net_d"]["network_cfg"])
+            print_mapping("net_g", ckpt["net_g"]["network_cfg"])
+            print_mapping("net_d", ckpt["net_d"]["network_cfg"])
 
             self.img_resolution = ckpt["net_g"]["network_cfg"]["img_resolution"]
 
@@ -181,6 +210,8 @@ class Trainer:
             net_d.load_state_dict(ckpt["net_d"]["state_dict"])
 
         else:
+            if net_g_cfg is None or net_d_cfg is None:
+                raise ValueError("net_g_cfg 和 net_d_cfg 在未提供 ckpt 时不能为空")
             self.iter, self.img_resolution = 0, net_g_cfg["img_resolution"]
             net_g = Generator(**net_g_cfg)
             net_d = AlphaFaceDiscriminator(**net_d_cfg)
@@ -238,23 +269,17 @@ class Trainer:
 
         # ========================= Sample =========================
 
-        major, _minor = torch.cuda.get_device_capability(device)
+        device_id = self.device.index if self.device.index is not None else torch.cuda.current_device()
+        major, _minor = torch.cuda.get_device_capability(device_id)
         hw_decoder = major >= 8
         pipe = datasetloader(
             batch_size=self.batch_size,
-            num_threads=16,
-            prefetch_queue_depth=20,
-            py_num_workers=8,
-            py_start_method="spawn",
-            device_id=self.device.index,
+            device_id=device_id,
             img_resolution=self.img_resolution,
             src=src,
             dst=dst,
             hw_decoder=hw_decoder,
-            rotation_range=(-10.0, 10.0),
-            scale_range=(-0.3, 0.25),
-            tx_range=(-0.15, 0.15),
-            ty_range=(-0.15, 0.15),
+            **dataloader_cfg,
         )
 
         print(f"hw_decoder={hw_decoder}")
@@ -345,12 +370,16 @@ class Trainer:
     def apply_gaussian_blur_use_mask(self, x: Tensor) -> tuple[Tensor, Tensor]:
 
         x_mask = self.face_parser(x)
-        x_mask = TF.gaussian_blur(x_mask, self.mask_blur_kernel_size, self.mask_blur_sigma).clamp_(0.0, 1.0)
+        x_mask = TF.gaussian_blur(
+            x_mask,
+            [self.mask_blur_kernel_size, self.mask_blur_kernel_size],
+            [self.mask_blur_sigma, self.mask_blur_sigma],
+        ).clamp_(0.0, 1.0)
         x_inv_mask = 1.0 - x_mask
 
         low = NF.interpolate(x, size=16, mode="bilinear", align_corners=False)
         blur = NF.interpolate(low, size=self.img_resolution, mode="bilinear", align_corners=False)
-        x_blur = TF.gaussian_blur(blur, kernel_size=51, sigma=15)
+        x_blur = TF.gaussian_blur(blur, kernel_size=[51, 51], sigma=[15.0, 15.0])
 
         return (x * x_mask + x_inv_mask * x_blur, x_mask)
 
@@ -436,7 +465,7 @@ class Trainer:
                     g_loss += wfm_loss
 
                 # id_loss
-                grid = NF.affine_grid(theta_restore, size=fake.shape, align_corners=False)
+                grid = NF.affine_grid(theta_restore, size=list(fake.shape), align_corners=False)
                 fake_restored = NF.grid_sample(fake, grid, mode="bilinear", padding_mode="reflection", align_corners=False)
                 generated_identity_embeddings = self.id_loss.extract_identity_embeddings(center_crop_and_resize(fake_restored))
                 id_loss = self.id_loss(generated_identity_embeddings, source_identity_embeddings)
@@ -502,7 +531,7 @@ class Trainer:
                     dst_vis = torch.cat((sample_dst[:half], dst_org[: self.batch_size - half]), dim=0)
 
                     theta_restore_vis = torch.cat((sample_theta_restore[:half], theta_restore[: self.batch_size - half]), dim=0)
-                    grid_vis = NF.affine_grid(theta_restore_vis, size=fake.shape, align_corners=False)
+                    grid_vis = NF.affine_grid(theta_restore_vis, size=list(fake.shape), align_corners=False)
                     dst_restored_vis = NF.grid_sample(dst_vis, grid_vis, mode="bilinear", padding_mode="reflection", align_corners=False)
 
                     source_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(center_crop_and_resize(src_vis))
@@ -521,7 +550,7 @@ class Trainer:
                     # ========================= ID loss grad map =========================
                     with torch.enable_grad():
                         fake_for_id_grad = fake_vis.detach().requires_grad_(True)
-                        grid_id_vis = NF.affine_grid(theta_restore_vis, size=fake_for_id_grad.shape, align_corners=False)
+                        grid_id_vis = NF.affine_grid(theta_restore_vis, size=list(fake_for_id_grad.shape), align_corners=False)
                         fake_for_id_grad_restored = NF.grid_sample(fake_for_id_grad, grid_id_vis, mode="bilinear", padding_mode="reflection", align_corners=False)
 
                         generated_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(center_crop_and_resize(fake_for_id_grad_restored))
@@ -571,7 +600,7 @@ if __name__ == "__main__":
         # ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
     ]
 
-    def_config = {"src": src, "dst": dst}
+    def_config: dict[str, Any] = {"src": src, "dst": dst}
 
     def_config.update(
         {

@@ -10,3 +10,4 @@ onnx_export/
 *.jpg
 *.jpeg
 *.engine
+.venv/
