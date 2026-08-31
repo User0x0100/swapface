@@ -1,7 +1,7 @@
 from torch import Tensor, nn
 from torchvision.models import vgg
 
-VGG_Layer_Name = {
+VGG_LAYER_NAMES = {
     "vgg11": [
         "conv1_1",
         "relu1_1",
@@ -127,32 +127,62 @@ VGG_Layer_Name = {
 }
 
 
-def get_vgg_support_vgg_type() -> list[str]:
-    return VGG_Layer_Name.keys()
+def get_supported_vgg_types() -> tuple[str, ...]:
+    return tuple(VGG_LAYER_NAMES)
 
 
-def get_vgg_layer_name(vgg_type: str):
-    return VGG_Layer_Name[vgg_type]
+def get_vgg_layer_names(vgg_type: str) -> tuple[str, ...]:
+    try:
+        return tuple(VGG_LAYER_NAMES[vgg_type])
+    except KeyError as exc:
+        supported = ", ".join(VGG_LAYER_NAMES)
+        raise ValueError(
+            f"Unsupported VGG type: {vgg_type!r}. Supported types: {supported}"
+        ) from exc
 
 
 class VGGFeatureExtractor(nn.Module):
     def __init__(self, layer_names: list[str], vgg_type: str):
         super().__init__()
 
+        if not layer_names:
+            raise ValueError("layer_names must not be empty")
+
+        try:
+            available_layer_names = VGG_LAYER_NAMES[vgg_type]
+        except KeyError as exc:
+            supported = ", ".join(VGG_LAYER_NAMES)
+            raise ValueError(
+                f"Unsupported VGG type: {vgg_type!r}. Supported types: {supported}"
+            ) from exc
+
+        unknown_layers = [
+            name for name in layer_names if name not in available_layer_names
+        ]
+        if unknown_layers:
+            raise ValueError(f"Unknown {vgg_type} layer names: {unknown_layers}")
+
         create_vgg_fn = getattr(vgg, vgg_type)
         weights = getattr(vgg, f"{vgg_type.upper()}_Weights").DEFAULT
+        vgg_features = create_vgg_fn(weights=weights).features
+        if not isinstance(vgg_features, nn.Sequential):
+            raise TypeError(
+                f"Expected VGG features to be nn.Sequential, got {type(vgg_features).__name__}"
+            )
 
-        vgg_features: nn.Module = create_vgg_fn(weights=weights).features
+        vgg_features.eval().requires_grad_(False)
+        for layer in vgg_features:
+            if isinstance(layer, nn.ReLU):
+                layer.inplace = False
 
-        vgg_features.eval()
-        vgg_features.requires_grad_(False)
+        self.selected_layers = tuple(
+            sorted(available_layer_names.index(name) for name in layer_names)
+        )
+        self._selected_layer_set = frozenset(self.selected_layers)
 
-        Layer_Name = VGG_Layer_Name[vgg_type]
-        self.selected_layers = [Layer_Name.index(i) for i in layer_names]
-        self.selected_layers.sort()
-
-        max_idx = self.selected_layers[-1] + 1
-        self.features = vgg_features[: max_idx + 1]
+        # Slice is exclusive: include the last requested layer, but do not execute one extra layer.
+        stop_idx = self.selected_layers[-1] + 1
+        self.features = vgg_features[:stop_idx]
 
     def forward(self, x: Tensor) -> list[Tensor]:
 
@@ -160,7 +190,7 @@ class VGGFeatureExtractor(nn.Module):
 
         for idx, layer in enumerate(self.features):
             x = layer(x)
-            if idx in self.selected_layers:
+            if idx in self._selected_layer_set:
                 features.append(x)
 
         return features

@@ -17,15 +17,15 @@ from torchvision.utils import make_grid
 from tqdm import tqdm
 
 from losses import (
-    DLoss,
+    DiscriminatorAdversarialLoss,
     DSSIMLoss,
-    GANLoss,
-    IDLoss,
+    GeneratorAdversarialLoss,
+    IdentityLoss,
     IFSRLoss,
-    StyleLossLabChroma,
+    LabStyleLoss,
     VGGPerceptualLoss,
-    WFMLoss,
-    l1_loss_fn,
+    WeightedFeatureMatchingLoss,
+    make_l1_loss,
     r1_reg_loss,
 )
 from misc.face_alignment import center_crop_and_resize
@@ -59,7 +59,7 @@ DEFAULT_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
 DATALOADER_RESERVED_KEYS = frozenset({"batch_size", "device_id", "img_resolution", "src", "dst", "hw_decoder"})
 
 
-DEFAULT_IFSR_WEIGHT: dict[str, tuple[float, float]] = {
+DEFAULT_IFSR_CONSTRAINTS: dict[str, tuple[float, float]] = {
     "layer3.5": (0.121357, 1.0),
     "layer3.4": (0.128827, 1.0),
     "layer3.3": (0.117972, 1.0),
@@ -131,8 +131,8 @@ class Trainer:
         wfm_loss_weight: dict[int, float] | None = None,
         # ArcFace ID 编码器中间层特征匹配
         enable_ifsr_loss: bool = False,
-        ifsr_scale: float = 1.2,
-        ifsr_weight: dict[str, tuple[float, float]] | None = None,
+        ifsr_margin_scale: float = 1.2,
+        ifsr_constraints: dict[str, tuple[float, float]] | None = None,
         # 色彩一致损失
         enable_color_loss: bool = False,
         color_loss_weight: float = 0.1,
@@ -153,8 +153,8 @@ class Trainer:
             perceptual_loss_weight = dict(DEFAULT_PERCEPTUAL_LOSS_WEIGHT)
         if wfm_loss_weight is None:
             wfm_loss_weight = {}
-        if ifsr_weight is None:
-            ifsr_weight = dict(DEFAULT_IFSR_WEIGHT)
+        if ifsr_constraints is None:
+            ifsr_constraints = dict(DEFAULT_IFSR_CONSTRAINTS)
 
         args = locals().copy()
         for k in ["src", "dst", "self"]:
@@ -233,25 +233,25 @@ class Trainer:
 
         # ========================= LOSS =========================
 
-        self.d_loss = DLoss(weight=1.0, reduction="mean").to(self.device)
-        self.gan_loss = GANLoss(weight=1.0, reduction="mean").to(self.device)
+        self.d_loss = DiscriminatorAdversarialLoss(weight=1.0, reduction="mean").to(self.device)
+        self.gan_loss = GeneratorAdversarialLoss(weight=1.0, reduction="mean").to(self.device)
 
-        self.id_loss = IDLoss(weight=id_loss_weight, provider=id_encoder_provider).to(self.device)
+        self.id_loss = IdentityLoss(weight=id_loss_weight, provider=id_encoder_provider).to(self.device)
 
         if self.enable_rec_loss:
-            self.rec_loss = l1_loss_fn(weight=rec_loss_weight, reduction="none" if self.masked_train else "mean")
+            self.rec_loss = make_l1_loss(weight=rec_loss_weight, reduction="none" if self.masked_train else "mean")
 
         if self.enable_perceptual_loss:
             self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
 
         if self.enable_ifsr_loss:
-            self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight, id_encoder_provider=IDEncoderProvider.MS1MV3_ARCFACE_R100_FP16).to(self.device)
+            self.ifsr_loss = IFSRLoss(ifsr_margin_scale=ifsr_margin_scale, ifsr_constraints=ifsr_constraints, id_encoder_provider=IDEncoderProvider.MS1MV3_ARCFACE_R100_FP16).to(self.device)
 
         if self.enable_wfm_loss:
-            self.wfm_loss = WFMLoss(layer_weights=wfm_loss_weight, criterion="l1").to(self.device)
+            self.wfm_loss = WeightedFeatureMatchingLoss(layer_weights=wfm_loss_weight, criterion="l1").to(self.device)
 
         if self.enable_color_loss:
-            self.color_loss = StyleLossLabChroma(weight=color_loss_weight, range_norm=True).to(self.device)
+            self.color_loss = LabStyleLoss(weight=color_loss_weight, range_norm=True).to(self.device)
 
         if self.enable_dssim_loss:
             self.dssim_loss = DSSIMLoss(weight=dssim_loss_weight, reduction="mean").to(self.device)
@@ -474,9 +474,9 @@ class Trainer:
 
                 # ifsr_loss
                 if self.enable_ifsr_loss:
-                    fake_ifsr_feats = self.ifsr_loss.get_ifsr_feats(fake)
+                    fake_ifsr_feats = self.ifsr_loss.extract_features(fake)
                     with torch.no_grad():
-                        dst_ifsr_feats = self.ifsr_loss.get_ifsr_feats(dst)
+                        dst_ifsr_feats = self.ifsr_loss.extract_features(dst)
                     ifsr_loss = self.ifsr_loss(fake_ifsr_feats, dst_ifsr_feats)
                     self.log("ifsr_loss", ifsr_loss)
                     g_loss += ifsr_loss

@@ -1,40 +1,40 @@
-from .losses import (
-    l1_loss_fn,
-    mse_loss_fn,
-    charbonnier_loss_fn,
-    bce_loss_fn,
-    bce_with_logits_loss_fn,
+from .adversarial import DiscriminatorAdversarialLoss, GeneratorAdversarialLoss
+from .color import LabStyleLoss
+from .functional import (
+    make_bce_loss,
+    make_bce_with_logits_loss,
+    make_charbonnier_loss,
+    make_l1_loss,
+    make_mse_loss,
+    make_orthogonal_loss,
     r1_reg_loss,
-    VGGPerceptualLoss,
-    DSSIMLoss,
-    StyleLossLabChroma,
-    DLoss,
-    GANLoss,
-    IDLoss,
-    IFSRLoss,
-    DINOv2PerceptualLoss,
-    WFMLoss,
-    orthogonal_loss_fn,
 )
-from .vgg import get_vgg_layer_name, get_vgg_support_vgg_type
+from .identity import IdentityLoss, IFSRLoss
+from .perceptual import (
+    DINOv2PerceptualLoss,
+    VGGPerceptualLoss,
+    WeightedFeatureMatchingLoss,
+)
+from .structural import DSSIMLoss
+from .vgg import get_supported_vgg_types, get_vgg_layer_names
 
 __all__ = [
-    "l1_loss_fn",
-    "mse_loss_fn",
-    "charbonnier_loss_fn",
-    "bce_loss_fn",
-    "bce_with_logits_loss_fn",
-    "VGGPerceptualLoss",
-    "DSSIMLoss",
-    "StyleLossLabChroma",
-    "r1_reg_loss",
-    "DLoss",
-    "GANLoss",
-    "IDLoss",
-    "IFSRLoss",
-    "get_vgg_support_vgg_type",
-    "get_vgg_layer_name",
     "DINOv2PerceptualLoss",
-    "WFMLoss",
-    "orthogonal_loss_fn",
+    "DSSIMLoss",
+    "DiscriminatorAdversarialLoss",
+    "GeneratorAdversarialLoss",
+    "IFSRLoss",
+    "IdentityLoss",
+    "LabStyleLoss",
+    "VGGPerceptualLoss",
+    "WeightedFeatureMatchingLoss",
+    "get_supported_vgg_types",
+    "get_vgg_layer_names",
+    "make_bce_loss",
+    "make_bce_with_logits_loss",
+    "make_charbonnier_loss",
+    "make_l1_loss",
+    "make_mse_loss",
+    "make_orthogonal_loss",
+    "r1_reg_loss",
 ]
