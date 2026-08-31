@@ -128,10 +128,15 @@ VGG_LAYER_NAMES = {
 
 
 def get_supported_vgg_types() -> tuple[str, ...]:
+    """返回当前特征提取器支持的 torchvision VGG 型号。"""
     return tuple(VGG_LAYER_NAMES)
 
 
 def get_vgg_layer_names(vgg_type: str) -> tuple[str, ...]:
+    """返回指定 VGG 型号的可选特征层名称，顺序与网络执行顺序一致。
+
+    异常:
+        ValueError: ``vgg_type`` 不受支持。"""
     try:
         return tuple(VGG_LAYER_NAMES[vgg_type])
     except KeyError as exc:
@@ -142,7 +147,21 @@ def get_vgg_layer_names(vgg_type: str) -> tuple[str, ...]:
 
 
 class VGGFeatureExtractor(nn.Module):
+    """从冻结 torchvision VGG 中提取指定中间层特征。
+
+    只保留到最深请求层为止的特征子网络；所有 ReLU 均关闭原地模式，防止后续层修改
+    已经捕获的 ReLU 前卷积特征。"""
+
     def __init__(self, layer_names: list[str], vgg_type: str):
+        """初始化 VGG 特征提取器。
+
+        参数:
+            layer_names: 要返回的层名列表。输出始终按 VGG 执行顺序排列。
+            vgg_type: torchvision VGG 型号。
+
+        异常:
+            ValueError: 层列表为空、VGG 型号无效或层名不存在。
+            TypeError: torchvision 模型未提供 ``nn.Sequential`` features。"""
         super().__init__()
 
         if not layer_names:
@@ -185,6 +204,13 @@ class VGGFeatureExtractor(nn.Module):
         self.features = vgg_features[:stop_idx]
 
     def forward(self, x: Tensor) -> list[Tensor]:
+        """顺序执行 VGG 特征层并返回选定中间特征。
+
+        参数:
+            x: 已按调用方要求预处理的 NCHW RGB 张量。
+
+        返回:
+            按 VGG 执行顺序排列的特征张量列表。"""
 
         features: list[Tensor] = []
 

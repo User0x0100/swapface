@@ -16,12 +16,23 @@ from .vgg import VGGFeatureExtractor, get_vgg_layer_names
 
 
 class WeightedFeatureMatchingLoss(nn.Module):
+    """对判别器或其他网络的多层中间特征进行加权匹配。"""
+
     def __init__(
         self,
         layer_weights: Mapping[int, float],
         criterion: Literal["l1", "mse", "charbonnier"] = "l1",
         reduction: Reduction = "mean",
     ) -> None:
+        """初始化多层特征匹配损失。
+
+        参数:
+            layer_weights: ``特征列表索引 -> 权重`` 映射。
+            criterion: 单层差异函数，可选 L1、MSE、Charbonnier。
+            reduction: ``none`` 返回逐样本损失；``mean``/``sum`` 返回标量。
+
+        异常:
+            ValueError: 未配置任何层或存在负索引。"""
         super().__init__()
 
         if not layer_weights:
@@ -40,6 +51,18 @@ class WeightedFeatureMatchingLoss(nn.Module):
     def forward(
         self, predicted_features: list[Tensor], target_features: list[Tensor]
     ) -> Tensor:
+        """计算两组 特征列表 的加权匹配损失。
+
+        参数:
+            predicted_features: 预测特征列表。
+            target_features: 参考特征列表，与预测列表长度一致。
+
+        返回:
+            所有配置层损失之和。
+
+        异常:
+            ValueError: 两个特征列表长度不同。
+            IndexError: 配置层索引超出特征列表范围。"""
         if len(predicted_features) != len(target_features):
             raise ValueError(
                 f"feature list length mismatch: {len(predicted_features)} != {len(target_features)}"
@@ -67,6 +90,11 @@ class WeightedFeatureMatchingLoss(nn.Module):
 
 
 class DINOv2PerceptualLoss(nn.Module):
+    """基于冻结 DINOv2 Transformer 块特征的感知损失。
+
+    ``layer_weights`` 的整数键表示 DINOv2 的**真实 Transformer 块索引**，不是返回列表
+    中的相对索引。只请求配置的块，避免计算/返回无关中间层。"""
+
     def __init__(
         self,
         layer_weights: Mapping[int, float],
@@ -76,6 +104,19 @@ class DINOv2PerceptualLoss(nn.Module):
         use_input_norm: bool = True,
         range_norm: bool = True,
     ) -> None:
+        """初始化 DINOv2 感知损失。
+
+        参数:
+            layer_weights: ``块索引 -> 权重`` 映射。
+            criterion: L1、MSE、Charbonnier 或 ``cosine``（余弦距离）。
+            reduction: 单层损失的聚合方式。
+            dino_type: ``torch.hub`` 中的 DINOv2 模型入口名称。
+            use_input_norm: 是否应用 ImageNet 均值/标准差。
+            range_norm: 是否先将输入从 ``[-1, 1]`` 映射到 ``[0, 1]``。
+
+        异常:
+            ValueError: 未配置块、块索引为负或超出模型深度。
+            TypeError: 加载的模型没有公开 ``blocks``。"""
         super().__init__()
 
         if not layer_weights:
@@ -130,10 +171,17 @@ class DINOv2PerceptualLoss(nn.Module):
 
     @staticmethod
     def _cosine_distance(x: Tensor, y: Tensor, reduction: Reduction = "mean") -> Tensor:
+        """计算 令牌特征最后一维上的余弦距离。"""
         loss = 1.0 - F.cosine_similarity(x, y, dim=-1)
         return _reduce_loss(loss, reduction)
 
     def forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        """计算预测图像与目标图像的 DINOv2 多块感知损失。
+
+        输入会缩放为 224×224。冻结 DINOv2 参数不会阻断对 ``prediction`` 的梯度。
+
+        返回:
+            各配置块的加权损失之和。"""
         prediction = F.interpolate(
             prediction, size=(224, 224), mode="bilinear", align_corners=False
         )
@@ -174,6 +222,11 @@ class DINOv2PerceptualLoss(nn.Module):
 
 
 class VGGPerceptualLoss(nn.Module):
+    """基于冻结 torchvision VGG 中间特征的感知损失。
+
+    层名对应真实 VGG 执行位置；VGG 的 ReLU 被设置为非原地，确保 ``conv*`` 层保存的是
+    稳定的 ReLU 前特征。层权重按网络执行顺序与输出严格对齐。"""
+
     def __init__(
         self,
         layer_weights: Mapping[str, float],
@@ -183,6 +236,18 @@ class VGGPerceptualLoss(nn.Module):
         use_input_norm: bool = True,
         range_norm: bool = True,
     ) -> None:
+        """初始化 VGG 感知损失。
+
+        参数:
+            layer_weights: ``VGG 层名 -> 权重`` 映射。
+            criterion: L1、MSE 或 Charbonnier。
+            reduction: ``none`` 返回逐样本损失；``mean``/``sum`` 返回标量。
+            vgg_type: torchvision VGG 型号，例如 ``vgg16`` 或 ``vgg19``。
+            use_input_norm: 是否应用 ImageNet 均值/标准差。
+            range_norm: 是否先将输入从 ``[-1, 1]`` 映射到 ``[0, 1]``。
+
+        异常:
+            ValueError: 配置为空、VGG 型号或层名无效。"""
         super().__init__()
 
         if not layer_weights:
@@ -236,6 +301,14 @@ class VGGPerceptualLoss(nn.Module):
         options={"epilogue_fusion": True, "max_autotune": True},
     )
     def forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        """计算预测图像和目标图像的多层 VGG 感知损失。
+
+        参数:
+            prediction: 预测 RGB 图像张量。
+            target: 目标 RGB 图像张量。
+
+        返回:
+            各配置 VGG 层的加权损失之和。"""
         if self.range_norm:
             prediction = prediction.add(1.0).mul(0.5)
             target = target.add(1.0).mul(0.5)
