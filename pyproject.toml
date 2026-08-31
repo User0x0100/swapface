@@ -1,0 +1,51 @@
+[project]
+name = "swap"
+version = "0.1.0"
+description = "Experimental face-swap training workspace"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "nvidia-dali-cuda120",
+    "torch",
+    "torchvision",
+    "torchcodec",
+    "huggingface-hub",
+    "numpy",
+    "onnx",
+    "onnxscript",
+    "onnxruntime-gpu",
+    "opencv-python",
+    "tensorboard",
+    "tqdm",
+    "segmentation-models-pytorch",
+    "fvcore",
+    "xformers",
+    "torchinfo",
+    "ninja",
+    "scipy",
+    "tensorrt-cu12==10.9.0.34",
+]
+
+[project.scripts]
+swap = "swap.cli:main"
+swap-export = "swap.export:main"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchcodec = { index = "pytorch-cu128" }
+nvidia-dali-cuda120 = { index = "nvidia" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
