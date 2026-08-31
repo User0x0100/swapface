@@ -19,7 +19,8 @@ from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 from losses import IDLoss, l1_loss_fn, VGGPerceptualLoss, DLoss, GANLoss, StyleLossLabChroma, r1_reg_loss, WFMLoss, IFSRLoss, DSSIMLoss
 
 from .dataloader import datasetloader
-from .networks import Generator, AlphaFaceDiscriminator
+from .networks import Generator
+from models.discriminator import AlphaFaceDiscriminator
 from misc.facealign import zoom_in
 from misc.models.face_parsing import FaceParsing
 from misc.models.idencoder import PROVIDER

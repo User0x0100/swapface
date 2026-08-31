@@ -116,7 +116,7 @@ class EqualizedLinear(nn.Module):
         self.weight = EqualizedWeight([out_ch, in_ch])
         self.bias = nn.Parameter(torch.ones(out_ch) * bias)
 
-    def forward(self, x: Tensor) -> None:
+    def forward(self, x: Tensor) -> Tensor:
 
         return F.linear(x, self.weight(), bias=self.bias)
 
@@ -161,7 +161,7 @@ class Stylegan2DiscriminatorLite(nn.Module):
 
         for block in self.blocks:
             x = block(x)
-            if return_feats:
+            if feats is not None:
                 feats.append(x)
 
         x = self.std_dev(x)

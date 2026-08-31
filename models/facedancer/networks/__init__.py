@@ -3,13 +3,8 @@
 # from .generator_new import Generator
 # from .stylegan2_base import Generator
 from .baseline import Generator
-from .discriminator import AlphaFaceDiscriminator, Discriminator, Stylegan2DiscriminatorLite, UNetDiscriminatorSN
 
 
 __all__ = [
     "Generator",
-    "AlphaFaceDiscriminator",
-    "Discriminator",
-    "Stylegan2DiscriminatorLite",
-    "UNetDiscriminatorSN",
 ]

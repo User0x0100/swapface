@@ -52,7 +52,7 @@ class Discriminator(nn.Module):
 
         for down_block in self.down_blocks:
             x = down_block(x)
-            if return_feats:
+            if feats is not None:
                 feats.append(x)
 
         x = self.final_conv(x)

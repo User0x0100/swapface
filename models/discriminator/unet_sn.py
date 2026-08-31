@@ -45,14 +45,13 @@ class UNetDiscriminatorSN(nn.Module):
         x2 = F.leaky_relu(self.conv2(x1), negative_slope=0.2, inplace=inplace)
         x3 = F.leaky_relu(self.conv3(x2), negative_slope=0.2, inplace=inplace)
 
-        if return_feats:
-            for v in [x0, x1, x2, x3]:
-                feats.append(v)
+        if feats is not None:
+            feats.extend((x0, x1, x2, x3))
 
         # upsample
         x3 = F.interpolate(x3, scale_factor=2, mode="bilinear", align_corners=False)
         x4 = F.leaky_relu(self.conv4(x3), negative_slope=0.2, inplace=inplace)
-        if return_feats:
+        if feats is not None:
             feats.append(x4)
 
         if self.skip_connection:

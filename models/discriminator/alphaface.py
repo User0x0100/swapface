@@ -1,7 +1,7 @@
 import math
 import torch
 from torch import nn, Tensor
-from ..upfirdn2d import DownFIRDn2d
+from .upfirdn2d import DownFIRDn2d
 
 
 class MinibatchStdLayer(nn.Module):
@@ -97,7 +97,7 @@ class AlphaFaceDiscriminator(nn.Module):
         feats = [] if return_feats else None
         for down_block in self.down_blocks:
             x = down_block(x)
-            if return_feats:
+            if feats is not None:
                 feats.append(x)
 
         x = self.final_conv(x)
