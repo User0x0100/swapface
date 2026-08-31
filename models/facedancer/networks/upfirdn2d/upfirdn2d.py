@@ -8,8 +8,11 @@
 
 """Custom PyTorch ops for efficient resampling of 2D images."""
 
-import torch
+import threading
+from pathlib import Path
+
 import numpy as np
+import torch
 from torch import Tensor, nn
 
 
@@ -177,6 +180,8 @@ def upfirdn2d(
         - Critical for preventing aliasing in downsampling
     """
 
+    _ensure_kernel_loaded()
+
     if f.ndim == 2:
         x = torch.ops.upfirdn2d.upfirdn2d(x, f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain)
     else:
@@ -264,7 +269,7 @@ class UpFIRDn2d(nn.Module):
             Tensor of the shape `[batch_size, num_channels, out_height, out_width]`.
         """
 
-        return upfirdn2d(x, self.f, self.upx, self.upy, self.downx, self.downy, self.padx0, self.padx1, self.pady0, self.pady1, self.flip_filter, self.gain)
+        return upfirdn2d(x, self.get_buffer("f"), self.upx, self.upy, self.downx, self.downy, self.padx0, self.padx1, self.pady0, self.pady1, self.flip_filter, self.gain)
 
 
 class DownFIRDn2d(nn.Module):
@@ -340,7 +345,7 @@ class DownFIRDn2d(nn.Module):
         Returns:
             Tensor of the shape `[batch_size, num_channels, out_height, out_width]`.
         """
-        return upfirdn2d(x, self.f, self.upx, self.upy, self.downx, self.downy, self.padx0, self.padx1, self.pady0, self.pady1, self.flip_filter, self.gain)
+        return upfirdn2d(x, self.get_buffer("f"), self.upx, self.upy, self.downx, self.downy, self.padx0, self.padx1, self.pady0, self.pady1, self.flip_filter, self.gain)
 
 
 def setup_context(
@@ -383,43 +388,39 @@ def backward(ctx, dy: Tensor):
     return dx, df, None, None, None, None, None, None, None, None, None, None
 
 
-def load_kernel_fn():
+_kernel_loaded = False
+_kernel_init_lock = threading.Lock()
 
-    from pathlib import Path
-    from torch.utils.cpp_extension import load
-    from torch.library import register_autograd
 
-    device = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device)
+def _ensure_kernel_loaded() -> None:
+    """Load and register the CUDA op exactly once per Python process.
 
-    cuda_arch_flags = f"-arch=sm_{major}{minor}"
-
-    BASE_DIR = Path(__file__).resolve().parent
-    load(
-        "upfirdn2d",
-        sources=[BASE_DIR / "upfirdn2d.cpp", BASE_DIR / "upfirdn2d.cu"],
-        is_python_module=False,
-        verbose=True,
-        extra_cuda_cflags=["-O3", "-use_fast_math", "--expt-relaxed-constexpr", cuda_arch_flags],
-        extra_cflags=["-O3"],
-    )
-
+    The fast path is lock-free after initialization. The lock covers both the
+    extension load and autograd registration so concurrent first calls cannot
+    observe or publish a partially initialized operator. If initialization
+    raises, the loaded flag remains false and a later call may retry.
     """
-    Autograd support:
+    global _kernel_loaded
 
-    The backward pass of upfirdn2d is implemented by applying the same operator
-    with swapped up/down factors and adjusted padding.
+    if _kernel_loaded:
+        return
 
-    This ensures:
-        - Exact gradient propagation
-        - No numerical approximation
-        - Full compatibility with PyTorch autograd
+    with _kernel_init_lock:
+        if _kernel_loaded:
+            return
 
-    Key idea:
-        Forward:  up → filter → down
-        Backward: down → filter → up
-    """
-    register_autograd("upfirdn2d::upfirdn2d", backward, setup_context=setup_context)
+        from torch.library import register_autograd
+        from torch.utils.cpp_extension import load
 
+        base_dir = Path(__file__).resolve().parent
+        load(
+            "upfirdn2d",
+            sources=[str(base_dir / "upfirdn2d.cpp"), str(base_dir / "upfirdn2d.cu")],
+            is_python_module=False,
+            verbose=True,
+            extra_cuda_cflags=["-O3", "-use_fast_math", "--expt-relaxed-constexpr"],
+            extra_cflags=["-O3"],
+        )
 
-load_kernel_fn()
+        register_autograd("upfirdn2d::upfirdn2d", backward, setup_context=setup_context)
+        _kernel_loaded = True
