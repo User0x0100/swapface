@@ -1,11 +1,12 @@
-import math
 from enum import Enum
+
 import torch
-from torch import Tensor, nn
 import torch.nn.functional as F
-from .models import FAN, ResNetDepth
 from huggingface_hub import hf_hub_download
+from torch import Tensor, nn
+
 from ...models import MODEL_REPOSITORY_ID
+from .models import FAN, ResNetDepth
 
 
 class LandmarkMode(Enum):
@@ -14,7 +15,9 @@ class LandmarkMode(Enum):
 
 
 def hf_dl(name: str) -> str:
-    return hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename=f"FaceAlignmentFan/{name}")
+    return hf_hub_download(
+        repo_id=MODEL_REPOSITORY_ID, filename=f"FaceAlignmentFan/{name}"
+    )
 
 
 MODEL_LIST = {
@@ -45,7 +48,7 @@ class FANLandmarkModel(nn.Module):
     HEATMAP_SIZE: int = 64
     NETWORK_SIZE: int = 4
 
-    LR_ORDER = [
+    LR_ORDER = (
         16,
         15,
         14,
@@ -114,7 +117,7 @@ class FANLandmarkModel(nn.Module):
         67,
         66,
         65,
-    ]
+    )
 
     def __init__(self, mode: LandmarkMode = LandmarkMode.L2D) -> None:
         super().__init__()
@@ -125,17 +128,34 @@ class FANLandmarkModel(nn.Module):
         self.depth_net = None
 
         fan_weight_name = "2DFAN" if mode is LandmarkMode.L2D else "3DFAN"
-        fan_weight = torch.load(hf_dl(MODEL_LIST[f"{fan_weight_name}-{self.NETWORK_SIZE}"]), map_location=torch.device("cpu"), weights_only=True)
+        fan_weight = torch.load(
+            hf_dl(MODEL_LIST[f"{fan_weight_name}-{self.NETWORK_SIZE}"]),
+            map_location=torch.device("cpu"),
+            weights_only=True,
+        )
         self.fan.load_state_dict(fan_weight)
 
         if mode is LandmarkMode.L3D:
             self.depth_net = ResNetDepth()
-            depth_net_weight = torch.load(hf_dl(MODEL_LIST["depth"]), map_location=torch.device("cpu"), weights_only=False)
-            depth_net_weight = {k.removeprefix("module."): v for k, v in depth_net_weight["state_dict"].items()}
+            depth_net_weight = torch.load(
+                hf_dl(MODEL_LIST["depth"]),
+                map_location=torch.device("cpu"),
+                weights_only=False,
+            )
+            depth_net_weight = {
+                k.removeprefix("module."): v
+                for k, v in depth_net_weight["state_dict"].items()
+            }
             self.depth_net.load_state_dict(depth_net_weight)
 
-        self.register_buffer("lr_order", torch.tensor(self.LR_ORDER, dtype=torch.long), persistent=False)
-        self.register_buffer("depth_gaussian_kernel", self._build_depth_gaussian_kernel(), persistent=False)
+        self.register_buffer(
+            "lr_order", torch.tensor(self.LR_ORDER, dtype=torch.long), persistent=False
+        )
+        self.register_buffer(
+            "depth_gaussian_kernel",
+            self._build_depth_gaussian_kernel(),
+            persistent=False,
+        )
 
     @staticmethod
     def _build_depth_gaussian_kernel() -> Tensor:
@@ -149,7 +169,12 @@ class FANLandmarkModel(nn.Module):
         xs = torch.arange(1, size + 1, dtype=torch.float)
         yy, xx = torch.meshgrid(ys, xs, indexing="ij")
 
-        kernel = torch.exp(-(((xx - center) / denom).square() / 2.0 + ((yy - center) / denom).square() / 2.0))
+        kernel = torch.exp(
+            -(
+                ((xx - center) / denom).square() / 2.0
+                + ((yy - center) / denom).square() / 2.0
+            )
+        )
 
         return kernel
 
@@ -169,7 +194,12 @@ class FANLandmarkModel(nn.Module):
         if h == self.CROP_SIZE:
             x = image
         else:
-            x = F.interpolate(image, size=(self.CROP_SIZE, self.CROP_SIZE), mode="bilinear", align_corners=False)
+            x = F.interpolate(
+                image,
+                size=(self.CROP_SIZE, self.CROP_SIZE),
+                mode="bilinear",
+                align_corners=False,
+            )
 
         heatmaps = self._forward_fan(x)
         pts_256, scores = self._decode_heatmaps(heatmaps)
@@ -216,7 +246,7 @@ class FANLandmarkModel(nn.Module):
 
     def _flip_heatmaps(self, heatmaps: Tensor) -> Tensor:
         heatmaps = torch.flip(heatmaps, dims=(-1,))
-        heatmaps = heatmaps.index_select(dim=1, index=self.lr_order)
+        heatmaps = heatmaps.index_select(dim=1, index=self.get_buffer("lr_order"))
         return heatmaps
 
     def _decode_heatmaps(self, heatmaps: Tensor) -> tuple[Tensor, Tensor]:
@@ -244,8 +274,14 @@ class FANLandmarkModel(nn.Module):
         b_idx = torch.arange(n, device=heatmaps.device).view(n, 1).expand(n, k)
         k_idx = torch.arange(k, device=heatmaps.device).view(1, k).expand(n, k)
 
-        dx = heatmaps[b_idx, k_idx, iy_c, ix_c + 1] - heatmaps[b_idx, k_idx, iy_c, ix_c - 1]
-        dy = heatmaps[b_idx, k_idx, iy_c + 1, ix_c] - heatmaps[b_idx, k_idx, iy_c - 1, ix_c]
+        dx = (
+            heatmaps[b_idx, k_idx, iy_c, ix_c + 1]
+            - heatmaps[b_idx, k_idx, iy_c, ix_c - 1]
+        )
+        dy = (
+            heatmaps[b_idx, k_idx, iy_c + 1, ix_c]
+            - heatmaps[b_idx, k_idx, iy_c - 1, ix_c]
+        )
 
         offset = torch.stack([dx, dy], dim=-1).sign() * 0.25
         pts = pts + torch.where(inside.unsqueeze(-1), offset, torch.zeros_like(offset))
@@ -262,7 +298,9 @@ class FANLandmarkModel(nn.Module):
 
         heatmaps = torch.zeros(n, k, h, w, device=device, dtype=torch.float)
 
-        kernel = self.depth_gaussian_kernel.to(device=device, dtype=torch.float)
+        kernel = self.get_buffer("depth_gaussian_kernel").to(
+            device=device, dtype=torch.float
+        )
         size = kernel.shape[0]  # 13
 
         # 官方 draw_gaussian(..., sigma=2)
@@ -349,7 +387,15 @@ class FANLandmarkModel(nn.Module):
         return heatmaps
 
 
-def draw_landmarks_on_tensor(image: Tensor, landmarks: Tensor, *, color: tuple[float, ...] = (1.0, 0.0, 0.0), radius: int = 2, alpha: float = 1.0, inplace: bool = False) -> Tensor:
+def draw_landmarks_on_tensor(
+    image: Tensor,
+    landmarks: Tensor,
+    *,
+    color: tuple[float, ...] = (1.0, 0.0, 0.0),
+    radius: int = 2,
+    alpha: float = 1.0,
+    inplace: bool = False,
+) -> Tensor:
     """
     在 NCHW tensor 图像上绘制 landmark 点。
 
@@ -380,12 +426,16 @@ def draw_landmarks_on_tensor(image: Tensor, landmarks: Tensor, *, color: tuple[f
         raise ValueError(f"image must be NCHW, got shape={tuple(image.shape)}")
 
     if landmarks.ndim != 3:
-        raise ValueError(f"landmarks must be [N, K, 2/3], got shape={tuple(landmarks.shape)}")
+        raise ValueError(
+            f"landmarks must be [N, K, 2/3], got shape={tuple(landmarks.shape)}"
+        )
 
     n, c, h, w = image.shape
 
     if landmarks.shape[0] != n:
-        raise ValueError(f"batch size mismatch: image N={n}, landmarks N={landmarks.shape[0]}")
+        raise ValueError(
+            f"batch size mismatch: image N={n}, landmarks N={landmarks.shape[0]}"
+        )
 
     if landmarks.shape[-1] < 2:
         raise ValueError(f"landmarks last dim must be >= 2, got {landmarks.shape[-1]}")
@@ -462,21 +512,32 @@ def draw_landmarks_on_tensor(image: Tensor, landmarks: Tensor, *, color: tuple[f
 
 if __name__ == "__main__":
     import torch.nn.functional as F
-    import torchvision.utils as utils
-    from misc.utils import ImageDirectory
+    from torchvision import utils
 
     # from misc.face_alignment import center_crop_and_resize
     from torchvision.transforms import functional as TF
 
-    sample_dir = ImageDirectory("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result")
+    from misc.utils import ImageDirectory
+
+    sample_dir = ImageDirectory(
+        "/opt/share/deepfake/dataset_1/vggface2_hq512/align_result"
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 8
     print(f"使用设备: {device}")
 
-    images = torch.stack([sample_dir.sample_tensor() for _ in range(batch_size)]).to(device=device)
-    H, C, H, W = images.size()
-    images = TF.affine(images, angle=0, translate=(0, -(H * 0.075)), scale=0.81, shear=0)
+    images = torch.stack([sample_dir.sample_tensor() for _ in range(batch_size)]).to(
+        device=device
+    )
+    _, _, height, _ = images.size()
+    images = TF.affine(
+        images,
+        angle=0,
+        translate=[0, -int(height * 0.075)],
+        scale=0.81,
+        shear=[0.0, 0.0],
+    )
 
     images.div_(255.0)
 
@@ -488,10 +549,14 @@ if __name__ == "__main__":
         print(f"关键点形状: {lmks.shape}")
 
     # 使用PyTorch绘制关键点
-    images_with_landmarks = draw_landmarks_on_tensor(images, lmks, color=(0, 1, 0), radius=2)
+    images_with_landmarks = draw_landmarks_on_tensor(
+        images, lmks, color=(0, 1, 0), radius=2
+    )
 
     # 使用torchvision创建网格并保存
-    grid = utils.make_grid(images_with_landmarks, nrow=4, padding=2, normalize=True, value_range=(0.0, 1.0))
+    grid = utils.make_grid(
+        images_with_landmarks, nrow=4, padding=2, normalize=True, value_range=(0, 1)
+    )
     utils.save_image(grid, "landmarks_grid_pytorch.png")
 
     print(f"处理了 {batch_size} 张图片")

@@ -1,13 +1,13 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from .resnet import Resnet18
 
 
 class ConvBNReLU(nn.Module):
     def __init__(self, in_chan, out_chan, ks=3, stride=1, padding=1, *args, **kwargs):
-        super(ConvBNReLU, self).__init__()
+        super().__init__()
         self.conv = nn.Conv2d(
             in_chan,
             out_chan,
@@ -34,7 +34,7 @@ class ConvBNReLU(nn.Module):
 
 class BiSeNetOutput(nn.Module):
     def __init__(self, in_chan, mid_chan, n_classes, *args, **kwargs):
-        super(BiSeNetOutput, self).__init__()
+        super().__init__()
         self.conv = ConvBNReLU(in_chan, mid_chan, ks=3, stride=1, padding=1)
         self.conv_out = nn.Conv2d(mid_chan, n_classes, kernel_size=1, bias=False)
         self.init_weight()
@@ -54,7 +54,7 @@ class BiSeNetOutput(nn.Module):
     def get_params(self):
         wd_params, nowd_params = [], []
         for name, module in self.named_modules():
-            if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
                 wd_params.append(module.weight)
                 if module.bias is not None:
                     nowd_params.append(module.bias)
@@ -65,7 +65,7 @@ class BiSeNetOutput(nn.Module):
 
 class AttentionRefinementModule(nn.Module):
     def __init__(self, in_chan, out_chan, *args, **kwargs):
-        super(AttentionRefinementModule, self).__init__()
+        super().__init__()
         self.conv = ConvBNReLU(in_chan, out_chan, ks=3, stride=1, padding=1)
         self.conv_atten = nn.Conv2d(out_chan, out_chan, kernel_size=1, bias=False)
         self.bn_atten = nn.BatchNorm2d(out_chan)
@@ -91,7 +91,7 @@ class AttentionRefinementModule(nn.Module):
 
 class ContextPath(nn.Module):
     def __init__(self, *args, **kwargs):
-        super(ContextPath, self).__init__()
+        super().__init__()
         self.resnet = Resnet18()
         self.arm16 = AttentionRefinementModule(256, 128)
         self.arm32 = AttentionRefinementModule(512, 128)
@@ -102,7 +102,6 @@ class ContextPath(nn.Module):
         self.init_weight()
 
     def forward(self, x):
-        H0, W0 = x.size()[2:]
         feat8, feat16, feat32 = self.resnet(x)
         H8, W8 = feat8.size()[2:]
         H16, W16 = feat16.size()[2:]
@@ -146,7 +145,7 @@ class ContextPath(nn.Module):
 ### This is not used, since I replace this with the resnet feature with the same size
 class SpatialPath(nn.Module):
     def __init__(self, *args, **kwargs):
-        super(SpatialPath, self).__init__()
+        super().__init__()
         self.conv1 = ConvBNReLU(3, 64, ks=7, stride=2, padding=3)
         self.conv2 = ConvBNReLU(64, 64, ks=3, stride=2, padding=1)
         self.conv3 = ConvBNReLU(64, 64, ks=3, stride=2, padding=1)
@@ -170,7 +169,7 @@ class SpatialPath(nn.Module):
     def get_params(self):
         wd_params, nowd_params = [], []
         for name, module in self.named_modules():
-            if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
                 wd_params.append(module.weight)
                 if module.bias is not None:
                     nowd_params.append(module.bias)
@@ -181,10 +180,14 @@ class SpatialPath(nn.Module):
 
 class FeatureFusionModule(nn.Module):
     def __init__(self, in_chan, out_chan, *args, **kwargs):
-        super(FeatureFusionModule, self).__init__()
+        super().__init__()
         self.convblk = ConvBNReLU(in_chan, out_chan, ks=1, stride=1, padding=0)
-        self.conv1 = nn.Conv2d(out_chan, out_chan // 4, kernel_size=1, stride=1, padding=0, bias=False)
-        self.conv2 = nn.Conv2d(out_chan // 4, out_chan, kernel_size=1, stride=1, padding=0, bias=False)
+        self.conv1 = nn.Conv2d(
+            out_chan, out_chan // 4, kernel_size=1, stride=1, padding=0, bias=False
+        )
+        self.conv2 = nn.Conv2d(
+            out_chan // 4, out_chan, kernel_size=1, stride=1, padding=0, bias=False
+        )
         self.relu = nn.ReLU(inplace=True)
         self.sigmoid = nn.Sigmoid()
         self.init_weight()
@@ -211,7 +214,7 @@ class FeatureFusionModule(nn.Module):
     def get_params(self):
         wd_params, nowd_params = [], []
         for name, module in self.named_modules():
-            if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
                 wd_params.append(module.weight)
                 if module.bias is not None:
                     nowd_params.append(module.bias)
@@ -222,7 +225,7 @@ class FeatureFusionModule(nn.Module):
 
 class BiSeNet(nn.Module):
     def __init__(self, n_classes, *args, **kwargs):
-        super(BiSeNet, self).__init__()
+        super().__init__()
         self.cp = ContextPath()
         ## here self.sp is deleted
         self.ffm = FeatureFusionModule(256, 256)
@@ -236,7 +239,7 @@ class BiSeNet(nn.Module):
         x,
     ):
 
-        feat_res8, feat_cp8, feat_cp16 = self.cp(x)  # here return res3b1 feature
+        feat_res8, feat_cp8, _feat_cp16 = self.cp(x)  # here return res3b1 feature
         feat_sp = feat_res8  # use res3b1 feature to replace spatial path feature
         feat_fuse = self.ffm(feat_sp, feat_cp8)
 
@@ -263,9 +266,11 @@ class BiSeNet(nn.Module):
 
     def get_params(self):
         wd_params, nowd_params, lr_mul_wd_params, lr_mul_nowd_params = [], [], [], []
-        for name, child in self.named_children():
+        for _name, child in self.named_children():
+            if not isinstance(child, (ContextPath, FeatureFusionModule, BiSeNetOutput)):
+                continue
             child_wd_params, child_nowd_params = child.get_params()
-            if isinstance(child, FeatureFusionModule) or isinstance(child, BiSeNetOutput):
+            if isinstance(child, (FeatureFusionModule, BiSeNetOutput)):
                 lr_mul_wd_params += child_wd_params
                 lr_mul_nowd_params += child_nowd_params
             else:

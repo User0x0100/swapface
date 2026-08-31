@@ -74,7 +74,9 @@ class ImageDirectory:
 
     DEFAULT_FILTERS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp")
 
-    def __init__(self, directory: str | Path, file_filters: tuple[str, ...] | None = None) -> None:
+    def __init__(
+        self, directory: str | Path, file_filters: tuple[str, ...] | None = None
+    ) -> None:
         """
         初始化 。
 
@@ -94,18 +96,26 @@ class ImageDirectory:
         filters = tuple(ext.lower() for ext in file_filters)
 
         self.file_names = sorted(
-            [entry.name for entry in self.directory.iterdir() if entry.is_file() and entry.name.lower().endswith(filters)],
+            [
+                entry.name
+                for entry in self.directory.iterdir()
+                if entry.is_file() and entry.name.lower().endswith(filters)
+            ],
             key=self._natural_sort_key,
         )
 
         if not self.file_names:
-            raise FileNotFoundError(f"没有在目录：{directory}下找到任何图片文件，file_filters：{file_filters}")
+            raise FileNotFoundError(
+                f"没有在目录：{directory}下找到任何图片文件，file_filters：{file_filters}"
+            )
 
         self.rng = np.random.default_rng(int.from_bytes(os.urandom(8), "little"))
 
     @staticmethod
     def _natural_sort_key(file_name: str) -> list:
-        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", file_name)]
+        return [
+            int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", file_name)
+        ]
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -159,12 +169,27 @@ class ImageDirectory:
         return decode_image(str(path), ImageReadMode.RGB).to(device=device, dtype=dtype)
 
     @overload
-    def sample_tensor(self, return_stem: Literal[False] = False, device: torch.device | str = "cpu", dtype: torch.dtype = torch.float) -> Tensor: ...
+    def sample_tensor(
+        self,
+        return_stem: Literal[False] = False,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float,
+    ) -> Tensor: ...
 
     @overload
-    def sample_tensor(self, return_stem: Literal[True], device: torch.device | str = "cpu", dtype: torch.dtype = torch.float) -> tuple[Tensor, str]: ...
+    def sample_tensor(
+        self,
+        return_stem: Literal[True],
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float,
+    ) -> tuple[Tensor, str]: ...
 
-    def sample_tensor(self, return_stem: bool = False, device: torch.device | str = "cpu", dtype: torch.dtype = torch.float) -> Tensor | tuple[Tensor, str]:
+    def sample_tensor(
+        self,
+        return_stem: bool = False,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float,
+    ) -> Tensor | tuple[Tensor, str]:
         """
         随机采样一张图片并解码为 RGB 张量。
 
@@ -192,7 +217,12 @@ class ImageDirectory:
 
         return image
 
-    def iter_tensors(self, return_stem: bool = False, device: torch.device | str = "cpu", dtype=torch.float) -> Iterator[Tensor] | Iterator[tuple[Tensor, str]]:
+    def iter_tensors(
+        self,
+        return_stem: bool = False,
+        device: torch.device | str = "cpu",
+        dtype=torch.float,
+    ) -> Iterator[Tensor] | Iterator[tuple[Tensor, str]]:
         """
         按自然排序顺序逐一产出 RGB 张量（惰性求值，不预加载到内存）。
 
@@ -218,7 +248,11 @@ class ImageDirectory:
                 yield image
 
     def iter_tensor_batches(
-        self, batch_size: int, return_stem: bool = False, device: torch.device | str = "cpu", dtype=torch.float
+        self,
+        batch_size: int,
+        return_stem: bool = False,
+        device: torch.device | str = "cpu",
+        dtype=torch.float,
     ) -> Iterator[list[Tensor] | tuple[list[Tensor], list[str]]]:
         """
         按自然排序顺序以批次为单位产出 RGB 张量列表（惰性求值）。
@@ -253,7 +287,9 @@ class ImageDirectory:
 
         for i in range(0, len(self), batch_size):
             batch_paths = self[i : min(i + batch_size, len(self))]
-            images = [self._decode(path, device=device, dtype=dtype) for path in batch_paths]
+            images = [
+                self._decode(path, device=device, dtype=dtype) for path in batch_paths
+            ]
 
             if return_stem:
                 yield images, [path.stem for path in batch_paths]

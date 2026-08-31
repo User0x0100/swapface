@@ -25,7 +25,9 @@ def center_crop_and_resize(images: Tensor, crop_fraction: float = 0.102) -> Tens
 
     cropped = images[:, :, crop_h : height - crop_h, crop_w : width - crop_w]
 
-    return F.interpolate(cropped, size=(height, width), mode="bilinear", align_corners=False)
+    return F.interpolate(
+        cropped, size=(height, width), mode="bilinear", align_corners=False
+    )
 
 
 def compute_similarity_transform(src_points: Tensor, dst_points: Tensor) -> Tensor:
@@ -70,7 +72,12 @@ def compute_similarity_transform(src_points: Tensor, dst_points: Tensor) -> Tens
     return affine
 
 
-def affine_to_grid_theta(src_to_dst_affine: Tensor, in_hw: tuple[int, int], output_size: int, align_corners: bool = False) -> Tensor:
+def affine_to_grid_theta(
+    src_to_dst_affine: Tensor,
+    in_hw: tuple[int, int],
+    output_size: int,
+    align_corners: bool = False,
+) -> Tensor:
 
     if src_to_dst_affine.dim() == 2:
         src_to_dst_affine = src_to_dst_affine.unsqueeze(0)
@@ -117,11 +124,17 @@ def affine_to_grid_theta(src_to_dst_affine: Tensor, in_hw: tuple[int, int], outp
 
     theta[:, 0, 0] = scale_in_x * (inv_a * scale_out_x)
     theta[:, 0, 1] = scale_in_x * (inv_b * scale_out_y)
-    theta[:, 0, 2] = scale_in_x * (inv_a * offset_out_x + inv_b * offset_out_y + inv_tx) + offset_in_x
+    theta[:, 0, 2] = (
+        scale_in_x * (inv_a * offset_out_x + inv_b * offset_out_y + inv_tx)
+        + offset_in_x
+    )
 
     theta[:, 1, 0] = scale_in_y * (inv_c * scale_out_x)
     theta[:, 1, 1] = scale_in_y * (inv_d * scale_out_y)
-    theta[:, 1, 2] = scale_in_y * (inv_c * offset_out_x + inv_d * offset_out_y + inv_ty) + offset_in_y
+    theta[:, 1, 2] = (
+        scale_in_y * (inv_c * offset_out_x + inv_d * offset_out_y + inv_ty)
+        + offset_in_y
+    )
 
     return theta
 
@@ -191,17 +204,25 @@ def align_faces(
     if output_size <= 0:
         raise ValueError("output_size must be greater than 0")
     if source_landmarks.ndim != 3 or source_landmarks.shape[-1] != 2:
-        raise ValueError(f"source_landmarks must have shape [N, P, 2], got {tuple(source_landmarks.shape)}")
+        raise ValueError(
+            f"source_landmarks must have shape [N, P, 2], got {tuple(source_landmarks.shape)}"
+        )
     if alignment_template.ndim != 2 or alignment_template.shape[-1] != 2:
-        raise ValueError(f"alignment_template must have shape [P, 2], got {tuple(alignment_template.shape)}")
+        raise ValueError(
+            f"alignment_template must have shape [P, 2], got {tuple(alignment_template.shape)}"
+        )
     if source_landmarks.shape[1] != alignment_template.shape[0]:
-        raise ValueError("source_landmarks and alignment_template must contain the same number of landmarks")
+        raise ValueError(
+            "source_landmarks and alignment_template must contain the same number of landmarks"
+        )
 
     image_count = images.shape[0] if isinstance(images, Tensor) else len(images)
     if image_count == 0:
         raise ValueError("images must not be empty")
     if len(segment_lengths) != image_count:
-        raise ValueError(f"segment_lengths length ({len(segment_lengths)}) must match image count ({image_count})")
+        raise ValueError(
+            f"segment_lengths length ({len(segment_lengths)}) must match image count ({image_count})"
+        )
     if sum(segment_lengths) != source_landmarks.shape[0]:
         raise ValueError("sum(segment_lengths) must match source_landmarks.shape[0]")
 
@@ -215,10 +236,16 @@ def align_faces(
         C, H, W = image.shape
         image = image.unsqueeze(0).expand(face_count, -1, -1, -1)
 
-        src_to_dst_affine = compute_similarity_transform(src_point, alignment_template.unsqueeze(0).expand(face_count, -1, -1))
-        grid_theta = affine_to_grid_theta(src_to_dst_affine, (H, W), output_size, align_corners=False)
+        src_to_dst_affine = compute_similarity_transform(
+            src_point, alignment_template.unsqueeze(0).expand(face_count, -1, -1)
+        )
+        grid_theta = affine_to_grid_theta(
+            src_to_dst_affine, (H, W), output_size, align_corners=False
+        )
 
-        grid = F.affine_grid(grid_theta, [face_count, C, output_size, output_size], align_corners=False)
+        grid = F.affine_grid(
+            grid_theta, [face_count, C, output_size, output_size], align_corners=False
+        )
         faces = F.grid_sample(image, grid, align_corners=False, mode="bilinear")
 
         aligned_batches.append(faces)
@@ -235,12 +262,20 @@ def align_faces(
 
 
 @overload
-def restore_faces_to_original(original_images: Tensor, aligned_faces: Tensor, grid_theta: Tensor, segment_lengths: list[int]) -> Tensor: ...
+def restore_faces_to_original(
+    original_images: Tensor,
+    aligned_faces: Tensor,
+    grid_theta: Tensor,
+    segment_lengths: list[int],
+) -> Tensor: ...
 
 
 @overload
 def restore_faces_to_original(
-    original_images: tuple[Tensor, ...] | list[Tensor], aligned_faces: Tensor, grid_theta: Tensor, segment_lengths: list[int]
+    original_images: tuple[Tensor, ...] | list[Tensor],
+    aligned_faces: Tensor,
+    grid_theta: Tensor,
+    segment_lengths: list[int],
 ) -> list[Tensor]: ...
 
 
@@ -251,11 +286,22 @@ def restore_faces_to_original(
     segment_lengths: list[int],
 ) -> Tensor | list[Tensor]:
 
-    image_count = original_images.shape[0] if isinstance(original_images, Tensor) else len(original_images)
+    image_count = (
+        original_images.shape[0]
+        if isinstance(original_images, Tensor)
+        else len(original_images)
+    )
     if len(segment_lengths) != image_count:
-        raise ValueError(f"segment_lengths length ({len(segment_lengths)}) must match image count ({image_count})")
-    if sum(segment_lengths) != aligned_faces.shape[0] or aligned_faces.shape[0] != grid_theta.shape[0]:
-        raise ValueError("segment_lengths, aligned_faces, and grid_theta face counts must match")
+        raise ValueError(
+            f"segment_lengths length ({len(segment_lengths)}) must match image count ({image_count})"
+        )
+    if (
+        sum(segment_lengths) != aligned_faces.shape[0]
+        or aligned_faces.shape[0] != grid_theta.shape[0]
+    ):
+        raise ValueError(
+            "segment_lengths, aligned_faces, and grid_theta face counts must match"
+        )
 
     result: list[Tensor] = []
     for theta, original_image, face in zip(
@@ -274,22 +320,30 @@ def restore_faces_to_original(
         original_image = original_image.unsqueeze(0)
 
         grid = F.affine_grid(inverse_theta, [face_count, C, H, W], align_corners=False)
-        faces_on_canvas = F.grid_sample(face, grid, padding_mode="zeros", align_corners=False, mode="bicubic")
+        faces_on_canvas = F.grid_sample(
+            face, grid, padding_mode="zeros", align_corners=False, mode="bicubic"
+        )
 
         # affine_grid is independent of the channel count, so reuse it for masks.
         sum_faces = faces_on_canvas.sum(dim=0, keepdim=True)
         ones = torch.ones_like(face[:, :1])
-        masks_on_canvas = F.grid_sample(ones, grid, padding_mode="zeros", align_corners=False, mode="bicubic")
+        masks_on_canvas = F.grid_sample(
+            ones, grid, padding_mode="zeros", align_corners=False, mode="bicubic"
+        )
 
         # 各像素被覆盖的次数（权重图），避免除以零
-        weight = masks_on_canvas.sum(dim=0, keepdim=True).clamp(min=1e-6)  # [1, 1, H, W]
+        weight = masks_on_canvas.sum(dim=0, keepdim=True).clamp(
+            min=1e-6
+        )  # [1, 1, H, W]
 
         # 加权平均后的人脸区域
         avg_faces = sum_faces / weight  # [1, C, H, W]
 
         # 仅在有人脸覆盖的区域替换原图，其余保留原图像素
         binary_mask = (weight > 0.5).float()  # [1, 1, H, W]，广播到 C 通道
-        original_image.copy_(avg_faces * binary_mask + original_image * (1.0 - binary_mask))
+        original_image.copy_(
+            avg_faces * binary_mask + original_image * (1.0 - binary_mask)
+        )
 
         # 恢复原图的 batch 维度（squeeze 掉之前 unsqueeze_ 的维度）
         result.append(original_image.squeeze_(0))
@@ -317,10 +371,14 @@ class _FaceExtractorBase:
             raise ValueError("output_size must be greater than 0")
 
         self.device = torch.device(device)
-        self.face_detector = RetinaFace(use_mobilenet=use_mobilenet).to(device=self.device).eval()
+        self.face_detector = (
+            RetinaFace(use_mobilenet=use_mobilenet).to(device=self.device).eval()
+        )
 
         alignment_template = get_alignment_template(output_size)
-        self.alignment_template = torch.as_tensor(alignment_template, device=self.device, dtype=torch.float32)
+        self.alignment_template = torch.as_tensor(
+            alignment_template, device=self.device, dtype=torch.float32
+        )
 
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
@@ -328,10 +386,23 @@ class _FaceExtractorBase:
         self.batch_size = batch_size
         self.output_size = output_size
 
-    def align(self, images: Tensor | list[Tensor] | tuple[Tensor, ...]) -> tuple[Tensor, Tensor, list[int]]:
-        detections, segment_lengths = self.face_detector.detect(images, confidence_threshold=self.confidence_threshold, iou_threshold=self.iou_threshold, min_face_size=self.min_face_size)
+    def align(
+        self, images: Tensor | list[Tensor] | tuple[Tensor, ...]
+    ) -> tuple[Tensor, Tensor, list[int]]:
+        detections, segment_lengths = self.face_detector.detect(
+            images,
+            confidence_threshold=self.confidence_threshold,
+            iou_threshold=self.iou_threshold,
+            min_face_size=self.min_face_size,
+        )
         source_landmarks = extract_landmarks(detections)
-        aligned_faces, grid_theta = align_faces(images, source_landmarks, segment_lengths, self.alignment_template, self.output_size)
+        aligned_faces, grid_theta = align_faces(
+            images,
+            source_landmarks,
+            segment_lengths,
+            self.alignment_template,
+            self.output_size,
+        )
         return aligned_faces, grid_theta, segment_lengths
 
 
@@ -374,7 +445,9 @@ class VideoFaceExtractor(_FaceExtractorBase):
         for i in range(0, total_frames, self.batch_size):
             j = min(i + self.batch_size, total_frames)
 
-            batch_frames = self.decoder[i:j].data.to(device=self.device, dtype=torch.float)  # [0.0, 255.0]
+            batch_frames = self.decoder[i:j].data.to(
+                device=self.device, dtype=torch.float
+            )  # [0.0, 255.0]
             aligned_faces, grid_theta, segment_lengths = self.align(batch_frames)
             frame_count = j - i
             yield batch_frames, aligned_faces, grid_theta, segment_lengths, frame_count
@@ -412,7 +485,12 @@ class ImageDirectoryFaceExtractor(_FaceExtractorBase):
         return ceil(self.image_count / self.batch_size)
 
     def __iter__(self):
-        for images, stems in self.image_folder.iter_tensor_batches(batch_size=self.batch_size, return_stem=True, device=self.device, dtype=torch.float):
+        for images, stems in self.image_folder.iter_tensor_batches(
+            batch_size=self.batch_size,
+            return_stem=True,
+            device=self.device,
+            dtype=torch.float,
+        ):
             aligned_faces, grid_theta, segment_lengths = self.align(images)
             image_count = len(segment_lengths)
             yield images, stems, aligned_faces, grid_theta, segment_lengths, image_count
