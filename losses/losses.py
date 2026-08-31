@@ -1,10 +1,13 @@
+from collections.abc import Callable, Mapping
+from typing import Literal
+
 import torch
 import torch.nn.functional as F
-from torch import Tensor, nn, autocast
-from typing import Literal, Callable, Mapping
+from torch import Tensor, autocast, nn
+
+from misc.models.id_encoder import IDEncoder, IDEncoderProvider
 
 from .vgg import VGGFeatureExtractor
-from misc.models.idencoder import PROVIDER, IDEncoder
 
 EPS = 1e-8
 
@@ -690,24 +693,22 @@ class GANLoss(nn.Module):
 
 
 class IDLoss(nn.Module):
-    Provider = PROVIDER
-
-    def __init__(self, provider: Provider = Provider.MS1MV3_ARCFACE_R50_FP16, weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean"):
+    def __init__(self, provider: IDEncoderProvider = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16, weight: float = 1.0, reduction: Literal["none", "mean", "sum"] = "mean"):
         super().__init__()
 
         self.weight = weight
         self.reduction = reduction
-        self.idencoder = IDEncoder(provider=provider)
+        self.id_encoder = IDEncoder(provider=provider)
 
         self.eval()
         self.requires_grad_(False)
 
     @torch.compile(fullgraph=True, dynamic=False, options={"epilogue_fusion": True, "max_autotune": True})
-    def get_id_feats(self, face: Tensor) -> Tensor:
-        return self.idencoder(face)
+    def extract_identity_embeddings(self, faces: Tensor) -> Tensor:
+        return self.id_encoder(faces)
 
-    def forward(self, fake_id: Tensor, real_id: Tensor) -> Tensor:
-        loss = (1.0 - F.cosine_similarity(fake_id, real_id)) * self.weight
+    def forward(self, generated_embeddings: Tensor, reference_embeddings: Tensor) -> Tensor:
+        loss = (1.0 - F.cosine_similarity(generated_embeddings, reference_embeddings)) * self.weight
 
         match self.reduction:
             case "none":
@@ -719,10 +720,10 @@ class IDLoss(nn.Module):
 
 
 class IFSRLoss(nn.Module):
-    def __init__(self, ifsr_scale: float, ifsr_weight: dict[str, tuple[float, float]], idencoder_provider: PROVIDER = PROVIDER.MS1MV3_ARCFACE_R50_FP16):
+    def __init__(self, ifsr_scale: float, ifsr_weight: dict[str, tuple[float, float]], id_encoder_provider: IDEncoderProvider = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16):
         super().__init__()
 
-        idencoder = IDEncoder(provider=idencoder_provider)
+        id_encoder = IDEncoder(provider=id_encoder_provider)
         self.feature_layer_indices: dict[int, str] = {}
 
         self.ifsr_weight = {k: (m * ifsr_scale, w) for k, (m, w) in ifsr_weight.items()}
@@ -732,7 +733,7 @@ class IFSRLoss(nn.Module):
         ifsr_layer_name = list(ifsr_weight.keys())
         max_layer_idx = 0
         idx = 0
-        for module_name_0, module_0 in idencoder.backbone.named_children():
+        for module_name_0, module_0 in id_encoder.backbone.named_children():
             if not list(module_0.children()):
                 net.append(module_0)
                 idx += 1

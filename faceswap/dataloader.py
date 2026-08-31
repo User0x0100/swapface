@@ -1,12 +1,13 @@
 import os
+
 import cv2
 import numpy as np
 from numpy import ndarray
-import nvidia.dali.fn as fn
-from nvidia.dali import pipeline_def
+from nvidia.dali import fn, pipeline_def
 from nvidia.dali.math import clamp
 from nvidia.dali.types import DALIDataType, DALIImageType, DALIInterpType
-from misc.utils import ImageFolder
+
+from misc.utils import ImageDirectory
 
 
 class RndAffinePars:
@@ -127,7 +128,7 @@ class RndAffinePars:
         return dali_mtx, theta_restore
 
 
-class SampleReader(object):
+class SampleReader:
     def __init__(
         self,
         src: list[str] | list[tuple[str, float]],
@@ -165,21 +166,21 @@ class SampleReader(object):
 
         return src, dst
 
-    def collect_folder(self, folder_weight_list: list[str] | list[tuple[str, float]]) -> tuple[list[ImageFolder], list[float]]:
+    def collect_folder(self, folder_weight_list: list[str] | list[tuple[str, float]]) -> tuple[list[ImageDirectory], list[float]]:
 
-        readers: list[ImageFolder] = []
+        readers: list[ImageDirectory] = []
         file_counts: list[int] = []
         adjustments: list[float] = []
 
         if isinstance(folder_weight_list[0], str):
             for folder in folder_weight_list:
-                reader = ImageFolder(folder)
+                reader = ImageDirectory(folder)
                 readers.append(reader)
                 file_counts.append(len(reader))
                 adjustments.append(0.0)
         else:
             for folder, adj in folder_weight_list:
-                reader = ImageFolder(folder)
+                reader = ImageDirectory(folder)
                 readers.append(reader)
                 file_counts.append(len(reader))
                 adjustments.append(adj)
@@ -213,7 +214,7 @@ class SampleReader(object):
         使用 ANSI 绿色高亮文件夹路径。
         """
 
-        def dump(title, folders: list[ImageFolder] | None, weights: list[float]):
+        def dump(title, folders: list[ImageDirectory] | None, weights: list[float]):
 
             count_w = 7
             GREEN = "\033[32m"

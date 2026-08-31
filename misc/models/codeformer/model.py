@@ -1,30 +1,31 @@
 import torch
-from torch import Tensor
-from .arch import CodeFormer
 from huggingface_hub import hf_hub_download
-from ...models import REPO_ID
+from torch import Tensor
+
+from ...models import MODEL_REPOSITORY_ID
+from .arch import CodeFormer
 
 
-def get_net(device: torch.device | str = "cuda") -> CodeFormer:
+def load_codeformer(device: torch.device | str = "cuda") -> CodeFormer:
     net = CodeFormer(dim_embd=512, codebook_size=1024, n_head=8, n_layers=9, connect_list=["32", "64", "128", "256"])
-    weight = hf_hub_download(repo_id=REPO_ID, filename="codeformer.pth")
-    checkpoint = torch.load(weight)["params_ema"]
-    net.load_state_dict(checkpoint)
-    net = net.to(device).eval()
-
-    return net
+    weight_path = hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename="codeformer.pth")
+    state_dict = torch.load(weight_path, map_location="cpu", weights_only=True)["params_ema"]
+    net.load_state_dict(state_dict)
+    return net.to(device).eval().requires_grad_(False)
 
 
 if __name__ == "__main__":
     from pathlib import Path
-    from misc.utils import ImageFolder
+
     import cv2
+
+    from misc.utils import ImageDirectory
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    net = get_net(device=device)
+    net = load_codeformer(device=device)
 
-    sample_dir = ImageFolder("codeformer_sample")
+    sample_dir = ImageDirectory("codeformer_sample")
     save_dir = Path("codeformer_result")
 
     save_dir.mkdir(exist_ok=True, parents=True)
@@ -33,7 +34,7 @@ if __name__ == "__main__":
 
     with torch.inference_mode():
         for idx in range(sample_nb):
-            image, fn = sample_dir.sample2tensor(label=True, device=device)  # image: 0.0 ~ 255.0 RGB CHW
+            image, fn = sample_dir.sample_tensor(return_stem=True, device=device)  # image: 0.0 ~ 255.0 RGB CHW
 
             image.div_(127.5).sub_(1.0).unsqueeze_(0)  # -1.0 ~ 1.0 1CHW RGB
 

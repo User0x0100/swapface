@@ -1,3 +1,3 @@
-from .model import get_net
+from .model import load_codeformer
 
-__all__ = ["get_net"]
+__all__ = ["load_codeformer"]

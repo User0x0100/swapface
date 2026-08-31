@@ -1,3 +1,3 @@
-from .model import RetinaFace, batch_resize_and_pad_varsize, draw_boxes_batch, get_pts
+from .model import RetinaFace, draw_detections, extract_landmarks
 
-__all__ = ["RetinaFace", "batch_resize_and_pad_varsize", "draw_boxes_batch", "get_pts"]
+__all__ = ["RetinaFace", "draw_detections", "extract_landmarks"]

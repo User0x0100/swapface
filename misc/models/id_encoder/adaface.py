@@ -1,7 +1,20 @@
 from collections import namedtuple
+
 import torch
-import torch.nn as nn
-from torch.nn import Dropout, MaxPool2d, Sequential, Conv2d, Linear, BatchNorm1d, BatchNorm2d, ReLU, Sigmoid, Module, PReLU
+from torch import nn
+from torch.nn import (
+    BatchNorm1d,
+    BatchNorm2d,
+    Conv2d,
+    Dropout,
+    Linear,
+    MaxPool2d,
+    Module,
+    PReLU,
+    ReLU,
+    Sequential,
+    Sigmoid,
+)
 
 
 def initialize_weights(modules):
@@ -31,7 +44,7 @@ class LinearBlock(Module):
     """Convolution block without no-linear activation layer"""
 
     def __init__(self, in_c, out_c, kernel=(1, 1), stride=(1, 1), padding=(0, 0), groups=1):
-        super(LinearBlock, self).__init__()
+        super().__init__()
         self.conv = Conv2d(in_c, out_c, kernel, stride, padding, groups=groups, bias=False)
         self.bn = BatchNorm2d(out_c)
 
@@ -45,7 +58,7 @@ class GNAP(Module):
     """Global Norm-Aware Pooling block"""
 
     def __init__(self, in_c):
-        super(GNAP, self).__init__()
+        super().__init__()
         self.bn1 = BatchNorm2d(in_c, affine=False)
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.bn2 = BatchNorm1d(in_c, affine=False)
@@ -66,7 +79,7 @@ class GDC(Module):
     """Global Depthwise Convolution block"""
 
     def __init__(self, in_c, embedding_size):
-        super(GDC, self).__init__()
+        super().__init__()
         self.conv_6_dw = LinearBlock(in_c, in_c, groups=in_c, kernel=(7, 7), stride=(1, 1), padding=(0, 0))
         self.conv_6_flatten = Flatten()
         self.linear = Linear(in_c, embedding_size, bias=False)
@@ -84,7 +97,7 @@ class SEModule(Module):
     """SE block"""
 
     def __init__(self, channels, reduction):
-        super(SEModule, self).__init__()
+        super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc1 = Conv2d(channels, channels // reduction, kernel_size=1, padding=0, bias=False)
 
@@ -110,7 +123,7 @@ class BasicBlockIR(Module):
     """BasicBlock for IRNet"""
 
     def __init__(self, in_channel, depth, stride):
-        super(BasicBlockIR, self).__init__()
+        super().__init__()
         if in_channel == depth:
             self.shortcut_layer = MaxPool2d(1, stride)
         else:
@@ -135,7 +148,7 @@ class BottleneckIR(Module):
     """BasicBlock with bottleneck for IRNet"""
 
     def __init__(self, in_channel, depth, stride):
-        super(BottleneckIR, self).__init__()
+        super().__init__()
         reduction_channel = depth // 4
         if in_channel == depth:
             self.shortcut_layer = MaxPool2d(1, stride)
@@ -162,13 +175,13 @@ class BottleneckIR(Module):
 
 class BasicBlockIRSE(BasicBlockIR):
     def __init__(self, in_channel, depth, stride):
-        super(BasicBlockIRSE, self).__init__(in_channel, depth, stride)
+        super().__init__(in_channel, depth, stride)
         self.res_layer.add_module("se_block", SEModule(depth, 16))
 
 
 class BottleneckIRSE(BottleneckIR):
     def __init__(self, in_channel, depth, stride):
-        super(BottleneckIRSE, self).__init__(in_channel, depth, stride)
+        super().__init__(in_channel, depth, stride)
         self.res_layer.add_module("se_block", SEModule(depth, 16))
 
 
@@ -235,7 +248,7 @@ class Backbone(Module):
         num_layers: num_layers of backbone
         mode: support ir or irse
         """
-        super(Backbone, self).__init__()
+        super().__init__()
         assert input_size[0] in [112, 224], "input_size should be [112, 112] or [224, 224]"
         assert num_layers in [18, 34, 50, 100, 152, 200], "num_layers should be 18, 34, 50, 100 or 152"
         assert mode in ["ir", "ir_se"], "mode should be ir or ir_se"

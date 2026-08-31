@@ -1,29 +1,32 @@
 import os
+import re
 import time
+from collections.abc import Iterator
 from functools import wraps
 from pathlib import Path
-from typing import Iterator
+from typing import Literal, Self, overload
 
 import numpy as np
 import torch
 from torch import Tensor
 from torchvision.io import decode_image
 from torchvision.io.image import ImageReadMode
-import re
 
 
 class Timer:
-    def __init__(self, name=None, verbose=True):
+    def __init__(self, name: str | None = None, verbose: bool = True) -> None:
         self.name = name
         self.verbose = verbose
-        self.start = None
-        self.elapsed = None
+        self.start: float | None = None
+        self.elapsed: float | None = None
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         self.start = time.perf_counter()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self.start is None:
+            raise RuntimeError("Timer was not started")
         self.elapsed = time.perf_counter() - self.start
         if self.verbose:
             label = self.name or "Block"
@@ -50,7 +53,7 @@ class Timer:
             return f"{seconds * 1e6:.3f} µs"
 
 
-class ImageFolder:
+class ImageDirectory:
     """
     一个轻量的图片目录封装器，提供确定性排序、随机采样和张量迭代功能。
 
@@ -71,7 +74,7 @@ class ImageFolder:
 
     DEFAULT_FILTERS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp")
 
-    def __init__(self, folder: str, file_filters: tuple[str, ...] | None = None):
+    def __init__(self, directory: str | Path, file_filters: tuple[str, ...] | None = None) -> None:
         """
         初始化 。
 
@@ -84,21 +87,25 @@ class ImageFolder:
             FileNotFoundError: 目录下无匹配文件。
         """
 
-        self.folder = Path(folder).resolve(strict=True)
+        self.directory = Path(directory).resolve(strict=True)
 
         if file_filters is None:
             file_filters = self.DEFAULT_FILTERS
+        filters = tuple(ext.lower() for ext in file_filters)
 
-        self.files = sorted([f for f in os.listdir(self.folder) if f.lower().endswith(file_filters)], key=self._natural_sort_key)
+        self.file_names = sorted(
+            [entry.name for entry in self.directory.iterdir() if entry.is_file() and entry.name.lower().endswith(filters)],
+            key=self._natural_sort_key,
+        )
 
-        if not self.files:
-            raise FileNotFoundError(f"没有在目录：{folder}下找到任何图片文件，file_filters：{file_filters}")
+        if not self.file_names:
+            raise FileNotFoundError(f"没有在目录：{directory}下找到任何图片文件，file_filters：{file_filters}")
 
         self.rng = np.random.default_rng(int.from_bytes(os.urandom(8), "little"))
 
     @staticmethod
-    def _natural_sort_key(filename: str) -> list:
-        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", filename)]
+    def _natural_sort_key(file_name: str) -> list:
+        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", file_name)]
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -110,24 +117,29 @@ class ImageFolder:
         seed = int.from_bytes(os.urandom(8), "little")
         self.rng = np.random.default_rng(seed)
 
-    def __len__(self):
-        return len(self.files)
+    def __len__(self) -> int:
+        return len(self.file_names)
 
-    def __iter__(self):
-        for f in self.files:
-            yield self.folder / f
+    def __iter__(self) -> Iterator[Path]:
+        for f in self.file_names:
+            yield self.directory / f
+
+    @overload
+    def __getitem__(self, index: int) -> Path: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[Path]: ...
 
     def __getitem__(self, index: int | slice) -> Path | list[Path]:
         if isinstance(index, slice):
-            return [self.folder / f for f in self.files[index]]
-        else:
-            return self.folder / self.files[index]
+            return [self.directory / f for f in self.file_names[index]]
+        return self.directory / self.file_names[index]
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return self.__str__()
 
-    def __str__(self):
-        return f"ImageFolder(path='{self.folder}', nb={len(self)})"
+    def __str__(self) -> str:
+        return f"ImageDirectory(path='{self.directory}', count={len(self)})"
 
     def sample(self) -> Path:
         """
@@ -140,64 +152,73 @@ class ImageFolder:
             使用实例私有的 ``numpy`` RNG，多进程环境下各 worker
             的随机序列相互独立（见 ``__setstate__``）。
         """
-        return self[self.rng.integers(len(self))]
+        return self[int(self.rng.integers(len(self)))]
 
-    def sample2tensor(self, label: bool = False, device: torch.device | str = "cpu", dtype=torch.float) -> Tensor | tuple[Tensor, str]:
+    @staticmethod
+    def _decode(path: Path, device: torch.device | str, dtype: torch.dtype) -> Tensor:
+        return decode_image(str(path), ImageReadMode.RGB).to(device=device, dtype=dtype)
+
+    @overload
+    def sample_tensor(self, return_stem: Literal[False] = False, device: torch.device | str = "cpu", dtype: torch.dtype = torch.float) -> Tensor: ...
+
+    @overload
+    def sample_tensor(self, return_stem: Literal[True], device: torch.device | str = "cpu", dtype: torch.dtype = torch.float) -> tuple[Tensor, str]: ...
+
+    def sample_tensor(self, return_stem: bool = False, device: torch.device | str = "cpu", dtype: torch.dtype = torch.float) -> Tensor | tuple[Tensor, str]:
         """
         随机采样一张图片并解码为 RGB 张量。
 
         Args:
-            label  (bool):                是否同时返回文件名（不含扩展名）作为标签。
+            return_stem (bool):                是否同时返回文件名 stem。
             device (torch.device | str):  目标设备，默认 ``"cpu"``。
             dtype  (torch.dtype):         目标数据类型，默认 ``torch.float``。
 
         Returns:
-            Tensor:               ``label=False`` 时，形状为 ``[3, H, W]``，
+            Tensor:               ``return_stem=False`` 时，形状为 ``[3, H, W]``，
                                   值域为 ``[0.0, 255.0]``（float32 直接转换自 uint8，
                                   **未归一化**，如需 [0,1] 请手动除以 255）。
-            tuple[Tensor, str]:   ``label=True`` 时，额外返回 ``(tensor, stem)``，
+            tuple[Tensor, str]:   ``return_stem=True`` 时，额外返回 ``(tensor, stem)``，
                                   ``stem`` 为不含扩展名的文件名字符串。
 
         Note:
             底层使用 ``torchvision.io.decode_image``，直接从磁盘解码，
             避免经过 PIL 的中间转换，性能更优。
         """
-        fp = self.sample()
+        path = self.sample()
+        image = self._decode(path, device=device, dtype=dtype)
 
-        image = decode_image(fp, ImageReadMode.RGB).to(device=device, dtype=dtype)
-
-        if label:
-            return image, fp.stem
+        if return_stem:
+            return image, path.stem
 
         return image
 
-    def iter_tensor(self, label: bool = False, device: torch.device | str = "cpu", dtype=torch.float) -> Iterator[Tensor] | Iterator[tuple[Tensor, str]]:
+    def iter_tensors(self, return_stem: bool = False, device: torch.device | str = "cpu", dtype=torch.float) -> Iterator[Tensor] | Iterator[tuple[Tensor, str]]:
         """
         按自然排序顺序逐一产出 RGB 张量（惰性求值，不预加载到内存）。
 
         Args:
-            label  (bool):                是否同时 yield 文件名（不含扩展名）。
+            return_stem (bool):                是否同时 yield 文件名 stem。
             device (torch.device | str):  目标设备，默认 ``"cpu"``。
             dtype  (torch.dtype):         目标数据类型，默认 ``torch.float``。
 
         Yields:
-            Tensor:               ``label=False`` 时，形状 ``[3, H, W]``，
+            Tensor:               ``return_stem=False`` 时，形状 ``[3, H, W]``，
                                   值域 ``[0.0, 255.0]``（**未归一化**）。
-            tuple[Tensor, str]:   ``label=True`` 时，产出 ``(tensor, stem)``。
+            tuple[Tensor, str]:   ``return_stem=True`` 时，产出 ``(tensor, stem)``。
 
         Note:
             适合在单线程脚本中遍历全量数据；若需并行预取，
             建议封装为 ``torch.utils.data.Dataset`` 并配合 ``DataLoader``。
         """
-        for fp in self:
-            image = decode_image(fp, ImageReadMode.RGB).to(device=device, dtype=dtype)
-            if label:
-                yield image, fp.stem
+        for path in self:
+            image = self._decode(path, device=device, dtype=dtype)
+            if return_stem:
+                yield image, path.stem
             else:
                 yield image
 
-    def iter_batch_tensor(
-        self, batch_size: int, label: bool = False, device: torch.device | str = "cpu", dtype=torch.float
+    def iter_tensor_batches(
+        self, batch_size: int, return_stem: bool = False, device: torch.device | str = "cpu", dtype=torch.float
     ) -> Iterator[list[Tensor] | tuple[list[Tensor], list[str]]]:
         """
         按自然排序顺序以批次为单位产出 RGB 张量列表（惰性求值）。
@@ -206,15 +227,15 @@ class ImageFolder:
 
         Args:
             batch_size (int):             每批图片数量，建议为 2 的幂次（如 8、16、32）。
-            label      (bool):            是否同时返回文件名列表。
+            return_stem (bool):      是否同时返回文件名 stem 列表。
             device     (torch.device | str): 目标设备，默认 ``"cpu"``。
             dtype      (torch.dtype):     目标数据类型，默认 ``torch.float``。
 
         Yields:
-            list[Tensor]:                       ``label=False`` 时，长度 ≤ ``batch_size``
+            list[Tensor]:                       ``return_stem=False`` 时，长度 ≤ ``batch_size``
                                                 的张量列表，每项形状 ``[3, H, W]``，
                                                 值域 ``[0.0, 255.0]``（**未归一化**）。
-            tuple[list[Tensor], list[str]]:     ``label=True`` 时，额外返回对应文件名列表。
+            tuple[list[Tensor], list[str]]:     ``return_stem=True`` 时，额外返回对应文件名列表。
 
         Note:
             由于图片尺寸不一定相同，本方法返回 **列表** 而非堆叠的 4D 张量；
@@ -222,17 +243,19 @@ class ImageFolder:
 
         Example::
 
-            folder = ImageFolder("/data/faces")
-            for batch, names in folder.iter_batch_tensor(32, label=True, device="cuda"):
+            folder = ImageDirectory("/data/faces")
+            for batch, names in folder.iter_tensor_batches(32, return_stem=True, device="cuda"):
                 # batch: list of [3, H, W] tensors  (len <= 32)
                 x = torch.stack(batch) / 255.0      # → [B, 3, H, W], 归一化
         """
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than 0")
+
         for i in range(0, len(self), batch_size):
             batch_paths = self[i : min(i + batch_size, len(self))]
+            images = [self._decode(path, device=device, dtype=dtype) for path in batch_paths]
 
-            images = [decode_image(fp, ImageReadMode.RGB).to(device=device, dtype=dtype) for fp in batch_paths]
-
-            if label:
-                yield images, [fp.stem for fp in batch_paths]
+            if return_stem:
+                yield images, [path.stem for path in batch_paths]
             else:
                 yield images

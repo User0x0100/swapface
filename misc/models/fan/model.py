@@ -5,7 +5,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from .models import FAN, ResNetDepth
 from huggingface_hub import hf_hub_download
-from ...models import REPO_ID
+from ...models import MODEL_REPOSITORY_ID
 
 
 class LandmarkMode(Enum):
@@ -14,7 +14,7 @@ class LandmarkMode(Enum):
 
 
 def hf_dl(name: str) -> str:
-    return hf_hub_download(repo_id=REPO_ID, filename=f"FaceAlignmentFan/{name}")
+    return hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename=f"FaceAlignmentFan/{name}")
 
 
 MODEL_LIST = {
@@ -463,18 +463,18 @@ def draw_landmarks_on_tensor(image: Tensor, landmarks: Tensor, *, color: tuple[f
 if __name__ == "__main__":
     import torch.nn.functional as F
     import torchvision.utils as utils
-    from misc.utils import ImageFolder
+    from misc.utils import ImageDirectory
 
-    # from misc.facealign import zoom_in
+    # from misc.face_alignment import center_crop_and_resize
     from torchvision.transforms import functional as TF
 
-    sample_dir = ImageFolder("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result")
+    sample_dir = ImageDirectory("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 8
     print(f"使用设备: {device}")
 
-    images = torch.stack([sample_dir.sample2tensor() for _ in range(batch_size)]).to(device=device)
+    images = torch.stack([sample_dir.sample_tensor() for _ in range(batch_size)]).to(device=device)
     H, C, H, W = images.size()
     images = TF.affine(images, angle=0, translate=(0, -(H * 0.075)), scale=0.81, shear=0)
 

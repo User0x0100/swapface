@@ -1,10 +1,11 @@
-import warnings
-import math
-import torch
-import torch.nn as nn
-from typing import Optional, Callable
-from itertools import repeat
 import collections.abc
+import math
+import warnings
+from collections.abc import Callable
+from itertools import repeat
+
+import torch
+from torch import nn
 
 
 def vit_l():
@@ -201,7 +202,7 @@ class VITBatchNorm(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False, qk_scale: Optional[None] = None, attn_drop: float = 0.0, proj_drop: float = 0.0):
+    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False, qk_scale: None = None, attn_drop: float = 0.0, proj_drop: float = 0.0):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -239,7 +240,7 @@ class Block(nn.Module):
         num_patches: int,
         mlp_ratio: float = 4.0,
         qkv_bias: bool = False,
-        qk_scale: Optional[None] = None,
+        qk_scale: None = None,
         drop: float = 0.0,
         attn_drop: float = 0.0,
         drop_path: float = 0.0,
@@ -303,11 +304,11 @@ class VisionTransformer(nn.Module):
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
         qkv_bias: bool = False,
-        qk_scale: Optional[None] = None,
+        qk_scale: None = None,
         drop_rate: float = 0.0,
         attn_drop_rate: float = 0.0,
         drop_path_rate: float = 0.0,
-        hybrid_backbone: Optional[None] = None,
+        hybrid_backbone: None = None,
         norm_layer: str = "ln",
         mask_ratio=0.1,
         using_checkpoint=False,

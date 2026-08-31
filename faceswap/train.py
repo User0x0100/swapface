@@ -21,9 +21,9 @@ from losses import IDLoss, l1_loss_fn, VGGPerceptualLoss, DLoss, GANLoss, StyleL
 from .dataloader import datasetloader
 from models.networks import Generator
 from models.discriminator import AlphaFaceDiscriminator
-from misc.facealign import zoom_in
-from misc.models.face_parsing import FaceParsing
-from misc.models.idencoder import PROVIDER
+from misc.face_alignment import center_crop_and_resize
+from misc.models.face_mask import FaceMasker
+from misc.models.id_encoder import IDEncoderProvider
 import torchvision.transforms.functional as TF
 
 
@@ -75,7 +75,7 @@ class Trainer:
         net_g_cfg: dict | None = None,
         net_d_cfg: dict | None = None,
         # 身份损失
-        id_encode_provider: IDLoss.Provider = IDLoss.Provider.BLENDFACE,
+        id_encoder_provider: IDEncoderProvider = IDEncoderProvider.BLENDFACE,
         id_loss_weight: float = 10.0,
         # 重建损失
         enable_rec_loss: bool = True,
@@ -205,7 +205,7 @@ class Trainer:
         self.d_loss = DLoss(weight=1.0, reduction="mean").to(self.device)
         self.gan_loss = GANLoss(weight=1.0, reduction="mean").to(self.device)
 
-        self.id_loss = IDLoss(weight=id_loss_weight, provider=id_encode_provider).to(self.device)
+        self.id_loss = IDLoss(weight=id_loss_weight, provider=id_encoder_provider).to(self.device)
 
         if self.enable_rec_loss:
             self.rec_loss = l1_loss_fn(weight=rec_loss_weight, reduction="none" if self.masked_train else "mean")
@@ -214,7 +214,7 @@ class Trainer:
             self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
 
         if self.enable_ifsr_loss:
-            self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight, idencoder_provider=PROVIDER.MS1MV3_ARCFACE_R100_FP16).to(self.device)
+            self.ifsr_loss = IFSRLoss(ifsr_scale=ifsr_scale, ifsr_weight=ifsr_weight, id_encoder_provider=IDEncoderProvider.MS1MV3_ARCFACE_R100_FP16).to(self.device)
 
         if self.enable_wfm_loss:
             self.wfm_loss = WFMLoss(layer_weights=wfm_loss_weight, criterion="l1").to(self.device)
@@ -272,7 +272,7 @@ class Trainer:
             else:
                 self.train_module[net_name] = net
 
-        face_parser = FaceParsing(range_norm=True, occ=occ_mask).to(device=self.device)
+        face_parser = FaceMasker(input_range="minus_one_to_one", mode="occlusion" if occ_mask else "parsing").to(device=self.device)
         if not occ_mask:
             face_parser = face_parser.eval()
         face_parser.requires_grad_(False)
@@ -367,8 +367,8 @@ class Trainer:
             # ========================= forward g =========================
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
                 with torch.no_grad():
-                    src_id_feats = self.id_loss.get_id_feats(zoom_in(src))
-                fake: Tensor = net_g(dst, src_id_feats)
+                    source_identity_embeddings = self.id_loss.extract_identity_embeddings(center_crop_and_resize(src))
+                fake: Tensor = net_g(dst, source_identity_embeddings)
 
             dst_org = dst
             if self.masked_train:
@@ -438,8 +438,8 @@ class Trainer:
                 # id_loss
                 grid = NF.affine_grid(theta_restore, size=fake.shape, align_corners=False)
                 fake_restored = NF.grid_sample(fake, grid, mode="bilinear", padding_mode="reflection", align_corners=False)
-                fake_id_feats = self.id_loss.get_id_feats(zoom_in(fake_restored))
-                id_loss = self.id_loss(fake_id_feats, src_id_feats)
+                generated_identity_embeddings = self.id_loss.extract_identity_embeddings(center_crop_and_resize(fake_restored))
+                id_loss = self.id_loss(generated_identity_embeddings, source_identity_embeddings)
                 self.log("id_loss", id_loss)
                 g_loss += id_loss
 
@@ -505,8 +505,8 @@ class Trainer:
                     grid_vis = NF.affine_grid(theta_restore_vis, size=fake.shape, align_corners=False)
                     dst_restored_vis = NF.grid_sample(dst_vis, grid_vis, mode="bilinear", padding_mode="reflection", align_corners=False)
 
-                    src_id_feats_vis = self.id_loss.get_id_feats(zoom_in(src_vis))
-                    fake_vis: Tensor = self.net_g_ema(dst_vis, src_id_feats_vis)
+                    source_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(center_crop_and_resize(src_vis))
+                    fake_vis: Tensor = self.net_g_ema(dst_vis, source_identity_embeddings_vis)
 
                     grid = [src_vis, dst_vis, fake_vis, dst_restored_vis]
 
@@ -524,8 +524,8 @@ class Trainer:
                         grid_id_vis = NF.affine_grid(theta_restore_vis, size=fake_for_id_grad.shape, align_corners=False)
                         fake_for_id_grad_restored = NF.grid_sample(fake_for_id_grad, grid_id_vis, mode="bilinear", padding_mode="reflection", align_corners=False)
 
-                        fake_id_feats_vis = self.id_loss.get_id_feats(zoom_in(fake_for_id_grad_restored))
-                        id_loss_vis = self.id_loss(fake_id_feats_vis, src_id_feats_vis.detach())
+                        generated_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(center_crop_and_resize(fake_for_id_grad_restored))
+                        id_loss_vis = self.id_loss(generated_identity_embeddings_vis, source_identity_embeddings_vis.detach())
                         id_grad_map = self.loss_grad_map(id_loss_vis, fake_for_id_grad)
 
                     grid.append(id_grad_map)
@@ -580,7 +580,7 @@ if __name__ == "__main__":
             "occ_mask": False,
             "log_path": "train_log/512-MS1MV3_ARCFACE_R50_FP16",
             "batch_size": 16,
-            "id_encode_provider": IDLoss.Provider.MS1MV3_ARCFACE_R50_FP16,
+            "id_encoder_provider": IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16,
             "net_g_cfg": {
                 # "img_resolution": 512,
                 # "img_channels": 3,

@@ -1,7 +1,7 @@
 import torch
 from torch import nn, Tensor
 from huggingface_hub import hf_hub_download
-from ...models import REPO_ID
+from ...models import MODEL_REPOSITORY_ID
 
 from .mobilenetv2_backbone import MobileNetV2
 from .pointnet_backbone import MLP_for, MLP_rev
@@ -14,7 +14,7 @@ class ParamsPack:
     def __init__(self):
 
         def df_dl(name: str) -> str:
-            return hf_hub_download(repo_id=REPO_ID, filename=f"SynergyNet/3dmm_data/{name}")
+            return hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename=f"SynergyNet/3dmm_data/{name}")
 
         self.keypoints = np.load(df_dl("keypoints_sim.npy"))
 
@@ -67,8 +67,8 @@ class SynergyNet(nn.Module):
         self.register_buffer("w_exp_base", Tensor(self.param_pack.w_exp_base))
         self.keypoints = Tensor(self.param_pack.keypoints).long()
 
-        # state_dict = torch.load(hf_hub_download(repo_id=REPO_ID, filename="SynergyNet/best.pth.tar"), map_location=torch.device("cpu"), weights_only=False)["state_dict"]
-        state_dict = torch.load(hf_hub_download(repo_id=REPO_ID, filename="SynergyNet/best_pose.pth.tar"), map_location=torch.device("cpu"), weights_only=False)["state_dict"]
+        # state_dict = torch.load(hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename="SynergyNet/best.pth.tar"), map_location=torch.device("cpu"), weights_only=False)["state_dict"]
+        state_dict = torch.load(hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename="SynergyNet/best_pose.pth.tar"), map_location=torch.device("cpu"), weights_only=False)["state_dict"]
 
         # 去掉 "module. I2P. 排除顶层 u_tex w_tex"
         state_dict = {cleaned: v for k, v in state_dict.items() if (cleaned := k.removeprefix("module.").removeprefix("I2P.")) not in ("u_tex", "w_tex")}
@@ -180,22 +180,22 @@ if __name__ == "__main__":
     import torch.nn.functional as F
     from torchvision.transforms import functional as TF
     import torchvision.utils as utils
-    from misc.utils import ImageFolder
-    # from misc.facealign import zoom_in
+    from misc.utils import ImageDirectory
+    # from misc.face_alignment import center_crop_and_resize
 
     INPUT_SIZE = 120
-    sample_dir = ImageFolder("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result")
+    sample_dir = ImageDirectory("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 8
     print(f"使用设备: {device}")
 
-    images = torch.stack([sample_dir.sample2tensor() for _ in range(batch_size)]).to(device=device)
+    images = torch.stack([sample_dir.sample_tensor() for _ in range(batch_size)]).to(device=device)
 
     N, C, H, W = images.size()
     assert H == W
     scale = float(H / INPUT_SIZE)
-    # images = zoom_in(images, zoom=0.05)
+    # images = center_crop_and_resize(images, crop_fraction=0.05)
     images = TF.affine(images, angle=0, translate=(0, -(H * 0.05)), scale=1.0, shear=0)
 
     images.div_(127.5).sub_(1.0)

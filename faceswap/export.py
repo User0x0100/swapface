@@ -1,15 +1,16 @@
+import argparse
 import os
 import random
-import argparse
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
-import torch
-from torch import nn, Tensor
-from models.networks import Generator
-from misc.models.idencoder import IDEncoder, PROVIDER
 import onnxruntime as ort
+import torch
+from torch import Tensor, nn
+
+from misc.models.id_encoder import IDEncoder, IDEncoderProvider
+from models.networks import Generator
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Reproducibility
@@ -23,57 +24,57 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cuda.matmul.allow_tf32 = False
 
 
-def print_dict(title: str, d: dict, indent: int = 2):
+def print_mapping(title: str, mapping: dict, indent: int = 2) -> None:
     print(f"{title}:")
-    for k, v in d.items():
-        if isinstance(v, dict):
-            print(" " * indent + f"{k}:")
-            print_dict("", v, indent + 2)
+    for key, value in mapping.items():
+        if isinstance(value, dict):
+            print(" " * indent + f"{key}:")
+            print_mapping("", value, indent + 2)
         else:
-            print(" " * indent + f"{k:25}: {v}")
+            print(" " * indent + f"{key:25}: {value}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Wrappers
 # ──────────────────────────────────────────────────────────────────────────────
-class FaceSwapNHWCWrapper(nn.Module):
+class FaceSwapNHWCAdapter(nn.Module):
     def __init__(self, model: Generator) -> None:
         super().__init__()
         self.model = model
 
-    def forward(self, nhwc: Tensor, id_feat: Tensor) -> Tensor:
-        nhwc = torch.clamp(nhwc, -1.0, 1.0)
-        nchw = nhwc.permute(0, 3, 1, 2).contiguous()
-        x = self.model(nchw, id_feat)
-        return x.permute(0, 2, 3, 1)
+    def forward(self, images_nhwc: Tensor, identity_embedding: Tensor) -> Tensor:
+        images_nhwc = torch.clamp(images_nhwc, -1.0, 1.0)
+        images_nchw = images_nhwc.permute(0, 3, 1, 2).contiguous()
+        output = self.model(images_nchw, identity_embedding)
+        return output.permute(0, 2, 3, 1)
 
 
-class IDEncoderNHWCWrapper(nn.Module):
+class IDEncoderNHWCAdapter(nn.Module):
     def __init__(self, model: IDEncoder) -> None:
         super().__init__()
         self.model = model
 
-    def forward(self, nhwc: Tensor) -> Tensor:
-        nhwc = torch.clamp(nhwc, -1.0, 1.0)
-        return self.model(nhwc.permute(0, 3, 1, 2).contiguous())
+    def forward(self, images_nhwc: Tensor) -> Tensor:
+        images_nhwc = torch.clamp(images_nhwc, -1.0, 1.0)
+        return self.model(images_nhwc.permute(0, 3, 1, 2).contiguous())
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Core export helper
 # ──────────────────────────────────────────────────────────────────────────────
-def torch2onnx(
+def export_to_onnx(
     model: nn.Module,
-    args: tuple[Any, ...],
+    example_inputs: tuple[Any, ...],
     output_dir: str | os.PathLike = "onnx_export",
     file_prefix: str | None = None,
 ):
 
     model = model.eval()
-    out_dir = Path(output_dir)
-    out_dir.mkdir(exist_ok=True, parents=True)
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(exist_ok=True, parents=True)
 
     with torch.inference_mode():
-        exported_program = torch.export.export(model, args, strict=True)
+        exported_program = torch.export.export(model, example_inputs, strict=True)
         onnx_program = torch.onnx.export(
             model=exported_program,
             # opset_version=21,
@@ -82,17 +83,17 @@ def torch2onnx(
             verify=True,
             report=True,
             external_data=False,
-            artifacts_dir=out_dir / "onnx_artifacts",
+            artifacts_dir=output_dir_path / "onnx_artifacts",
             verbose=True,
             profile=True,
         )
 
     file_prefix = "" if file_prefix is None else file_prefix
-    time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = out_dir / f"{file_prefix}-{time_str}.onnx"
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    output_path = output_dir_path / f"{file_prefix}-{timestamp}.onnx"
 
-    onnx_program.save(out_path)
-    print(f"模型成功导出到: {out_path}")
+    onnx_program.save(output_path)
+    print(f"模型成功导出到: {output_path}")
 
     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
@@ -101,50 +102,50 @@ def torch2onnx(
 
     sess_options = ort.SessionOptions()
     sess_options.log_severity_level = 0
-    ort.InferenceSession(out_path, providers=providers, sess_options=sess_options)
+    ort.InferenceSession(output_path, providers=providers, sess_options=sess_options)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Export functions
 # ──────────────────────────────────────────────────────────────────────────────
-def export_FaceSwap(
-    ckpt: str | None = None,
+def export_face_swap(
+    checkpoint_path: str | None = None,
     batch_size: int = 1,
     nhwc: bool = True,
     device: str = "cuda",
     output_dir: str = "onnx_export",
     file_prefix: str = "faceswap",
 ) -> None:
-    dev = torch.device(device)
+    target_device = torch.device(device)
 
-    if ckpt is not None:
-        print(f"Loading ckpt from {ckpt}")
-        state: dict[str, Any] = torch.load(ckpt, map_location=dev, weights_only=False)
-        iter = state["iter"]
-        print(f"ckpt info:\n  {'iter':25}: {iter}")
-        print_dict("net_g", state["net_g"]["network_cfg"])
-        print_dict("net_d", state["net_d"]["network_cfg"])
-        model = Generator(**state["net_g"]["network_cfg"])
-        model.load_state_dict(state["net_g"]["state_dict"])
+    if checkpoint_path is not None:
+        print(f"Loading ckpt from {checkpoint_path}")
+        checkpoint: dict[str, Any] = torch.load(checkpoint_path, map_location=target_device, weights_only=False)
+        training_iteration = checkpoint["iter"]
+        print(f"ckpt info:\n  {'iter':25}: {training_iteration}")
+        print_mapping("net_g", checkpoint["net_g"]["network_cfg"])
+        print_mapping("net_d", checkpoint["net_d"]["network_cfg"])
+        model = Generator(**checkpoint["net_g"]["network_cfg"])
+        model.load_state_dict(checkpoint["net_g"]["state_dict"])
     else:
-        iter = 0
+        training_iteration = 0
         model = Generator()
 
-    cfg = model.network_cfg
-    res, ch, id_dim = cfg["img_resolution"], cfg["img_channels"], cfg["id_dim"]
+    network_config = model.network_cfg
+    image_resolution, image_channels, identity_dim = network_config["img_resolution"], network_config["img_channels"], network_config["id_dim"]
 
     if nhwc:
-        wrapped = FaceSwapNHWCWrapper(model).to(dev)
-        x = torch.randn((batch_size, res, res, ch), device=dev, dtype=torch.float32)
+        wrapped = FaceSwapNHWCAdapter(model).to(target_device)
+        x = torch.randn((batch_size, image_resolution, image_resolution, image_channels), device=target_device, dtype=torch.float32)
     else:
-        wrapped = model.to(dev)
-        x = torch.randn((batch_size, ch, res, res), device=dev, dtype=torch.float32)
+        wrapped = model.to(target_device)
+        x = torch.randn((batch_size, image_channels, image_resolution, image_resolution), device=target_device, dtype=torch.float32)
 
-    id_feat = torch.randn((batch_size, id_dim), device=dev, dtype=torch.float32)
-    torch2onnx(wrapped, (x, id_feat), output_dir=output_dir, file_prefix=f"{file_prefix}-{iter}")
+    identity_embedding = torch.randn((batch_size, identity_dim), device=target_device, dtype=torch.float32)
+    export_to_onnx(wrapped, (x, identity_embedding), output_dir=output_dir, file_prefix=f"{file_prefix}-{training_iteration}")
 
 
-def export_IDEncoder(
+def export_id_encoder(
     provider_name: str = "MS1MV3_ARCFACE_R50_FP16",
     batch_size: int = 1,
     nhwc: bool = True,
@@ -152,25 +153,24 @@ def export_IDEncoder(
     output_dir: str = "onnx_export",
     file_prefix: str = "IDEncoder",
 ) -> None:
-    _ = file_prefix
-    dev = torch.device(device)
-    provider = PROVIDER[provider_name]
+    target_device = torch.device(device)
+    provider = IDEncoderProvider[provider_name]
     encoder = IDEncoder(provider)
 
     if nhwc:
-        wrapped = IDEncoderNHWCWrapper(encoder).to(dev).eval()
-        x = torch.randn((batch_size, 112, 112, 3), device=dev, dtype=torch.float32)
+        wrapped = IDEncoderNHWCAdapter(encoder).to(target_device).eval()
+        x = torch.randn((batch_size, 112, 112, 3), device=target_device, dtype=torch.float32)
     else:
-        wrapped = encoder.to(dev).eval()
-        x = torch.randn((batch_size, 3, 112, 112), device=dev, dtype=torch.float32)
+        wrapped = encoder.to(target_device).eval()
+        x = torch.randn((batch_size, 3, 112, 112), device=target_device, dtype=torch.float32)
 
-    torch2onnx(wrapped, (x,), output_dir=output_dir, file_prefix=f"IDEncoder-{provider_name}")
+    export_to_onnx(wrapped, (x,), output_dir=output_dir, file_prefix=f"{file_prefix}-{provider_name}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
-PROVIDER_CHOICES = [p.name for p in PROVIDER]
+ID_ENCODER_PROVIDER_CHOICES = [p.name for p in IDEncoderProvider]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -178,7 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="将 FaceSwap / IDEncoder 模型导出为 ONNX 格式",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub = parser.add_subparsers(dest="command", required=True)
 
     # ── 公共参数工厂 ──────────────────────────────────────────────────────────
     def add_common(p: argparse.ArgumentParser) -> None:
@@ -190,26 +190,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── faceswap 子命令 ───────────────────────────────────────────────────────
     p_fs = sub.add_parser("faceswap", help="导出 Generator（换脸模型）")
-    p_fs.add_argument("--ckpt", default=None, metavar="PATH", help="检查点路径（.pth）；不传则使用默认权重")
+    p_fs.add_argument("--checkpoint", default=None, metavar="PATH", help="检查点路径（.pth）；不传则使用默认权重")
     add_common(p_fs)
 
-    # ── idencoder 子命令 ──────────────────────────────────────────────────────
-    p_id = sub.add_parser("idencoder", help="导出 IDEncoder（人脸识别编码器）")
+    # ── id-encoder 子命令 ──────────────────────────────────────────────────────
+    p_id = sub.add_parser("id-encoder", help="导出 IDEncoder（人脸识别编码器）")
     p_id.add_argument(
         "--provider",
         default="BLENDFACE",
-        choices=PROVIDER_CHOICES,
+        choices=ID_ENCODER_PROVIDER_CHOICES,
         help="IDEncoder 权重/骨干网络选择",
     )
     add_common(p_id)
 
     # ── all 子命令（两者一起导出）────────────────────────────────────────────
     p_all = sub.add_parser("all", help="同时导出 FaceSwap 与 IDEncoder")
-    p_all.add_argument("--ckpt", default=None, metavar="PATH", help="Generator 检查点路径")
+    p_all.add_argument("--checkpoint", default=None, metavar="PATH", help="Generator 检查点路径")
     p_all.add_argument(
         "--provider",
         default="BLENDFACE",
-        choices=PROVIDER_CHOICES,
+        choices=ID_ENCODER_PROVIDER_CHOICES,
         help="IDEncoder provider",
     )
     add_common(p_all)
@@ -222,19 +222,19 @@ def main() -> None:
     args = parser.parse_args()
 
     nhwc = not args.nchw
-    kwargs = dict(
-        batch_size=args.batch_size,
-        nhwc=nhwc,
-        device=args.device,
-        output_dir=args.output_dir,
-        file_prefix=args.file_prefix,
-    )
+    kwargs = {
+        "batch_size": args.batch_size,
+        "nhwc": nhwc,
+        "device": args.device,
+        "output_dir": args.output_dir,
+        "file_prefix": args.file_prefix,
+    }
 
-    if args.cmd in ("faceswap", "all"):
-        export_FaceSwap(ckpt=args.ckpt, **kwargs)
+    if args.command in ("faceswap", "all"):
+        export_face_swap(checkpoint_path=args.checkpoint, **kwargs)
 
-    if args.cmd in ("idencoder", "all"):
-        export_IDEncoder(provider_name=args.provider, **kwargs)
+    if args.command in ("id-encoder", "all"):
+        export_id_encoder(provider_name=args.provider, **kwargs)
 
 
 if __name__ == "__main__":

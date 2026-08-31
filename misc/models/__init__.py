@@ -1,1 +1,1 @@
-REPO_ID = "leehx/model_hub"
+MODEL_REPOSITORY_ID = "leehx/model_hub"

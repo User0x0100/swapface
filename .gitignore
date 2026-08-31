@@ -8,5 +8,5 @@ onnx_export/
 *.onnx
 *.pth
 *.jpg
-*.jpge
+*.jpeg
 *.engine
