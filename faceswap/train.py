@@ -1,6 +1,7 @@
 import copy
 import itertools
 import random
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -35,20 +36,9 @@ from misc.models.id_encoder import IDEncoderProvider
 from models.discriminator import AlphaFaceDiscriminator
 from models.networks import Generator
 
-from .dataloader import datasetloader
+from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, ImageDecoderBackend, ImageSource, create_dataloader_pipeline
 
 EPS = 1e-8
-
-DEFAULT_DATALOADER_CFG: dict[str, Any] = {
-    "num_threads": 16,
-    "prefetch_queue_depth": 20,
-    "py_num_workers": 8,
-    "py_start_method": "spawn",
-    "rotation_range": (-10.0, 10.0),
-    "scale_range": (-0.3, 0.25),
-    "tx_range": (-0.15, 0.15),
-    "ty_range": (-0.15, 0.15),
-}
 
 DEFAULT_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
     "conv1_2": 2.5,
@@ -56,8 +46,6 @@ DEFAULT_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
     "conv3_3": 2.5,
     "conv4_3": 2.5,
 }
-
-DATALOADER_RESERVED_KEYS = frozenset({"batch_size", "device_id", "img_resolution", "src", "dst", "hw_decoder"})
 
 
 DEFAULT_IFSR_CONSTRAINTS: dict[str, tuple[float, float]] = {
@@ -97,8 +85,8 @@ def print_mapping(title: str, mapping: dict, indent: int = 2) -> None:
 class Trainer:
     def __init__(
         self,
-        src: list[tuple[str, float]],
-        dst: list[tuple[str, float]],
+        src: Sequence[ImageSource],
+        dst: Sequence[ImageSource],
         masked_train: bool = True,
         occ_mask: bool = False,
         batch_size: int = 10,
@@ -114,7 +102,8 @@ class Trainer:
         log_interval: int = 10,
         sample_save_every: int = 1000,
         weight_save_every: int = 10000,
-        # 模型与数据管线配置
+        # 模型与数据管线配置。dataloader_cfg 覆盖 DEFAULT_DATALOADER_CONFIG，
+        # batch_size/device_id/img_resolution/src/dst 由 Trainer 管理，禁止在其中重复指定。
         net_g_cfg: dict | None = None,
         net_d_cfg: dict | None = None,
         dataloader_cfg: dict[str, Any] | None = None,
@@ -142,13 +131,13 @@ class Trainer:
         dssim_loss_weight: float = 10.0,
     ):
         if dataloader_cfg is None:
-            dataloader_cfg = dict(DEFAULT_DATALOADER_CFG)
+            dataloader_cfg = dict(DEFAULT_DATALOADER_CONFIG)
         else:
             reserved_keys = DATALOADER_RESERVED_KEYS.intersection(dataloader_cfg)
             if reserved_keys:
                 names = ", ".join(sorted(reserved_keys))
                 raise ValueError(f"dataloader_cfg cannot override reserved keys: {names}")
-            dataloader_cfg = DEFAULT_DATALOADER_CFG | dataloader_cfg
+            dataloader_cfg = DEFAULT_DATALOADER_CONFIG | dataloader_cfg
 
         if perceptual_loss_weight is None:
             perceptual_loss_weight = dict(DEFAULT_PERCEPTUAL_LOSS_WEIGHT)
@@ -271,19 +260,14 @@ class Trainer:
         # ========================= Sample =========================
 
         device_id = self.device.index if self.device.index is not None else torch.cuda.current_device()
-        major, _minor = torch.cuda.get_device_capability(device_id)
-        hw_decoder = major >= 8
-        pipe = datasetloader(
+        pipe = create_dataloader_pipeline(
             batch_size=self.batch_size,
             device_id=device_id,
             img_resolution=self.img_resolution,
             src=src,
             dst=dst,
-            hw_decoder=hw_decoder,
             **dataloader_cfg,
         )
-
-        print(f"hw_decoder={hw_decoder}")
 
         self.sample_output_map = ["src", "dst", "theta_restore"]
         self.dataset = DALIGenericIterator(pipelines=pipe, output_map=self.sample_output_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
@@ -610,6 +594,23 @@ if __name__ == "__main__":
         "log_path": "train_log/512-MS1MV3_ARCFACE_R50_FP16",
         "batch_size": 16,
         "id_encoder_provider": IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16,
+        "dataloader_cfg": {
+            "num_threads": 16,
+            "prefetch_queue_depth": 4,
+            "py_num_workers": 8,
+            "py_start_method": "spawn",
+            "reader_prefetch_queue_depth": 2,
+            "decoder_backend": ImageDecoderBackend.MIXED,
+            "decoder_hw_load": 0.75,
+            "brightness": 0.2,
+            "contrast": 0.2,
+            "saturation": 0.2,
+            "flip_prob": 0.5,
+            "rotation_range": (-10.0, 10.0),
+            "scale_factor_range": (1.0 / 1.3, 1.25),
+            "tx_range": (-0.15, 0.15),
+            "ty_range": (-0.15, 0.15),
+        },
         "net_g_cfg": {
             # "img_resolution": 512,
             # "img_channels": 3,
