@@ -8,7 +8,11 @@
 
 from __future__ import annotations
 
+import io
+import tarfile
 from enum import Enum
+from pathlib import Path
+from urllib.request import urlopen
 
 import torch
 import torch.nn.functional as F
@@ -16,7 +20,15 @@ from huggingface_hub import hf_hub_download
 from torch import Tensor, nn
 
 from ...models import MODEL_REPOSITORY_ID, ImageInputRange
+from .dinov3 import Dinov3ViTL16Backbone
 from .vit import ViTTiny
+
+
+class HRFFAModelVariant(Enum):
+    """HRFFA inference model variant."""
+
+    VITT_256 = "vitt-256"
+    VITL_320 = "vitl-320"
 
 
 class HRFFAScheme(Enum):
@@ -42,7 +54,7 @@ class HRFFAVisibility(Enum):
     VISIBLE = 2
 
 
-class _HRFFABackbone(nn.Module):
+class _HRFFAStudentBackbone(nn.Module):
     """保持上游 state_dict 键结构的 ViT-T backbone wrapper。"""
 
     def __init__(self) -> None:
@@ -82,19 +94,19 @@ def _sincos_pos_embed_2d(dim: int, height: int, width: int, device: torch.device
 
 
 class _HRFFANetwork(nn.Module):
-    """与 HRFFA ViT-T 学生 checkpoint 严格匹配的原生 PyTorch 网络。"""
+    """HRFFA point-query head shared by student and teacher variants."""
 
-    def __init__(self) -> None:
+    def __init__(self, backbone: nn.Module, backbone_dim: int, decoder_layers: int) -> None:
         super().__init__()
-        self.backbone = _HRFFABackbone()
+        self.backbone = backbone
         d_model = 256
 
-        self.input_proj = nn.Linear(self.backbone.embed_dim, d_model)
-        self.cls_proj = nn.Linear(self.backbone.embed_dim, d_model)
+        self.input_proj = nn.Linear(backbone_dim, d_model)
+        self.cls_proj = nn.Linear(backbone_dim, d_model)
         self.queries = nn.ParameterDict({scheme.value: nn.Parameter(torch.empty(count, d_model, dtype=torch.float32)) for scheme, count in SCHEME_LANDMARK_COUNTS.items()})
 
         decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=8, dim_feedforward=1024, dropout=0.0, batch_first=True, norm_first=True)
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=3, norm=nn.LayerNorm(d_model))
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=decoder_layers, norm=nn.LayerNorm(d_model))
         self.coord_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
@@ -130,52 +142,122 @@ class _HRFFANetwork(nn.Module):
 
 
 class HRFFALandmarkModel(nn.Module):
-    """HRFFA ViT-T/256 整头部关键点模型。
+    """HRFFA whole-head landmark model.
 
-    输入是已经裁好的**正方形整头部 crop**，不是传统紧致人脸 crop。模型内部会将
-    任意正方形输入缩放到 256×256，并按学生模型的 center05 规范转换到 ``[-1, 1]``。
-    输出关键点会恢复到调用方输入 crop 的像素坐标，因此输入尺寸不必固定为 256。
+    ``VITT_256`` is the lightweight student and remains the default. ``VITL_320`` is
+    the highest-accuracy clean_v3 teacher using the official DINOv3 ViT-L/16 runtime
+    implementation. Both accept an arbitrary square RGB crop and restore predicted
+    coordinates to the caller's original pixel size.
 
-    参数:
-        scheme: 关键点拓扑，默认 ``HRFFAScheme.IBUG68``。
-        input_range: 调用方输入张量值域枚举。
-
-    输出:
-        默认返回 ``(N, K, 2)`` 像素坐标；设置 ``return_visibility=True`` 时返回
-        ``(landmarks, visibility)``，其中 visibility 形状为 ``(N, K)``，类别含义为
-        0=图像外、1=遮挡、2=可见。
-
-    说明:
-        上游训练 crop 几何为：以头部框中心为中心，取框长边的 ``1.1`` 倍正方形区域，
-        即每侧约 5% padding。若输入 crop 几何不同，关键点精度可能下降。
+    The teacher checkpoint is downloaded directly from the upstream HRFFA GitHub
+    release into ``~/.cache/swap/hrffa`` on first use. The split release archive is
+    streamed and only the first ``clean_v3_best_*.pt`` member is retained.
     """
 
-    INPUT_SIZE = 256
-    WEIGHT_FILENAME = "HRFFA/student_s256_96gb_r2_best_e0449_0.007970.pt"
+    STUDENT_INPUT_SIZE = 256
+    TEACHER_INPUT_SIZE = 320
+    STUDENT_WEIGHT_FILENAME = "HRFFA/student_s256_96gb_r2_best_e0449_0.007970.pt"
+    TEACHER_RELEASE_BASE = "https://github.com/PINTO0309/High-Angle_Robust_Fast_FaceAlignment/releases/download/weights"
+    TEACHER_RELEASE_PARTS = tuple(f"clean_v3.tar.gz.part{i:02d}" for i in range(4))
 
-    def __init__(self, scheme: HRFFAScheme = HRFFAScheme.IBUG68, input_range: ImageInputRange = ImageInputRange.ZERO_TO_ONE) -> None:
+    def __init__(
+        self,
+        scheme: HRFFAScheme = HRFFAScheme.IBUG68,
+        input_range: ImageInputRange = ImageInputRange.ZERO_TO_ONE,
+        variant: HRFFAModelVariant = HRFFAModelVariant.VITT_256,
+        teacher_checkpoint: str | Path | None = None,
+    ) -> None:
         super().__init__()
         if not isinstance(input_range, ImageInputRange):
             raise TypeError(f"input_range 必须为 ImageInputRange，实际为 {type(input_range).__name__}")
+        if not isinstance(variant, HRFFAModelVariant):
+            raise TypeError(f"variant 必须为 HRFFAModelVariant，实际为 {type(variant).__name__}")
 
         self.scheme = scheme
         self.input_range = input_range
-        self.network = _HRFFANetwork()
+        self.variant = variant
 
-        checkpoint_path = hf_hub_download(
-            repo_id=MODEL_REPOSITORY_ID,
-            filename=self.WEIGHT_FILENAME,
-        )
-        checkpoint = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=True,
-        )
-        state_dict = checkpoint.get("ema")
+        match variant:
+            case HRFFAModelVariant.VITT_256:
+                self.input_size = self.STUDENT_INPUT_SIZE
+                self.network = _HRFFANetwork(_HRFFAStudentBackbone(), backbone_dim=192, decoder_layers=3)
+                checkpoint_path = hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename=self.STUDENT_WEIGHT_FILENAME)
+                checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            case HRFFAModelVariant.VITL_320:
+                self.input_size = self.TEACHER_INPUT_SIZE
+                self.network = _HRFFANetwork(Dinov3ViTL16Backbone(patch_instance_norm=True), backbone_dim=1024, decoder_layers=4)
+                checkpoint_path = Path(teacher_checkpoint).expanduser() if teacher_checkpoint is not None else self._download_teacher_checkpoint()
+                checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+
+        state_dict = checkpoint.get("ema") or checkpoint.get("model")
         if not isinstance(state_dict, dict):
-            raise TypeError("HRFFA checkpoint 的 ema 必须为 state_dict")
+            raise TypeError("HRFFA checkpoint 必须包含 ema 或 model state_dict")
         self.network.load_state_dict(state_dict, strict=True)
         self.eval().requires_grad_(False)
+
+    @classmethod
+    def _download_teacher_checkpoint(cls) -> Path:
+        cache_dir = Path.home() / ".cache" / "swap" / "hrffa"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cached = sorted(cache_dir.glob("clean_v3_best_*.pt"))
+        if cached:
+            return cached[-1]
+
+        class _MultipartStream(io.RawIOBase):
+            def __init__(self) -> None:
+                super().__init__()
+                self.part_index = 0
+                self.response = None
+
+            def readable(self) -> bool:
+                return True
+
+            def readinto(self, buffer) -> int:
+                view = memoryview(buffer)
+                written = 0
+                while written < len(view):
+                    if self.response is None:
+                        if self.part_index >= len(cls.TEACHER_RELEASE_PARTS):
+                            break
+                        url = f"{cls.TEACHER_RELEASE_BASE}/{cls.TEACHER_RELEASE_PARTS[self.part_index]}"
+                        self.response = urlopen(url)
+                        self.part_index += 1
+                    chunk = self.response.read(len(view) - written)
+                    if not chunk:
+                        self.response.close()
+                        self.response = None
+                        continue
+                    view[written : written + len(chunk)] = chunk
+                    written += len(chunk)
+                return written
+
+            def close(self) -> None:
+                if self.response is not None:
+                    self.response.close()
+                    self.response = None
+                super().close()
+
+        stream = _MultipartStream()
+        buffered = io.BufferedReader(stream, buffer_size=8 * 1024 * 1024)
+        try:
+            with tarfile.open(fileobj=buffered, mode="r|gz") as archive:
+                for member in archive:
+                    name = Path(member.name).name
+                    if not member.isfile() or not (name.startswith("clean_v3_best_") and name.endswith(".pt")):
+                        continue
+                    extracted = archive.extractfile(member)
+                    if extracted is None:
+                        raise RuntimeError(f"无法读取 teacher checkpoint: {member.name}")
+                    output = cache_dir / name
+                    temporary = output.with_suffix(output.suffix + ".part")
+                    with temporary.open("wb") as file:
+                        while chunk := extracted.read(8 * 1024 * 1024):
+                            file.write(chunk)
+                    temporary.replace(output)
+                    return output
+        finally:
+            buffered.close()
+        raise FileNotFoundError("clean_v3 release archive 中未找到 clean_v3_best_*.pt")
 
     def _prepare_input(self, images: Tensor) -> tuple[Tensor, int]:
         if images.ndim != 4:
@@ -189,34 +271,27 @@ class HRFFALandmarkModel(nn.Module):
         x = images.float()
         match self.input_range:
             case ImageInputRange.ZERO_TO_255:
-                x = x.div(127.5).sub(1.0)
+                x = x.div(255.0)
             case ImageInputRange.ZERO_TO_ONE:
-                x = x.mul(2.0).sub(1.0)
-            case ImageInputRange.MINUS_ONE_TO_ONE:
                 pass
+            case ImageInputRange.MINUS_ONE_TO_ONE:
+                x = x.add(1.0).mul(0.5)
 
-        if height != self.INPUT_SIZE:
-            x = F.interpolate(
-                x,
-                size=(self.INPUT_SIZE, self.INPUT_SIZE),
-                mode="bilinear",
-                align_corners=False,
-                antialias=True,
-            )
+        match self.variant:
+            case HRFFAModelVariant.VITT_256:
+                x = x.sub(0.5).div(0.5)
+            case HRFFAModelVariant.VITL_320:
+                mean = x.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
+                std = x.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
+                x = x.sub(mean).div(std)
+
+        if height != self.input_size:
+            x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False, antialias=True)
         return x, height
 
     @torch.inference_mode()
     def forward(self, images: Tensor, return_visibility: bool = False) -> Tensor | tuple[Tensor, Tensor]:
-        """预测整头部 crop 的关键点。
-
-        参数:
-            images: ``(N, 3, H, H)`` RGB 张量。
-            return_visibility: 是否同时返回三分类可见性标签。
-
-        返回:
-            关键点像素坐标 ``(N, K, 2)``；若请求可见性，则额外返回 ``(N, K)``
-            的整型类别标签。
-        """
+        """Predict pixel-space landmarks for square whole-head crops."""
         x, original_size = self._prepare_input(images)
         normalized_points, visibility_logits = self.network(x, self.scheme)
         landmarks = normalized_points * float(original_size)
