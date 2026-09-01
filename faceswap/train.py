@@ -24,7 +24,7 @@ from losses import (
     r1_reg_loss,
 )
 from misc.face_alignment import center_crop_and_resize
-from misc.models.id_encoder import IDEncoderProvider
+from misc.models.id_encoder import IDEncoder, IDEncoderProvider
 from models.discriminator import Discriminator
 from models.networks import Generator
 
@@ -74,7 +74,6 @@ class Trainer:
         net_d_cfg: dict[str, Any] | None = None,
         dataloader_cfg: dict[str, Any] | None = None,
         # 身份损失
-        id_encoder_provider: IDEncoderProvider = IDEncoderProvider.BLENDFACE,
         id_loss_weight: float = 10.0,
         # 重建损失
         enable_rec_loss: bool = True,
@@ -190,7 +189,8 @@ class Trainer:
         self.d_loss = DiscriminatorAdversarialLoss(weight=1.0, reduction="mean").to(self.device)
         self.gan_loss = GeneratorAdversarialLoss(weight=1.0, reduction="mean").to(self.device)
 
-        self.id_loss = IdentityLoss(weight=id_loss_weight, provider=id_encoder_provider).to(self.device)
+        self.generator_id_encoder = IDEncoder(IDEncoderProvider.BLENDFACE).to(self.device).eval().requires_grad_(False)
+        self.id_loss = IdentityLoss(weight=id_loss_weight, provider=IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16).to(self.device)
 
         if self.enable_rec_loss:
             self.rec_loss = make_l1_loss(weight=rec_loss_weight, reduction="mean")
@@ -303,8 +303,10 @@ class Trainer:
             # ========================= 生成器前向 =========================
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
                 with torch.no_grad():
-                    source_identity_embeddings = self.id_loss.extract_identity_embeddings(center_crop_and_resize(src))
-                fake: Tensor = net_g(dst, source_identity_embeddings)
+                    source_faces = center_crop_and_resize(src)
+                    generator_identity_embeddings = self.generator_id_encoder(source_faces)
+                    source_identity_embeddings = self.id_loss.extract_identity_embeddings(source_faces)
+                fake: Tensor = net_g(dst, generator_identity_embeddings)
 
             # ========================= 训练判别器 =========================
             self.net_d.requires_grad_(True)
@@ -400,8 +402,10 @@ class Trainer:
                     grid_vis = NF.affine_grid(theta_restore_vis, size=list(fake.shape), align_corners=False)
                     dst_restored_vis = NF.grid_sample(dst_vis, grid_vis, mode="bilinear", padding_mode="reflection", align_corners=False)
 
-                    source_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(center_crop_and_resize(src_vis))
-                    fake_vis: Tensor = self.net_g_ema(dst_vis, source_identity_embeddings_vis)
+                    source_faces_vis = center_crop_and_resize(src_vis)
+                    generator_identity_embeddings_vis = self.generator_id_encoder(source_faces_vis)
+                    source_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(source_faces_vis)
+                    fake_vis: Tensor = self.net_g_ema(dst_vis, generator_identity_embeddings_vis)
 
                     grid = [src_vis, dst_vis, fake_vis, dst_restored_vis]
 
@@ -454,7 +458,6 @@ if __name__ == "__main__":
         "ckpt": "train_log/512-MS1MV3_ARCFACE_R50_FP16/ckpt/328696.pth",
         "log_path": "train_log/512-MS1MV3_ARCFACE_R50_FP16",
         "batch_size": 16,
-        "id_encoder_provider": IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16,
         "dataloader_cfg": {
             "num_threads": 16,
             "prefetch_queue_depth": 4,
