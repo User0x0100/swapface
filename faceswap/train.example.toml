@@ -1,0 +1,202 @@
+# FaceSwap 训练配置示例
+#
+# 使用方式：
+#   uv run python -m faceswap.train --config faceswap/train.example.toml
+#
+# 说明：
+# - 本文件用于展示所有当前支持的训练参数及其含义。
+# - 路径均为占位示例，使用前请替换为实际数据集/日志/checkpoint 路径。
+# - 未显式配置的参数会使用 Trainer 或 dataloader 中的默认值。
+# - checkpoint 仅支持当前 v2 格式；恢复时会严格校验关键训练配置和身份编码器类型。
+
+[train]
+# 每个训练 batch 的样本数。当前判别器的 minibatch group_size 必须能整除该值。
+batch_size = 16
+
+# Generator / Discriminator 的 Adam 初始学习率。
+lr = 1.0e-4
+
+# CosineAnnealingLR 的 T_max（单位：训练迭代数）。
+# 设为 0 表示禁用余弦学习率调度器。
+lr_scheduler_t_max = 0
+
+# Lazy R1：每隔多少个 iteration 执行一次 R1 正则。
+r1_reg_step = 16
+
+# R1 正则 gamma。实际 lazy R1 会再乘以 r1_reg_step 进行间隔补偿。
+r1_gamma = 10.0
+
+# 是否启用 BF16 autocast。若 GPU 不支持 BF16，会自动回退。
+bf16 = true
+
+# 当前 Trainer 仅支持 NVIDIA CUDA 设备。
+# 可写 "cuda"、"cuda:0" 等。
+device = "cuda"
+
+# 是否使用 torch.compile 编译 Generator、Discriminator 和 BlendFace 条件编码器。
+compile_module = true
+
+# 可选：恢复 v2 训练 checkpoint。
+# 不配置时从头训练。
+# ckpt = "train_log/my_experiment/ckpt/100000.pth"
+
+# 训练日志根目录。checkpoint、sample、tensorboard 会分别写入其子目录。
+log_path = "train_log/my_experiment"
+
+# TensorBoard loss 写入间隔，单位为 iteration。
+log_interval = 10
+
+# 保存可视化 sample 的间隔，单位为 iteration。
+sample_save_every = 1000
+
+# 保存完整训练 checkpoint 的间隔，单位为 iteration。
+weight_save_every = 10000
+
+
+[identity]
+# Generator 条件身份编码器。
+# 当前推荐/默认：BLENDFACE。
+# checkpoint 会记录并在恢复时严格校验该类型。
+generator_provider = "BLENDFACE"
+
+# Identity Loss 使用的身份编码器。
+# 当前训练设计固定使用 MS1MV3 ArcFace R50 FP16 权重。
+loss_provider = "MS1MV3_ARCFACE_R50_FP16"
+
+# Identity Loss 的总权重。
+loss_weight = 10.0
+
+
+[loss]
+# 是否启用 fake 与增强后 dst 之间的 L1 reconstruction loss。
+enable_rec_loss = true
+
+# Reconstruction Loss 权重。
+rec_loss_weight = 10.0
+
+
+[loss.wfm]
+# 是否启用判别器中间特征的 Weighted Feature Matching Loss。
+# fake 分支保留梯度，real 分支在 no_grad 下作为目标特征。
+enable = true
+
+# WFM 使用的判别器特征层索引及对应权重。
+# 键是 Discriminator down_blocks 的 0-based 索引。
+# 当前 512 模型共有 0..6 共 7 层特征。
+# 注意：越浅的层特征图越大，显存/带宽开销也越高。
+[loss.wfm.weights]
+0 = 0.1
+1 = 0.1
+2 = 0.1
+3 = 0.1
+
+
+[dataloader]
+# DALI pipeline CPU worker/thread 数量。
+num_threads = 16
+
+# DALI 整体 pipeline 预取深度。值越大可能提高吞吐，也会增加内存/显存占用。
+prefetch_queue_depth = 4
+
+# parallel external_source 的 Python worker 数量。
+py_num_workers = 8
+
+# Python worker multiprocessing 启动方式。
+py_start_method = "spawn"
+
+# external_source 每个 worker 的读取预取深度。
+reader_prefetch_queue_depth = 2
+
+# 图像解码后端："mixed" 或 "cpu"。
+# mixed 通常是 CUDA 训练的推荐路径。
+decoder_backend = "mixed"
+
+# mixed decoder 尝试交给硬件 JPEG decoder 的负载比例，范围 [0, 1]。
+decoder_hw_load = 0.75
+
+# 以下三项只应用于 dst。
+# 例如 brightness=0.2 表示随机乘数约为 [0.8, 1.2]。
+brightness = 0.2
+contrast = 0.2
+saturation = 0.2
+
+# src 与 dst 独立执行水平翻转的概率，范围 [0, 1]。
+flip_prob = 0.5
+
+# dst 随机旋转角范围，单位：度。
+rotation_range = [-10.0, 10.0]
+
+# dst 实际缩放倍数范围，必须为正数。
+scale_factor_range = [0.7692307692307693, 1.25]
+
+# dst 水平/垂直平移范围，单位为图像宽高的比例。
+# 例如 0.15 表示最多平移 15%。
+tx_range = [-0.15, 0.15]
+ty_range = [-0.15, 0.15]
+
+
+[generator]
+# Generator 输入/输出正方形分辨率。
+img_resolution = 512
+
+# RGB 图像为 3 通道。
+img_channels = 3
+
+# Encoder/Decoder 下采样深度。
+num_depth = 5
+
+# 身份 latent 数量。
+num_latent = 6
+
+# Generator 基础通道数。
+base_ch = 16
+
+# Generator 最大通道数。
+max_ch = 2048
+
+# Generator 身份条件向量维度。BlendFace 输出为 512。
+id_dim = 512
+
+# 是否启用浅层 skip feature 到最终 ToRGB。
+skip = true
+
+
+[discriminator]
+# 必须与 Generator img_resolution 一致。
+img_resolution = 512
+img_channels = 3
+
+# 判别器基础/最大通道数。
+base_ch = 64
+max_ch = 512
+
+# MinibatchStd group size。
+# 实际 effective group 为 min(group_size, batch_size)，且 batch_size 必须可被其整除。
+group_size = 4
+
+
+# 身份来源数据池。
+# 每项可以单独设置 adjustment；实际文件夹采样权重为：
+#   sqrt(file_count) * 2**adjustment
+[[src]]
+path = "/path/to/source_faces_a"
+adjustment = 0.0
+
+[[src]]
+path = "/path/to/source_faces_b"
+adjustment = 0.0
+
+
+# 目标/姿态/表情数据池，语义与 [[src]] 相同。
+[[dst]]
+path = "/path/to/target_faces_a"
+adjustment = 0.0
+
+[[dst]]
+path = "/path/to/target_faces_b"
+adjustment = 0.0
+
+# adjustment=1.0 表示相对基础权重乘 2，可用于提高特定困难数据的采样概率。
+[[dst]]
+path = "/path/to/occlusion_faces"
+adjustment = 1.0

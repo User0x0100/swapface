@@ -1,5 +1,7 @@
+import argparse
 import copy
 import itertools
+import tomllib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -32,9 +34,10 @@ from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, Ima
 
 EPS = 1e-8
 CHECKPOINT_VERSION = 2
-GENERATOR_ID_ENCODER_PROVIDER = IDEncoderProvider.BLENDFACE
-IDENTITY_LOSS_PROVIDER = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16
+DEFAULT_GENERATOR_ID_ENCODER_PROVIDER = IDEncoderProvider.BLENDFACE
+DEFAULT_IDENTITY_LOSS_PROVIDER = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16
 DEFAULT_WFM_LOSS_WEIGHT: dict[int, float] = {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.1}
+DEFAULT_TRAIN_CONFIG_PATH = Path(__file__).with_name("train.toml")
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -77,7 +80,9 @@ class Trainer:
         net_g_cfg: dict[str, Any] | None = None,
         net_d_cfg: dict[str, Any] | None = None,
         dataloader_cfg: dict[str, Any] | None = None,
-        # 身份损失
+        # 身份编码与身份损失
+        generator_id_encoder_provider: IDEncoderProvider = DEFAULT_GENERATOR_ID_ENCODER_PROVIDER,
+        identity_loss_provider: IDEncoderProvider = DEFAULT_IDENTITY_LOSS_PROVIDER,
         id_loss_weight: float = 10.0,
         # 重建损失
         enable_rec_loss: bool = True,
@@ -95,6 +100,10 @@ class Trainer:
                 raise ValueError(f"dataloader_cfg 不能覆盖保留字段：{names}")
             dataloader_cfg = DEFAULT_DATALOADER_CONFIG | dataloader_cfg
 
+        if not isinstance(generator_id_encoder_provider, IDEncoderProvider):
+            raise TypeError(f"generator_id_encoder_provider 必须为 IDEncoderProvider，实际为 {type(generator_id_encoder_provider).__name__}")
+        if not isinstance(identity_loss_provider, IDEncoderProvider):
+            raise TypeError(f"identity_loss_provider 必须为 IDEncoderProvider，实际为 {type(identity_loss_provider).__name__}")
         if batch_size <= 0:
             raise ValueError(f"batch_size 必须为正数，实际为 {batch_size}")
         if lr <= 0.0:
@@ -123,6 +132,8 @@ class Trainer:
             raise RuntimeError("Trainer 仅支持 NVIDIA CUDA 设备")
 
         self.batch_size = batch_size
+        self.generator_id_encoder_provider = generator_id_encoder_provider
+        self.identity_loss_provider = identity_loss_provider
         self.r1_reg_step = r1_reg_step
         self.r1_gamma = r1_gamma
         self.enable_rec_loss = enable_rec_loss
@@ -191,10 +202,10 @@ class Trainer:
             identity_encoders = checkpoint["identity_encoders"]
             saved_generator_provider = identity_encoders["generator"]
             saved_loss_provider = identity_encoders["identity_loss"]
-            if saved_generator_provider != GENERATOR_ID_ENCODER_PROVIDER.name:
-                raise ValueError(f"检查点 Generator 身份编码器不匹配：{saved_generator_provider} != {GENERATOR_ID_ENCODER_PROVIDER.name}")
-            if saved_loss_provider != IDENTITY_LOSS_PROVIDER.name:
-                raise ValueError(f"检查点身份损失编码器不匹配：{saved_loss_provider} != {IDENTITY_LOSS_PROVIDER.name}")
+            if saved_generator_provider != self.generator_id_encoder_provider.name:
+                raise ValueError(f"检查点 Generator 身份编码器不匹配：{saved_generator_provider} != {self.generator_id_encoder_provider.name}")
+            if saved_loss_provider != self.identity_loss_provider.name:
+                raise ValueError(f"检查点身份损失编码器不匹配：{saved_loss_provider} != {self.identity_loss_provider.name}")
 
             self.img_resolution = int(checkpoint["net_g"]["network_cfg"]["img_resolution"])
             net_g = Generator(**checkpoint["net_g"]["network_cfg"])
@@ -253,8 +264,8 @@ class Trainer:
         self.d_loss = DiscriminatorAdversarialLoss(weight=1.0, reduction="mean").to(self.device)
         self.gan_loss = GeneratorAdversarialLoss(weight=1.0, reduction="mean").to(self.device)
 
-        self.generator_id_encoder = IDEncoder(GENERATOR_ID_ENCODER_PROVIDER).to(self.device).eval().requires_grad_(False)
-        self.id_loss = IdentityLoss(weight=id_loss_weight, provider=IDENTITY_LOSS_PROVIDER).to(self.device)
+        self.generator_id_encoder = IDEncoder(self.generator_id_encoder_provider).to(self.device).eval().requires_grad_(False)
+        self.id_loss = IdentityLoss(weight=id_loss_weight, provider=self.identity_loss_provider).to(self.device)
 
         if self.enable_rec_loss:
             self.rec_loss = make_l1_loss(weight=rec_loss_weight, reduction="mean")
@@ -344,8 +355,8 @@ class Trainer:
             "iter": self.iter,
             "next_iter": self.iter + 1,
             "identity_encoders": {
-                "generator": GENERATOR_ID_ENCODER_PROVIDER.name,
-                "identity_loss": IDENTITY_LOSS_PROVIDER.name,
+                "generator": self.generator_id_encoder_provider.name,
+                "identity_loss": self.identity_loss_provider.name,
             },
             "training_config": self.training_config,
             "net_g": net_g,
@@ -523,62 +534,118 @@ class Trainer:
                 cv2.imwrite(self.sample_dir / f"{self.iter}.png", grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3])
 
 
-if __name__ == "__main__":
-    src = [
-        ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
-        ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
-        # ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
-    ]
+def _load_image_sources(entries: object, section: str) -> list[ImageSource]:
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"TOML [{section}] 数据源不能为空")
 
-    dst = [
-        ("/opt/share/deepfake/dataset_1/ffhq_1024/realign_arcface_dst", 0.0),
-        ("/opt/share/deepfake/dataset_1/CelebAHQ-1024x1024/realign_arcface_dst", 0.0),
-        ("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result", 0.0),
-        ("/opt/share/deepfake/dataset_1/RealOcc/image/realign_arcface_dst", 1.0),
-        # ("/opt/share/deepfake/dataset_1/oneman/1_align_results/", 0.0),
-    ]
+    sources: list[ImageSource] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise TypeError(f"TOML [[{section}]] 第 {index} 项必须是表")
+        unknown = set(entry) - {"path", "adjustment"}
+        if unknown:
+            raise ValueError(f"TOML [[{section}]] 第 {index} 项包含未知字段：{sorted(unknown)}")
+        path = entry.get("path")
+        if not isinstance(path, str) or not path:
+            raise ValueError(f"TOML [[{section}]] 第 {index} 项 path 必须为非空字符串")
+        adjustment = entry.get("adjustment")
+        sources.append(path if adjustment is None else (path, float(adjustment)))
+    return sources
 
-    def_config: dict[str, Any] = {
-        "src": src,
-        "dst": dst,
-        "ckpt": "train_log/512-MS1MV3_ARCFACE_R50_FP16/ckpt/328696.pth",
-        "log_path": "train_log/512-MS1MV3_ARCFACE_R50_FP16",
-        "batch_size": 16,
-        "dataloader_cfg": {
-            "num_threads": 16,
-            "prefetch_queue_depth": 4,
-            "py_num_workers": 8,
-            "py_start_method": "spawn",
-            "reader_prefetch_queue_depth": 2,
-            "decoder_backend": ImageDecoderBackend.MIXED,
-            "decoder_hw_load": 0.75,
-            "brightness": 0.2,
-            "contrast": 0.2,
-            "saturation": 0.2,
-            "flip_prob": 0.5,
-            "rotation_range": (-10.0, 10.0),
-            "scale_factor_range": (1.0 / 1.3, 1.25),
-            "tx_range": (-0.15, 0.15),
-            "ty_range": (-0.15, 0.15),
-        },
-        "net_g_cfg": {
-            "img_resolution": 512,
-            "img_channels": 3,
-            "num_depth": 5,
-            "num_latent": 6,
-            "base_ch": 16,
-            "max_ch": 2048,
-            "id_dim": 512,
-            "skip": True,
-        },
-        "net_d_cfg": {
-            "img_resolution": 512,
-            "img_channels": 3,
-            "base_ch": 64,
-            "max_ch": 512,
-            "group_size": 4,
-        },
+
+def _load_range(config: dict[str, Any], key: str) -> None:
+    if key not in config:
+        return
+    value = config[key]
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError(f"dataloader.{key} 必须为包含两个数值的 TOML 数组")
+    config[key] = (float(value[0]), float(value[1]))
+
+
+def load_train_config(path: str | Path) -> dict[str, Any]:
+    """读取外部 TOML，并转换为 ``Trainer`` 构造参数。"""
+    config_path = Path(path)
+    with config_path.open("rb") as file:
+        config = tomllib.load(file)
+
+    allowed_sections = {"train", "identity", "loss", "dataloader", "generator", "discriminator", "src", "dst"}
+    unknown_sections = set(config) - allowed_sections
+    if unknown_sections:
+        raise ValueError(f"TOML 包含未知顶层配置：{sorted(unknown_sections)}")
+
+    train = dict(config.get("train", {}))
+    identity = dict(config.get("identity", {}))
+    loss = dict(config.get("loss", {}))
+    dataloader = dict(config.get("dataloader", {}))
+    generator = dict(config.get("generator", {}))
+    discriminator = dict(config.get("discriminator", {}))
+
+    generator_provider = identity.pop("generator_provider", DEFAULT_GENERATOR_ID_ENCODER_PROVIDER.name)
+    loss_provider = identity.pop("loss_provider", DEFAULT_IDENTITY_LOSS_PROVIDER.name)
+    id_loss_weight = identity.pop("loss_weight", 10.0)
+    if identity:
+        raise ValueError(f"[identity] 包含未知字段：{sorted(identity)}")
+
+    wfm = loss.pop("wfm", {})
+    if not isinstance(wfm, dict):
+        raise TypeError("[loss.wfm] 必须为 TOML 表")
+    enable_wfm_loss = wfm.pop("enable", True)
+    raw_wfm_weights = wfm.pop("weights", None)
+    if wfm:
+        raise ValueError(f"[loss.wfm] 包含未知字段：{sorted(wfm)}")
+
+    if raw_wfm_weights is None:
+        wfm_loss_weight: dict[int, float] | None = None
+    else:
+        if not isinstance(raw_wfm_weights, dict):
+            raise TypeError("[loss.wfm.weights] 必须为 TOML 表")
+        try:
+            wfm_loss_weight = {int(index): float(weight) for index, weight in raw_wfm_weights.items()}
+        except (TypeError, ValueError) as exc:
+            raise ValueError("[loss.wfm.weights] 的键必须是整数层索引，值必须是数值") from exc
+
+    decoder_backend = dataloader.get("decoder_backend")
+    if decoder_backend is not None:
+        try:
+            dataloader["decoder_backend"] = ImageDecoderBackend(decoder_backend)
+        except ValueError as exc:
+            supported = ", ".join(backend.value for backend in ImageDecoderBackend)
+            raise ValueError(f"dataloader.decoder_backend={decoder_backend!r} 无效，可选：{supported}") from exc
+    for key in ("rotation_range", "scale_factor_range", "tx_range", "ty_range"):
+        _load_range(dataloader, key)
+
+    try:
+        generator_id_encoder_provider = IDEncoderProvider[str(generator_provider)]
+        identity_loss_provider = IDEncoderProvider[str(loss_provider)]
+    except KeyError as exc:
+        supported = ", ".join(provider.name for provider in IDEncoderProvider)
+        raise ValueError(f"身份编码器类型无效，可选：{supported}") from exc
+
+    trainer_config: dict[str, Any] = {
+        **train,
+        **loss,
+        "src": _load_image_sources(config.get("src"), "src"),
+        "dst": _load_image_sources(config.get("dst"), "dst"),
+        "generator_id_encoder_provider": generator_id_encoder_provider,
+        "identity_loss_provider": identity_loss_provider,
+        "id_loss_weight": float(id_loss_weight),
+        "enable_wfm_loss": bool(enable_wfm_loss),
+        "wfm_loss_weight": wfm_loss_weight,
+        "dataloader_cfg": dataloader,
+        "net_g_cfg": generator,
+        "net_d_cfg": discriminator,
     }
+    return trainer_config
 
-    trainer = Trainer(**def_config)
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="FaceSwap 训练")
+    parser.add_argument("--config", type=Path, default=DEFAULT_TRAIN_CONFIG_PATH, help=f"训练 TOML 配置文件，默认：{DEFAULT_TRAIN_CONFIG_PATH}")
+    args = parser.parse_args()
+
+    trainer = Trainer(**load_train_config(args.config))
     trainer.train()
+
+
+if __name__ == "__main__":
+    main()
