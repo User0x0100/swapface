@@ -38,10 +38,10 @@ compile_module = true
 
 # 可选：恢复 v2 训练 checkpoint。
 # 不配置时从头训练。
-# ckpt = "train_log/my_experiment/ckpt/100000.pth"
+# ckpt = "experiments/my_experiment/ckpt/100000.pth"
 
 # 训练日志根目录。checkpoint、sample、tensorboard 会分别写入其子目录。
-log_path = "train_log/my_experiment"
+log_path = "experiments/my_experiment"
 
 # TensorBoard loss 写入间隔，单位为 iteration。
 log_interval = 10

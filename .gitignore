@@ -11,3 +11,4 @@ onnx_export/
 *.jpeg
 *.engine
 .venv/
+experiments/

@@ -37,7 +37,7 @@ CHECKPOINT_VERSION = 2
 DEFAULT_GENERATOR_ID_ENCODER_PROVIDER = IDEncoderProvider.BLENDFACE
 DEFAULT_IDENTITY_LOSS_PROVIDER = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16
 DEFAULT_WFM_LOSS_WEIGHT: dict[int, float] = {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.1}
-DEFAULT_TRAIN_CONFIG_PATH = Path(__file__).with_name("train.toml")
+DEFAULT_TRAIN_CONFIG_PATH = Path(__file__).resolve().parents[1] / "experiments" / "train.toml"
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
