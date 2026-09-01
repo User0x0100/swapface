@@ -68,6 +68,54 @@ class ToRGB(nn.Sequential):
         )
 
 
+class AAD(nn.Module):
+    """Adaptive Attentional Denormalization。
+
+    将 decoder 特征分别按 encoder 属性特征和身份向量反归一化，并通过空间注意力掩码
+    自适应融合两条分支。
+    """
+
+    def __init__(self, channels: int, attribute_channels: int, id_dim: int) -> None:
+        super().__init__()
+
+        self.norm = nn.InstanceNorm2d(channels, affine=False)
+        self.mask = nn.Sequential(nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1), nn.Sigmoid())
+
+        self.attribute_gamma = nn.Conv2d(attribute_channels, channels, kernel_size=3, stride=1, padding=1)
+        self.attribute_beta = nn.Conv2d(attribute_channels, channels, kernel_size=3, stride=1, padding=1)
+        self.identity_gamma = nn.Linear(id_dim, channels)
+        self.identity_beta = nn.Linear(id_dim, channels)
+
+    def forward(self, x: Tensor, attribute: Tensor, identity: Tensor) -> Tensor:
+        normalized = self.norm(x)
+
+        attribute_feature = self.attribute_gamma(attribute) * normalized + self.attribute_beta(attribute)
+        identity_gamma = self.identity_gamma(identity)[:, :, None, None]
+        identity_beta = self.identity_beta(identity)[:, :, None, None]
+        identity_feature = identity_gamma * normalized + identity_beta
+
+        mask = self.mask(normalized)
+        return (1.0 - mask) * attribute_feature + mask * identity_feature
+
+
+class AADResBlock(nn.Module):
+    """使用 encoder skip feature 和身份向量调制 decoder 特征的 AAD 残差块。"""
+
+    def __init__(self, channels: int, attribute_channels: int, id_dim: int) -> None:
+        super().__init__()
+
+        self.act = nn.SiLU()
+        self.aad0 = AAD(channels, attribute_channels, id_dim)
+        self.conv0 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.aad1 = AAD(channels, attribute_channels, id_dim)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x: Tensor, attribute: Tensor, identity: Tensor) -> Tensor:
+        residual = self.conv0(self.act(self.aad0(x, attribute, identity)))
+        residual = self.conv1(self.act(self.aad1(residual, attribute, identity)))
+        return x + residual
+
+
 class UpSample(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__(
@@ -150,38 +198,61 @@ class Generator(nn.Module):
         base_ch: int = 256,
         max_ch: int = 1024,
         id_dim: int = 512,
-        skip: bool = True,
+        aad_skip_layers: tuple[int, ...] | list[int] = (),
     ) -> None:
         super().__init__()
 
-        self.network_cfg = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
         assert max_ch >= base_ch, f"max_ch={max_ch} must be >= base_ch={base_ch}"
+        if num_depth <= 0:
+            raise ValueError(f"num_depth must be greater than 0, got {num_depth}")
+
+        skip_layers = tuple(int(index) for index in aad_skip_layers)
+        if len(set(skip_layers)) != len(skip_layers):
+            raise ValueError(f"aad_skip_layers contains duplicate indices: {skip_layers}")
+        invalid_skip_layers = sorted(index for index in skip_layers if index < 0 or index >= num_depth)
+        if invalid_skip_layers:
+            raise ValueError(f"aad_skip_layers must be within 0~{num_depth - 1}, got {invalid_skip_layers}")
+        skip_layers = tuple(sorted(skip_layers))
+
+        self.network_cfg = {
+            "img_resolution": img_resolution,
+            "img_channels": img_channels,
+            "num_depth": num_depth,
+            "num_latent": num_latent,
+            "base_ch": base_ch,
+            "max_ch": max_ch,
+            "id_dim": id_dim,
+            "aad_skip_layers": list(skip_layers),
+        }
+        self.aad_skip_layers = skip_layers
 
         self.w_space_map = WSpaceMap(id_dim, num_latent)
-
         features = [min(max_ch, base_ch * (2**i)) for i in range(num_depth + 1)]
 
         self.from_rgb = FromRGB(img_channels, base_ch)
-        self.encoder = nn.Sequential(*[DownSample(features[i], features[i + 1]) for i in range(num_depth)])
+        self.encoder = nn.ModuleList([DownSample(features[i], features[i + 1]) for i in range(num_depth)])
         self.latent_space = LatentBlock(features[-1], id_dim, num_latent)
-        self.decoder = nn.Sequential(*[UpSample(features[-(i + 1)], features[-(i + 2)]) for i in range(num_depth)])
-        self.to_rgb = ToRGB(base_ch * 2 if skip else base_ch, img_channels)
+        self.decoder = nn.ModuleList([UpSample(features[-(i + 1)], features[-(i + 2)]) for i in range(num_depth)])
+        self.aad_skip = nn.ModuleDict({str(layer_index): AADResBlock(features[-(layer_index + 2)], features[-(layer_index + 2)], id_dim) for layer_index in skip_layers})
+        self.to_rgb = ToRGB(base_ch, img_channels)
 
     def forward(self, x: Tensor, id_feat: Tensor) -> Tensor:
-
         w_space = self.w_space_map(id_feat)
 
-        skip = self.from_rgb(x)
-        feat = self.encoder(skip)
+        feat = self.from_rgb(x)
+        encoder_features = [feat]
+        for downsample in self.encoder:
+            feat = downsample(feat)
+            encoder_features.append(feat)
+
         feat = self.latent_space(feat, w_space)
-        feat = self.decoder(feat)
+        for layer_index, upsample in enumerate(self.decoder):
+            feat = upsample(feat)
+            if layer_index in self.aad_skip_layers:
+                attribute = encoder_features[-(layer_index + 2)]
+                feat = self.aad_skip[str(layer_index)](feat, attribute, id_feat)
 
-        if self.network_cfg["skip"]:
-            feat = torch.cat([skip, feat], dim=1)
-
-        feat = self.to_rgb(feat)
-
-        return feat
+        return self.to_rgb(feat)
 
 
 if __name__ == "__main__":
@@ -199,7 +270,7 @@ if __name__ == "__main__":
         "base_ch": 16,
         "max_ch": 2048,
         "id_dim": 512,
-        "skip": True,
+        "aad_skip_layers": [0, 1, 2, 3, 4],
     }
 
     model = Generator(**network_cfg).to(device)

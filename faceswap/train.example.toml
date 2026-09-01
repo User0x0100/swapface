@@ -157,8 +157,11 @@ max_ch = 2048
 # Generator 身份条件向量维度。BlendFace 输出为 512。
 id_dim = 512
 
-# 是否启用浅层 skip feature 到最终 ToRGB。
-skip = true
+# 通过 AAD 连接的 U-Net decoder 层索引。
+# 0 表示最深的第一个 decoder 层，num_depth-1 表示最终全分辨率 decoder 层。
+# 配置某层即启用对应 encoder -> decoder 的 AAD skip；不配置则不连接。
+# num_depth = 5 时 [0, 1, 2, 3, 4] 表示完整 U-Net。
+aad_skip_layers = [0, 1, 2, 3, 4]
 
 
 [discriminator]
