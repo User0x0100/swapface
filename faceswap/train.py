@@ -1,6 +1,5 @@
 import copy
 import itertools
-import random
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -8,7 +7,6 @@ from typing import Any
 import cv2
 import torch
 import torch.nn.functional as NF
-import torchvision.transforms.functional as TF
 from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 from torch import Tensor, nn, optim
 from torch.amp import autocast
@@ -19,20 +17,13 @@ from tqdm import tqdm
 
 from losses import (
     DiscriminatorAdversarialLoss,
-    DSSIMLoss,
-    GazeLoss,
     GeneratorAdversarialLoss,
     IdentityLoss,
-    IFSRLoss,
-    LabStyleLoss,
-    VGGPerceptualLoss,
     WeightedFeatureMatchingLoss,
     make_l1_loss,
     r1_reg_loss,
 )
 from misc.face_alignment import center_crop_and_resize
-from misc.models import ImageInputRange
-from misc.models.face_mask import FaceMasker
 from misc.models.id_encoder import IDEncoderProvider
 from models.discriminator import Discriminator
 from models.networks import Generator
@@ -41,28 +32,6 @@ from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, Ima
 
 EPS = 1e-8
 
-DEFAULT_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
-    "conv1_2": 2.5,
-    "conv2_2": 2.5,
-    "conv3_3": 2.5,
-    "conv4_3": 2.5,
-}
-
-
-DEFAULT_IFSR_CONSTRAINTS: dict[str, tuple[float, float]] = {
-    "layer3.5": (0.121357, 1.0),
-    "layer3.4": (0.128827, 1.0),
-    "layer3.3": (0.117972, 1.0),
-    "layer3.2": (0.109391, 1.0),
-    "layer3.1": (0.097296, 1.0),
-    "layer3.0": (0.089046, 1.0),
-    "layer2.3": (0.044928, 1.0),
-    "layer2.2": (0.048719, 1.0),
-    "layer2.1": (0.047487, 1.0),
-    "layer2.0": (0.047970, 1.0),
-    "layer1.2": (0.035144, 1.0),
-}
-
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
@@ -70,7 +39,6 @@ torch.backends.cudnn.deterministic = False
 torch.set_float32_matmul_precision("high")
 
 torch.manual_seed(42)
-random.seed(42)
 
 
 def print_mapping(title: str, mapping: dict, indent: int = 2) -> None:
@@ -88,8 +56,6 @@ class Trainer:
         self,
         src: Sequence[ImageSource],
         dst: Sequence[ImageSource],
-        masked_train: bool = True,
-        occ_mask: bool = False,
         batch_size: int = 10,
         lr: float = 1e-4,
         lr_scheduler_t_max: int = 0,
@@ -114,27 +80,9 @@ class Trainer:
         # 重建损失
         enable_rec_loss: bool = True,
         rec_loss_weight: float = 10.0,
-        # VGG特征匹配
-        enable_perceptual_loss: bool = True,
-        perceptual_loss_weight: dict[str, float] | None = None,
         # 判别器中间特征的弱特征匹配
         enable_wfm_loss: bool = False,
         wfm_loss_weight: dict[int, float] | None = None,
-        # ArcFace ID 编码器中间层特征匹配
-        enable_ifsr_loss: bool = False,
-        ifsr_margin_scale: float = 1.2,
-        ifsr_constraints: dict[str, tuple[float, float]] | None = None,
-        # 色彩一致损失
-        enable_color_loss: bool = False,
-        color_loss_weight: float = 0.1,
-        # 结构损失
-        enable_dssim_loss: bool = False,
-        dssim_loss_weight: float = 10.0,
-        # gaze 保持损失
-        enable_gaze_loss: bool = False,
-        gaze_loss_weight: float = 1.0,
-        gaze_distribution_weight: float = 0.1,
-        gaze_confidence_weighted: bool = True,
     ):
         if dataloader_cfg is None:
             dataloader_cfg = dict(DEFAULT_DATALOADER_CONFIG)
@@ -145,12 +93,8 @@ class Trainer:
                 raise ValueError(f"dataloader_cfg cannot override reserved keys: {names}")
             dataloader_cfg = DEFAULT_DATALOADER_CONFIG | dataloader_cfg
 
-        if perceptual_loss_weight is None:
-            perceptual_loss_weight = dict(DEFAULT_PERCEPTUAL_LOSS_WEIGHT)
         if wfm_loss_weight is None:
             wfm_loss_weight = {}
-        if ifsr_constraints is None:
-            ifsr_constraints = dict(DEFAULT_IFSR_CONSTRAINTS)
 
         args = locals().copy()
         for k in ["src", "dst", "self"]:
@@ -158,22 +102,15 @@ class Trainer:
 
         print_mapping("Train_Info", args)
 
-        self.rng = random.Random()
         self.device = torch.device(device)
         if self.device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("Trainer 仅支持 NVIDIA CUDA 设备")
 
         self.batch_size = batch_size
-        self.masked_train = masked_train
         self.r1_reg_step = r1_reg_step
         self.r1_gamma = r1_gamma
         self.enable_rec_loss = enable_rec_loss
-        self.enable_perceptual_loss = enable_perceptual_loss
         self.enable_wfm_loss = enable_wfm_loss
-        self.enable_ifsr_loss = enable_ifsr_loss
-        self.enable_color_loss = enable_color_loss
-        self.enable_dssim_loss = enable_dssim_loss
-        self.enable_gaze_loss = enable_gaze_loss
 
         self.bf16 = bool(bf16 and torch.cuda.is_bf16_supported())
         if bf16 and not self.bf16:
@@ -235,25 +172,10 @@ class Trainer:
         self.id_loss = IdentityLoss(weight=id_loss_weight, provider=id_encoder_provider).to(self.device)
 
         if self.enable_rec_loss:
-            self.rec_loss = make_l1_loss(weight=rec_loss_weight, reduction="none" if self.masked_train else "mean")
-
-        if self.enable_perceptual_loss:
-            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
-
-        if self.enable_ifsr_loss:
-            self.ifsr_loss = IFSRLoss(ifsr_margin_scale=ifsr_margin_scale, ifsr_constraints=ifsr_constraints, id_encoder_provider=IDEncoderProvider.MS1MV3_ARCFACE_R100_FP16).to(self.device)
+            self.rec_loss = make_l1_loss(weight=rec_loss_weight, reduction="mean")
 
         if self.enable_wfm_loss:
             self.wfm_loss = WeightedFeatureMatchingLoss(layer_weights=wfm_loss_weight, criterion="l1").to(self.device)
-
-        if self.enable_color_loss:
-            self.color_loss = LabStyleLoss(weight=color_loss_weight, input_range=ImageInputRange.MINUS_ONE_TO_ONE).to(self.device)
-
-        if self.enable_dssim_loss:
-            self.dssim_loss = DSSIMLoss(weight=dssim_loss_weight, reduction="mean").to(self.device)
-
-        if self.enable_gaze_loss:
-            self.gaze_loss = GazeLoss(weight=gaze_loss_weight, distribution_weight=gaze_distribution_weight, confidence_weighted=gaze_confidence_weighted).to(self.device)
 
         # ========================= LOG =========================
         base_log_path = Path(log_path)
@@ -290,18 +212,6 @@ class Trainer:
                 self.train_module[net_name] = torch.compile(net, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
             else:
                 self.train_module[net_name] = net
-
-        face_parser = FaceMasker(input_range=ImageInputRange.MINUS_ONE_TO_ONE, mode="occlusion" if occ_mask else "parsing").to(device=self.device)
-        if not occ_mask:
-            face_parser = face_parser.eval()
-        face_parser.requires_grad_(False)
-        self.face_parser = torch.compile(face_parser, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
-
-        mask_blur_kernel_size = max(3, self.img_resolution // 32)
-        if mask_blur_kernel_size % 2 == 0:
-            mask_blur_kernel_size += 1
-        self.mask_blur_kernel_size = mask_blur_kernel_size
-        self.mask_blur_sigma = self.img_resolution / 128
 
     @torch.no_grad()
     def log(self, k: str, v: Tensor, right_now: bool = False) -> None:
@@ -344,7 +254,7 @@ class Trainer:
         try:
             ckpt_file = self.ckpt_dir / f"{self.iter}.pth"
             torch.save(state_dict, ckpt_file)
-        except Exception as e:
+        except (OSError, RuntimeError) as e:
             print(f"Failed to save ckpt: {e}")
 
     def loss_grad_map(self, loss: Tensor, x: Tensor) -> Tensor:
@@ -360,29 +270,13 @@ class Trainer:
 
         return h
 
-    @torch.no_grad()
-    def apply_gaussian_blur_use_mask(self, x: Tensor) -> tuple[Tensor, Tensor]:
-
-        x_mask = self.face_parser(x)
-        x_mask = TF.gaussian_blur(
-            x_mask,
-            [self.mask_blur_kernel_size, self.mask_blur_kernel_size],
-            [self.mask_blur_sigma, self.mask_blur_sigma],
-        ).clamp_(0.0, 1.0)
-        x_inv_mask = 1.0 - x_mask
-
-        low = NF.interpolate(x, size=16, mode="bilinear", align_corners=False)
-        blur = NF.interpolate(low, size=self.img_resolution, mode="bilinear", align_corners=False)
-        x_blur = TF.gaussian_blur(blur, kernel_size=[51, 51], sigma=[15.0, 15.0])
-
-        return (x * x_mask + x_inv_mask * x_blur, x_mask)
-
     def train(self):
 
         net_d, net_g = (self.train_module[module_name] for module_name in ("net_d", "net_g"))
         sample_src, sample_dst, sample_theta_restore = self.fetch_sample()
 
-        for self.iter in tqdm(itertools.count(start=self.iter), initial=self.iter, mininterval=1.0, bar_format="{n_fmt:7} | speed {rate_fmt:3} | train time {elapsed}"):
+        for iteration in tqdm(itertools.count(start=self.iter), initial=self.iter, mininterval=1.0, bar_format="{n_fmt:7} | speed {rate_fmt:3} | train time {elapsed}"):
+            self.iter = iteration
             src, dst, theta_restore = self.fetch_sample()
 
             torch.compiler.cudagraph_mark_step_begin()
@@ -392,10 +286,6 @@ class Trainer:
                 with torch.no_grad():
                     source_identity_embeddings = self.id_loss.extract_identity_embeddings(center_crop_and_resize(src))
                 fake: Tensor = net_g(dst, source_identity_embeddings)
-
-            dst_org = dst
-            if self.masked_train:
-                dst, dst_mask = self.apply_gaussian_blur_use_mask(dst)
 
             # ========================= train d =========================
             net_d.requires_grad_(True)
@@ -466,52 +356,11 @@ class Trainer:
                 self.log("id_loss", id_loss)
                 g_loss += id_loss
 
-                # ifsr_loss
-                if self.enable_ifsr_loss:
-                    fake_ifsr_feats = self.ifsr_loss.extract_features(fake)
-                    with torch.no_grad():
-                        dst_ifsr_feats = self.ifsr_loss.extract_features(dst)
-                    ifsr_loss = self.ifsr_loss(fake_ifsr_feats, dst_ifsr_feats)
-                    self.log("ifsr_loss", ifsr_loss)
-                    g_loss += ifsr_loss
-
-                # perceptual_loss
-                if self.enable_perceptual_loss:
-                    perceptual_loss = self.perceptual_loss(fake, dst)
-                    self.log("perceptual_loss", perceptual_loss)
-                    g_loss += perceptual_loss
-
                 # rec_loss
                 if self.enable_rec_loss:
-                    rec_loss = self.rec_loss(fake, dst)  # B C H W
-                    if self.masked_train:
-                        rec_loss *= dst_mask
-                        rec_loss = rec_loss.sum(dim=(1, 2, 3)) / (dst_mask.sum(dim=(1, 2, 3)) * rec_loss.size(1) + EPS)
-                        rec_loss = rec_loss.mean()
+                    rec_loss = self.rec_loss(fake, dst)
                     self.log("rec_loss", rec_loss)
                     g_loss += rec_loss
-
-                # color_loss
-                if self.enable_color_loss:
-                    if self.masked_train:
-                        fake_color_in = fake * dst_mask + dst.detach() * (1.0 - dst_mask)
-                    else:
-                        fake_color_in = fake
-                    color_loss = self.color_loss(fake_color_in, dst)
-                    self.log("color_loss", color_loss)
-                    g_loss += color_loss
-
-                # dssim_loss
-                if self.enable_dssim_loss:
-                    dssim_loss = self.dssim_loss(fake, dst)
-                    self.log("dssim_loss", dssim_loss)
-                    g_loss += dssim_loss
-
-                # gaze_loss: preserve target gaze using the unblurred generator input.
-                if self.enable_gaze_loss:
-                    gaze_loss = self.gaze_loss(fake, dst_org)
-                    self.log("gaze_loss", gaze_loss)
-                    g_loss += gaze_loss
 
             g_loss.backward()
             self.optim_g.step()
@@ -528,7 +377,7 @@ class Trainer:
                 with torch.no_grad():
                     half = self.batch_size // 2
                     src_vis = torch.cat((sample_src[:half], src[: self.batch_size - half]), dim=0)
-                    dst_vis = torch.cat((sample_dst[:half], dst_org[: self.batch_size - half]), dim=0)
+                    dst_vis = torch.cat((sample_dst[:half], dst[: self.batch_size - half]), dim=0)
 
                     theta_restore_vis = torch.cat((sample_theta_restore[:half], theta_restore[: self.batch_size - half]), dim=0)
                     grid_vis = NF.affine_grid(theta_restore_vis, size=list(fake.shape), align_corners=False)
@@ -559,24 +408,6 @@ class Trainer:
 
                     grid.append(id_grad_map)
 
-                    attn_map: list[Tensor] = []
-
-                    get_attention_maps = getattr(self.net_g_ema, "get_attention_maps", None)
-                    if callable(get_attention_maps):
-                        attn_map = get_attention_maps() or []
-
-                    if len(attn_map) > 0:
-                        for m in attn_map:
-                            m = m.mean(dim=1, keepdim=True)
-                            m = NF.interpolate(m, size=self.img_resolution, mode="bilinear", align_corners=False)
-                            m = m.expand(-1, 3, -1, -1)
-
-                            amin = m.amin(dim=(2, 3), keepdim=True)
-                            amax = m.amax(dim=(2, 3), keepdim=True)
-                            m = 2.0 * (m - amin) / (amax - amin + EPS) - 1.0
-
-                            grid.append(m)
-
                     grid = torch.cat(grid, dim=0)
                     grid.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)
                     grid = make_grid(grid, nrow=self.batch_size)[[2, 1, 0], :, :]  # RGB -> BGR
@@ -604,15 +435,9 @@ if __name__ == "__main__":
 
     def_config.update({
         "ckpt": "train_log/512-MS1MV3_ARCFACE_R50_FP16/ckpt/328696.pth",
-        "masked_train": False,
-        "occ_mask": False,
         "log_path": "train_log/512-MS1MV3_ARCFACE_R50_FP16",
         "batch_size": 16,
         "id_encoder_provider": IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16,
-        "enable_gaze_loss": True,
-        "gaze_loss_weight": 1.0,
-        "gaze_distribution_weight": 0.1,
-        "gaze_confidence_weighted": True,
         "dataloader_cfg": {
             "num_threads": 16,
             "prefetch_queue_depth": 4,
