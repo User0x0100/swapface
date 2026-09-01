@@ -107,6 +107,10 @@ py_start_method = "spawn"
 # external_source 每个 worker 的读取预取深度。
 reader_prefetch_queue_depth = 2
 
+# Hugging Face 在线数据集代理。取消注释后仅用于 Hugging Face Hub 请求。
+# 支持 HTTP/HTTPS 代理 URL。
+# huggingface_proxy = "http://127.0.0.1:7890"
+
 # 图像解码后端："mixed" 或 "cpu"。
 # mixed 通常是 CUDA 训练的推荐路径。
 decoder_backend = "mixed"

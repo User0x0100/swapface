@@ -36,8 +36,9 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+import httpx
 import numpy as np
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, set_client_factory
 from huggingface_hub import constants as hf_constants
 from huggingface_hub.constants import HF_HUB_CACHE
 from huggingface_hub.errors import HfHubHTTPError
@@ -51,7 +52,7 @@ type ImagePath = str | os.PathLike[str]
 type FloatRange = tuple[float, float]
 
 
-def _configure_huggingface_hub() -> None:
+def _configure_huggingface_hub(proxy: str | None = None) -> None:
     """关闭训练数据下载的 Xet/CAS 路径与终端进度条。
 
     FFHQ 镜像的部分 Xet reconstruction 在并发 worker 下可能返回 CAS 404；训练只需要
@@ -59,6 +60,11 @@ def _configure_huggingface_hub() -> None:
     """
     hf_constants.HF_HUB_DISABLE_XET = True
     disable_progress_bars()
+    if proxy is not None:
+        proxy = proxy.strip()
+        if not proxy:
+            raise ValueError("huggingface_proxy 不能为空字符串；不使用代理时请删除该配置")
+    set_client_factory(lambda: httpx.Client(proxy=proxy, follow_redirects=True, timeout=None))
 
 
 _configure_huggingface_hub()
@@ -131,6 +137,7 @@ DEFAULT_DATALOADER_CONFIG: dict[str, Any] = {
     "py_num_workers": 8,
     "py_start_method": "spawn",
     "reader_prefetch_queue_depth": 2,
+    "huggingface_proxy": None,
     "decoder_backend": ImageDecoderBackend.MIXED,
     "decoder_hw_load": 0.75,
     "brightness": 0.2,
@@ -225,7 +232,9 @@ class _RandomImagePairSource:
     在反序列化时创建独立 RNG。
     """
 
-    def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource]) -> None:
+    def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource], huggingface_proxy: str | None = None) -> None:
+        self.huggingface_proxy = huggingface_proxy
+        _configure_huggingface_hub(huggingface_proxy)
         self.src_pools, self.src_cdf, src_info = self._build_pool(src)
         self.dst_pools, self.dst_cdf, dst_info = self._build_pool(dst)
         self.rng = np.random.default_rng()
@@ -239,6 +248,7 @@ class _RandomImagePairSource:
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
+        _configure_huggingface_hub(self.huggingface_proxy)
         self.rng = np.random.default_rng()
 
     @staticmethod
@@ -385,6 +395,7 @@ def create_dataloader_pipeline(
     src: Sequence[ImageSource],
     dst: Sequence[ImageSource],
     reader_prefetch_queue_depth: int = 2,
+    huggingface_proxy: str | None = None,
     decoder_backend: ImageDecoderBackend = ImageDecoderBackend.MIXED,
     decoder_hw_load: float = 0.75,
     brightness: float = 0.2,
@@ -405,6 +416,8 @@ def create_dataloader_pipeline(
         dst: 目标图像池，格式与 ``src`` 相同；与 ``src`` 独立采样。
         reader_prefetch_queue_depth: parallel ``external_source`` 每个 Python worker
             可提前准备的 batch 数。只影响编码文件读取阶段。
+        huggingface_proxy: Hugging Face 在线数据源使用的 HTTP(S) 代理，例如
+            ``http://127.0.0.1:7890``。不配置时直接连接。
         decoder_backend: 图像 decoder backend。默认 ``MIXED``。
         decoder_hw_load: mixed decoder 可交给专用 JPEG HW decoder 的负载比例。
             该参数只在支持对应硬件路径的平台上实际生效。
@@ -441,7 +454,7 @@ def create_dataloader_pipeline(
         raise ValueError(f"flip_prob 必须位于 [0, 1]，实际为 {flip_prob}")
 
     src_raw, dst_raw = fn.external_source(
-        source=_RandomImagePairSource(src, dst),
+        source=_RandomImagePairSource(src, dst, huggingface_proxy),
         num_outputs=2,
         device="cpu",
         parallel=True,

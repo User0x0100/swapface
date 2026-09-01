@@ -23,6 +23,7 @@ dependencies = [
     "ninja",
     "scipy",
     "tensorrt-cu13",
+    "httpx[socks]>=0.28.1",
 ]
 
 [tool.uv]
