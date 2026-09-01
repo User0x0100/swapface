@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from torch import Tensor, nn
 
-from ...models import MODEL_REPOSITORY_ID
+from ...models import MODEL_REPOSITORY_ID, ImageInputRange
 from .vit import ViTTiny
 
 
@@ -32,14 +32,6 @@ SCHEME_LANDMARK_COUNTS: dict[HRFFAScheme, int] = {
     HRFFAScheme.WFLW98: 98,
     HRFFAScheme.COFW29: 29,
 }
-
-
-class HRFFAInputRange(Enum):
-    """HRFFA 输入张量支持的数值范围。"""
-
-    ZERO_TO_255 = "zero_to_255"
-    ZERO_TO_ONE = "zero_to_one"
-    MINUS_ONE_TO_ONE = "minus_one_to_one"
 
 
 class HRFFAVisibility(Enum):
@@ -161,10 +153,10 @@ class HRFFALandmarkModel(nn.Module):
     INPUT_SIZE = 256
     WEIGHT_FILENAME = "HRFFA/student_s256_96gb_r2_best_e0449_0.007970.pt"
 
-    def __init__(self, scheme: HRFFAScheme = HRFFAScheme.IBUG68, input_range: HRFFAInputRange = HRFFAInputRange.ZERO_TO_ONE) -> None:
+    def __init__(self, scheme: HRFFAScheme = HRFFAScheme.IBUG68, input_range: ImageInputRange = ImageInputRange.ZERO_TO_ONE) -> None:
         super().__init__()
-        if not isinstance(input_range, HRFFAInputRange):
-            raise TypeError(f"input_range 必须为 HRFFAInputRange，实际为 {type(input_range).__name__}")
+        if not isinstance(input_range, ImageInputRange):
+            raise TypeError(f"input_range 必须为 ImageInputRange，实际为 {type(input_range).__name__}")
 
         self.scheme = scheme
         self.input_range = input_range
@@ -196,11 +188,11 @@ class HRFFALandmarkModel(nn.Module):
 
         x = images.float()
         match self.input_range:
-            case HRFFAInputRange.ZERO_TO_255:
+            case ImageInputRange.ZERO_TO_255:
                 x = x.div(127.5).sub(1.0)
-            case HRFFAInputRange.ZERO_TO_ONE:
+            case ImageInputRange.ZERO_TO_ONE:
                 x = x.mul(2.0).sub(1.0)
-            case HRFFAInputRange.MINUS_ONE_TO_ONE:
+            case ImageInputRange.MINUS_ONE_TO_ONE:
                 pass
 
         if height != self.INPUT_SIZE:

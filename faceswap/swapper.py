@@ -16,6 +16,7 @@ from misc.face_alignment import (
     center_crop_and_resize,
     restore_faces_to_original,
 )
+from misc.models import ImageInputRange
 from misc.models.face_mask import FaceMasker
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider, get_alignment_template
 from misc.models.retinaface import RetinaFace, extract_landmarks
@@ -130,9 +131,9 @@ class FaceSwapper:
             net_g.load_state_dict(checkpoint["net_g"]["state_dict"])
             self.net_g = net_g.to(device=self.device).eval()
 
-        self.face_detector = RetinaFace(input_range="minus_one_to_one").to(device=self.device).eval()
+        self.face_detector = RetinaFace(input_range=ImageInputRange.MINUS_ONE_TO_ONE).to(device=self.device).eval()
         self.id_encoder = IDEncoder(provider=id_encoder_provider).to(device=self.device).eval()
-        self.face_masker = FaceMasker(input_range="minus_one_to_one", mode="occlusion").to(device=self.device)  # occ模型在eval模式下无法正常推理
+        self.face_masker = FaceMasker(input_range=ImageInputRange.MINUS_ONE_TO_ONE, mode="occlusion").to(device=self.device)  # occ模型在eval模式下无法正常推理
 
         self.alignment_template = torch.as_tensor(get_alignment_template(self.img_resolution), device=self.device, dtype=torch.float32)
 

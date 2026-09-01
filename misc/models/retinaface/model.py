@@ -9,7 +9,7 @@ from torch import Tensor, nn
 from torchvision import models, ops
 from torchvision.models import _utils
 
-from ...models import MODEL_REPOSITORY_ID
+from ...models import MODEL_REPOSITORY_ID, ImageInputRange
 from .net import FPN, SSH, BboxHead, ClassHead, LandmarkHead, MobileNetV1
 
 
@@ -60,7 +60,7 @@ class RetinaFace(nn.Module):
 
     Args:
         use_mobilenet: 是否使用 MobileNetV1-0.25 backbone；否则使用 ResNet-50。
-        input_range: 输入张量值域：zero_to_255 / zero_to_one / minus_one_to_one。
+        input_range: 输入张量值域。
         color_order: 输入通道顺序：rgb / bgr。
 
 
@@ -71,10 +71,12 @@ class RetinaFace(nn.Module):
     def __init__(
         self,
         use_mobilenet: bool = False,
-        input_range: Literal["zero_to_255", "zero_to_one", "minus_one_to_one"] = "zero_to_255",
+        input_range: ImageInputRange = ImageInputRange.ZERO_TO_255,
         color_order: Literal["rgb", "bgr"] = "rgb",
     ) -> None:
         super().__init__()
+        if not isinstance(input_range, ImageInputRange):
+            raise TypeError(f"input_range 必须为 ImageInputRange，实际为 {type(input_range).__name__}")
         self.input_range = input_range
         self.color_order = color_order
 
@@ -193,10 +195,13 @@ class RetinaFace(nn.Module):
             raise TypeError("images 必须为 Tensor 或 tuple/list[Tensor]")
 
         # Preprocess out-of-place so detect() never mutates caller-owned tensors.
-        if self.input_range == "minus_one_to_one":
-            batch = batch.add(1.0).mul(127.5)
-        elif self.input_range == "zero_to_one":
-            batch = batch.mul(255.0)
+        match self.input_range:
+            case ImageInputRange.MINUS_ONE_TO_ONE:
+                batch = batch.add(1.0).mul(127.5)
+            case ImageInputRange.ZERO_TO_ONE:
+                batch = batch.mul(255.0)
+            case ImageInputRange.ZERO_TO_255:
+                pass
 
         if self.color_order == "rgb":
             batch = batch[:, [2, 1, 0]]

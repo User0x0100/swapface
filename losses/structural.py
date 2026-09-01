@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from misc.models import ImageInputRange
+
 from .functional import EPS, Reduction, _reduce_loss
 
 
@@ -19,7 +21,7 @@ class DSSIMLoss(nn.Module):
         window_size: int = 11,
         sigma: float = 1.5,
         reduction: Reduction = "none",
-        range_norm: bool = True,
+        input_range: ImageInputRange = ImageInputRange.MINUS_ONE_TO_ONE,
     ) -> None:
         """初始化 DSSIM 损失。
 
@@ -28,7 +30,7 @@ class DSSIMLoss(nn.Module):
             window_size: 高斯窗口尺寸，必须为正奇数。
             sigma: 高斯标准差，必须为正数。
             reduction: ``none`` 返回 ``(N, 1, H, W)``；``mean``/``sum`` 返回标量。
-            range_norm: 是否先将输入从 ``[-1, 1]`` 映射到 ``[0, 1]``。"""
+            input_range: 输入 RGB 张量的值域。"""
         super().__init__()
 
         if window_size <= 0 or window_size % 2 == 0:
@@ -36,7 +38,9 @@ class DSSIMLoss(nn.Module):
         if sigma <= 0:
             raise ValueError(f"sigma must be positive, got {sigma}")
 
-        self.range_norm = range_norm
+        if not isinstance(input_range, ImageInputRange):
+            raise TypeError(f"input_range 必须为 ImageInputRange，实际为 {type(input_range).__name__}")
+        self.input_range = input_range
         self.weight = weight
         self.window_size = window_size
         self.reduction = reduction
@@ -97,9 +101,15 @@ class DSSIMLoss(nn.Module):
 
         返回:
             按 ``reduction`` 处理后的 DSSIM。"""
-        if self.range_norm:
-            prediction = prediction.add(1.0).mul(0.5)
-            target = target.add(1.0).mul(0.5)
+        match self.input_range:
+            case ImageInputRange.MINUS_ONE_TO_ONE:
+                prediction = prediction.add(1.0).mul(0.5)
+                target = target.add(1.0).mul(0.5)
+            case ImageInputRange.ZERO_TO_255:
+                prediction = prediction.div(255.0)
+                target = target.div(255.0)
+            case ImageInputRange.ZERO_TO_ONE:
+                pass
 
         dssim = (1.0 - self._ssim(prediction, target)) * (0.5 * self.weight)
         return _reduce_loss(dssim, self.reduction)

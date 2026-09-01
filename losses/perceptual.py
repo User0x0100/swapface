@@ -5,6 +5,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from misc.models import ImageInputRange
+
 from .functional import (
     CriterionFn,
     Reduction,
@@ -96,7 +98,7 @@ class DINOv2PerceptualLoss(nn.Module):
         reduction: Reduction = "mean",
         dino_type: str = "dinov2_vitb14_reg",
         use_input_norm: bool = True,
-        range_norm: bool = True,
+        input_range: ImageInputRange = ImageInputRange.MINUS_ONE_TO_ONE,
     ) -> None:
         """初始化 DINOv2 感知损失。
 
@@ -106,13 +108,15 @@ class DINOv2PerceptualLoss(nn.Module):
             reduction: 单层损失的聚合方式。
             dino_type: ``torch.hub`` 中的 DINOv2 模型入口名称。
             use_input_norm: 是否应用 ImageNet 均值/标准差。
-            range_norm: 是否先将输入从 ``[-1, 1]`` 映射到 ``[0, 1]``。
+            input_range: 输入 RGB 张量的值域。
 
         异常:
             ValueError: 未配置块、块索引为负或超出模型深度。
             TypeError: 加载的模型没有公开 ``blocks``。"""
         super().__init__()
 
+        if not isinstance(input_range, ImageInputRange):
+            raise TypeError(f"input_range 必须为 ImageInputRange，实际为 {type(input_range).__name__}")
         if not layer_weights:
             raise ValueError("layer_weights must not be empty")
         if any(index < 0 for index in layer_weights):
@@ -152,7 +156,7 @@ class DINOv2PerceptualLoss(nn.Module):
                 persistent=False,
             )
 
-        self.range_norm = range_norm
+        self.input_range = input_range
 
     @staticmethod
     def _cosine_distance(x: Tensor, y: Tensor, reduction: Reduction = "mean") -> Tensor:
@@ -170,9 +174,15 @@ class DINOv2PerceptualLoss(nn.Module):
         prediction = F.interpolate(prediction, size=(224, 224), mode="bilinear", align_corners=False)
         target = F.interpolate(target, size=(224, 224), mode="bilinear", align_corners=False)
 
-        if self.range_norm:
-            prediction = prediction.add(1.0).mul(0.5)
-            target = target.add(1.0).mul(0.5)
+        match self.input_range:
+            case ImageInputRange.MINUS_ONE_TO_ONE:
+                prediction = prediction.add(1.0).mul(0.5)
+                target = target.add(1.0).mul(0.5)
+            case ImageInputRange.ZERO_TO_255:
+                prediction = prediction.div(255.0)
+                target = target.div(255.0)
+            case ImageInputRange.ZERO_TO_ONE:
+                pass
         if self.use_input_norm:
             mean = self.get_buffer("mean")
             std = self.get_buffer("std")
@@ -211,7 +221,7 @@ class VGGPerceptualLoss(nn.Module):
         reduction: Reduction = "mean",
         vgg_type: str = "vgg19",
         use_input_norm: bool = True,
-        range_norm: bool = True,
+        input_range: ImageInputRange = ImageInputRange.MINUS_ONE_TO_ONE,
     ) -> None:
         """初始化 VGG 感知损失。
 
@@ -221,12 +231,14 @@ class VGGPerceptualLoss(nn.Module):
             reduction: ``none`` 返回逐样本损失；``mean``/``sum`` 返回标量。
             vgg_type: torchvision VGG 型号，例如 ``vgg16`` 或 ``vgg19``。
             use_input_norm: 是否应用 ImageNet 均值/标准差。
-            range_norm: 是否先将输入从 ``[-1, 1]`` 映射到 ``[0, 1]``。
+            input_range: 输入 RGB 张量的值域。
 
         异常:
             ValueError: 配置为空、VGG 型号或层名无效。"""
         super().__init__()
 
+        if not isinstance(input_range, ImageInputRange):
+            raise TypeError(f"input_range 必须为 ImageInputRange，实际为 {type(input_range).__name__}")
         if not layer_weights:
             raise ValueError("layer_weights must not be empty")
 
@@ -260,7 +272,7 @@ class VGGPerceptualLoss(nn.Module):
                 persistent=False,
             )
 
-        self.range_norm = range_norm
+        self.input_range = input_range
 
     @torch.compile(
         fullgraph=True,
@@ -276,9 +288,15 @@ class VGGPerceptualLoss(nn.Module):
 
         返回:
             各配置 VGG 层的加权损失之和。"""
-        if self.range_norm:
-            prediction = prediction.add(1.0).mul(0.5)
-            target = target.add(1.0).mul(0.5)
+        match self.input_range:
+            case ImageInputRange.MINUS_ONE_TO_ONE:
+                prediction = prediction.add(1.0).mul(0.5)
+                target = target.add(1.0).mul(0.5)
+            case ImageInputRange.ZERO_TO_255:
+                prediction = prediction.div(255.0)
+                target = target.div(255.0)
+            case ImageInputRange.ZERO_TO_ONE:
+                pass
         if self.use_input_norm:
             mean = self.get_buffer("mean")
             std = self.get_buffer("std")

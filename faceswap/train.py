@@ -29,6 +29,7 @@ from losses import (
     r1_reg_loss,
 )
 from misc.face_alignment import center_crop_and_resize
+from misc.models import ImageInputRange
 from misc.models.face_mask import FaceMasker
 from misc.models.id_encoder import IDEncoderProvider
 from models.discriminator import AlphaFaceDiscriminator
@@ -251,7 +252,7 @@ class Trainer:
             self.wfm_loss = WeightedFeatureMatchingLoss(layer_weights=wfm_loss_weight, criterion="l1").to(self.device)
 
         if self.enable_color_loss:
-            self.color_loss = LabStyleLoss(weight=color_loss_weight, range_norm=True).to(self.device)
+            self.color_loss = LabStyleLoss(weight=color_loss_weight, input_range=ImageInputRange.MINUS_ONE_TO_ONE).to(self.device)
 
         if self.enable_dssim_loss:
             self.dssim_loss = DSSIMLoss(weight=dssim_loss_weight, reduction="mean").to(self.device)
@@ -297,7 +298,7 @@ class Trainer:
             else:
                 self.train_module[net_name] = net
 
-        face_parser = FaceMasker(input_range="minus_one_to_one", mode="occlusion" if occ_mask else "parsing").to(device=self.device)
+        face_parser = FaceMasker(input_range=ImageInputRange.MINUS_ONE_TO_ONE, mode="occlusion" if occ_mask else "parsing").to(device=self.device)
         if not occ_mask:
             face_parser = face_parser.eval()
         face_parser.requires_grad_(False)

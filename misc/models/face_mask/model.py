@@ -5,13 +5,13 @@ from huggingface_hub import hf_hub_download
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from ...models import MODEL_REPOSITORY_ID
+from ...models import MODEL_REPOSITORY_ID, ImageInputRange
 
 
 class FaceMasker(nn.Module):
     def __init__(
         self,
-        input_range: Literal["minus_one_to_one", "zero_to_one"] = "minus_one_to_one",
+        input_range: ImageInputRange = ImageInputRange.MINUS_ONE_TO_ONE,
         mode: Literal["parsing", "occlusion"] = "parsing",
     ) -> None:
         """
@@ -20,8 +20,8 @@ class FaceMasker(nn.Module):
             mode: 使用 face parsing 或 occlusion 模型生成二值 mask。
         """
         super().__init__()
-        if input_range not in {"minus_one_to_one", "zero_to_one"}:
-            raise ValueError(f"unsupported input_range: {input_range}")
+        if not isinstance(input_range, ImageInputRange):
+            raise TypeError(f"input_range 必须为 ImageInputRange，实际为 {type(input_range).__name__}")
         if mode not in {"parsing", "occlusion"}:
             raise ValueError(f"unsupported mode: {mode}")
 
@@ -78,8 +78,13 @@ class FaceMasker(nn.Module):
         else:
             images = F.interpolate(images, [512, 512], mode="bicubic")
 
-        if self.input_range == "minus_one_to_one":
-            images = images.add(1.0).mul(0.5)
+        match self.input_range:
+            case ImageInputRange.MINUS_ONE_TO_ONE:
+                images = images.add(1.0).mul(0.5)
+            case ImageInputRange.ZERO_TO_255:
+                images = images.div(255.0)
+            case ImageInputRange.ZERO_TO_ONE:
+                pass
 
         mean = self.get_buffer("mean")
         std = self.get_buffer("std")
@@ -107,7 +112,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 32
 
-    masker = FaceMasker(input_range="minus_one_to_one", mode="occlusion")
+    masker = FaceMasker(input_range=ImageInputRange.MINUS_ONE_TO_ONE, mode="occlusion")
     masker.to(device)
 
     images = [read_image(f"/opt/share/deepfake/dataset_1/ffhq_1024/{random.randint(0, 69999):05d}.png") for _ in range(batch_size)]

@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from misc.models import ImageInputRange
+
 from .functional import EPS
 
 RGB_CHANNELS = 3
@@ -114,15 +116,17 @@ class LabStyleLoss(nn.Module):
     ``L``、``a``、``b`` 三个通道，因此同时包含亮度/光照和色度差异。
     """
 
-    def __init__(self, weight: float = 1.0, range_norm: bool = True) -> None:
+    def __init__(self, weight: float = 1.0, input_range: ImageInputRange = ImageInputRange.MINUS_ONE_TO_ONE) -> None:
         """初始化 Lab 风格损失。
 
         参数:
             weight: 最终损失的标量权重。
-            range_norm: 若为 True，将输入从 ``[-1, 1]`` 映射到 ``[0, 1]``。
+            input_range: 输入 RGB 张量的值域。
         """
         super().__init__()
-        self.range_norm = range_norm
+        if not isinstance(input_range, ImageInputRange):
+            raise TypeError(f"input_range 必须为 ImageInputRange，实际为 {type(input_range).__name__}")
+        self.input_range = input_range
         self.weight = weight
 
     @staticmethod
@@ -158,9 +162,15 @@ class LabStyleLoss(nn.Module):
         if prediction_rgb.shape != target_rgb.shape:
             raise ValueError(f"prediction and target shapes must match: {tuple(prediction_rgb.shape)} != {tuple(target_rgb.shape)}")
 
-        if self.range_norm:
-            prediction_rgb = prediction_rgb.add(1.0).mul(0.5)
-            target_rgb = target_rgb.add(1.0).mul(0.5)
+        match self.input_range:
+            case ImageInputRange.MINUS_ONE_TO_ONE:
+                prediction_rgb = prediction_rgb.add(1.0).mul(0.5)
+                target_rgb = target_rgb.add(1.0).mul(0.5)
+            case ImageInputRange.ZERO_TO_255:
+                prediction_rgb = prediction_rgb.div(255.0)
+                target_rgb = target_rgb.div(255.0)
+            case ImageInputRange.ZERO_TO_ONE:
+                pass
 
         prediction_lab = rgb_to_lab(prediction_rgb.clamp(0.0, 1.0))
         target_lab = rgb_to_lab(target_rgb.clamp(0.0, 1.0))
