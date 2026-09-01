@@ -12,6 +12,8 @@ from torch import Tensor, nn
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
 from models.networks import Generator
 
+DEFAULT_ID_ENCODER_PROVIDER_NAME = IDEncoderProvider.BLENDFACE.name
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Reproducibility
 # ──────────────────────────────────────────────────────────────────────────────
@@ -146,7 +148,7 @@ def export_face_swap(
 
 
 def export_id_encoder(
-    provider_name: str = "MS1MV3_ARCFACE_R50_FP16",
+    provider_name: str = DEFAULT_ID_ENCODER_PROVIDER_NAME,
     batch_size: int = 1,
     nhwc: bool = True,
     device: str = "cuda",
@@ -197,7 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_id = sub.add_parser("id-encoder", help="导出 IDEncoder（人脸识别编码器）")
     p_id.add_argument(
         "--provider",
-        default="BLENDFACE",
+        default=DEFAULT_ID_ENCODER_PROVIDER_NAME,
         choices=ID_ENCODER_PROVIDER_CHOICES,
         help="IDEncoder 权重/骨干网络选择",
     )
@@ -208,7 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_all.add_argument("--checkpoint", default=None, metavar="PATH", help="Generator 检查点路径")
     p_all.add_argument(
         "--provider",
-        default="BLENDFACE",
+        default=DEFAULT_ID_ENCODER_PROVIDER_NAME,
         choices=ID_ENCODER_PROVIDER_CHOICES,
         help="IDEncoder provider",
     )
