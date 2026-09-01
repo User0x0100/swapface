@@ -34,9 +34,7 @@ class DiscriminatorAdversarialLoss(nn.Module):
         """
         super().__init__()
         if loss_type not in self.SUPPORTED_TYPES:
-            raise ValueError(
-                f"Unsupported loss_type: {loss_type!r}. Supported types: {sorted(self.SUPPORTED_TYPES)}"
-            )
+            raise ValueError(f"Unsupported loss_type: {loss_type!r}. Supported types: {sorted(self.SUPPORTED_TYPES)}")
         self.loss_type = loss_type
         self.reduction = reduction
         self.weight = weight
@@ -62,11 +60,7 @@ class DiscriminatorAdversarialLoss(nn.Module):
         with autocast(device_type="cuda", enabled=False):
             fake_score = fake_score.float()
             real_score = real_score.float()
-            return F.binary_cross_entropy_with_logits(
-                real_score, torch.ones_like(real_score), reduction="none"
-            ) + F.binary_cross_entropy_with_logits(
-                fake_score, torch.zeros_like(fake_score), reduction="none"
-            )
+            return F.binary_cross_entropy_with_logits(real_score, torch.ones_like(real_score), reduction="none") + F.binary_cross_entropy_with_logits(fake_score, torch.zeros_like(fake_score), reduction="none")
 
     def forward(self, fake_score: Tensor, real_score: Tensor) -> Tensor:
         """计算生成样本与真实样本得分对应的判别器损失。
@@ -119,9 +113,7 @@ class GeneratorAdversarialLoss(nn.Module):
         """
         super().__init__()
         if loss_type not in self.SUPPORTED_TYPES:
-            raise ValueError(
-                f"Unsupported loss_type: {loss_type!r}. Supported types: {sorted(self.SUPPORTED_TYPES)}"
-            )
+            raise ValueError(f"Unsupported loss_type: {loss_type!r}. Supported types: {sorted(self.SUPPORTED_TYPES)}")
         self.loss_type = loss_type
         self.reduction = reduction
         self.weight = weight
@@ -141,9 +133,7 @@ class GeneratorAdversarialLoss(nn.Module):
         """使用 FP32 计算逐元素 BCE-with-logits 生成器损失。"""
         with autocast(device_type="cuda", enabled=False):
             predicted_score = predicted_score.float()
-            return F.binary_cross_entropy_with_logits(
-                predicted_score, torch.ones_like(predicted_score), reduction="none"
-            )
+            return F.binary_cross_entropy_with_logits(predicted_score, torch.ones_like(predicted_score), reduction="none")
 
     def forward(self, predicted_score: Tensor) -> Tensor:
         """计算生成样本得分对应的生成器损失。

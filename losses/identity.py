@@ -48,9 +48,7 @@ class IdentityLoss(nn.Module):
             形状通常为 ``(N, 512)`` 的身份嵌入向量。"""
         return self.id_encoder(faces)
 
-    def forward(
-        self, generated_embeddings: Tensor, reference_embeddings: Tensor
-    ) -> Tensor:
+    def forward(self, generated_embeddings: Tensor, reference_embeddings: Tensor) -> Tensor:
         """计算生成身份与参考身份嵌入向量的余弦距离。
 
         参数:
@@ -60,13 +58,8 @@ class IdentityLoss(nn.Module):
         返回:
             ``1 - cosine_similarity`` 经权重和 reduction 处理后的损失。"""
         if generated_embeddings.shape != reference_embeddings.shape:
-            raise ValueError(
-                "generated and reference embedding shapes must match: "
-                f"{tuple(generated_embeddings.shape)} != {tuple(reference_embeddings.shape)}"
-            )
-        loss = (
-            1.0 - F.cosine_similarity(generated_embeddings, reference_embeddings, dim=1)
-        ) * self.weight
+            raise ValueError(f"generated and reference embedding shapes must match: {tuple(generated_embeddings.shape)} != {tuple(reference_embeddings.shape)}")
+        loss = (1.0 - F.cosine_similarity(generated_embeddings, reference_embeddings, dim=1)) * self.weight
         return _reduce_loss(loss, self.reduction)
 
 
@@ -97,10 +90,7 @@ class IFSRLoss(nn.Module):
 
         id_encoder = IDEncoder(provider=id_encoder_provider)
         self.feature_layer_indices: dict[int, str] = {}
-        self.layer_constraints = {
-            layer_name: (margin * ifsr_margin_scale, weight)
-            for layer_name, (margin, weight) in ifsr_constraints.items()
-        }
+        self.layer_constraints = {layer_name: (margin * ifsr_margin_scale, weight) for layer_name, (margin, weight) in ifsr_constraints.items()}
 
         requested_layers = set(ifsr_constraints)
         feature_modules = nn.ModuleList()
@@ -128,9 +118,7 @@ class IFSRLoss(nn.Module):
         found_layers = set(self.feature_layer_indices.values())
         missing_layers = sorted(requested_layers - found_layers)
         if missing_layers:
-            raise ValueError(
-                f"IFSR layers not found in {id_encoder_provider.name}: {missing_layers}"
-            )
+            raise ValueError(f"IFSR layers not found in {id_encoder_provider.name}: {missing_layers}")
 
         self.net = feature_modules[: max_layer_index + 1].eval().requires_grad_(False)
 
@@ -176,10 +164,7 @@ class IFSRLoss(nn.Module):
                 raise KeyError(f"Missing IFSR feature: {layer_name}") from exc
 
             if reference.shape != generated.shape:
-                raise ValueError(
-                    f"IFSR feature shape mismatch at {layer_name}: "
-                    f"{tuple(reference.shape)} != {tuple(generated.shape)}"
-                )
+                raise ValueError(f"IFSR feature shape mismatch at {layer_name}: {tuple(reference.shape)} != {tuple(generated.shape)}")
 
             distance = (1.0 - F.cosine_similarity(reference, generated, dim=1)).mean()
             term = F.relu(distance - margin) * weight

@@ -43,3 +43,10 @@ explicit = true
 name = "nvidia"
 url = "https://pypi.nvidia.com"
 explicit = true
+
+[tool.ruff]
+line-length = 230
+preview = true
+
+[tool.ruff.format]
+skip-magic-trailing-comma = false

@@ -23,9 +23,7 @@ class AttnBlock(nn.Module):
         self.q = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
         self.k = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
         self.v = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
-        self.proj_out = nn.Conv2d(
-            in_channels, in_channels, kernel_size=1, stride=1, padding=0
-        )
+        self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x: Tensor) -> Tensor:
         h_ = x
@@ -60,17 +58,11 @@ class ResBlock(nn.Module):
         self.in_channels = in_channels
         self.out_channels = in_channels if out_channels is None else out_channels
         self.norm1 = normalize(in_channels)
-        self.conv1 = nn.Conv2d(
-            in_channels, self.out_channels, kernel_size=3, stride=1, padding=1
-        )
+        self.conv1 = nn.Conv2d(in_channels, self.out_channels, kernel_size=3, stride=1, padding=1)
         self.norm2 = normalize(self.out_channels)
-        self.conv2 = nn.Conv2d(
-            self.out_channels, self.out_channels, kernel_size=3, stride=1, padding=1
-        )
+        self.conv2 = nn.Conv2d(self.out_channels, self.out_channels, kernel_size=3, stride=1, padding=1)
         if self.in_channels != self.out_channels:
-            self.conv_out = nn.Conv2d(
-                in_channels, self.out_channels, kernel_size=1, stride=1, padding=0
-            )
+            self.conv_out = nn.Conv2d(in_channels, self.out_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x_in: Tensor) -> Tensor:
         x = x_in
@@ -89,9 +81,7 @@ class ResBlock(nn.Module):
 class Downsample(nn.Module):
     def __init__(self, in_channels: int):
         super().__init__()
-        self.conv = nn.Conv2d(
-            in_channels, in_channels, kernel_size=3, stride=2, padding=0
-        )
+        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
 
     def forward(self, x: Tensor) -> Tensor:
         pad = (0, 1, 0, 1)
@@ -103,9 +93,7 @@ class Downsample(nn.Module):
 class Upsample(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
-        self.conv = nn.Conv2d(
-            in_channels, in_channels, kernel_size=3, stride=1, padding=1
-        )
+        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
         x = F.interpolate(x, scale_factor=2.0, mode="nearest")
@@ -160,9 +148,7 @@ class Encoder(nn.Module):
 
         # normalise and convert to latent size
         blocks.append(normalize(block_in_ch))
-        blocks.append(
-            nn.Conv2d(block_in_ch, emb_dim, kernel_size=3, stride=1, padding=1)
-        )
+        blocks.append(nn.Conv2d(block_in_ch, emb_dim, kernel_size=3, stride=1, padding=1))
         self.blocks = nn.ModuleList(blocks)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -180,9 +166,7 @@ class VectorQuantizer(nn.Module):
         self.emb_dim = emb_dim  # dimension of embedding
         self.beta = beta  # commitment cost used in loss term, beta * ||z_e(x)-sg[e]||^2
         self.embedding = nn.Embedding(self.codebook_size, self.emb_dim)
-        self.embedding.weight.data.uniform_(
-            -1.0 / self.codebook_size, 1.0 / self.codebook_size
-        )
+        self.embedding.weight.data.uniform_(-1.0 / self.codebook_size, 1.0 / self.codebook_size)
 
     def forward(self, z: Tensor) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
         # reshape z -> (batch, height, width, channel) and flatten
@@ -190,11 +174,7 @@ class VectorQuantizer(nn.Module):
         z_flattened = z.view(-1, self.emb_dim)
 
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
-        d = (
-            (z_flattened**2).sum(dim=1, keepdim=True)
-            + (self.embedding.weight**2).sum(1)
-            - 2 * torch.matmul(z_flattened, self.embedding.weight.t())
-        )
+        d = (z_flattened**2).sum(dim=1, keepdim=True) + (self.embedding.weight**2).sum(1) - 2 * torch.matmul(z_flattened, self.embedding.weight.t())
 
         mean_distance = torch.mean(d)
         # find closest encodings
@@ -203,17 +183,13 @@ class VectorQuantizer(nn.Module):
         # [0-1], higher score, higher confidence
         # min_encoding_scores = torch.exp(-min_encoding_scores/10)
 
-        min_encodings = torch.zeros(
-            min_encoding_indices.shape[0], self.codebook_size
-        ).to(z)
+        min_encodings = torch.zeros(min_encoding_indices.shape[0], self.codebook_size).to(z)
         min_encodings.scatter_(1, min_encoding_indices, 1)
 
         # get quantized latent vectors
         z_q = torch.matmul(min_encodings, self.embedding.weight).view(z.shape)
         # compute loss for embedding
-        loss = torch.mean((z_q.detach() - z) ** 2) + self.beta * torch.mean(
-            (z_q - z.detach()) ** 2
-        )
+        loss = torch.mean((z_q.detach() - z) ** 2) + self.beta * torch.mean((z_q - z.detach()) ** 2)
         # preserve gradients
         z_q = z + (z_q - z).detach()
 
@@ -265,9 +241,7 @@ class Generator(nn.Module):
 
         blocks: list[nn.Module] = []
         # initial conv
-        blocks.append(
-            nn.Conv2d(self.in_channels, block_in_ch, kernel_size=3, stride=1, padding=1)
-        )
+        blocks.append(nn.Conv2d(self.in_channels, block_in_ch, kernel_size=3, stride=1, padding=1))
 
         # non-local attention block
         blocks.append(ResBlock(block_in_ch, block_in_ch))
@@ -289,11 +263,7 @@ class Generator(nn.Module):
                 curr_res = curr_res * 2
 
         blocks.append(normalize(block_in_ch))
-        blocks.append(
-            nn.Conv2d(
-                block_in_ch, self.out_channels, kernel_size=3, stride=1, padding=1
-            )
-        )
+        blocks.append(nn.Conv2d(block_in_ch, self.out_channels, kernel_size=3, stride=1, padding=1))
 
         self.blocks = nn.ModuleList(blocks)
 
@@ -354,13 +324,9 @@ class VQAutoEncoder(nn.Module):
         if model_path is not None:
             chkpt = torch.load(model_path, map_location="cpu")
             if "params_ema" in chkpt:
-                self.load_state_dict(
-                    torch.load(model_path, map_location="cpu")["params_ema"]
-                )
+                self.load_state_dict(torch.load(model_path, map_location="cpu")["params_ema"])
             elif "params" in chkpt:
-                self.load_state_dict(
-                    torch.load(model_path, map_location="cpu")["params"]
-                )
+                self.load_state_dict(torch.load(model_path, map_location="cpu")["params"])
             else:
                 raise ValueError("Wrong params!")
 
@@ -401,9 +367,7 @@ def adaptive_instance_normalization(content_feat, style_feat):
     size = content_feat.size()
     style_mean, style_std = calc_mean_std(style_feat)
     content_mean, content_std = calc_mean_std(content_feat)
-    normalized_feat = (content_feat - content_mean.expand(size)) / content_std.expand(
-        size
-    )
+    normalized_feat = (content_feat - content_mean.expand(size)) / content_std.expand(size)
     return normalized_feat * style_std.expand(size) + style_mean.expand(size)
 
 
@@ -413,9 +377,7 @@ class PositionEmbeddingSine(nn.Module):
     used by the Attention is all you need paper, generalized to work on images.
     """
 
-    def __init__(
-        self, num_pos_feats=64, temperature=10000, normalize=False, scale=None
-    ):
+    def __init__(self, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
         super().__init__()
         self.num_pos_feats = num_pos_feats
         self.temperature = temperature
@@ -428,9 +390,7 @@ class PositionEmbeddingSine(nn.Module):
 
     def forward(self, x, mask=None):
         if mask is None:
-            mask = torch.zeros(
-                (x.size(0), x.size(2), x.size(3)), device=x.device, dtype=torch.bool
-            )
+            mask = torch.zeros((x.size(0), x.size(2), x.size(3)), device=x.device, dtype=torch.bool)
         not_mask = ~mask
         y_embed = not_mask.cumsum(1, dtype=torch.float32)
         x_embed = not_mask.cumsum(2, dtype=torch.float32)
@@ -444,12 +404,8 @@ class PositionEmbeddingSine(nn.Module):
 
         pos_x = x_embed[:, :, :, None] / dim_t
         pos_y = y_embed[:, :, :, None] / dim_t
-        pos_x = torch.stack(
-            (pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4
-        ).flatten(3)
-        pos_y = torch.stack(
-            (pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4
-        ).flatten(3)
+        pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
         return pos
 
@@ -466,9 +422,7 @@ def _get_activation_fn(activation):
 
 
 class TransformerSALayer(nn.Module):
-    def __init__(
-        self, embed_dim, nhead=8, dim_mlp=2048, dropout=0.0, activation="gelu"
-    ):
+    def __init__(self, embed_dim, nhead=8, dim_mlp=2048, dropout=0.0, activation="gelu"):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(embed_dim, nhead, dropout=dropout)
         # Implementation of Feedforward model - MLP
@@ -497,9 +451,7 @@ class TransformerSALayer(nn.Module):
         # self attention
         tgt2 = self.norm1(tgt)
         q = k = self.with_pos_embed(tgt2, query_pos)
-        tgt2 = self.self_attn(
-            q, k, value=tgt2, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask
-        )[0]
+        tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)[0]
         tgt = tgt + self.dropout1(tgt2)
 
         # ffn
@@ -562,19 +514,10 @@ class CodeFormer(VQAutoEncoder):
         self.feat_emb = nn.Linear(256, self.dim_embd)
 
         # transformer
-        self.ft_layers = nn.Sequential(
-            *[
-                TransformerSALayer(
-                    embed_dim=dim_embd, nhead=n_head, dim_mlp=self.dim_mlp, dropout=0.0
-                )
-                for _ in range(self.n_layers)
-            ]
-        )
+        self.ft_layers = nn.Sequential(*[TransformerSALayer(embed_dim=dim_embd, nhead=n_head, dim_mlp=self.dim_mlp, dropout=0.0) for _ in range(self.n_layers)])
 
         # logits_predict head
-        self.idx_pred_layer = nn.Sequential(
-            nn.LayerNorm(dim_embd), nn.Linear(dim_embd, codebook_size, bias=False)
-        )
+        self.idx_pred_layer = nn.Sequential(nn.LayerNorm(dim_embd), nn.Linear(dim_embd, codebook_size, bias=False))
 
         self.channels = {
             "16": 512,
@@ -673,9 +616,7 @@ class CodeFormer(VQAutoEncoder):
             if i in fuse_list:  # fuse after i-th block
                 f_size = str(x.shape[-1])
                 if w > 0:
-                    x = self.fuse_convs_dict[f_size](
-                        enc_feat_dict[f_size].detach(), x, w
-                    )
+                    x = self.fuse_convs_dict[f_size](enc_feat_dict[f_size].detach(), x, w)
         out = x
         # logits doesn't need softmax before cross_entropy loss
         # return out, logits, lq_feat

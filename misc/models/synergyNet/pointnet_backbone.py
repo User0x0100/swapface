@@ -108,9 +108,7 @@ class MLP_rev(nn.Module):
         self.num_pts = num_pts
         self.max_pool = nn.MaxPool1d(num_pts)
 
-    def forward(
-        self, x: torch.Tensor, other_input1=None, other_input2=None, other_input3=None
-    ):
+    def forward(self, x: torch.Tensor, other_input1=None, other_input2=None, other_input3=None):
         out = F.relu(self.bn1(self.conv1(x)))
         out = F.relu(self.bn2(self.conv2(out)))
         out = F.relu(self.bn3(self.conv3(out)))

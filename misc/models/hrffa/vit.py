@@ -22,9 +22,7 @@ class Rope2D(nn.Module):
         if head_dim % 4 != 0:
             raise ValueError(f"head_dim 必须能被 4 整除，实际为 {head_dim}")
         self.head_dim = head_dim
-        self.register_buffer(
-            "periods", torch.empty(head_dim // 4, dtype=torch.float32), persistent=True
-        )
+        self.register_buffer("periods", torch.empty(head_dim // 4, dtype=torch.float32), persistent=True)
         self._cache: dict[tuple[int, int, str], tuple[Tensor, Tensor]] = {}
 
     def forward(self, height: int, width: int) -> tuple[Tensor, Tensor]:
@@ -35,17 +33,9 @@ class Rope2D(nn.Module):
             return cached
 
         periods = self.get_buffer("periods")
-        rows = (
-            torch.arange(0.5, float(height), device=periods.device, dtype=torch.float32)
-            / height
-        )
-        cols = (
-            torch.arange(0.5, float(width), device=periods.device, dtype=torch.float32)
-            / width
-        )
-        coordinates = torch.stack(
-            torch.meshgrid(rows, cols, indexing="ij"), dim=-1
-        ).flatten(0, 1)
+        rows = torch.arange(0.5, float(height), device=periods.device, dtype=torch.float32) / height
+        cols = torch.arange(0.5, float(width), device=periods.device, dtype=torch.float32) / width
+        coordinates = torch.stack(torch.meshgrid(rows, cols, indexing="ij"), dim=-1).flatten(0, 1)
         coordinates = coordinates.mul(2.0).sub(1.0)
         angles = 2.0 * math.pi * coordinates[:, :, None] / periods.float()[None, None]
         angles = angles.flatten(1, 2).tile(2)
@@ -82,12 +72,7 @@ class _Attention(nn.Module):
         prefix_tokens: int,
     ) -> Tensor:
         batch_size, token_count, channels = x.shape
-        q, k, v = (
-            tensor.reshape(
-                batch_size, token_count, self.num_heads, self.head_dim
-            ).transpose(1, 2)
-            for tensor in self.qkv(x).split(channels, dim=-1)
-        )
+        q, k, v = (tensor.reshape(batch_size, token_count, self.num_heads, self.head_dim).transpose(1, 2) for tensor in self.qkv(x).split(channels, dim=-1))
 
         sin, cos = rope
         q = torch.cat(
@@ -145,17 +130,11 @@ class ViTTiny(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.patch_size = patch_size
-        self.patch_embed = nn.ModuleDict(
-            {"proj": nn.Conv2d(3, embed_dim, patch_size, stride=patch_size)}
-        )
+        self.patch_embed = nn.ModuleDict({"proj": nn.Conv2d(3, embed_dim, patch_size, stride=patch_size)})
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.rope_embed = Rope2D(embed_dim // num_heads)
-        self.blocks = nn.ModuleList(
-            [_Block(embed_dim, num_heads) for _ in range(depth)]
-        )
-        self.patch_in = (
-            nn.InstanceNorm2d(embed_dim, affine=True) if patch_instance_norm else None
-        )
+        self.blocks = nn.ModuleList([_Block(embed_dim, num_heads) for _ in range(depth)])
+        self.patch_in = nn.InstanceNorm2d(embed_dim, affine=True) if patch_instance_norm else None
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         patch = self.patch_embed["proj"](x)
@@ -172,7 +151,5 @@ class ViTTiny(nn.Module):
             tokens = block(tokens, rope)
 
         cls_output = tokens[:, 0]
-        patch_output = (
-            tokens[:, 1:].transpose(1, 2).reshape(batch_size, channels, height, width)
-        )
+        patch_output = tokens[:, 1:].transpose(1, 2).reshape(batch_size, channels, height, width)
         return patch_output, cls_output

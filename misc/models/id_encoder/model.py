@@ -48,12 +48,8 @@ class IDEncoderProviderConfig:
 
 class IDEncoderProvider(Enum):
     BLENDFACE = IDEncoderProviderConfig(iresnet100, "blendface.pth")
-    MS1MV3_ARCFACE_R50_FP16 = IDEncoderProviderConfig(
-        iresnet50, "ms1mv3_arcface_r50_fp16.pth"
-    )
-    MS1MV3_ARCFACE_R100_FP16 = IDEncoderProviderConfig(
-        iresnet100, "ms1mv3_arcface_r100_fp16.pth"
-    )
+    MS1MV3_ARCFACE_R50_FP16 = IDEncoderProviderConfig(iresnet50, "ms1mv3_arcface_r50_fp16.pth")
+    MS1MV3_ARCFACE_R100_FP16 = IDEncoderProviderConfig(iresnet100, "ms1mv3_arcface_r100_fp16.pth")
     MS1MV2_TRANSFACE_S = IDEncoderProviderConfig(vit_s, "ms1mv2_model_TransFace_S.pt")
     MS1MV2_TRANSFACE_B = IDEncoderProviderConfig(vit_b, "ms1mv2_model_TransFace_B.pt")
     MS1MV2_TRANSFACE_L = IDEncoderProviderConfig(vit_l, "ms1mv2_model_TransFace_L.pt")
@@ -74,15 +70,11 @@ class IDEncoder(nn.Module):
         >>> features = encoder(face_images)
     """
 
-    def __init__(
-        self, provider: IDEncoderProvider = IDEncoderProvider.BLENDFACE
-    ) -> None:
+    def __init__(self, provider: IDEncoderProvider = IDEncoderProvider.BLENDFACE) -> None:
         super().__init__()
 
         self.provider = provider
-        weight_path = hf_hub_download(
-            repo_id=MODEL_REPOSITORY_ID, filename=provider.value.weight_filename
-        )
+        weight_path = hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename=provider.value.weight_filename)
         self.backbone = provider.value.backbone()
 
         state_dict = torch.load(weight_path, weights_only=True, map_location="cpu")
@@ -100,9 +92,7 @@ class IDEncoder(nn.Module):
         """
 
         if x.shape[2:] != ID_ENCODER_INPUT_SIZE:
-            x = F.interpolate(
-                x, ID_ENCODER_INPUT_SIZE, mode="bilinear", align_corners=False
-            )
+            x = F.interpolate(x, ID_ENCODER_INPUT_SIZE, mode="bilinear", align_corners=False)
         features = self.backbone(x)
         return F.normalize(features, p=2, dim=1)
 

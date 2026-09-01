@@ -141,9 +141,7 @@ def get_vgg_layer_names(vgg_type: str) -> tuple[str, ...]:
         return tuple(VGG_LAYER_NAMES[vgg_type])
     except KeyError as exc:
         supported = ", ".join(VGG_LAYER_NAMES)
-        raise ValueError(
-            f"Unsupported VGG type: {vgg_type!r}. Supported types: {supported}"
-        ) from exc
+        raise ValueError(f"Unsupported VGG type: {vgg_type!r}. Supported types: {supported}") from exc
 
 
 class VGGFeatureExtractor(nn.Module):
@@ -171,13 +169,9 @@ class VGGFeatureExtractor(nn.Module):
             available_layer_names = VGG_LAYER_NAMES[vgg_type]
         except KeyError as exc:
             supported = ", ".join(VGG_LAYER_NAMES)
-            raise ValueError(
-                f"Unsupported VGG type: {vgg_type!r}. Supported types: {supported}"
-            ) from exc
+            raise ValueError(f"Unsupported VGG type: {vgg_type!r}. Supported types: {supported}") from exc
 
-        unknown_layers = [
-            name for name in layer_names if name not in available_layer_names
-        ]
+        unknown_layers = [name for name in layer_names if name not in available_layer_names]
         if unknown_layers:
             raise ValueError(f"Unknown {vgg_type} layer names: {unknown_layers}")
 
@@ -185,18 +179,14 @@ class VGGFeatureExtractor(nn.Module):
         weights = getattr(vgg, f"{vgg_type.upper()}_Weights").DEFAULT
         vgg_features = create_vgg_fn(weights=weights).features
         if not isinstance(vgg_features, nn.Sequential):
-            raise TypeError(
-                f"Expected VGG features to be nn.Sequential, got {type(vgg_features).__name__}"
-            )
+            raise TypeError(f"Expected VGG features to be nn.Sequential, got {type(vgg_features).__name__}")
 
         vgg_features.eval().requires_grad_(False)
         for layer in vgg_features:
             if isinstance(layer, nn.ReLU):
                 layer.inplace = False
 
-        self.selected_layers = tuple(
-            sorted(available_layer_names.index(name) for name in layer_names)
-        )
+        self.selected_layers = tuple(sorted(available_layer_names.index(name) for name in layer_names))
         self._selected_layer_set = frozenset(self.selected_layers)
 
         # Slice is exclusive: include the last requested layer, but do not execute one extra layer.

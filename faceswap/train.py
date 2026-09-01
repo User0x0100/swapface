@@ -602,41 +602,39 @@ if __name__ == "__main__":
 
     def_config: dict[str, Any] = {"src": src, "dst": dst}
 
-    def_config.update(
-        {
-            "ckpt": "train_log/512-MS1MV3_ARCFACE_R50_FP16/ckpt/328696.pth",
-            "masked_train": False,
-            "occ_mask": False,
-            "log_path": "train_log/512-MS1MV3_ARCFACE_R50_FP16",
-            "batch_size": 16,
-            "id_encoder_provider": IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16,
-            "net_g_cfg": {
-                # "img_resolution": 512,
-                # "img_channels": 3,
-                # "num_depth": 4,
-                # "num_latent": 6,
-                # "base_ch": 64,
-                # "max_ch": 2048,
-                # "id_dim": 512,
-                # "skip": True,
-                "img_resolution": 512,
-                "img_channels": 3,
-                "num_depth": 5,
-                "num_latent": 6,
-                "base_ch": 16,
-                "max_ch": 2048,
-                "id_dim": 512,
-                "skip": True,
-            },
-            "net_d_cfg": {
-                "img_resolution": 512,
-                "img_channels": 3,
-                "base_ch": 64,
-                "max_ch": 512,
-                # "group_size": 4,
-            },
-        }
-    )
+    def_config.update({
+        "ckpt": "train_log/512-MS1MV3_ARCFACE_R50_FP16/ckpt/328696.pth",
+        "masked_train": False,
+        "occ_mask": False,
+        "log_path": "train_log/512-MS1MV3_ARCFACE_R50_FP16",
+        "batch_size": 16,
+        "id_encoder_provider": IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16,
+        "net_g_cfg": {
+            # "img_resolution": 512,
+            # "img_channels": 3,
+            # "num_depth": 4,
+            # "num_latent": 6,
+            # "base_ch": 64,
+            # "max_ch": 2048,
+            # "id_dim": 512,
+            # "skip": True,
+            "img_resolution": 512,
+            "img_channels": 3,
+            "num_depth": 5,
+            "num_latent": 6,
+            "base_ch": 16,
+            "max_ch": 2048,
+            "id_dim": 512,
+            "skip": True,
+        },
+        "net_d_cfg": {
+            "img_resolution": 512,
+            "img_channels": 3,
+            "base_ch": 64,
+            "max_ch": 512,
+            # "group_size": 4,
+        },
+    })
 
     trainer = Trainer(**def_config)
 

@@ -32,9 +32,7 @@ class DSSIMLoss(nn.Module):
         super().__init__()
 
         if window_size <= 0 or window_size % 2 == 0:
-            raise ValueError(
-                f"window_size must be a positive odd integer, got {window_size}"
-            )
+            raise ValueError(f"window_size must be a positive odd integer, got {window_size}")
         if sigma <= 0:
             raise ValueError(f"sigma must be positive, got {sigma}")
 
@@ -43,9 +41,7 @@ class DSSIMLoss(nn.Module):
         self.window_size = window_size
         self.reduction = reduction
 
-        window = self._create_window(window_size, sigma).expand(
-            self.CHANNELS, 1, window_size, window_size
-        )
+        window = self._create_window(window_size, sigma).expand(self.CHANNELS, 1, window_size, window_size)
         self.register_buffer("window", window, persistent=False)
 
     @staticmethod
@@ -64,46 +60,27 @@ class DSSIMLoss(nn.Module):
     def _ssim(self, prediction: Tensor, target: Tensor) -> Tensor:
         """计算 RGB 输入的局部 SSIM 图，并对颜色通道取平均。"""
         if prediction.shape != target.shape:
-            raise ValueError(
-                f"prediction and target shapes must match: {tuple(prediction.shape)} != {tuple(target.shape)}"
-            )
+            raise ValueError(f"prediction and target shapes must match: {tuple(prediction.shape)} != {tuple(target.shape)}")
         if prediction.ndim != 4 or prediction.shape[1] != self.CHANNELS:
-            raise ValueError(
-                f"DSSIM expects NCHW RGB tensors, got shape={tuple(prediction.shape)}"
-            )
+            raise ValueError(f"DSSIM expects NCHW RGB tensors, got shape={tuple(prediction.shape)}")
 
         window = self.get_buffer("window")
         padding = self.window_size // 2
 
-        mu_prediction = F.conv2d(
-            prediction, window, padding=padding, groups=self.CHANNELS
-        )
+        mu_prediction = F.conv2d(prediction, window, padding=padding, groups=self.CHANNELS)
         mu_target = F.conv2d(target, window, padding=padding, groups=self.CHANNELS)
 
         mu_prediction2 = mu_prediction.square()
         mu_target2 = mu_target.square()
         mu_cross = mu_prediction * mu_target
 
-        sigma_prediction2 = (
-            F.conv2d(prediction.square(), window, padding=padding, groups=self.CHANNELS)
-            - mu_prediction2
-        ).clamp_min(0.0)
-        sigma_target2 = (
-            F.conv2d(target.square(), window, padding=padding, groups=self.CHANNELS)
-            - mu_target2
-        ).clamp_min(0.0)
-        sigma_cross = (
-            F.conv2d(prediction * target, window, padding=padding, groups=self.CHANNELS)
-            - mu_cross
-        )
+        sigma_prediction2 = (F.conv2d(prediction.square(), window, padding=padding, groups=self.CHANNELS) - mu_prediction2).clamp_min(0.0)
+        sigma_target2 = (F.conv2d(target.square(), window, padding=padding, groups=self.CHANNELS) - mu_target2).clamp_min(0.0)
+        sigma_cross = F.conv2d(prediction * target, window, padding=padding, groups=self.CHANNELS) - mu_cross
 
         c1 = 0.01**2
         c2 = 0.03**2
-        ssim_map = ((2 * mu_cross + c1) * (2 * sigma_cross + c2)) / (
-            (mu_prediction2 + mu_target2 + c1)
-            * (sigma_prediction2 + sigma_target2 + c2)
-            + EPS
-        )
+        ssim_map = ((2 * mu_cross + c1) * (2 * sigma_cross + c2)) / ((mu_prediction2 + mu_target2 + c1) * (sigma_prediction2 + sigma_target2 + c2) + EPS)
         return ssim_map.mean(dim=1, keepdim=True)
 
     @torch.compile(

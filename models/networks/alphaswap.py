@@ -116,17 +116,13 @@ class Encoder_noBNIN(nn.Module):
         self.Encoder_kernel_size = [7, 3, 3, 3]
         self.pading_scale = [0, 1, 1, 1]
         self.stride_scale = [1, 1, 2, 2]
-        self.Encoder = nn.ModuleDict(
-            {
-                f"layer_{i}": nn.Sequential(
-                    nn.Conv2d(
-                        self.Encoder_channel[i], self.Encoder_channel[i + 1], kernel_size=self.Encoder_kernel_size[i], stride=self.stride_scale[i], padding=self.pading_scale[i]
-                    ),
-                    nn.LeakyReLU(0.2),
-                )
-                for i in range(4)
-            }
-        )
+        self.Encoder = nn.ModuleDict({
+            f"layer_{i}": nn.Sequential(
+                nn.Conv2d(self.Encoder_channel[i], self.Encoder_channel[i + 1], kernel_size=self.Encoder_kernel_size[i], stride=self.stride_scale[i], padding=self.pading_scale[i]),
+                nn.LeakyReLU(0.2),
+            )
+            for i in range(4)
+        })
 
         # self.FFB1 = Feature_Fusion_Block(1024,2048)
 
@@ -151,17 +147,13 @@ class Encoder(nn.Module):
         self.Encoder_kernel_size = [7, 3, 3, 3]
         self.pading_scale = [0, 1, 1, 1]
         self.stride_scale = [1, 1, 2, 2]
-        self.Encoder = nn.ModuleDict(
-            {
-                f"layer_{i}": nn.Sequential(
-                    nn.Conv2d(
-                        self.Encoder_channel[i], self.Encoder_channel[i + 1], kernel_size=self.Encoder_kernel_size[i], stride=self.stride_scale[i], padding=self.pading_scale[i]
-                    ),
-                    nn.LeakyReLU(0.2),
-                )
-                for i in range(4)
-            }
-        )
+        self.Encoder = nn.ModuleDict({
+            f"layer_{i}": nn.Sequential(
+                nn.Conv2d(self.Encoder_channel[i], self.Encoder_channel[i + 1], kernel_size=self.Encoder_kernel_size[i], stride=self.stride_scale[i], padding=self.pading_scale[i]),
+                nn.LeakyReLU(0.2),
+            )
+            for i in range(4)
+        })
 
         # self.FFB1 = Feature_Fusion_Block(1024,2048)
 

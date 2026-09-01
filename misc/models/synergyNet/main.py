@@ -14,9 +14,7 @@ class ParamsPack:
     def __init__(self):
 
         def df_dl(name: str) -> str:
-            return hf_hub_download(
-                repo_id=MODEL_REPOSITORY_ID, filename=f"SynergyNet/3dmm_data/{name}"
-            )
+            return hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename=f"SynergyNet/3dmm_data/{name}")
 
         self.keypoints = np.load(df_dl("keypoints_sim.npy"))
 
@@ -72,20 +70,13 @@ class SynergyNet(nn.Module):
 
         # state_dict = torch.load(hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename="SynergyNet/best.pth.tar"), map_location=torch.device("cpu"), weights_only=False)["state_dict"]
         state_dict = torch.load(
-            hf_hub_download(
-                repo_id=MODEL_REPOSITORY_ID, filename="SynergyNet/best_pose.pth.tar"
-            ),
+            hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename="SynergyNet/best_pose.pth.tar"),
             map_location=torch.device("cpu"),
             weights_only=False,
         )["state_dict"]
 
         # 去掉 "module. I2P. 排除顶层 u_tex w_tex"
-        state_dict = {
-            cleaned: v
-            for k, v in state_dict.items()
-            if (cleaned := k.removeprefix("module.").removeprefix("I2P."))
-            not in ("u_tex", "w_tex")
-        }
+        state_dict = {cleaned: v for k, v in state_dict.items() if (cleaned := k.removeprefix("module.").removeprefix("I2P.")) not in ("u_tex", "w_tex")}
 
         self.load_state_dict(state_dict, strict=True)
 
@@ -103,9 +94,7 @@ class SynergyNet(nn.Module):
         alpha_exp = param[:, 52:62].reshape(-1, 10, 1)
         return p, offset, alpha_shp, alpha_exp
 
-    def reconstruct_vertex_62(
-        self, param, whitening=True, dense=False, transform=True, lmk_pts=68
-    ):
+    def reconstruct_vertex_62(self, param, whitening=True, dense=False, transform=True, lmk_pts=68):
         """
         Whitening param -> 3d vertex, based on the 3dmm param: u_base, w_shp, w_exp
         dense: if True, return dense vertex, else return 68 sparse landmarks. All dense or sparse vertex is transformed to
@@ -126,14 +115,7 @@ class SynergyNet(nn.Module):
         p, offset, alpha_shp, alpha_exp = self.parse_param_62(param_)
 
         if dense:
-            vertex = (
-                p
-                @ (self.u + self.w_shp @ alpha_shp + self.w_exp @ alpha_exp)
-                .contiguous()
-                .view(-1, 53215, 3)
-                .transpose(1, 2)
-                + offset
-            )
+            vertex = p @ (self.u + self.w_shp @ alpha_shp + self.w_exp @ alpha_exp).contiguous().view(-1, 53215, 3).transpose(1, 2) + offset
 
             if transform:
                 # transform to image coordinate space
@@ -141,18 +123,7 @@ class SynergyNet(nn.Module):
 
         else:
             """For 68 pts"""
-            vertex = (
-                p
-                @ (
-                    self.u_base
-                    + self.w_shp_base @ alpha_shp
-                    + self.w_exp_base @ alpha_exp
-                )
-                .contiguous()
-                .view(-1, lmk_pts, 3)
-                .transpose(1, 2)
-                + offset
-            )
+            vertex = p @ (self.u_base + self.w_shp_base @ alpha_shp + self.w_exp_base @ alpha_exp).contiguous().view(-1, lmk_pts, 3).transpose(1, 2) + offset
 
             if transform:
                 # transform to image coordinate space
@@ -161,9 +132,7 @@ class SynergyNet(nn.Module):
         return vertex
 
 
-def draw_landmarks_on_tensor(
-    images: Tensor, landmarks: Tensor, color: tuple = (0, 1, 0), radius: int = 1
-) -> Tensor:
+def draw_landmarks_on_tensor(images: Tensor, landmarks: Tensor, color: tuple = (0, 1, 0), radius: int = 1) -> Tensor:
     """
     使用PyTorch在图像tensor上绘制关键点
     Args:
@@ -224,25 +193,19 @@ if __name__ == "__main__":
     # from misc.face_alignment import center_crop_and_resize
 
     INPUT_SIZE = 120
-    sample_dir = ImageDirectory(
-        "/opt/share/deepfake/dataset_1/vggface2_hq512/align_result"
-    )
+    sample_dir = ImageDirectory("/opt/share/deepfake/dataset_1/vggface2_hq512/align_result")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 8
     print(f"使用设备: {device}")
 
-    images = torch.stack([sample_dir.sample_tensor() for _ in range(batch_size)]).to(
-        device=device
-    )
+    images = torch.stack([sample_dir.sample_tensor() for _ in range(batch_size)]).to(device=device)
 
     N, C, H, W = images.size()
     assert H == W
     scale = float(H / INPUT_SIZE)
     # images = center_crop_and_resize(images, crop_fraction=0.05)
-    images = TF.affine(
-        images, angle=0, translate=[0, -int(H * 0.05)], scale=1.0, shear=[0.0, 0.0]
-    )
+    images = TF.affine(images, angle=0, translate=[0, -int(H * 0.05)], scale=1.0, shear=[0.0, 0.0])
 
     images.div_(127.5).sub_(1.0)
 
@@ -253,22 +216,16 @@ if __name__ == "__main__":
     net.eval()
 
     with torch.no_grad():
-        _3D_attr, _ = net(
-            F.interpolate(images_BGR, INPUT_SIZE, mode="bilinear", align_corners=False)
-        )
+        _3D_attr, _ = net(F.interpolate(images_BGR, INPUT_SIZE, mode="bilinear", align_corners=False))
         lmks = net.reconstruct_vertex_62(_3D_attr)
         print(f"关键点形状: {lmks.shape}")
         lmks *= scale
 
     # 使用PyTorch绘制关键点
-    images_with_landmarks = draw_landmarks_on_tensor(
-        images, lmks, color=(-1, 1, -1), radius=3
-    )
+    images_with_landmarks = draw_landmarks_on_tensor(images, lmks, color=(-1, 1, -1), radius=3)
 
     # 使用torchvision创建网格并保存
-    grid = utils.make_grid(
-        images_with_landmarks, nrow=4, padding=2, normalize=True, value_range=(-1, 1)
-    )
+    grid = utils.make_grid(images_with_landmarks, nrow=4, padding=2, normalize=True, value_range=(-1, 1))
     utils.save_image(grid, "landmarks_grid_pytorch.png")
 
     print(f"处理了 {batch_size} 张图片")

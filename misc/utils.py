@@ -74,9 +74,7 @@ class ImageDirectory:
 
     DEFAULT_FILTERS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp")
 
-    def __init__(
-        self, directory: str | Path, file_filters: tuple[str, ...] | None = None
-    ) -> None:
+    def __init__(self, directory: str | Path, file_filters: tuple[str, ...] | None = None) -> None:
         """
         初始化 。
 
@@ -96,26 +94,18 @@ class ImageDirectory:
         filters = tuple(ext.lower() for ext in file_filters)
 
         self.file_names = sorted(
-            [
-                entry.name
-                for entry in self.directory.iterdir()
-                if entry.is_file() and entry.name.lower().endswith(filters)
-            ],
+            [entry.name for entry in self.directory.iterdir() if entry.is_file() and entry.name.lower().endswith(filters)],
             key=self._natural_sort_key,
         )
 
         if not self.file_names:
-            raise FileNotFoundError(
-                f"没有在目录：{directory}下找到任何图片文件，file_filters：{file_filters}"
-            )
+            raise FileNotFoundError(f"没有在目录：{directory}下找到任何图片文件，file_filters：{file_filters}")
 
         self.rng = np.random.default_rng(int.from_bytes(os.urandom(8), "little"))
 
     @staticmethod
     def _natural_sort_key(file_name: str) -> list:
-        return [
-            int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", file_name)
-        ]
+        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", file_name)]
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -287,9 +277,7 @@ class ImageDirectory:
 
         for i in range(0, len(self), batch_size):
             batch_paths = self[i : min(i + batch_size, len(self))]
-            images = [
-                self._decode(path, device=device, dtype=dtype) for path in batch_paths
-            ]
+            images = [self._decode(path, device=device, dtype=dtype) for path in batch_paths]
 
             if return_stem:
                 yield images, [path.stem for path in batch_paths]

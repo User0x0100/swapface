@@ -182,26 +182,22 @@ class SkipFusion(nn.Module):
 
 class FromRGB(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int):
-        super().__init__(
-            *[
-                nn.Conv2d(in_ch, out_ch, 5, stride=1, padding=2),
-                nn.SiLU(),
-                nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            ]
-        )
+        super().__init__(*[
+            nn.Conv2d(in_ch, out_ch, 5, stride=1, padding=2),
+            nn.SiLU(),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+        ])
 
 
 class ToRGB(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int):
-        super().__init__(
-            *[
-                nn.SiLU(),
-                nn.Conv2d(in_ch, out_ch, 3, padding=1),
-                nn.SiLU(),
-                nn.Conv2d(out_ch, out_ch, 1),
-                nn.Tanh(),
-            ]
-        )
+        super().__init__(*[
+            nn.SiLU(),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(out_ch, out_ch, 1),
+            nn.Tanh(),
+        ])
 
 
 class Generator(nn.Module):

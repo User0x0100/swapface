@@ -48,9 +48,7 @@ class WeightedFeatureMatchingLoss(nn.Module):
         self.reduction = reduction
         self.layer_weights = dict(layer_weights)
 
-    def forward(
-        self, predicted_features: list[Tensor], target_features: list[Tensor]
-    ) -> Tensor:
+    def forward(self, predicted_features: list[Tensor], target_features: list[Tensor]) -> Tensor:
         """计算两组 特征列表 的加权匹配损失。
 
         参数:
@@ -64,15 +62,11 @@ class WeightedFeatureMatchingLoss(nn.Module):
             ValueError: 两个特征列表长度不同。
             IndexError: 配置层索引超出特征列表范围。"""
         if len(predicted_features) != len(target_features):
-            raise ValueError(
-                f"feature list length mismatch: {len(predicted_features)} != {len(target_features)}"
-            )
+            raise ValueError(f"feature list length mismatch: {len(predicted_features)} != {len(target_features)}")
 
         max_index = max(self.layer_weights)
         if max_index >= len(predicted_features):
-            raise IndexError(
-                f"feature layer index {max_index} is out of range for {len(predicted_features)} features"
-            )
+            raise IndexError(f"feature layer index {max_index} is out of range for {len(predicted_features)} features")
 
         total: Tensor | None = None
         for index, weight in self.layer_weights.items():
@@ -140,30 +134,21 @@ class DINOv2PerceptualLoss(nn.Module):
         if blocks is None:
             raise TypeError(f"{dino_type} does not expose transformer blocks")
         block_count = len(blocks)
-        invalid_indices = sorted(
-            index for index in self.layer_weights if index >= block_count
-        )
+        invalid_indices = sorted(index for index in self.layer_weights if index >= block_count)
         if invalid_indices:
-            raise ValueError(
-                f"DINOv2 block indices out of range for {dino_type} "
-                f"with {block_count} blocks: {invalid_indices}"
-            )
+            raise ValueError(f"DINOv2 block indices out of range for {dino_type} with {block_count} blocks: {invalid_indices}")
         self.layer_indices = tuple(sorted(self.layer_weights))
 
         self.use_input_norm = use_input_norm
         if use_input_norm:
             self.register_buffer(
                 "mean",
-                torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(
-                    1, 3, 1, 1
-                ),
+                torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
                 persistent=False,
             )
             self.register_buffer(
                 "std",
-                torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(
-                    1, 3, 1, 1
-                ),
+                torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
                 persistent=False,
             )
 
@@ -182,12 +167,8 @@ class DINOv2PerceptualLoss(nn.Module):
 
         返回:
             各配置块的加权损失之和。"""
-        prediction = F.interpolate(
-            prediction, size=(224, 224), mode="bilinear", align_corners=False
-        )
-        target = F.interpolate(
-            target, size=(224, 224), mode="bilinear", align_corners=False
-        )
+        prediction = F.interpolate(prediction, size=(224, 224), mode="bilinear", align_corners=False)
+        target = F.interpolate(target, size=(224, 224), mode="bilinear", align_corners=False)
 
         if self.range_norm:
             prediction = prediction.add(1.0).mul(0.5)
@@ -199,15 +180,11 @@ class DINOv2PerceptualLoss(nn.Module):
             target = (target - mean) / std
 
         requested_blocks = list(self.layer_indices)
-        predicted_features = self.dino.get_intermediate_layers(
-            prediction, n=requested_blocks
-        )
+        predicted_features = self.dino.get_intermediate_layers(prediction, n=requested_blocks)
         target_features = self.dino.get_intermediate_layers(target, n=requested_blocks)
 
         total: Tensor | None = None
-        for block_index, predicted_feature, target_feature in zip(
-            self.layer_indices, predicted_features, target_features
-        ):
+        for block_index, predicted_feature, target_feature in zip(self.layer_indices, predicted_features, target_features):
             term = _weighted_feature_loss(
                 self.criterion,
                 predicted_feature,
@@ -254,20 +231,14 @@ class VGGPerceptualLoss(nn.Module):
             raise ValueError("layer_weights must not be empty")
 
         available_layers = get_vgg_layer_names(vgg_type)
-        unknown_layers = [
-            name for name in layer_weights if name not in available_layers
-        ]
+        unknown_layers = [name for name in layer_weights if name not in available_layers]
         if unknown_layers:
             raise ValueError(f"Unknown {vgg_type} layer names: {unknown_layers}")
 
         layer_order = {name: index for index, name in enumerate(available_layers)}
         ordered_layers = sorted(layer_weights, key=layer_order.__getitem__)
         self.layer_weights = tuple(layer_weights[name] for name in ordered_layers)
-        self.vgg = (
-            VGGFeatureExtractor(layer_names=ordered_layers, vgg_type=vgg_type)
-            .eval()
-            .requires_grad_(False)
-        )
+        self.vgg = VGGFeatureExtractor(layer_names=ordered_layers, vgg_type=vgg_type).eval().requires_grad_(False)
 
         self.criterion: CriterionFn = {
             "l1": F.l1_loss,
@@ -280,16 +251,12 @@ class VGGPerceptualLoss(nn.Module):
         if use_input_norm:
             self.register_buffer(
                 "mean",
-                torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(
-                    1, 3, 1, 1
-                ),
+                torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
                 persistent=False,
             )
             self.register_buffer(
                 "std",
-                torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(
-                    1, 3, 1, 1
-                ),
+                torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
                 persistent=False,
             )
 
@@ -322,9 +289,7 @@ class VGGPerceptualLoss(nn.Module):
         target_features = self.vgg(target)
 
         total: Tensor | None = None
-        for weight, predicted_feature, target_feature in zip(
-            self.layer_weights, predicted_features, target_features
-        ):
+        for weight, predicted_feature, target_feature in zip(self.layer_weights, predicted_features, target_features):
             term = _weighted_feature_loss(
                 self.criterion,
                 predicted_feature,

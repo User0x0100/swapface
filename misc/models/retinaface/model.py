@@ -71,9 +71,7 @@ class RetinaFace(nn.Module):
     def __init__(
         self,
         use_mobilenet: bool = False,
-        input_range: Literal[
-            "zero_to_255", "zero_to_one", "minus_one_to_one"
-        ] = "zero_to_255",
+        input_range: Literal["zero_to_255", "zero_to_one", "minus_one_to_one"] = "zero_to_255",
         color_order: Literal["rgb", "bgr"] = "rgb",
     ) -> None:
         super().__init__()
@@ -90,14 +88,10 @@ class RetinaFace(nn.Module):
 
         match config["backbone"]:
             case "mobilenet0.25":
-                checkpoint_path = hf_hub_download(
-                    repo_id=MODEL_REPOSITORY_ID, filename="mobilenet0.25_Final.pth"
-                )
+                checkpoint_path = hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename="mobilenet0.25_Final.pth")
                 backbone = MobileNetV1()
             case "resnet50":
-                checkpoint_path = hf_hub_download(
-                    repo_id=MODEL_REPOSITORY_ID, filename="Resnet50_Final.pth"
-                )
+                checkpoint_path = hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename="Resnet50_Final.pth")
                 backbone = models.resnet50(weights=None)
 
         self.body = _utils.IntermediateLayerGetter(backbone, config["return_layers"])
@@ -113,46 +107,30 @@ class RetinaFace(nn.Module):
         self.ssh2 = SSH(out_channels, out_channels)
         self.ssh3 = SSH(out_channels, out_channels)
 
-        self.class_heads = self._make_class_heads(
-            fpn_num=3, inchannels=config["out_channel"]
-        )
-        self.box_heads = self._make_box_heads(
-            fpn_num=3, inchannels=config["out_channel"]
-        )
-        self.landmark_heads = self._make_landmark_heads(
-            fpn_num=3, inchannels=config["out_channel"]
-        )
+        self.class_heads = self._make_class_heads(fpn_num=3, inchannels=config["out_channel"])
+        self.box_heads = self._make_box_heads(fpn_num=3, inchannels=config["out_channel"])
+        self.landmark_heads = self._make_landmark_heads(fpn_num=3, inchannels=config["out_channel"])
 
-        state_dict: dict[str, Tensor] = torch.load(
-            checkpoint_path, map_location="cpu", weights_only=True
-        )
-        state_dict = {
-            key.removeprefix("module."): value for key, value in state_dict.items()
-        }
+        state_dict: dict[str, Tensor] = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
         self.load_state_dict(state_dict)
 
         self.config = config
         self._priors_cache: OrderedDict[tuple[int, int, str], Tensor] = OrderedDict()
 
-    def _make_class_heads(
-        self, fpn_num: int = 3, inchannels: int = 64, anchor_num: int = 2
-    ) -> nn.ModuleList:
+    def _make_class_heads(self, fpn_num: int = 3, inchannels: int = 64, anchor_num: int = 2) -> nn.ModuleList:
         heads = nn.ModuleList()
         for _ in range(fpn_num):
             heads.append(ClassHead(inchannels, anchor_num))
         return heads
 
-    def _make_box_heads(
-        self, fpn_num: int = 3, inchannels: int = 64, anchor_num: int = 2
-    ) -> nn.ModuleList:
+    def _make_box_heads(self, fpn_num: int = 3, inchannels: int = 64, anchor_num: int = 2) -> nn.ModuleList:
         heads = nn.ModuleList()
         for _ in range(fpn_num):
             heads.append(BboxHead(inchannels, anchor_num))
         return heads
 
-    def _make_landmark_heads(
-        self, fpn_num: int = 3, inchannels: int = 64, anchor_num: int = 2
-    ) -> nn.ModuleList:
+    def _make_landmark_heads(self, fpn_num: int = 3, inchannels: int = 64, anchor_num: int = 2) -> nn.ModuleList:
         heads = nn.ModuleList()
         for _ in range(fpn_num):
             heads.append(LandmarkHead(inchannels, anchor_num))
@@ -209,12 +187,8 @@ class RetinaFace(nn.Module):
 
         if isinstance(images, Tensor):
             batch, scales = images, None
-        elif isinstance(images, (list, tuple)) and all(
-            isinstance(x, Tensor) for x in images
-        ):
-            batch, scales = _resize_and_pad_images(
-                images, self.config["image_size"], self.config["image_size"]
-            )
+        elif isinstance(images, (list, tuple)) and all(isinstance(x, Tensor) for x in images):
+            batch, scales = _resize_and_pad_images(images, self.config["image_size"], self.config["image_size"])
         else:
             raise TypeError("images 必须为 Tensor 或 tuple/list[Tensor]")
 
@@ -237,12 +211,8 @@ class RetinaFace(nn.Module):
         feature3 = self.ssh3(fpn[2])
         features = [feature1, feature2, feature3]
 
-        box_regression = torch.cat(
-            [self.box_heads[i](feature) for i, feature in enumerate(features)], dim=1
-        )
-        class_logits = torch.cat(
-            [self.class_heads[i](feature) for i, feature in enumerate(features)], dim=1
-        )
+        box_regression = torch.cat([self.box_heads[i](feature) for i, feature in enumerate(features)], dim=1)
+        class_logits = torch.cat([self.class_heads[i](feature) for i, feature in enumerate(features)], dim=1)
         landmark_regression = torch.cat(
             [self.landmark_heads[i](feature) for i, feature in enumerate(features)],
             dim=1,
@@ -296,21 +266,15 @@ class RetinaFace(nn.Module):
 
             filtered_priors = priors[confidence_mask]
             filtered_scores = scores[confidence_mask]
-            filtered_landmark_regression = landmark_regression[batch_index][
-                confidence_mask
-            ]
+            filtered_landmark_regression = landmark_regression[batch_index][confidence_mask]
 
-            boxes = decode_boxes(
-                box_regression[batch_index][confidence_mask], filtered_priors, variances
-            )
+            boxes = decode_boxes(box_regression[batch_index][confidence_mask], filtered_priors, variances)
             boxes[:, 0::2] *= width * inverse_scales[batch_index]
             boxes[:, 1::2] *= height * inverse_scales[batch_index]
 
             box_widths = boxes[:, 2] - boxes[:, 0]
             box_heights = boxes[:, 3] - boxes[:, 1]
-            size_mask = (box_widths >= min_face_size[0]) & (
-                box_heights >= min_face_size[1]
-            )
+            size_mask = (box_widths >= min_face_size[0]) & (box_heights >= min_face_size[1])
             if not size_mask.any():
                 segment_lengths.append(0)
                 continue
@@ -318,9 +282,7 @@ class RetinaFace(nn.Module):
             boxes = boxes[size_mask]
             filtered_scores = filtered_scores[size_mask]
             filtered_priors = filtered_priors[size_mask]
-            landmarks = decode_landmarks(
-                filtered_landmark_regression[size_mask], filtered_priors, variances
-            )
+            landmarks = decode_landmarks(filtered_landmark_regression[size_mask], filtered_priors, variances)
             landmarks[:, 0::2] *= width * inverse_scales[batch_index]
             landmarks[:, 1::2] *= height * inverse_scales[batch_index]
 
@@ -336,9 +298,7 @@ class RetinaFace(nn.Module):
             return box_regression.new_empty((0, 15)), segment_lengths
         return torch.cat(detections, dim=0), segment_lengths
 
-    def _get_priors(
-        self, height: int, width: int, device: torch.device | str = "cpu"
-    ) -> Tensor:
+    def _get_priors(self, height: int, width: int, device: torch.device | str = "cpu") -> Tensor:
         """
         生成给定输入分辨率下的 prior anchor grid。
 
@@ -375,12 +335,8 @@ class RetinaFace(nn.Module):
         for min_sizes_k, step in zip(min_sizes, steps):
             feature_h = ceil(height / step)
             feature_w = ceil(width / step)
-            ys = (
-                torch.arange(feature_h, device=device_obj, dtype=torch.float32) + 0.5
-            ) * (step / height)
-            xs = (
-                torch.arange(feature_w, device=device_obj, dtype=torch.float32) + 0.5
-            ) * (step / width)
+            ys = (torch.arange(feature_h, device=device_obj, dtype=torch.float32) + 0.5) * (step / height)
+            xs = (torch.arange(feature_w, device=device_obj, dtype=torch.float32) + 0.5) * (step / width)
             cy, cx = torch.meshgrid(ys, xs, indexing="ij")
             centers = torch.stack((cx, cy), dim=-1).reshape(-1, 1, 2)
 
@@ -409,9 +365,7 @@ class RetinaFace(nn.Module):
         return grid
 
 
-def _resize_and_pad_images(
-    images: tuple[Tensor, ...] | list[Tensor], output_height: int, output_width: int
-) -> tuple[Tensor, Tensor]:
+def _resize_and_pad_images(images: tuple[Tensor, ...] | list[Tensor], output_height: int, output_width: int) -> tuple[Tensor, Tensor]:
     """
     将一组不同尺寸的图像等比例缩放后 padding 到固定大小，左上角对齐。
 
@@ -437,21 +391,11 @@ def _resize_and_pad_images(
     device = images[0].device
     dtype = images[0].dtype
     channels = images[0].shape[0]
-    if any(
-        image.ndim != 3
-        or image.shape[0] != channels
-        or image.device != device
-        or image.dtype != dtype
-        for image in images
-    ):
-        raise ValueError(
-            "all images must be CHW tensors with matching channels, device, and dtype"
-        )
+    if any(image.ndim != 3 or image.shape[0] != channels or image.device != device or image.dtype != dtype for image in images):
+        raise ValueError("all images must be CHW tensors with matching channels, device, and dtype")
 
     # 输出张量初始化
-    output = torch.zeros(
-        (batch_size, channels, output_height, output_width), device=device, dtype=dtype
-    )
+    output = torch.zeros((batch_size, channels, output_height, output_width), device=device, dtype=dtype)
     scales = torch.zeros((batch_size, 1), device=device, dtype=dtype)
 
     for index, image in enumerate(images):
@@ -473,9 +417,7 @@ def _resize_and_pad_images(
     return output, scales
 
 
-def decode_boxes(
-    box_regression: Tensor, priors: Tensor, variances: list[float]
-) -> torch.Tensor:
+def decode_boxes(box_regression: Tensor, priors: Tensor, variances: list[float]) -> torch.Tensor:
     """
     将网络输出的 bbox 回归偏移解码为 (x1, y1, x2, y2) 格式的归一化坐标。
 
@@ -517,9 +459,7 @@ def decode_boxes(
     return boxes
 
 
-def decode_landmarks(
-    landmark_regression: Tensor, priors: Tensor, variances: list[float]
-) -> torch.Tensor:
+def decode_landmarks(landmark_regression: Tensor, priors: Tensor, variances: list[float]) -> torch.Tensor:
     """
     将网络输出的关键点回归偏移解码为归一化坐标。
 
@@ -627,9 +567,7 @@ def draw_detections(
                 kx_end = min(W, kx + half_size + 1)
                 ky_start = max(0, ky - half_size)
                 ky_end = min(H, ky + half_size + 1)
-                image[:, ky_start:ky_end, kx_start:kx_end] = (
-                    color_tensor  # 填充正方形区域
-                )
+                image[:, ky_start:ky_end, kx_start:kx_end] = color_tensor  # 填充正方形区域
 
     return new_images
 
@@ -661,9 +599,7 @@ if __name__ == "__main__":
     dataset = ImageDirectory("/home/liaohaixun/swap/IDAssets")
     # dataset = ImageDirectory("/opt/share/deepfake/dataset_1/ffhq_1024")
 
-    images_org = [
-        dataset.sample_tensor().float().to(device=device) for _ in range(batch_size)
-    ]
+    images_org = [dataset.sample_tensor().float().to(device=device) for _ in range(batch_size)]
 
     # images_org = torch.stack(images_org)
 

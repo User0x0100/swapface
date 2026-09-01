@@ -140,9 +140,7 @@ def _ntuple(n):
 to_2tuple = _ntuple(2)
 
 
-def drop_path(
-    x, drop_prob: float = 0.0, training: bool = False, scale_by_keep: bool = True
-):
+def drop_path(x, drop_prob: float = 0.0, training: bool = False, scale_by_keep: bool = True):
     """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
 
     This is the same as the DropConnect impl I created for EfficientNet, etc networks, however,
@@ -155,9 +153,7 @@ def drop_path(
     if drop_prob == 0.0 or not training:
         return x
     keep_prob = 1 - drop_prob
-    shape = (x.shape[0],) + (1,) * (
-        x.ndim - 1
-    )  # work with diff dim tensors, not just 2D ConvNets
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
     random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
     if keep_prob > 0.0 and scale_by_keep:
         random_tensor.div_(keep_prob)
@@ -242,7 +238,8 @@ class Attention(nn.Module):
             batch_size, num_token, embed_dim = x.shape
             # qkv is [3,batch_size,num_heads,num_token, embed_dim//num_heads]
             qkv = (
-                self.qkv(x)
+                self
+                .qkv(x)
                 .reshape(
                     batch_size,
                     num_token,
@@ -306,9 +303,7 @@ class Block(nn.Module):
             act_layer=act_layer,
             drop=drop,
         )
-        self.extra_gflops: float = (
-            num_heads * patch_n * (dim // num_heads) * patch_n * 2
-        ) / (1000**3)
+        self.extra_gflops: float = (num_heads * patch_n * (dim // num_heads) * patch_n * 2) / (1000**3)
 
     def forward(self, x):
         x = x + self.drop_path(self.attn(self.norm1(x)))
@@ -326,15 +321,11 @@ class PatchEmbed(nn.Module):
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = num_patches
-        self.proj = nn.Conv2d(
-            in_channels, embed_dim, kernel_size=patch_size, stride=patch_size
-        )
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x):
         _, _, height, width = x.shape
-        assert height == self.img_size[0] and width == self.img_size[1], (
-            f"Input image size ({height}*{width}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        )
+        assert height == self.img_size[0] and width == self.img_size[1], f"Input image size ({height}*{width}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x).flatten(2).transpose(1, 2)
 
         return x
@@ -388,30 +379,26 @@ class VisionTransformer(nn.Module):
         # stochastic depth decay rule
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         patch_n = (img_size // patch_size) ** 2
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    dim=embed_dim,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias,
-                    qk_scale=qk_scale,
-                    drop=drop_rate,
-                    attn_drop=attn_drop_rate,
-                    drop_path=dpr[i],
-                    norm_layer=norm_layer,
-                    num_patches=num_patches,
-                    patch_n=patch_n,
-                )
-                for i in range(depth)
-            ]
-        )
+        self.blocks = nn.ModuleList([
+            Block(
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[i],
+                norm_layer=norm_layer,
+                num_patches=num_patches,
+                patch_n=patch_n,
+            )
+            for i in range(depth)
+        ])
         self.extra_gflops: float = 0.0
         for block in self.blocks:
             if not isinstance(block, Block):
-                raise TypeError(
-                    f"expected Block in transformer ModuleList, got {type(block).__name__}"
-                )
+                raise TypeError(f"expected Block in transformer ModuleList, got {type(block).__name__}")
             self.extra_gflops += block.extra_gflops
 
         if norm_layer == "ln":
@@ -421,9 +408,7 @@ class VisionTransformer(nn.Module):
 
         # features head
         self.feature = nn.Sequential(
-            nn.Linear(
-                in_features=embed_dim * num_patches, out_features=embed_dim, bias=False
-            ),
+            nn.Linear(in_features=embed_dim * num_patches, out_features=embed_dim, bias=False),
             nn.BatchNorm1d(num_features=embed_dim, eps=2e-5),
             nn.Linear(in_features=embed_dim, out_features=num_classes, bias=False),
             nn.BatchNorm1d(num_features=num_classes, eps=2e-5),
@@ -510,13 +495,9 @@ class VisionTransformer(nn.Module):
         x = self.norm(x.float())
 
         if self.training and self.mask_ratio > 0:
-            mask_tokens = self.mask_token.repeat(
-                x.shape[0], ids_restore.shape[1] - x.shape[1], 1
-            )
+            mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] - x.shape[1], 1)
             x_ = torch.cat([x[:, :, :], mask_tokens], dim=1)  # no cls token
-            x_ = torch.gather(
-                x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2])
-            )  # unshuffle
+            x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
             x = x_
 
         orginal = x

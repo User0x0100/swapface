@@ -12,9 +12,7 @@ def _validate_rgb_image(image: Tensor) -> None:
     if not isinstance(image, Tensor):
         raise TypeError(f"image must be a Tensor, got {type(image).__name__}")
     if image.ndim < 3 or image.shape[-3] != RGB_CHANNELS:
-        raise ValueError(
-            f"image must have shape (*, {RGB_CHANNELS}, H, W), got {tuple(image.shape)}"
-        )
+        raise ValueError(f"image must have shape (*, {RGB_CHANNELS}, H, W), got {tuple(image.shape)}")
 
 
 def rgb_to_linear_rgb(image: Tensor) -> Tensor:
@@ -33,9 +31,7 @@ def rgb_to_linear_rgb(image: Tensor) -> Tensor:
 
     _validate_rgb_image(image)
 
-    lin_rgb: Tensor = torch.where(
-        image > 0.04045, torch.pow(((image + 0.055) / 1.055), 2.4), image / 12.92
-    )
+    lin_rgb: Tensor = torch.where(image > 0.04045, torch.pow(((image + 0.055) / 1.055), 2.4), image / 12.92)
 
     return lin_rgb
 
@@ -92,9 +88,7 @@ def rgb_to_lab(image: Tensor) -> Tensor:
     xyz_im: Tensor = rgb_to_xyz(lin_rgb)
 
     # normalize for D65 white point
-    xyz_ref_white = torch.tensor(
-        [0.95047, 1.0, 1.08883], device=xyz_im.device, dtype=xyz_im.dtype
-    )[..., :, None, None]
+    xyz_ref_white = torch.tensor([0.95047, 1.0, 1.08883], device=xyz_im.device, dtype=xyz_im.dtype)[..., :, None, None]
     xyz_normalized = torch.div(xyz_im, xyz_ref_white)
 
     threshold = 0.008856
@@ -141,9 +135,7 @@ class LabStyleLoss(nn.Module):
         """计算两组 Lab 特征均值与标准差的 L1 距离。"""
         prediction_mean, prediction_std = self._mean_std(prediction)
         target_mean, target_std = self._mean_std(target)
-        return F.l1_loss(prediction_mean, target_mean) + F.l1_loss(
-            prediction_std, target_std
-        )
+        return F.l1_loss(prediction_mean, target_mean) + F.l1_loss(prediction_std, target_std)
 
     @torch.compile(
         fullgraph=True,
@@ -164,9 +156,7 @@ class LabStyleLoss(nn.Module):
             ValueError: 两个输入形状不一致或输入不符合 RGB 图像约定。
         """
         if prediction_rgb.shape != target_rgb.shape:
-            raise ValueError(
-                f"prediction and target shapes must match: {tuple(prediction_rgb.shape)} != {tuple(target_rgb.shape)}"
-            )
+            raise ValueError(f"prediction and target shapes must match: {tuple(prediction_rgb.shape)} != {tuple(target_rgb.shape)}")
 
         if self.range_norm:
             prediction_rgb = prediction_rgb.add(1.0).mul(0.5)

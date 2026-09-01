@@ -56,15 +56,9 @@ class FaceMasker(nn.Module):
                 activation=None,
             )
 
-            checkpoint_path = hf_hub_download(
-                repo_id=MODEL_REPOSITORY_ID, filename="epoch_16_best.ckpt"
-            )
-            state_dict: dict[str, Tensor] = torch.load(
-                checkpoint_path, map_location="cpu", weights_only=True
-            )
-            state_dict = {
-                key.removeprefix("module."): value for key, value in state_dict.items()
-            }
+            checkpoint_path = hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename="epoch_16_best.ckpt")
+            state_dict: dict[str, Tensor] = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
             self.model.load_state_dict(state_dict)
 
         else:
@@ -72,14 +66,8 @@ class FaceMasker(nn.Module):
             from .bisenet import BiSeNet
 
             self.model = BiSeNet(n_classes=19)
-            weight_path = hf_hub_download(
-                repo_id=MODEL_REPOSITORY_ID, filename="79999_iter.pth"
-            )
-            self.model.load_state_dict(
-                torch.load(
-                    weight_path, map_location=torch.device("cpu"), weights_only=True
-                )
-            )
+            weight_path = hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename="79999_iter.pth")
+            self.model.load_state_dict(torch.load(weight_path, map_location=torch.device("cpu"), weights_only=True))
 
     def forward(self, images: Tensor) -> Tensor:
 
@@ -104,11 +92,7 @@ class FaceMasker(nn.Module):
             mask = (mask > 0).float()
         else:
             parsing = mask.argmax(dim=1)
-            mask = (
-                torch.isin(parsing, self.get_buffer("face_part_indices"))
-                .float()
-                .unsqueeze(1)
-            )
+            mask = torch.isin(parsing, self.get_buffer("face_part_indices")).float().unsqueeze(1)
 
         return mask
 
@@ -126,12 +110,7 @@ if __name__ == "__main__":
     masker = FaceMasker(input_range="minus_one_to_one", mode="occlusion")
     masker.to(device)
 
-    images = [
-        read_image(
-            f"/opt/share/deepfake/dataset_1/ffhq_1024/{random.randint(0, 69999):05d}.png"
-        )
-        for _ in range(batch_size)
-    ]
+    images = [read_image(f"/opt/share/deepfake/dataset_1/ffhq_1024/{random.randint(0, 69999):05d}.png") for _ in range(batch_size)]
 
     # 0~1
     # images = [img.float().div(255.0) for img in images]
@@ -166,6 +145,4 @@ if __name__ == "__main__":
     mask = (mask.repeat(1, 3, 1, 1) - 0.5) / 0.5
 
     grid = torch.cat((mask, images), dim=0)
-    utils.save_image(
-        grid, "mask.png", nrow=batch_size, normalize=True, value_range=(-1, 1)
-    )
+    utils.save_image(grid, "mask.png", nrow=batch_size, normalize=True, value_range=(-1, 1))

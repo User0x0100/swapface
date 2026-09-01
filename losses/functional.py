@@ -42,9 +42,7 @@ def _weighted_feature_loss(
     return reduced * weight
 
 
-def _make_weighted_loss(
-    loss_fn: CriterionFn, weight: float = 1.0, reduction: Reduction = "mean"
-) -> LossFn:
+def _make_weighted_loss(loss_fn: CriterionFn, weight: float = 1.0, reduction: Reduction = "mean") -> LossFn:
     """将任意损失函数包装为带权重的版本。
 
     参数:
@@ -62,9 +60,7 @@ def _make_weighted_loss(
     return wrapper
 
 
-def charbonnier_loss(
-    pred: Tensor, target: Tensor, reduction: Reduction = "mean"
-) -> Tensor:
+def charbonnier_loss(pred: Tensor, target: Tensor, reduction: Reduction = "mean") -> Tensor:
     """Charbonnier 损失（pseudo-Huber / L1 平滑近似）。
 
     计算公式：``loss = sqrt((pred - target)^2 + eps)``，
@@ -169,9 +165,7 @@ def make_bce_loss(weight: float = 1.0, reduction: Reduction = "mean") -> LossFn:
     return disable_amp
 
 
-def make_bce_with_logits_loss(
-    weight: float = 1.0, reduction: Reduction = "mean"
-) -> LossFn:
+def make_bce_with_logits_loss(weight: float = 1.0, reduction: Reduction = "mean") -> LossFn:
     """工厂函数：返回带权重的 BCE-with-logits 损失（强制禁用 AMP）。
 
     接受未经 sigmoid 的 logits，内部数值更稳定。
@@ -217,9 +211,7 @@ def r1_reg_loss(real_score: Tensor, real_image: Tensor, gamma: float = 10.0) -> 
     if gamma < 0:
         raise ValueError(f"gamma must be non-negative, got {gamma}")
     if not real_image.requires_grad:
-        raise ValueError(
-            "real_image must have requires_grad=True before the discriminator forward pass"
-        )
+        raise ValueError("real_image must have requires_grad=True before the discriminator forward pass")
 
     gradients = torch.autograd.grad(
         outputs=real_score.sum(),

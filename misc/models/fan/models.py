@@ -12,9 +12,7 @@ class Bottleneck(nn.Module):
         super().__init__()
         self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(
-            planes, planes, kernel_size=3, stride=stride, padding=1, bias=False
-        )
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
         self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm2d(planes * 4)
@@ -49,9 +47,7 @@ class ResNetDepth(nn.Module):
     def __init__(self, block=Bottleneck, layers=(3, 8, 36, 3), num_classes=68):
         self.inplanes = 64
         super().__init__()
-        self.conv1 = nn.Conv2d(
-            3 + 68, 64, kernel_size=7, stride=2, padding=3, bias=False
-        )
+        self.conv1 = nn.Conv2d(3 + 68, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
@@ -104,9 +100,7 @@ class ResNetDepth(nn.Module):
 
 def conv3x3(in_planes, out_planes, strd=1, padding=1, bias=False):
     "3x3 convolution with padding"
-    return nn.Conv2d(
-        in_planes, out_planes, kernel_size=3, stride=strd, padding=padding, bias=bias
-    )
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=strd, padding=padding, bias=bias)
 
 
 class ConvBlock(nn.Module):
@@ -170,9 +164,7 @@ class HourGlass(nn.Module):
         if level > 1:
             self._generate_network(level - 1)
         else:
-            self.add_module(
-                "b2_plus_" + str(level), ConvBlock(self.features, self.features)
-            )
+            self.add_module("b2_plus_" + str(level), ConvBlock(self.features, self.features))
 
         self.add_module("b3_" + str(level), ConvBlock(self.features, self.features))
 
@@ -254,9 +246,7 @@ class FAN(nn.Module):
             ll = cast(nn.Module, self._modules["top_m_" + str(i)])(ll)
 
             ll = F.relu(
-                cast(nn.Module, self._modules["bn_end" + str(i)])(
-                    cast(nn.Module, self._modules["conv_last" + str(i)])(ll)
-                ),
+                cast(nn.Module, self._modules["bn_end" + str(i)])(cast(nn.Module, self._modules["conv_last" + str(i)])(ll)),
                 True,
             )
 

@@ -43,13 +43,9 @@ class Flatten(Module):
 class LinearBlock(Module):
     """Convolution block without no-linear activation layer"""
 
-    def __init__(
-        self, in_c, out_c, kernel=(1, 1), stride=(1, 1), padding=(0, 0), groups=1
-    ):
+    def __init__(self, in_c, out_c, kernel=(1, 1), stride=(1, 1), padding=(0, 0), groups=1):
         super().__init__()
-        self.conv = Conv2d(
-            in_c, out_c, kernel, stride, padding, groups=groups, bias=False
-        )
+        self.conv = Conv2d(in_c, out_c, kernel, stride, padding, groups=groups, bias=False)
         self.bn = BatchNorm2d(out_c)
 
     def forward(self, x):
@@ -84,9 +80,7 @@ class GDC(Module):
 
     def __init__(self, in_c, embedding_size):
         super().__init__()
-        self.conv_6_dw = LinearBlock(
-            in_c, in_c, groups=in_c, kernel=(7, 7), stride=(1, 1), padding=(0, 0)
-        )
+        self.conv_6_dw = LinearBlock(in_c, in_c, groups=in_c, kernel=(7, 7), stride=(1, 1), padding=(0, 0))
         self.conv_6_flatten = Flatten()
         self.linear = Linear(in_c, embedding_size, bias=False)
         self.bn = BatchNorm1d(embedding_size, affine=False)
@@ -105,16 +99,12 @@ class SEModule(Module):
     def __init__(self, channels, reduction):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc1 = Conv2d(
-            channels, channels // reduction, kernel_size=1, padding=0, bias=False
-        )
+        self.fc1 = Conv2d(channels, channels // reduction, kernel_size=1, padding=0, bias=False)
 
         nn.init.xavier_uniform_(self.fc1.weight.data)
 
         self.relu = ReLU(inplace=True)
-        self.fc2 = Conv2d(
-            channels // reduction, channels, kernel_size=1, padding=0, bias=False
-        )
+        self.fc2 = Conv2d(channels // reduction, channels, kernel_size=1, padding=0, bias=False)
 
         self.sigmoid = Sigmoid()
 
@@ -207,9 +197,7 @@ class Bottleneck(namedtuple("Block", ["in_channel", "depth", "stride"])):
 
 def get_block(in_channel, depth, num_units, stride=2):
 
-    return [Bottleneck(in_channel, depth, stride)] + [
-        Bottleneck(depth, depth, 1) for i in range(num_units - 1)
-    ]
+    return [Bottleneck(in_channel, depth, stride)] + [Bottleneck(depth, depth, 1) for i in range(num_units - 1)]
 
 
 def get_blocks(num_layers):
@@ -267,16 +255,10 @@ class Backbone(Module):
         mode: support ir or irse
         """
         super().__init__()
-        assert input_size[0] in [112, 224], (
-            "input_size should be [112, 112] or [224, 224]"
-        )
-        assert num_layers in [18, 34, 50, 100, 152, 200], (
-            "num_layers should be 18, 34, 50, 100 or 152"
-        )
+        assert input_size[0] in [112, 224], "input_size should be [112, 112] or [224, 224]"
+        assert num_layers in [18, 34, 50, 100, 152, 200], "num_layers should be 18, 34, 50, 100 or 152"
         assert mode in ["ir", "ir_se"], "mode should be ir or ir_se"
-        self.input_layer = Sequential(
-            Conv2d(3, 64, (3, 3), 1, 1, bias=False), BatchNorm2d(64), PReLU(64)
-        )
+        self.input_layer = Sequential(Conv2d(3, 64, (3, 3), 1, 1, bias=False), BatchNorm2d(64), PReLU(64))
         blocks = get_blocks(num_layers)
         if num_layers <= 100:
             if mode == "ir":
@@ -311,11 +293,7 @@ class Backbone(Module):
         modules = []
         for block in blocks:
             for bottleneck in block:
-                modules.append(
-                    unit_module(
-                        bottleneck.in_channel, bottleneck.depth, bottleneck.stride
-                    )
-                )
+                modules.append(unit_module(bottleneck.in_channel, bottleneck.depth, bottleneck.stride))
         self.body = Sequential(*modules)
 
         initialize_weights(self.modules())
