@@ -20,6 +20,7 @@ from tqdm import tqdm
 from losses import (
     DiscriminatorAdversarialLoss,
     DSSIMLoss,
+    GazeLoss,
     GeneratorAdversarialLoss,
     IdentityLoss,
     IFSRLoss,
@@ -129,6 +130,11 @@ class Trainer:
         # 结构损失
         enable_dssim_loss: bool = False,
         dssim_loss_weight: float = 10.0,
+        # gaze 保持损失
+        enable_gaze_loss: bool = False,
+        gaze_loss_weight: float = 1.0,
+        gaze_distribution_weight: float = 0.1,
+        gaze_confidence_weighted: bool = True,
     ):
         if dataloader_cfg is None:
             dataloader_cfg = dict(DEFAULT_DATALOADER_CONFIG)
@@ -167,6 +173,7 @@ class Trainer:
         self.enable_ifsr_loss = enable_ifsr_loss
         self.enable_color_loss = enable_color_loss
         self.enable_dssim_loss = enable_dssim_loss
+        self.enable_gaze_loss = enable_gaze_loss
 
         self.bf16 = bool(bf16 and torch.cuda.is_bf16_supported())
         if bf16 and not self.bf16:
@@ -244,6 +251,9 @@ class Trainer:
 
         if self.enable_dssim_loss:
             self.dssim_loss = DSSIMLoss(weight=dssim_loss_weight, reduction="mean").to(self.device)
+
+        if self.enable_gaze_loss:
+            self.gaze_loss = GazeLoss(weight=gaze_loss_weight, distribution_weight=gaze_distribution_weight, confidence_weighted=gaze_confidence_weighted).to(self.device)
 
         # ========================= LOG =========================
         base_log_path = Path(log_path)
@@ -497,6 +507,12 @@ class Trainer:
                     self.log("dssim_loss", dssim_loss)
                     g_loss += dssim_loss
 
+                # gaze_loss: preserve target gaze using the unblurred generator input.
+                if self.enable_gaze_loss:
+                    gaze_loss = self.gaze_loss(fake, dst_org)
+                    self.log("gaze_loss", gaze_loss)
+                    g_loss += gaze_loss
+
             g_loss.backward()
             self.optim_g.step()
 
@@ -593,6 +609,10 @@ if __name__ == "__main__":
         "log_path": "train_log/512-MS1MV3_ARCFACE_R50_FP16",
         "batch_size": 16,
         "id_encoder_provider": IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16,
+        "enable_gaze_loss": True,
+        "gaze_loss_weight": 1.0,
+        "gaze_distribution_weight": 0.1,
+        "gaze_confidence_weighted": True,
         "dataloader_cfg": {
             "num_threads": 16,
             "prefetch_queue_depth": 4,

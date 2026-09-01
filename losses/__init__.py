@@ -9,6 +9,7 @@ from .functional import (
     make_orthogonal_loss,
     r1_reg_loss,
 )
+from .gaze import GazeLoss
 from .identity import IdentityLoss, IFSRLoss
 from .perceptual import (
     DINOv2PerceptualLoss,
@@ -22,6 +23,7 @@ __all__ = [
     "DINOv2PerceptualLoss",
     "DSSIMLoss",
     "DiscriminatorAdversarialLoss",
+    "GazeLoss",
     "GeneratorAdversarialLoss",
     "IFSRLoss",
     "IdentityLoss",
