@@ -168,8 +168,10 @@ class WSpaceMap(nn.Module):
 
     def forward(self, id_feat: Tensor) -> tuple[Tensor, ...]:
         w = id_feat + self.shared_delta(id_feat)
-
-        return tuple(w + head(w) for head in self.private_delta)
+        outputs: list[Tensor] = []
+        for head in self.private_delta:
+            outputs.append(w + head(w))
+        return tuple(outputs)
 
 
 class LatentBlock(nn.Module):
@@ -182,8 +184,8 @@ class LatentBlock(nn.Module):
 
         assert len(w_space) == len(self.layers), f"w_p_all length {len(w_space)} != layers length {len(self.layers)}"
 
-        for layer, w_p in zip(self.layers, w_space):
-            x = layer(x, w_p)
+        for layer_index, layer in enumerate(self.layers):
+            x = layer(x, w_space[layer_index])
 
         return x
 

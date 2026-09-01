@@ -139,9 +139,16 @@ class Trainer:
         self.enable_rec_loss = enable_rec_loss
         self.enable_wfm_loss = enable_wfm_loss
 
-        self.bf16 = bool(bf16 and torch.cuda.is_bf16_supported())
+        device_id = self.device.index if self.device.index is not None else torch.cuda.current_device()
+        compute_capability = torch.cuda.get_device_capability(device_id)
+        bf16_runtime_supported = torch.cuda.is_bf16_supported()
+        bf16_compile_supported = compute_capability[0] >= 8
+        self.bf16 = bool(bf16 and bf16_runtime_supported and (not compile_module or bf16_compile_supported))
         if bf16 and not self.bf16:
-            print("警告：当前显卡不支持 BF16")
+            if compile_module and bf16_runtime_supported and not bf16_compile_supported:
+                print(f"警告：当前 GPU SM{compute_capability[0]}{compute_capability[1]} 可运行 BF16，但 torch.compile 不支持该架构的 BF16，训练自动回退 FP32")
+            else:
+                print("警告：当前显卡不支持 BF16，训练自动回退 FP32")
 
         self.sample_save_every = sample_save_every
         self.weight_save_every = weight_save_every
@@ -290,7 +297,6 @@ class Trainer:
 
         # ========================= 数据采样 =========================
 
-        device_id = self.device.index if self.device.index is not None else torch.cuda.current_device()
         pipe = create_dataloader_pipeline(
             batch_size=self.batch_size,
             device_id=device_id,
