@@ -1,6 +1,5 @@
 import torch
-from torch import Tensor
-import torch.nn as nn
+from torch import Tensor, nn
 
 
 class AdaIN(nn.Module):
@@ -107,12 +106,17 @@ class WSpaceMap(nn.Module):
         self.num = num
         self.id_dim = id_dim
 
-        nn.init.zeros_(self.shared_delta[-1].weight)
-        nn.init.zeros_(self.shared_delta[-1].bias)
+        shared_output = self.shared_delta[-1]
+        assert isinstance(shared_output, nn.Linear)
+        nn.init.zeros_(shared_output.weight)
+        nn.init.zeros_(shared_output.bias)
 
         for head in self.private_delta:
-            nn.init.zeros_(head[-1].weight)
-            nn.init.zeros_(head[-1].bias)
+            assert isinstance(head, nn.Sequential)
+            private_output = head[-1]
+            assert isinstance(private_output, nn.Linear)
+            nn.init.zeros_(private_output.weight)
+            nn.init.zeros_(private_output.bias)
 
     def forward(self, id_feat: Tensor) -> tuple[Tensor, ...]:
         w = id_feat + self.shared_delta(id_feat)
@@ -182,8 +186,8 @@ class Generator(nn.Module):
 
 if __name__ == "__main__":
     import torch
-    from torchinfo import summary
     from fvcore.nn import FlopCountAnalysis
+    from torchinfo import summary
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 1

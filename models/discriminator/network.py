@@ -1,6 +1,8 @@
 import math
+
 import torch
-from torch import nn, Tensor
+from torch import Tensor, nn
+
 from .upfirdn2d import DownFIRDn2d
 
 
@@ -52,7 +54,7 @@ class DownRB(nn.Module):
         return (self.shortcut(x) + self.residual(x)) * self.scale
 
 
-class AlphaFaceDiscriminator(nn.Module):
+class Discriminator(nn.Module):
     def __init__(self, img_resolution: int = 256, img_channels: int = 3, base_ch: int = 64, max_ch: int = 512, group_size: int = 4):
         super().__init__()
 

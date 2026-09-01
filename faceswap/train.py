@@ -33,7 +33,7 @@ from misc.face_alignment import center_crop_and_resize
 from misc.models import ImageInputRange
 from misc.models.face_mask import FaceMasker
 from misc.models.id_encoder import IDEncoderProvider
-from models.discriminator import AlphaFaceDiscriminator
+from models.discriminator import Discriminator
 from models.networks import Generator
 
 from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, ImageDecoderBackend, ImageSource, create_dataloader_pipeline
@@ -195,7 +195,7 @@ class Trainer:
             self.img_resolution = ckpt["net_g"]["network_cfg"]["img_resolution"]
 
             net_g = Generator(**ckpt["net_g"]["network_cfg"])
-            net_d = AlphaFaceDiscriminator(**ckpt["net_d"]["network_cfg"])
+            net_d = Discriminator(**ckpt["net_d"]["network_cfg"])
             net_g.load_state_dict(ckpt["net_g"]["state_dict"])
             net_d.load_state_dict(ckpt["net_d"]["state_dict"])
 
@@ -204,9 +204,8 @@ class Trainer:
                 raise ValueError("net_g_cfg 和 net_d_cfg 在未提供 ckpt 时不能为空")
             self.iter, self.img_resolution = 0, net_g_cfg["img_resolution"]
             net_g = Generator(**net_g_cfg)
-            net_d = AlphaFaceDiscriminator(**net_d_cfg)
+            net_d = Discriminator(**net_d_cfg)
 
-        # net_d = Discriminator(**net_d_cfg)
         self.net_g = net_g.to(self.device).train()
         self.net_d = net_d.to(self.device).train()
 

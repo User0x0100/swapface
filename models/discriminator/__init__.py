@@ -1,12 +1,3 @@
-from .alphaface import AlphaFaceDiscriminator
-from .original import Discriminator
-from .stylegan2 import Stylegan2DiscriminatorLite
-from .unet_sn import UNetDiscriminatorSN
+from .network import Discriminator
 
-
-__all__ = [
-    "AlphaFaceDiscriminator",
-    "Discriminator",
-    "Stylegan2DiscriminatorLite",
-    "UNetDiscriminatorSN",
-]
+__all__ = ["Discriminator"]
