@@ -138,7 +138,6 @@ class RetinaFace(nn.Module):
             heads.append(LandmarkHead(inchannels, anchor_num))
         return heads
 
-    @torch.inference_mode()
     def detect(
         self,
         images: list[Tensor] | tuple[Tensor, ...] | Tensor,
@@ -495,7 +494,6 @@ def decode_landmarks(landmark_regression: Tensor, priors: Tensor, variances: lis
     return landmarks
 
 
-@torch.inference_mode()
 def draw_detections(
     images: Tensor | tuple[Tensor] | list[Tensor],
     detections: Tensor,

@@ -166,7 +166,6 @@ class FANLandmarkModel(nn.Module):
 
         return kernel
 
-    @torch.inference_mode()
     def forward(self, image: Tensor, return_scores: bool = False):
         if image.ndim != 4:
             raise ValueError(f"image must be NCHW, got shape={tuple(image.shape)}")
@@ -516,9 +515,8 @@ if __name__ == "__main__":
     net = FANLandmarkModel(LandmarkMode.L3D).to(device)
     net.eval()
 
-    with torch.no_grad():
-        lmks = net(images)
-        print(f"关键点形状: {lmks.shape}")
+    lmks = net(images)
+    print(f"关键点形状: {lmks.shape}")
 
     # 使用PyTorch绘制关键点
     images_with_landmarks = draw_landmarks_on_tensor(images, lmks, color=(0, 1, 0), radius=2)

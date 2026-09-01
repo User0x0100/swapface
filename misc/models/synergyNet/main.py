@@ -215,11 +215,10 @@ if __name__ == "__main__":
     net = SynergyNet().to(device)
     net.eval()
 
-    with torch.no_grad():
-        _3D_attr, _ = net(F.interpolate(images_BGR, INPUT_SIZE, mode="bilinear", align_corners=False))
-        lmks = net.reconstruct_vertex_62(_3D_attr)
-        print(f"关键点形状: {lmks.shape}")
-        lmks *= scale
+    _3D_attr, _ = net(F.interpolate(images_BGR, INPUT_SIZE, mode="bilinear", align_corners=False))
+    lmks = net.reconstruct_vertex_62(_3D_attr)
+    print(f"关键点形状: {lmks.shape}")
+    lmks *= scale
 
     # 使用PyTorch绘制关键点
     images_with_landmarks = draw_landmarks_on_tensor(images, lmks, color=(-1, 1, -1), radius=3)

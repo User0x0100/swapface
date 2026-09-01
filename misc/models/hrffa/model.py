@@ -289,7 +289,6 @@ class HRFFALandmarkModel(nn.Module):
             x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False, antialias=True)
         return x, height
 
-    @torch.inference_mode()
     def forward(self, images: Tensor, return_visibility: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         """Predict pixel-space landmarks for square whole-head crops."""
         x, original_size = self._prepare_input(images)

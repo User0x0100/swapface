@@ -106,6 +106,7 @@ def _decode_webp(data: bytes) -> Tensor:
     return decode_image(encoded, mode=ImageReadMode.RGB)
 
 
+@torch.inference_mode()
 def _infer_batch(
     model: HRFFALandmarkModel,
     device: torch.device,
@@ -224,7 +225,7 @@ def main() -> None:
     print(f"selected_shards={len(shards)} limit={'all' if global_limit is None else global_limit}")
     print(f"output={output_dir}")
 
-    model = HRFFALandmarkModel(scheme=scheme, input_range=ImageInputRange.ZERO_TO_255, variant=variant, teacher_checkpoint=args.teacher_checkpoint).to(device)
+    model = HRFFALandmarkModel(scheme=scheme, input_range=ImageInputRange.ZERO_TO_255, variant=variant, teacher_checkpoint=args.teacher_checkpoint).to(device).eval()
 
     total_processed = 0
     written_files: list[str] = []

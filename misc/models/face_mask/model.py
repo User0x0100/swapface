@@ -127,14 +127,13 @@ if __name__ == "__main__":
     for i in range(10):
         mask = masker(images)
 
-    with torch.inference_mode():
-        # 性能测试
-        print("执行性能测试...")
-        times = []
-        for i in range(100):
-            start_time = time.time()
-            mask = masker(images)
-            times.append((time.time() - start_time) * 1000)
+    # 性能测试
+    print("执行性能测试...")
+    times = []
+    for i in range(100):
+        start_time = time.time()
+        mask = masker(images)
+        times.append((time.time() - start_time) * 1000)
 
     avg_time = sum(times) / len(times)
     min_time = min(times)
