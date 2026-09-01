@@ -11,7 +11,8 @@
 图片源:
     每个源可以是路径，也可以是 ``(path, adjustment)``。文件夹首先按
     ``sqrt(file_count) * 2**adjustment`` 分配采样概率，再在选中的文件夹内均匀
-    采样图片。``adjustment=1`` 表示将该文件夹的基础权重翻倍，``-1`` 表示减半。
+    采样图片。也支持 ``HuggingFaceImageSource`` 远程图片池，图片按需下载并复用 Hub cache。
+    ``adjustment=1`` 表示将该数据源的基础权重翻倍，``-1`` 表示减半。
 
 性能原则:
     Python 侧只负责目录扫描和读取压缩图像字节；解码后的 resize、flip、颜色增强、
@@ -25,24 +26,79 @@
     ``torch.nn.functional.affine_grid(..., align_corners=False)``。
 """
 
+import hashlib
+import json
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 from enum import Enum
+from functools import cache
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import constants as hf_constants
+from huggingface_hub.constants import HF_HUB_CACHE
+from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.utils import disable_progress_bars
 from numpy import ndarray
 from nvidia.dali import fn, pipeline_def
 from nvidia.dali.math import clamp
 from nvidia.dali.types import DALIDataType, DALIImageType, DALIInterpType
 
 type ImagePath = str | os.PathLike[str]
-type ImageSource = ImagePath | tuple[ImagePath, float]
-type ImageFolder = tuple[str, tuple[str, ...]]
 type FloatRange = tuple[float, float]
 
+
+def _configure_huggingface_hub() -> None:
+    """关闭训练数据下载的 Xet/CAS 路径与终端进度条。
+
+    FFHQ 镜像的部分 Xet reconstruction 在并发 worker 下可能返回 CAS 404；训练只需要
+    普通 Hub 文件下载与本地 cache，因此强制使用标准 HTTP 路径。
+    """
+    hf_constants.HF_HUB_DISABLE_XET = True
+    disable_progress_bars()
+
+
+_configure_huggingface_hub()
+
+
+@dataclass(frozen=True, slots=True)
+class HuggingFaceImageSource:
+    """Hugging Face dataset 仓库中的远程图片池。
+
+    仓库只在初始化时读取一次图片文件清单；训练时随机选择图片并通过
+    ``hf_hub_download`` 按需下载。已访问文件复用 Hugging Face 本地 cache，
+    不需要预先下载整个数据集。
+    """
+
+    repo_id: str
+    revision: str = "main"
+    path_prefix: str = ""
+    adjustment: float = 0.0
+
+
+type ImageSource = ImagePath | tuple[ImagePath, float] | HuggingFaceImageSource
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalImagePool:
+    root: str
+    file_names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _HuggingFaceImagePool:
+    repo_id: str
+    revision: str
+    file_names: tuple[str, ...]
+
+
+type ImagePool = _LocalImagePool | _HuggingFaceImagePool
+
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp")
+HF_DOWNLOAD_ATTEMPTS = 5
 DATALOADER_RESERVED_KEYS = frozenset({"batch_size", "device_id", "img_resolution", "src", "dst"})
 
 
@@ -97,29 +153,84 @@ def _validate_range(name: str, value: FloatRange) -> FloatRange:
     return low, high
 
 
-def _scan_image_files(directory: ImagePath) -> ImageFolder:
+def _scan_image_files(directory: ImagePath) -> _LocalImagePool:
     folder = Path(directory).resolve(strict=True)
     with os.scandir(folder) as entries:
         file_names = tuple(entry.name for entry in entries if entry.is_file() and entry.name.lower().endswith(IMAGE_EXTENSIONS))
     if not file_names:
         raise FileNotFoundError(f"目录中没有支持的图片文件: {folder}")
-    return str(folder), file_names
+    return _LocalImagePool(str(folder), file_names)
+
+
+def _hf_manifest_cache_path(repo_id: str, revision: str, path_prefix: str) -> Path:
+    key = hashlib.sha256(f"{repo_id}\0{revision}\0{path_prefix}".encode()).hexdigest()[:24]
+    return Path(HF_HUB_CACHE) / "swap-image-manifests" / f"{key}.json"
+
+
+@cache
+def _scan_huggingface_image_files(repo_id: str, revision: str, path_prefix: str) -> tuple[str, tuple[str, ...]]:
+    repo_id = repo_id.strip()
+    revision = revision.strip()
+    path_prefix = path_prefix.strip("/")
+    if not repo_id:
+        raise ValueError("Hugging Face repo_id 不能为空")
+    if not revision:
+        raise ValueError("Hugging Face revision 不能为空")
+
+    api = HfApi()
+    repo_info = api.dataset_info(repo_id=repo_id, revision=revision)
+    resolved_revision = repo_info.sha
+    if not resolved_revision:
+        raise RuntimeError(f"无法解析 Hugging Face dataset revision：{repo_id}@{revision}")
+
+    cache_path = _hf_manifest_cache_path(repo_id, resolved_revision, path_prefix)
+    try:
+        with cache_path.open("r", encoding="utf-8") as file:
+            cached_files = json.load(file)
+        if isinstance(cached_files, list) and cached_files and all(isinstance(name, str) for name in cached_files):
+            return resolved_revision, tuple(cached_files)
+    except FileNotFoundError:
+        pass
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    if path_prefix:
+        entries = api.list_repo_tree(repo_id=repo_id, repo_type="dataset", revision=resolved_revision, path_in_repo=path_prefix, recursive=True)
+        file_names = tuple(path for entry in entries if isinstance(path := getattr(entry, "path", None), str) and path.lower().endswith(IMAGE_EXTENSIONS))
+    else:
+        file_names = tuple(path for path in api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision=resolved_revision) if path.lower().endswith(IMAGE_EXTENSIONS))
+
+    if not file_names:
+        location = f"/{path_prefix}" if path_prefix else ""
+        raise FileNotFoundError(f"Hugging Face dataset 中没有支持的图片文件：{repo_id}@{revision}{location}")
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = cache_path.with_suffix(".tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as file:
+            json.dump(file_names, file, ensure_ascii=False)
+        temp_path.replace(cache_path)
+    except OSError:
+        temp_path.unlink(missing_ok=True)
+
+    return resolved_revision, file_names
 
 
 class _RandomImagePairSource:
     """为 DALI parallel external_source 提供独立的 source/target 编码图像。
 
-    初始化时只扫描一次目录并预计算文件夹采样 CDF。worker 热路径只执行一次
-    CDF 查找、一次文件索引随机采样和一次 ``np.fromfile``，不做目录排序或图像解码。
-    ``rng`` 不参与 pickle；每个 spawn worker 在反序列化时创建独立 RNG。
+    本地目录初始化时只扫描一次；Hugging Face 源初始化时只获取远程图片清单。
+    worker 热路径只负责随机选图并读取压缩字节。HF 图片通过 Hub cache 按需下载，
+    已访问过的文件直接命中本地 cache。``rng`` 不参与 pickle；每个 spawn worker
+    在反序列化时创建独立 RNG。
     """
 
     def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource]) -> None:
-        self.src_files, self.src_cdf, src_info = self._build_pool(src)
-        self.dst_files, self.dst_cdf, dst_info = self._build_pool(dst)
+        self.src_pools, self.src_cdf, src_info = self._build_pool(src)
+        self.dst_pools, self.dst_cdf, dst_info = self._build_pool(dst)
         self.rng = np.random.default_rng()
-        self._print_pool("SRC Folders", src_info)
-        self._print_pool("DST Folders", dst_info)
+        self._print_pool("SRC Sources", src_info)
+        self._print_pool("DST Sources", dst_info)
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -131,36 +242,46 @@ class _RandomImagePairSource:
         self.rng = np.random.default_rng()
 
     @staticmethod
-    def _build_pool(sources: Sequence[ImageSource]) -> tuple[tuple[ImageFolder, ...], ndarray, tuple[tuple[str, int, float], ...]]:
+    def _build_pool(sources: Sequence[ImageSource]) -> tuple[tuple[ImagePool, ...], ndarray, tuple[tuple[str, int, float], ...]]:
         if isinstance(sources, (str, os.PathLike)):
-            raise TypeError(f"图片源必须是路径序列；单个目录请写成 [{os.fspath(sources)!r}]")
+            raise TypeError(f"图片源必须是路径/远程源序列；单个目录请写成 [{os.fspath(sources)!r}]")
         if not sources:
             raise ValueError("图片源列表不能为空")
 
-        folders: list[ImageFolder] = []
-        paths: list[str] = []
+        pools: list[ImagePool] = []
+        labels: list[str] = []
         counts: list[int] = []
         adjustments: list[float] = []
 
         for source in sources:
-            if isinstance(source, (str, os.PathLike)):
-                path, adjustment = source, 0.0
-            elif isinstance(source, tuple) and len(source) == 2 and isinstance(source[0], (str, os.PathLike)):
-                path, adjustment = source
+            if isinstance(source, HuggingFaceImageSource):
+                adjustment = float(source.adjustment)
+                resolved_revision, file_names = _scan_huggingface_image_files(source.repo_id, source.revision, source.path_prefix)
+                pool = _HuggingFaceImagePool(source.repo_id, resolved_revision, file_names)
+                prefix = source.path_prefix.strip("/")
+                location = f"/{prefix}" if prefix else ""
+                label = f"hf://{source.repo_id}@{resolved_revision[:12]}{location}"
             else:
-                raise TypeError(f"图片源必须为路径或 (路径, 权重调整)，实际为 {source!r}")
+                if isinstance(source, (str, os.PathLike)):
+                    path, adjustment = source, 0.0
+                elif isinstance(source, tuple) and len(source) == 2 and isinstance(source[0], (str, os.PathLike)):
+                    path, adjustment = source
+                else:
+                    raise TypeError(f"图片源必须为路径、(路径, 权重调整) 或 HuggingFaceImageSource，实际为 {source!r}")
+                adjustment = float(adjustment)
+                pool = _scan_image_files(path)
+                label = pool.root
+                file_names = pool.file_names
 
-            adjustment = float(adjustment)
             if not np.isfinite(adjustment):
                 raise ValueError(f"权重调整必须为有限数值，实际为 {adjustment!r}")
 
-            resolved_path, file_names = _scan_image_files(path)
-            folders.append((resolved_path, file_names))
-            paths.append(resolved_path)
+            pools.append(pool)
+            labels.append(label)
             counts.append(len(file_names))
             adjustments.append(adjustment)
 
-        # 保留旧规则：folder_weight ∝ sqrt(file_count) * 2**adjustment。
+        # 保留旧规则：source_weight ∝ sqrt(file_count) * 2**adjustment。
         # 在 log 域归一化，避免极端 adjustment 导致上溢/下溢。
         log_weights = 0.5 * np.log(np.asarray(counts, dtype=np.float64)) + np.asarray(adjustments, dtype=np.float64) * np.log(2.0)
         weights = np.exp(log_weights - log_weights.max())
@@ -168,23 +289,36 @@ class _RandomImagePairSource:
         cdf = np.cumsum(weights)
         cdf[-1] = 1.0
 
-        info = tuple((path, count, float(weight)) for path, count, weight in zip(paths, counts, weights))
-        return tuple(folders), cdf, info
+        info = tuple((label, count, float(weight)) for label, count, weight in zip(labels, counts, weights))
+        return tuple(pools), cdf, info
 
     @staticmethod
     def _print_pool(title: str, info: tuple[tuple[str, int, float], ...]) -> None:
         print(title + ":")
-        for path, count, weight in info:
-            print(f"    {path}\n        count: {count:<7d} weight: {weight:<6.3f}")
+        for label, count, weight in info:
+            print(f"    {label}\n        count: {count:<7d} weight: {weight:<6.3f}")
 
-    def _sample_encoded(self, folders: tuple[ImageFolder, ...], cdf: ndarray) -> ndarray:
-        folder_index = min(int(np.searchsorted(cdf, self.rng.random(), side="right")), len(folders) - 1)
-        root, file_names = folders[folder_index]
-        file_name = file_names[int(self.rng.integers(len(file_names)))]
-        return np.fromfile(os.path.join(root, file_name), dtype=np.uint8)
+    def _sample_encoded(self, pools: tuple[ImagePool, ...], cdf: ndarray) -> ndarray:
+        pool_index = min(int(np.searchsorted(cdf, self.rng.random(), side="right")), len(pools) - 1)
+        pool = pools[pool_index]
+
+        if isinstance(pool, _LocalImagePool):
+            file_name = pool.file_names[int(self.rng.integers(len(pool.file_names)))]
+            return np.fromfile(os.path.join(pool.root, file_name), dtype=np.uint8)
+
+        last_error: Exception | None = None
+        for _ in range(HF_DOWNLOAD_ATTEMPTS):
+            file_name = pool.file_names[int(self.rng.integers(len(pool.file_names)))]
+            try:
+                image_path = hf_hub_download(repo_id=pool.repo_id, filename=file_name, repo_type="dataset", revision=pool.revision)
+                return np.fromfile(image_path, dtype=np.uint8)
+            except (HfHubHTTPError, OSError, RuntimeError) as exc:
+                last_error = exc
+
+        raise RuntimeError(f"Hugging Face 数据源连续 {HF_DOWNLOAD_ATTEMPTS} 次下载失败：{pool.repo_id}@{pool.revision}") from last_error
 
     def __call__(self, _sample_info) -> tuple[ndarray, ndarray]:
-        return self._sample_encoded(self.src_files, self.src_cdf), self._sample_encoded(self.dst_files, self.dst_cdf)
+        return self._sample_encoded(self.src_pools, self.src_cdf), self._sample_encoded(self.dst_pools, self.dst_cdf)
 
 
 def _random_affine_matrices(img_resolution: int, rotation_range: FloatRange, scale_factor_range: FloatRange, tx_range: FloatRange, ty_range: FloatRange):

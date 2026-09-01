@@ -179,8 +179,17 @@ group_size = 4
 
 
 # 身份来源数据池。
-# 每项可以单独设置 adjustment；实际文件夹采样权重为：
+# 每项可以是本地目录 path，也可以是 Hugging Face dataset repo_id。
+# 每项可以单独设置 adjustment；实际数据源采样权重为：
 #   sqrt(file_count) * 2**adjustment
+#
+# Hugging Face 在线 FFHQ 示例（70,000 张 1024x1024 PNG，按需下载并复用 HF cache）：
+# [[src]]
+# repo_id = "marcosv/ffhq-dataset"
+# revision = "main"
+# # 可选：只使用仓库中的某个子目录，例如 "Part1"。留空表示整个仓库。
+# path_prefix = ""
+# adjustment = 0.0
 [[src]]
 path = "/path/to/source_faces_a"
 adjustment = 0.0

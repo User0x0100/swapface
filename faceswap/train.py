@@ -30,7 +30,7 @@ from misc.models.id_encoder import IDEncoder, IDEncoderProvider
 from models.discriminator import Discriminator
 from models.networks import Generator
 
-from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, ImageDecoderBackend, ImageSource, create_dataloader_pipeline
+from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, HuggingFaceImageSource, ImageDecoderBackend, ImageSource, create_dataloader_pipeline
 
 EPS = 1e-8
 CHECKPOINT_VERSION = 2
@@ -539,17 +539,40 @@ def _load_image_sources(entries: object, section: str) -> list[ImageSource]:
         raise ValueError(f"TOML [{section}] 数据源不能为空")
 
     sources: list[ImageSource] = []
+    allowed_fields = {"path", "repo_id", "revision", "path_prefix", "adjustment"}
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise TypeError(f"TOML [[{section}]] 第 {index} 项必须是表")
-        unknown = set(entry) - {"path", "adjustment"}
+        unknown = set(entry) - allowed_fields
         if unknown:
             raise ValueError(f"TOML [[{section}]] 第 {index} 项包含未知字段：{sorted(unknown)}")
-        path = entry.get("path")
-        if not isinstance(path, str) or not path:
-            raise ValueError(f"TOML [[{section}]] 第 {index} 项 path 必须为非空字符串")
-        adjustment = entry.get("adjustment")
-        sources.append(path if adjustment is None else (path, float(adjustment)))
+
+        has_path = "path" in entry
+        has_repo = "repo_id" in entry
+        if has_path == has_repo:
+            raise ValueError(f"TOML [[{section}]] 第 {index} 项必须且只能设置 path 或 repo_id")
+
+        adjustment = float(entry.get("adjustment", 0.0))
+        if has_path:
+            path = entry["path"]
+            if not isinstance(path, str) or not path:
+                raise ValueError(f"TOML [[{section}]] 第 {index} 项 path 必须为非空字符串")
+            if "revision" in entry or "path_prefix" in entry:
+                raise ValueError(f"TOML [[{section}]] 第 {index} 项本地 path 不能设置 revision/path_prefix")
+            sources.append(path if "adjustment" not in entry else (path, adjustment))
+            continue
+
+        repo_id = entry["repo_id"]
+        revision = entry.get("revision", "main")
+        path_prefix = entry.get("path_prefix", "")
+        if not isinstance(repo_id, str) or not repo_id:
+            raise ValueError(f"TOML [[{section}]] 第 {index} 项 repo_id 必须为非空字符串")
+        if not isinstance(revision, str) or not revision:
+            raise ValueError(f"TOML [[{section}]] 第 {index} 项 revision 必须为非空字符串")
+        if not isinstance(path_prefix, str):
+            raise TypeError(f"TOML [[{section}]] 第 {index} 项 path_prefix 必须为字符串")
+        sources.append(HuggingFaceImageSource(repo_id=repo_id, revision=revision, path_prefix=path_prefix, adjustment=adjustment))
+
     return sources
 
 
