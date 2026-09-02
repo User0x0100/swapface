@@ -55,13 +55,12 @@ type FloatRange = tuple[float, float]
 
 
 def _configure_huggingface_hub(proxy: str | None = None) -> None:
-    """关闭训练数据下载的 Xet/CAS 路径与终端进度条。
+    """关闭训练数据下载的 Xet/CAS 路径并配置 HTTP client。
 
     FFHQ 镜像的部分 Xet reconstruction 在并发 worker 下可能返回 CAS 404；训练只需要
     普通 Hub 文件下载与本地 cache，因此强制使用标准 HTTP 路径。
     """
     hf_constants.HF_HUB_DISABLE_XET = True
-    disable_progress_bars()
     if proxy is not None:
         proxy = proxy.strip()
         if not proxy:
@@ -309,8 +308,9 @@ class _RandomImagePairSource:
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         _configure_huggingface_hub(self.huggingface_proxy)
-        # ModelScope 单文件 cache miss 会默认输出 tqdm；DALI worker 是独立进程，
-        # 在这里关闭其 tqdm，避免训练期间每张新图片都刷下载进度而不影响主进程。
+        # Hugging Face / ModelScope 单文件 cache miss 都可能输出进度条；DALI worker
+        # 是独立进程，因此只在 worker 内关闭，避免污染主进程中的模型权重下载进度。
+        disable_progress_bars()
         os.environ.setdefault("TQDM_DISABLE", "1")
         self.rng = np.random.default_rng()
         self.modelscope_api = ModelScopeHubApi()
