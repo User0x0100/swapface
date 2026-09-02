@@ -11,7 +11,7 @@
 图片源:
     每个源可以是路径，也可以是 ``(path, adjustment)``。文件夹首先按
     ``sqrt(file_count) * 2**adjustment`` 分配采样概率，再在选中的文件夹内均匀
-    采样图片。也支持 ``HuggingFaceImageSource`` 远程图片池，图片按需下载并复用 Hub cache。
+    采样图片。也支持 Hugging Face 与 ModelScope 远程图片池，图片按需下载并复用各自 Hub cache。
     ``adjustment=1`` 表示将该数据源的基础权重翻倍，``-1`` 表示减半。
 
 性能原则:
@@ -43,6 +43,8 @@ from huggingface_hub import constants as hf_constants
 from huggingface_hub.constants import HF_HUB_CACHE
 from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.utils import disable_progress_bars
+from modelscope_hub import HubApi as ModelScopeHubApi
+from modelscope_hub.errors import HubError as ModelScopeHubError
 from numpy import ndarray
 from nvidia.dali import fn, pipeline_def
 from nvidia.dali.math import clamp
@@ -85,7 +87,22 @@ class HuggingFaceImageSource:
     adjustment: float = 0.0
 
 
-type ImageSource = ImagePath | tuple[ImagePath, float] | HuggingFaceImageSource
+@dataclass(frozen=True, slots=True)
+class ModelScopeImageSource:
+    """ModelScope dataset 仓库中的远程图片池。
+
+    仓库在训练进程初始化时枚举一次图片文件；训练时通过 ``download_file``
+    按需下载单张图片并复用 ModelScope cache。DALI worker 继承已经构建好的
+    文件清单，不会在每个 worker 中重复枚举远程仓库。
+    """
+
+    repo_id: str
+    revision: str = "master"
+    path_prefix: str = ""
+    adjustment: float = 0.0
+
+
+type ImageSource = ImagePath | tuple[ImagePath, float] | HuggingFaceImageSource | ModelScopeImageSource
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,10 +118,18 @@ class _HuggingFaceImagePool:
     file_names: tuple[str, ...]
 
 
-type ImagePool = _LocalImagePool | _HuggingFaceImagePool
+@dataclass(frozen=True, slots=True)
+class _ModelScopeImagePool:
+    repo_id: str
+    revision: str
+    file_names: tuple[str, ...]
+    cache_dir: str | None
+
+
+type ImagePool = _LocalImagePool | _HuggingFaceImagePool | _ModelScopeImagePool
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp")
-HF_DOWNLOAD_ATTEMPTS = 5
+REMOTE_DOWNLOAD_ATTEMPTS = 5
 DATALOADER_RESERVED_KEYS = frozenset({"batch_size", "device_id", "img_resolution", "src", "dst"})
 
 
@@ -138,6 +163,7 @@ DEFAULT_DATALOADER_CONFIG: dict[str, Any] = {
     "py_start_method": "spawn",
     "reader_prefetch_queue_depth": 2,
     "huggingface_proxy": None,
+    "modelscope_cache_dir": None,
     "decoder_backend": ImageDecoderBackend.MIXED,
     "decoder_hw_load": 0.75,
     "brightness": 0.2,
@@ -223,36 +249,74 @@ def _scan_huggingface_image_files(repo_id: str, revision: str, path_prefix: str)
     return resolved_revision, file_names
 
 
+@cache
+def _scan_modelscope_image_files(repo_id: str, revision: str, path_prefix: str) -> tuple[str, ...]:
+    """枚举 ModelScope dataset 当前 revision 下的独立图片文件。
+
+    ModelScope 当前没有像 Hugging Face 那样可廉价解析并缓存的 immutable commit SHA，
+    因此这里只做进程内缓存：同一训练进程中的 src/dst 复用清单，而下一次训练启动
+    会重新枚举，从而能看到 ``master`` 上新上传的图片。
+    """
+    repo_id = repo_id.strip()
+    revision = revision.strip()
+    path_prefix = path_prefix.strip("/")
+    if not repo_id:
+        raise ValueError("ModelScope repo_id 不能为空")
+    if not revision:
+        raise ValueError("ModelScope revision 不能为空")
+
+    prefix = f"{path_prefix}/" if path_prefix else ""
+    files = ModelScopeHubApi().list_repo_files(repo_id, "dataset", revision=revision, recursive=True)
+    file_names = tuple(path for entry in files if isinstance(path := getattr(entry, "path", None), str) and path.startswith(prefix) and path.lower().endswith(IMAGE_EXTENSIONS))
+    if not file_names:
+        location = f"/{path_prefix}" if path_prefix else ""
+        raise FileNotFoundError(f"ModelScope dataset 中没有支持的图片文件：{repo_id}@{revision}{location}")
+    return file_names
+
+
 class _RandomImagePairSource:
     """为 DALI parallel external_source 提供独立的 source/target 编码图像。
 
-    本地目录初始化时只扫描一次；Hugging Face 源初始化时只获取远程图片清单。
-    worker 热路径只负责随机选图并读取压缩字节。HF 图片通过 Hub cache 按需下载，
-    已访问过的文件直接命中本地 cache。``rng`` 不参与 pickle；每个 spawn worker
-    在反序列化时创建独立 RNG。
+    本地目录初始化时只扫描一次；远程源初始化时只获取一次图片清单。worker 热路径
+    只负责随机选图并读取压缩字节；Hugging Face/ModelScope 图片均通过各自 Hub cache
+    按需下载。``rng`` 与 ModelScope HTTP client 不参与 pickle；每个 spawn worker 在
+    反序列化时创建独立实例。
     """
 
-    def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource], huggingface_proxy: str | None = None) -> None:
+    def __init__(
+        self,
+        src: Sequence[ImageSource],
+        dst: Sequence[ImageSource],
+        huggingface_proxy: str | None = None,
+        modelscope_cache_dir: str | None = None,
+    ) -> None:
         self.huggingface_proxy = huggingface_proxy
+        self.modelscope_cache_dir = modelscope_cache_dir
         _configure_huggingface_hub(huggingface_proxy)
-        self.src_pools, self.src_cdf, src_info = self._build_pool(src)
-        self.dst_pools, self.dst_cdf, dst_info = self._build_pool(dst)
+        self.src_pools, self.src_cdf, src_info = self._build_pool(src, modelscope_cache_dir)
+        self.dst_pools, self.dst_cdf, dst_info = self._build_pool(dst, modelscope_cache_dir)
         self.rng = np.random.default_rng()
+        self.modelscope_api = ModelScopeHubApi()
         self._print_pool("SRC Sources", src_info)
         self._print_pool("DST Sources", dst_info)
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state.pop("rng", None)
+        state.pop("modelscope_api", None)
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         _configure_huggingface_hub(self.huggingface_proxy)
+        # ModelScope 单文件 cache miss 会默认输出 tqdm；DALI worker 是独立进程，
+        # 在这里关闭其 tqdm，避免训练期间每张新图片都刷下载进度而不影响主进程。
+        os.environ.setdefault("TQDM_DISABLE", "1")
         self.rng = np.random.default_rng()
+        self.modelscope_api = ModelScopeHubApi()
 
     @staticmethod
-    def _build_pool(sources: Sequence[ImageSource]) -> tuple[tuple[ImagePool, ...], ndarray, tuple[tuple[str, int, float], ...]]:
+    def _build_pool(sources: Sequence[ImageSource], modelscope_cache_dir: str | None) -> tuple[tuple[ImagePool, ...], ndarray, tuple[tuple[str, int, float], ...]]:
         if isinstance(sources, (str, os.PathLike)):
             raise TypeError(f"图片源必须是路径/远程源序列；单个目录请写成 [{os.fspath(sources)!r}]")
         if not sources:
@@ -271,13 +335,20 @@ class _RandomImagePairSource:
                 prefix = source.path_prefix.strip("/")
                 location = f"/{prefix}" if prefix else ""
                 label = f"hf://{source.repo_id}@{resolved_revision[:12]}{location}"
+            elif isinstance(source, ModelScopeImageSource):
+                adjustment = float(source.adjustment)
+                file_names = _scan_modelscope_image_files(source.repo_id, source.revision, source.path_prefix)
+                pool = _ModelScopeImagePool(source.repo_id, source.revision, file_names, modelscope_cache_dir)
+                prefix = source.path_prefix.strip("/")
+                location = f"/{prefix}" if prefix else ""
+                label = f"modelscope://{source.repo_id}@{source.revision}{location}"
             else:
                 if isinstance(source, (str, os.PathLike)):
                     path, adjustment = source, 0.0
                 elif isinstance(source, tuple) and len(source) == 2 and isinstance(source[0], (str, os.PathLike)):
                     path, adjustment = source
                 else:
-                    raise TypeError(f"图片源必须为路径、(路径, 权重调整) 或 HuggingFaceImageSource，实际为 {source!r}")
+                    raise TypeError(f"图片源必须为路径、(路径, 权重调整)、HuggingFaceImageSource 或 ModelScopeImageSource，实际为 {source!r}")
                 adjustment = float(adjustment)
                 pool = _scan_image_files(path)
                 label = pool.root
@@ -317,15 +388,25 @@ class _RandomImagePairSource:
             return np.fromfile(os.path.join(pool.root, file_name), dtype=np.uint8)
 
         last_error: Exception | None = None
-        for _ in range(HF_DOWNLOAD_ATTEMPTS):
+        for _ in range(REMOTE_DOWNLOAD_ATTEMPTS):
             file_name = pool.file_names[int(self.rng.integers(len(pool.file_names)))]
             try:
-                image_path = hf_hub_download(repo_id=pool.repo_id, filename=file_name, repo_type="dataset", revision=pool.revision)
+                if isinstance(pool, _HuggingFaceImagePool):
+                    image_path = hf_hub_download(repo_id=pool.repo_id, filename=file_name, repo_type="dataset", revision=pool.revision)
+                else:
+                    image_path = self.modelscope_api.download_file(
+                        pool.repo_id,
+                        "dataset",
+                        file_name,
+                        revision=pool.revision,
+                        cache_dir=pool.cache_dir,
+                    )
                 return np.fromfile(image_path, dtype=np.uint8)
-            except (HfHubHTTPError, OSError, RuntimeError) as exc:
+            except (HfHubHTTPError, ModelScopeHubError, OSError, RuntimeError) as exc:
                 last_error = exc
 
-        raise RuntimeError(f"Hugging Face 数据源连续 {HF_DOWNLOAD_ATTEMPTS} 次下载失败：{pool.repo_id}@{pool.revision}") from last_error
+        backend = "Hugging Face" if isinstance(pool, _HuggingFaceImagePool) else "ModelScope"
+        raise RuntimeError(f"{backend} 数据源连续 {REMOTE_DOWNLOAD_ATTEMPTS} 次下载失败：{pool.repo_id}@{pool.revision}") from last_error
 
     def __call__(self, _sample_info) -> tuple[ndarray, ndarray]:
         return self._sample_encoded(self.src_pools, self.src_cdf), self._sample_encoded(self.dst_pools, self.dst_cdf)
@@ -396,6 +477,7 @@ def create_dataloader_pipeline(
     dst: Sequence[ImageSource],
     reader_prefetch_queue_depth: int = 2,
     huggingface_proxy: str | None = None,
+    modelscope_cache_dir: str | None = None,
     decoder_backend: ImageDecoderBackend = ImageDecoderBackend.MIXED,
     decoder_hw_load: float = 0.75,
     brightness: float = 0.2,
@@ -411,13 +493,15 @@ def create_dataloader_pipeline(
 
     参数:
         img_resolution: 最终训练图像的正方形边长。
-        src: 身份来源图像池。必须是序列，元素为路径或 ``(路径, adjustment)``；
-            单个目录也应写成 ``[path]``，而不是直接传入字符串。
+        src: 身份来源图像池。必须是 ``ImageSource`` 序列；可包含本地路径、
+            ``(路径, adjustment)``、``HuggingFaceImageSource`` 或
+            ``ModelScopeImageSource``。单个本地目录也应写成 ``[path]``。
         dst: 目标图像池，格式与 ``src`` 相同；与 ``src`` 独立采样。
         reader_prefetch_queue_depth: parallel ``external_source`` 每个 Python worker
             可提前准备的 batch 数。只影响编码文件读取阶段。
         huggingface_proxy: Hugging Face 在线数据源使用的 HTTP(S) 代理，例如
             ``http://127.0.0.1:7890``。不配置时直接连接。
+        modelscope_cache_dir: ModelScope 单文件下载 cache 目录；留空使用 SDK 默认 cache。
         decoder_backend: 图像 decoder backend。默认 ``MIXED``。
         decoder_hw_load: mixed decoder 可交给专用 JPEG HW decoder 的负载比例。
             该参数只在支持对应硬件路径的平台上实际生效。
@@ -454,7 +538,7 @@ def create_dataloader_pipeline(
         raise ValueError(f"flip_prob 必须位于 [0, 1]，实际为 {flip_prob}")
 
     src_raw, dst_raw = fn.external_source(
-        source=_RandomImagePairSource(src, dst, huggingface_proxy),
+        source=_RandomImagePairSource(src, dst, huggingface_proxy, modelscope_cache_dir),
         num_outputs=2,
         device="cpu",
         parallel=True,

@@ -31,7 +31,7 @@ from models.discriminator import Discriminator
 from models.discriminator.upfirdn2d import initialize_upfirdn2d
 from models.networks import Generator
 
-from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, HuggingFaceImageSource, ImageDecoderBackend, ImageSource, create_dataloader_pipeline
+from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, HuggingFaceImageSource, ImageDecoderBackend, ImageSource, ModelScopeImageSource, create_dataloader_pipeline
 
 EPS = 1e-8
 CHECKPOINT_VERSION = 2
@@ -547,7 +547,7 @@ def _load_image_sources(entries: object, section: str) -> list[ImageSource]:
         raise ValueError(f"TOML [{section}] 数据源不能为空")
 
     sources: list[ImageSource] = []
-    allowed_fields = {"path", "repo_id", "revision", "path_prefix", "adjustment"}
+    allowed_fields = {"backend", "path", "repo_id", "revision", "path_prefix", "adjustment"}
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise TypeError(f"TOML [[{section}]] 第 {index} 项必须是表")
@@ -555,31 +555,37 @@ def _load_image_sources(entries: object, section: str) -> list[ImageSource]:
         if unknown:
             raise ValueError(f"TOML [[{section}]] 第 {index} 项包含未知字段：{sorted(unknown)}")
 
-        has_path = "path" in entry
-        has_repo = "repo_id" in entry
-        if has_path == has_repo:
-            raise ValueError(f"TOML [[{section}]] 第 {index} 项必须且只能设置 path 或 repo_id")
+        backend = entry.get("backend")
+        if not isinstance(backend, str) or not backend:
+            raise ValueError(f"TOML [[{section}]] 第 {index} 项 backend 必须为非空字符串")
+        if backend not in {"local", "huggingface", "modelscope"}:
+            raise ValueError(f"TOML [[{section}]] 第 {index} 项 backend={backend!r} 无效，可选：local, huggingface, modelscope")
 
         adjustment = float(entry.get("adjustment", 0.0))
-        if has_path:
-            path = entry["path"]
+        if backend == "local":
+            if "repo_id" in entry or "revision" in entry or "path_prefix" in entry:
+                raise ValueError(f"TOML [[{section}]] 第 {index} 项 local backend 只能设置 path/adjustment")
+            path = entry.get("path")
             if not isinstance(path, str) or not path:
-                raise ValueError(f"TOML [[{section}]] 第 {index} 项 path 必须为非空字符串")
-            if "revision" in entry or "path_prefix" in entry:
-                raise ValueError(f"TOML [[{section}]] 第 {index} 项本地 path 不能设置 revision/path_prefix")
+                raise ValueError(f"TOML [[{section}]] 第 {index} 项 local backend 的 path 必须为非空字符串")
             sources.append(path if "adjustment" not in entry else (path, adjustment))
             continue
 
-        repo_id = entry["repo_id"]
-        revision = entry.get("revision", "main")
-        path_prefix = entry.get("path_prefix", "")
+        if "path" in entry:
+            raise ValueError(f"TOML [[{section}]] 第 {index} 项 {backend} backend 不能设置 path")
+        repo_id = entry.get("repo_id")
         if not isinstance(repo_id, str) or not repo_id:
-            raise ValueError(f"TOML [[{section}]] 第 {index} 项 repo_id 必须为非空字符串")
+            raise ValueError(f"TOML [[{section}]] 第 {index} 项 {backend} backend 的 repo_id 必须为非空字符串")
+        default_revision = "main" if backend == "huggingface" else "master"
+        revision = entry.get("revision", default_revision)
+        path_prefix = entry.get("path_prefix", "")
         if not isinstance(revision, str) or not revision:
             raise ValueError(f"TOML [[{section}]] 第 {index} 项 revision 必须为非空字符串")
         if not isinstance(path_prefix, str):
             raise TypeError(f"TOML [[{section}]] 第 {index} 项 path_prefix 必须为字符串")
-        sources.append(HuggingFaceImageSource(repo_id=repo_id, revision=revision, path_prefix=path_prefix, adjustment=adjustment))
+
+        source_type = HuggingFaceImageSource if backend == "huggingface" else ModelScopeImageSource
+        sources.append(source_type(repo_id=repo_id, revision=revision, path_prefix=path_prefix, adjustment=adjustment))
 
     return sources
 
@@ -634,6 +640,18 @@ def load_train_config(path: str | Path) -> dict[str, Any]:
             wfm_loss_weight = {int(index): float(weight) for index, weight in raw_wfm_weights.items()}
         except (TypeError, ValueError) as exc:
             raise ValueError("[loss.wfm.weights] 的键必须是整数层索引，值必须是数值") from exc
+
+    unknown_dataloader = set(dataloader) - set(DEFAULT_DATALOADER_CONFIG)
+    if unknown_dataloader:
+        raise ValueError(f"[dataloader] 包含未知字段：{sorted(unknown_dataloader)}")
+
+    huggingface_proxy = dataloader.get("huggingface_proxy")
+    if huggingface_proxy is not None and (not isinstance(huggingface_proxy, str) or not huggingface_proxy.strip()):
+        raise ValueError("dataloader.huggingface_proxy 必须为非空字符串；不使用代理时请删除该配置")
+
+    modelscope_cache_dir = dataloader.get("modelscope_cache_dir")
+    if modelscope_cache_dir is not None and (not isinstance(modelscope_cache_dir, str) or not modelscope_cache_dir.strip()):
+        raise ValueError("dataloader.modelscope_cache_dir 必须为非空字符串；使用默认 cache 时请删除该配置")
 
     decoder_backend = dataloader.get("decoder_backend")
     if decoder_backend is not None:
