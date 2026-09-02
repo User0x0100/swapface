@@ -81,14 +81,15 @@ class Discriminator(nn.Module):
             nn.Linear(final_features, 1),
         )
 
-    def get_feats(self, x: Tensor) -> list[Tensor]:
-
+    def get_feats(self, x: Tensor, max_layer: int | None = None) -> list[Tensor]:
         x = self.from_rgb(x)
 
         feats = []
-        for down_block in self.down_blocks:
+        for layer_index, down_block in enumerate(self.down_blocks):
             x = down_block(x)
             feats.append(x)
+            if max_layer is not None and layer_index >= max_layer:
+                break
 
         return feats
 

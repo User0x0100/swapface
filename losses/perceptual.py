@@ -61,14 +61,10 @@ class WeightedFeatureMatchingLoss(nn.Module):
             所有配置层损失之和。
 
         异常:
-            ValueError: 两个特征列表长度不同。
-            IndexError: 配置层索引超出特征列表范围。"""
-        if len(predicted_features) != len(target_features):
-            raise ValueError(f"feature list length mismatch: {len(predicted_features)} != {len(target_features)}")
-
+            IndexError: 配置层索引超出任一特征列表范围。"""
         max_index = max(self.layer_weights)
-        if max_index >= len(predicted_features):
-            raise IndexError(f"feature layer index {max_index} is out of range for {len(predicted_features)} features")
+        if max_index >= len(predicted_features) or max_index >= len(target_features):
+            raise IndexError(f"feature layer index {max_index} is out of range: predicted={len(predicted_features)}, target={len(target_features)}")
 
         total: Tensor | None = None
         for index, weight in self.layer_weights.items():

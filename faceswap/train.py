@@ -26,7 +26,7 @@ from losses import (
     r1_reg_loss,
 )
 from misc.face_alignment import center_crop_and_resize
-from misc.models.id_encoder import IDEncoder, IDEncoderProvider
+from misc.models.id_encoder import ID_ENCODER_INPUT_SIZE, IDEncoder, IDEncoderProvider
 from models.discriminator import Discriminator
 from models.discriminator.upfirdn2d import initialize_upfirdn2d
 from models.networks import Generator
@@ -244,6 +244,8 @@ class Trainer:
         if checkpoint is not None:
             self.net_g_ema.load_state_dict(checkpoint["net_g"]["state_dict"])
         self.net_g_ema.eval().requires_grad_(False)
+        self._ema_params = tuple(self.net_g_ema.parameters())
+        self._train_g_params = tuple(self.net_g.parameters())
 
         # ========================= 优化器 =========================
         self.optim_g = optim.Adam(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
@@ -284,6 +286,7 @@ class Trainer:
             if invalid_layers:
                 raise ValueError(f"wfm_loss_weight 层索引超出判别器特征范围 0~{feature_count - 1}：{invalid_layers}")
             self.wfm_loss = WeightedFeatureMatchingLoss(layer_weights=wfm_loss_weight, criterion="l1").to(self.device)
+            self.wfm_max_layer = max(wfm_loss_weight)
 
         # ========================= 日志 =========================
         base_log_path = Path(log_path)
@@ -295,6 +298,7 @@ class Trainer:
             path.mkdir(exist_ok=True, parents=True)
 
         self.log_writer = SummaryWriter(self.tensorboard_dir)
+        self._log_buffer: dict[str, Tensor] = {}
 
         # ========================= 数据采样 =========================
 
@@ -316,15 +320,29 @@ class Trainer:
             self.train_g = torch.compile(self.net_g, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
             self.train_d = torch.compile(self.net_d, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
             self.generator_id_encoder_forward = torch.compile(self.generator_id_encoder, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
+            if self.enable_wfm_loss:
+                self.train_d_features = torch.compile(self.net_d.get_feats, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
         else:
             self.train_g = self.net_g
             self.train_d = self.net_d
             self.generator_id_encoder_forward = self.generator_id_encoder
+            if self.enable_wfm_loss:
+                self.train_d_features = self.net_d.get_feats
 
     @torch.no_grad()
     def log(self, key: str, value: Tensor) -> None:
         if self.iter % self.log_interval == 0:
-            self.log_writer.add_scalar(f"Loss/{key}", value.detach().mean().item(), self.iter)
+            self._log_buffer[key] = value.detach().mean()
+
+    @torch.no_grad()
+    def flush_logs(self) -> None:
+        if not self._log_buffer:
+            return
+        keys = tuple(self._log_buffer)
+        values = torch.stack(tuple(self._log_buffer[key] for key in keys)).float().cpu().tolist()
+        self._log_buffer.clear()
+        for key, value in zip(keys, values):
+            self.log_writer.add_scalar(f"Loss/{key}", value, self.iter)
 
     @torch.no_grad()
     def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor]:
@@ -338,8 +356,7 @@ class Trainer:
         decay = min(decay, 1 - 1 / (self.iter + 1))
         alpha = 1.0 - decay
 
-        for p_ema, p_train in zip(self.net_g_ema.parameters(), self.net_g.parameters()):
-            p_ema.lerp_(p_train, alpha)
+        torch._foreach_lerp_(self._ema_params, self._train_g_params, alpha)
 
     @torch.no_grad()
     def save_ckpt(self) -> None:
@@ -409,8 +426,9 @@ class Trainer:
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
                 with torch.no_grad():
                     source_faces = center_crop_and_resize(src)
-                    generator_identity_embeddings = self.generator_id_encoder_forward(source_faces)
-                    source_identity_embeddings = self.id_loss.extract_identity_embeddings(source_faces)
+                    source_faces_112 = NF.interpolate(source_faces, size=ID_ENCODER_INPUT_SIZE, mode="bilinear", align_corners=False)
+                    generator_identity_embeddings = self.generator_id_encoder_forward(source_faces_112)
+                    source_identity_embeddings = self.id_loss.extract_identity_embeddings(source_faces_112)
                 fake: Tensor = net_g(dst, generator_identity_embeddings)
 
             # ========================= 训练判别器 =========================
@@ -467,7 +485,7 @@ class Trainer:
                 # wfm_loss
                 if self.enable_wfm_loss:
                     with torch.no_grad():
-                        _, real_feats = net_d(dst, True)
+                        real_feats = self.train_d_features(dst, self.wfm_max_layer)
                     wfm_loss = self.wfm_loss(fake_feats, real_feats)
                     self.log("wfm_loss", wfm_loss)
                     g_loss = g_loss + wfm_loss
@@ -493,6 +511,7 @@ class Trainer:
                 self.lr_scheduler_g.step()
 
             self.update_ema()
+            self.flush_logs()
 
             if self.iter % self.weight_save_every == 0:
                 self.save_ckpt()
@@ -508,8 +527,9 @@ class Trainer:
                     dst_restored_vis = NF.grid_sample(dst_vis, grid_vis, mode="bilinear", padding_mode="reflection", align_corners=False)
 
                     source_faces_vis = center_crop_and_resize(src_vis)
-                    generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_faces_vis)
-                    source_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(source_faces_vis)
+                    source_faces_vis_112 = NF.interpolate(source_faces_vis, size=ID_ENCODER_INPUT_SIZE, mode="bilinear", align_corners=False)
+                    generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_faces_vis_112)
+                    source_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(source_faces_vis_112)
                     fake_vis: Tensor = self.net_g_ema(dst_vis, generator_identity_embeddings_vis)
 
                     grid = [src_vis, dst_vis, fake_vis, dst_restored_vis]
