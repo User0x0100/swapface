@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Experimental face-swap training workspace"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "nvidia-dali-cuda130",
+    "nvidia-dali-cuda120",
     "torch",
     "torchvision",
     "torchcodec",
@@ -23,7 +23,7 @@ dependencies = [
     "torchinfo",
     "ninja",
     "scipy",
-    "tensorrt-cu13",
+    "tensorrt-cu12",
     "httpx[socks]>=0.28.1",
 ]
 
@@ -31,14 +31,15 @@ dependencies = [
 package = false
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu132" }
-torchvision = { index = "pytorch-cu132" }
-torchcodec = { index = "pytorch-cu132" }
-nvidia-dali-cuda130 = { index = "nvidia" }
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+torchcodec = { index = "pytorch-cu126" }
+nvidia-dali-cuda120 = { index = "nvidia" }
+tensorrt-cu12 = { index = "nvidia" }
 
 [[tool.uv.index]]
-name = "pytorch-cu132"
-url = "https://download.pytorch.org/whl/cu132"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [[tool.uv.index]]
