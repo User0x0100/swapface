@@ -180,7 +180,7 @@ def upfirdn2d(
         - Critical for preventing aliasing in downsampling
     """
 
-    _ensure_kernel_loaded()
+    initialize_upfirdn2d()
 
     if f.ndim == 2:
         x = torch.ops.upfirdn2d.upfirdn2d(x, f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain)
@@ -392,13 +392,12 @@ _kernel_loaded = False
 _kernel_init_lock = threading.Lock()
 
 
-def _ensure_kernel_loaded() -> None:
-    """Load and register the CUDA op exactly once per Python process.
+def initialize_upfirdn2d() -> None:
+    """在当前 Python 进程中仅加载并注册一次 CUDA 算子。
 
-    The fast path is lock-free after initialization. The lock covers both the
-    extension load and autograd registration so concurrent first calls cannot
-    observe or publish a partially initialized operator. If initialization
-    raises, the loaded flag remains false and a later call may retry.
+    初始化完成后的快速路径不加锁。锁同时覆盖扩展加载与 autograd 注册，
+    避免并发首次调用观察到或发布未完整初始化的算子。若初始化抛出异常，
+    已加载标志保持为 false，后续调用仍可再次尝试。
     """
     global _kernel_loaded
 

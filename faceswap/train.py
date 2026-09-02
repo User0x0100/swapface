@@ -28,6 +28,7 @@ from losses import (
 from misc.face_alignment import center_crop_and_resize
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
 from models.discriminator import Discriminator
+from models.discriminator.upfirdn2d import initialize_upfirdn2d
 from models.networks import Generator
 
 from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, HuggingFaceImageSource, ImageDecoderBackend, ImageSource, create_dataloader_pipeline
@@ -311,6 +312,7 @@ class Trainer:
 
         # ========================= 编译模型 =========================
         if compile_module:
+            initialize_upfirdn2d()
             self.train_g = torch.compile(self.net_g, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
             self.train_d = torch.compile(self.net_d, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
             self.generator_id_encoder_forward = torch.compile(self.generator_id_encoder, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
