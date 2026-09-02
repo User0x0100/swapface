@@ -68,6 +68,24 @@ def _configure_huggingface_hub(proxy: str | None = None) -> None:
     set_client_factory(lambda: httpx.Client(proxy=proxy, follow_redirects=True, timeout=None))
 
 
+def _disable_modelscope_progress_bars() -> None:
+    """仅在当前 DALI worker 中关闭 ModelScope Hub 的下载进度条。
+
+    modelscope-hub 0.4.0 在 ``_download`` 中直接绑定 ``tqdm``；如果在模块导入后才设置
+    ``TQDM_DISABLE``，tqdm 已经读取过环境变量，因此不会生效。worker 是独立进程，
+    在这里覆盖其下载模块使用的 tqdm，不会影响训练主进程的进度条。
+    """
+    os.environ["TQDM_DISABLE"] = "1"
+    import modelscope_hub._download as modelscope_download
+    from tqdm.auto import tqdm as tqdm_auto
+
+    def silent_tqdm(*args, **kwargs):
+        kwargs["disable"] = True
+        return tqdm_auto(*args, **kwargs)
+
+    modelscope_download.tqdm = silent_tqdm
+
+
 _configure_huggingface_hub()
 
 
@@ -311,7 +329,7 @@ class _RandomImagePairSource:
         # Hugging Face / ModelScope 单文件 cache miss 都可能输出进度条；DALI worker
         # 是独立进程，因此只在 worker 内关闭，避免污染主进程中的模型权重下载进度。
         disable_progress_bars()
-        os.environ.setdefault("TQDM_DISABLE", "1")
+        _disable_modelscope_progress_bars()
         self.rng = np.random.default_rng()
         self.modelscope_api = ModelScopeHubApi()
 
