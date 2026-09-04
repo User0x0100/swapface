@@ -11,6 +11,74 @@ from .models.id_encoder import get_alignment_template
 from .models.retinaface import RetinaFace, extract_landmarks
 from .utils import ImageDirectory
 
+# FFHQ 512 canonical coordinates -> InsightFace ArcFace 112 canonical coordinates.
+# The linear part is scaled at runtime for the actual square FFHQ input resolution;
+# translation remains in the 112x112 destination coordinate system.
+FFHQ_TO_ARCFACE_112_AFFINE_512 = (
+    (0.29209004227630586, 4.4496195577163076e-05, -18.93014028585668),
+    (-4.4496195577163076e-05, 0.29209004227630586, -17.86002120510068),
+)
+
+
+def make_ffhq_to_arcface_112_grid(input_size: int, batch_size: int, device: torch.device) -> Tensor:
+    """预计算标准 FFHQ aligned 图像到 112x112 canonical 坐标系的采样网格。
+
+    该网格在固定训练分辨率、batch size 和 device 下完全不变，应在训练初始化阶段
+    构造一次并复用，避免在每个 iteration 重复创建 affine/theta/grid。
+    """
+    if input_size <= 0:
+        raise ValueError(f"input_size 必须为正数，实际为 {input_size}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size 必须为正数，实际为 {batch_size}")
+
+    affine = torch.tensor(FFHQ_TO_ARCFACE_112_AFFINE_512, device=device, dtype=torch.float32)
+    affine[:, :2] *= 512.0 / float(input_size)
+    theta = affine_to_grid_theta(affine, (input_size, input_size), 112, align_corners=False)
+    theta = theta.expand(batch_size, -1, -1)
+    return F.affine_grid(theta, (batch_size, 3, 112, 112), align_corners=False)
+
+
+def transform_sampling_grid(grid: Tensor, theta: Tensor) -> Tensor:
+    """将 normalized output->input 仿射变换作用到已有采样网格。
+
+    ``grid`` 中的点先落在 canonical FFHQ normalized 坐标系，``theta`` 再将这些点映射
+    到实际输入图像坐标系。这样可把“恢复到 FFHQ + FFHQ->ArcFace”合并为一次采样。
+    """
+    if grid.ndim != 4 or grid.shape[-1] != 2:
+        raise ValueError(f"grid 必须为 [B,H,W,2]，实际为 {tuple(grid.shape)}")
+    if theta.ndim != 3 or theta.shape[1:] != (2, 3):
+        raise ValueError(f"theta 必须为 [B,2,3]，实际为 {tuple(theta.shape)}")
+    if grid.shape[0] != theta.shape[0]:
+        raise ValueError(f"grid 与 theta batch size 不一致：{grid.shape[0]} != {theta.shape[0]}")
+    if grid.device != theta.device:
+        raise ValueError(f"grid 与 theta 必须位于同一 device：{grid.device} != {theta.device}")
+
+    with torch.amp.autocast(device_type=grid.device.type, enabled=False):
+        flat_grid = grid.float().reshape(grid.shape[0], -1, 2)
+        theta = theta.float()
+        transformed = torch.bmm(flat_grid, theta[:, :, :2].transpose(1, 2))
+        transformed.add_(theta[:, :, 2].unsqueeze(1))
+        return transformed.reshape_as(grid)
+
+
+def ffhq_to_arcface_112(images: Tensor, grid: Tensor, *, padding_mode: str = "border") -> Tensor:
+    """使用预计算网格将 FFHQ aligned 方形图像映射到 112x112 canonical 坐标系。"""
+    if images.ndim != 4:
+        raise ValueError(f"images must be NCHW, got shape={tuple(images.shape)}")
+    if images.shape[2] != images.shape[3]:
+        raise ValueError(f"FFHQ aligned input must be square, got {images.shape[2]}x{images.shape[3]}")
+    if grid.ndim != 4 or grid.shape[0] != images.shape[0] or grid.shape[1:] != (112, 112, 2):
+        raise ValueError(f"grid shape 必须为 ({images.shape[0]}, 112, 112, 2)，实际为 {tuple(grid.shape)}")
+    if grid.device != images.device:
+        raise ValueError(f"grid 与 images 必须位于同一 device：{grid.device} != {images.device}")
+    if padding_mode not in {"zeros", "border", "reflection"}:
+        raise ValueError(f"不支持的 padding_mode：{padding_mode}")
+
+    # grid_sample 要求 input/grid dtype 一致；固定几何网格保留 FP32 精度。
+    # 即使外层训练启用了 BF16 autocast，这一步也显式以 FP32 执行。
+    with torch.amp.autocast(device_type=images.device.type, enabled=False):
+        return F.grid_sample(images.float(), grid, mode="bilinear", padding_mode=padding_mode, align_corners=False)
+
 
 def center_crop_and_resize(images: Tensor, crop_fraction: float = 0.102) -> Tensor:
     """Crop the same fraction from each edge and resize back to the input size."""

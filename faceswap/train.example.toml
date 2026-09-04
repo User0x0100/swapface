@@ -7,6 +7,7 @@
 # - 本文件用于展示所有当前支持的训练参数及其含义。
 # - 路径均为占位示例，使用前请替换为实际数据集/日志/checkpoint 路径。
 # - 未显式配置的参数会使用 Trainer 或 dataloader 中的默认值。
+# - 训练输入图像默认要求使用 FFHQ canonical alignment；Identity Loss 前固定映射到 112x112 canonical 坐标系。
 # - checkpoint 仅支持当前 v2 格式；恢复时会严格校验关键训练配置和身份编码器类型。
 
 [train]
