@@ -25,8 +25,8 @@ from losses import (
     make_l1_loss,
     r1_reg_loss,
 )
-from misc.face_alignment import center_crop_and_resize, ffhq_to_arcface_112, make_ffhq_to_arcface_112_grid, transform_sampling_grid
-from misc.models.id_encoder import ID_ENCODER_INPUT_SIZE, IDEncoder, IDEncoderProvider
+from misc.face_alignment import ffhq_to_arcface_112, make_ffhq_to_arcface_112_grid, transform_sampling_grid
+from misc.models.id_encoder import IDEncoder, IDEncoderProvider
 from models.discriminator import Discriminator
 from models.discriminator.upfirdn2d import initialize_upfirdn2d
 from models.networks import Generator
@@ -276,9 +276,9 @@ class Trainer:
 
         self.generator_id_encoder = IDEncoder(self.generator_id_encoder_provider).to(self.device).eval().requires_grad_(False)
         self.id_loss = IdentityLoss(weight=id_loss_weight, provider=self.identity_loss_provider).to(self.device)
-        # 训练数据默认使用 FFHQ canonical alignment。Identity Loss 前固定映射到 112x112
-        # canonical 坐标系；sampling grid 在整个训练期间不变，因此只初始化一次。
-        self.identity_loss_grid = make_ffhq_to_arcface_112_grid(self.img_resolution, self.batch_size, self.device)
+        # 训练数据默认使用 FFHQ canonical alignment。Generator 身份编码器与 Identity Loss
+        # 共用同一套 FFHQ -> ArcFace 112 canonical 映射；sampling grid 仅初始化一次。
+        self.identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.img_resolution, self.batch_size, self.device)
 
         if self.enable_rec_loss:
             self.rec_loss = make_l1_loss(weight=rec_loss_weight, reduction="mean")
@@ -353,11 +353,11 @@ class Trainer:
         src, dst, theta_restore = (data[k] for k in self.sample_output_map)
         return src, dst, theta_restore
 
-    def prepare_identity_loss_faces(self, faces: Tensor, theta_restore: Tensor | None = None) -> Tensor:
-        """将默认的 FFHQ aligned 训练人脸映射为身份编码器使用的 112x112 输入。"""
+    def prepare_identity_encoder_faces(self, faces: Tensor, theta_restore: Tensor | None = None) -> Tensor:
+        """将 FFHQ canonical 训练人脸映射为身份编码器使用的 ArcFace 112 canonical 输入。"""
         if theta_restore is None:
-            return ffhq_to_arcface_112(faces, self.identity_loss_grid)
-        grid = transform_sampling_grid(self.identity_loss_grid, theta_restore)
+            return ffhq_to_arcface_112(faces, self.identity_encoder_grid)
+        grid = transform_sampling_grid(self.identity_encoder_grid, theta_restore)
         return ffhq_to_arcface_112(faces, grid, padding_mode="reflection")
 
     @torch.no_grad()
@@ -435,10 +435,9 @@ class Trainer:
             # ========================= 生成器前向 =========================
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
                 with torch.no_grad():
-                    source_faces = center_crop_and_resize(src)
-                    source_faces_112 = NF.interpolate(source_faces, size=ID_ENCODER_INPUT_SIZE, mode="bilinear", align_corners=False)
-                    generator_identity_embeddings = self.generator_id_encoder_forward(source_faces_112)
-                    source_identity_embeddings = self.id_loss.extract_identity_embeddings(self.prepare_identity_loss_faces(src))
+                    source_identity_faces = self.prepare_identity_encoder_faces(src)
+                    generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
+                    source_identity_embeddings = self.id_loss.extract_identity_embeddings(source_identity_faces)
                 fake: Tensor = net_g(dst, generator_identity_embeddings)
 
             # ========================= 训练判别器 =========================
@@ -501,7 +500,7 @@ class Trainer:
                     g_loss = g_loss + wfm_loss
 
                 # id_loss
-                generated_identity_embeddings = self.id_loss.extract_identity_embeddings(self.prepare_identity_loss_faces(fake, theta_restore))
+                generated_identity_embeddings = self.id_loss.extract_identity_embeddings(self.prepare_identity_encoder_faces(fake, theta_restore))
                 id_loss = self.id_loss(generated_identity_embeddings, source_identity_embeddings)
                 self.log("id_loss", id_loss)
                 g_loss = g_loss + id_loss
@@ -534,15 +533,14 @@ class Trainer:
                     grid_vis = NF.affine_grid(theta_restore_vis, size=list(fake.shape), align_corners=False)
                     dst_restored_vis = NF.grid_sample(dst_vis, grid_vis, mode="bilinear", padding_mode="reflection", align_corners=False)
 
-                    source_faces_vis = center_crop_and_resize(src_vis)
-                    source_faces_vis_112 = NF.interpolate(source_faces_vis, size=ID_ENCODER_INPUT_SIZE, mode="bilinear", align_corners=False)
-                    generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_faces_vis_112)
-                    source_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(self.prepare_identity_loss_faces(src_vis))
+                    source_identity_faces_vis = self.prepare_identity_encoder_faces(src_vis)
+                    generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
+                    source_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(source_identity_faces_vis)
                     fake_vis: Tensor = self.net_g_ema(dst_vis, generator_identity_embeddings_vis)
 
                     # Identity Loss 编码器真正接收的图像；直接组合 restore + FFHQ->112，
                     # 避免先恢复到全分辨率再二次重采样。仅为 sample grid 显示再放大回训练分辨率。
-                    identity_encoder_input_vis = self.prepare_identity_loss_faces(fake_vis, theta_restore_vis)
+                    identity_encoder_input_vis = self.prepare_identity_encoder_faces(fake_vis, theta_restore_vis)
                     identity_encoder_input_display_vis = NF.interpolate(
                         identity_encoder_input_vis,
                         size=fake_vis.shape[2:],
@@ -563,7 +561,7 @@ class Trainer:
                     # ========================= 身份损失梯度图 =========================
                     with torch.enable_grad():
                         fake_for_id_grad = fake_vis.detach().requires_grad_(True)
-                        generated_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(self.prepare_identity_loss_faces(fake_for_id_grad, theta_restore_vis))
+                        generated_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(self.prepare_identity_encoder_faces(fake_for_id_grad, theta_restore_vis))
                         id_loss_vis = self.id_loss(generated_identity_embeddings_vis, source_identity_embeddings_vis.detach())
                         id_grad_map = self.loss_grad_map(id_loss_vis, fake_for_id_grad)
 
