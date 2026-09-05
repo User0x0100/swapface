@@ -76,6 +76,18 @@ enable_rec_loss = true
 rec_loss_weight = 10.0
 
 
+[loss.vgg]
+# VGG19 感知特征损失。默认开启；配置与 2026-06-29 训练版本一致。
+# 比较 fake 与增强后的 dst，使用 L1 匹配以下冻结 VGG19 中间特征。
+enable = true
+
+[loss.vgg.weights]
+conv1_2 = 2.5
+conv2_2 = 2.5
+conv3_3 = 2.5
+conv4_3 = 2.5
+
+
 [loss.wfm]
 # 是否启用判别器中间特征的 Weighted Feature Matching Loss。
 # fake 分支保留梯度，real 分支在 no_grad 下作为目标特征。

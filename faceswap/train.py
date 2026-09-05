@@ -21,6 +21,7 @@ from losses import (
     DiscriminatorAdversarialLoss,
     GeneratorAdversarialLoss,
     IdentityLoss,
+    VGGPerceptualLoss,
     WeightedFeatureMatchingLoss,
     make_l1_loss,
     r1_reg_loss,
@@ -37,6 +38,12 @@ EPS = 1e-8
 CHECKPOINT_VERSION = 2
 DEFAULT_GENERATOR_ID_ENCODER_PROVIDER = IDEncoderProvider.BLENDFACE
 DEFAULT_IDENTITY_LOSS_PROVIDER = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16
+DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
+    "conv1_2": 2.5,
+    "conv2_2": 2.5,
+    "conv3_3": 2.5,
+    "conv4_3": 2.5,
+}
 DEFAULT_WFM_LOSS_WEIGHT: dict[int, float] = {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.1}
 DEFAULT_TRAIN_CONFIG_PATH = Path(__file__).resolve().parents[1] / "experiments" / "train.toml"
 
@@ -88,6 +95,9 @@ class Trainer:
         # 重建损失
         enable_rec_loss: bool = True,
         rec_loss_weight: float = 10.0,
+        # VGG19 感知特征损失
+        enable_perceptual_loss: bool = True,
+        perceptual_loss_weight: dict[str, float] | None = None,
         # 判别器浅层/中层特征的弱特征匹配
         enable_wfm_loss: bool = True,
         wfm_loss_weight: dict[int, float] | None = None,
@@ -117,6 +127,10 @@ class Trainer:
             raise ValueError(f"r1_gamma 不能为负数，实际为 {r1_gamma}")
         if log_interval <= 0 or sample_save_every <= 0 or weight_save_every <= 0:
             raise ValueError("log_interval、sample_save_every 和 weight_save_every 必须为正数")
+        if perceptual_loss_weight is None:
+            perceptual_loss_weight = dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)
+        if enable_perceptual_loss and not perceptual_loss_weight:
+            raise ValueError("enable_perceptual_loss=True 时 perceptual_loss_weight 不能为空")
         if wfm_loss_weight is None:
             wfm_loss_weight = dict(DEFAULT_WFM_LOSS_WEIGHT)
         if enable_wfm_loss and not wfm_loss_weight:
@@ -138,6 +152,7 @@ class Trainer:
         self.r1_reg_step = r1_reg_step
         self.r1_gamma = r1_gamma
         self.enable_rec_loss = enable_rec_loss
+        self.enable_perceptual_loss = enable_perceptual_loss
         self.enable_wfm_loss = enable_wfm_loss
 
         device_id = self.device.index if self.device.index is not None else torch.cuda.current_device()
@@ -164,6 +179,8 @@ class Trainer:
             "id_loss_weight": id_loss_weight,
             "enable_rec_loss": self.enable_rec_loss,
             "rec_loss_weight": rec_loss_weight,
+            "enable_perceptual_loss": self.enable_perceptual_loss,
+            "perceptual_loss_weight": dict(perceptual_loss_weight),
             "enable_wfm_loss": self.enable_wfm_loss,
             "wfm_loss_weight": dict(wfm_loss_weight),
             "lr_scheduler_t_max": lr_scheduler_t_max,
@@ -200,6 +217,8 @@ class Trainer:
                 "id_loss_weight",
                 "enable_rec_loss",
                 "rec_loss_weight",
+                "enable_perceptual_loss",
+                "perceptual_loss_weight",
                 "enable_wfm_loss",
                 "wfm_loss_weight",
             )
@@ -282,6 +301,9 @@ class Trainer:
 
         if self.enable_rec_loss:
             self.rec_loss = make_l1_loss(weight=rec_loss_weight, reduction="mean")
+
+        if self.enable_perceptual_loss:
+            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
 
         if self.enable_wfm_loss:
             feature_count = len(self.net_d.down_blocks)
@@ -505,6 +527,12 @@ class Trainer:
                 self.log("id_loss", id_loss)
                 g_loss = g_loss + id_loss
 
+                # perceptual_loss
+                if self.enable_perceptual_loss:
+                    perceptual_loss = self.perceptual_loss(fake, dst)
+                    self.log("perceptual_loss", perceptual_loss)
+                    g_loss = g_loss + perceptual_loss
+
                 # rec_loss
                 if self.enable_rec_loss:
                     rec_loss = self.rec_loss(fake, dst)
@@ -656,6 +684,24 @@ def load_train_config(path: str | Path) -> dict[str, Any]:
     if identity:
         raise ValueError(f"[identity] 包含未知字段：{sorted(identity)}")
 
+    vgg = loss.pop("vgg", {})
+    if not isinstance(vgg, dict):
+        raise TypeError("[loss.vgg] 必须为 TOML 表")
+    enable_perceptual_loss = vgg.pop("enable", True)
+    raw_perceptual_weights = vgg.pop("weights", None)
+    if vgg:
+        raise ValueError(f"[loss.vgg] 包含未知字段：{sorted(vgg)}")
+
+    if raw_perceptual_weights is None:
+        perceptual_loss_weight: dict[str, float] | None = None
+    else:
+        if not isinstance(raw_perceptual_weights, dict):
+            raise TypeError("[loss.vgg.weights] 必须为 TOML 表")
+        try:
+            perceptual_loss_weight = {str(layer): float(weight) for layer, weight in raw_perceptual_weights.items()}
+        except (TypeError, ValueError) as exc:
+            raise ValueError("[loss.vgg.weights] 的键必须是 VGG 层名，值必须是数值") from exc
+
     wfm = loss.pop("wfm", {})
     if not isinstance(wfm, dict):
         raise TypeError("[loss.wfm] 必须为 TOML 表")
@@ -711,6 +757,8 @@ def load_train_config(path: str | Path) -> dict[str, Any]:
         "generator_id_encoder_provider": generator_id_encoder_provider,
         "identity_loss_provider": identity_loss_provider,
         "id_loss_weight": float(id_loss_weight),
+        "enable_perceptual_loss": bool(enable_perceptual_loss),
+        "perceptual_loss_weight": perceptual_loss_weight,
         "enable_wfm_loss": bool(enable_wfm_loss),
         "wfm_loss_weight": wfm_loss_weight,
         "dataloader_cfg": dataloader,
