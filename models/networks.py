@@ -265,14 +265,14 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 1
     network_cfg = {
-        "img_resolution": 512,
+        "img_resolution": 256,
         "img_channels": 3,
-        "num_depth": 5,
+        "num_depth": 4,
         "num_latent": 6,
-        "base_ch": 16,
+        "base_ch": 32,
         "max_ch": 2048,
         "id_dim": 512,
-        "aad_skip_layers": [0, 1, 2, 3, 4],
+        "aad_skip_layers": [0, 1, 2],
     }
 
     model = Generator(**network_cfg).to(device)

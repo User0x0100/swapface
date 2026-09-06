@@ -199,6 +199,31 @@ def affine_to_grid_theta(
     return theta
 
 
+def make_alignment_grid_theta(
+    source_landmarks: Tensor,
+    alignment_template: Tensor,
+    input_hw: tuple[int, int],
+    output_size: int,
+) -> Tensor:
+    """只计算对齐采样所需的 output->input normalized theta，不执行图像重采样。"""
+    if output_size <= 0:
+        raise ValueError("output_size must be greater than 0")
+    if source_landmarks.ndim != 3 or source_landmarks.shape[-1] != 2:
+        raise ValueError(f"source_landmarks must have shape [N, P, 2], got {tuple(source_landmarks.shape)}")
+    if alignment_template.ndim != 2 or alignment_template.shape[-1] != 2:
+        raise ValueError(f"alignment_template must have shape [P, 2], got {tuple(alignment_template.shape)}")
+    if source_landmarks.shape[1] != alignment_template.shape[0]:
+        raise ValueError("source_landmarks and alignment_template must contain the same number of landmarks")
+    if source_landmarks.shape[0] == 0:
+        return source_landmarks.new_empty((0, 2, 3))
+
+    src_to_dst_affine = compute_similarity_transform(
+        source_landmarks,
+        alignment_template.unsqueeze(0).expand(source_landmarks.shape[0], -1, -1),
+    )
+    return affine_to_grid_theta(src_to_dst_affine, input_hw, output_size, align_corners=False)
+
+
 def invert_grid_theta(theta: Tensor) -> Tensor:
     """
     计算 grid theta 的逆变换
@@ -288,8 +313,7 @@ def align_faces(
         C, H, W = image.shape
         image = image.unsqueeze(0).expand(face_count, -1, -1, -1)
 
-        src_to_dst_affine = compute_similarity_transform(src_point, alignment_template.unsqueeze(0).expand(face_count, -1, -1))
-        grid_theta = affine_to_grid_theta(src_to_dst_affine, (H, W), output_size, align_corners=False)
+        grid_theta = make_alignment_grid_theta(src_point, alignment_template, (H, W), output_size)
 
         grid = F.affine_grid(grid_theta, [face_count, C, output_size, output_size], align_corners=False)
         faces = F.grid_sample(image, grid, align_corners=False, mode="bilinear")

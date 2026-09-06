@@ -32,10 +32,10 @@ from models.discriminator import Discriminator
 from models.discriminator.upfirdn2d import initialize_upfirdn2d
 from models.networks import Generator
 
+from .contracts import CHECKPOINT_VERSION
 from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, HuggingFaceImageSource, ImageDecoderBackend, ImageSource, ModelScopeImageSource, create_dataloader_pipeline
 
 EPS = 1e-8
-CHECKPOINT_VERSION = 2
 DEFAULT_GENERATOR_ID_ENCODER_PROVIDER = IDEncoderProvider.BLENDFACE
 DEFAULT_IDENTITY_LOSS_PROVIDER = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16
 DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
