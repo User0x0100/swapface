@@ -400,7 +400,8 @@ def restore_faces_to_original(
         result.append(original_image.squeeze_(0))
 
     if isinstance(original_images, Tensor):
-        return torch.stack(result, dim=0)
+        # 每一帧已通过 copy_ 写回输入，无需再次 stack 一份全分辨率视频。
+        return original_images
 
     return result
 

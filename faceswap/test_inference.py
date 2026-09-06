@@ -14,7 +14,7 @@ from torchvision.io import write_png
 from faceswap import export, swapper
 from faceswap.contracts import CHECKPOINT_VERSION
 from faceswap.inference import get_ffhq_alignment_template, load_generator
-from misc.face_alignment import FFHQ_TO_ARCFACE_112_AFFINE_512, make_alignment_grid_theta, transform_sampling_grid
+from misc.face_alignment import FFHQ_TO_ARCFACE_112_AFFINE_512, make_alignment_grid_theta, restore_faces_to_original, transform_sampling_grid
 from misc.models.id_encoder import IDEncoderProvider, get_alignment_template
 from models.networks import Generator
 
@@ -30,6 +30,10 @@ class RecordingEncoder(nn.Module):
 
 
 class Detector(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = {"image_size": 840}
+
     def detect(self, images):
         return None, [1]
 
@@ -107,6 +111,7 @@ def main() -> None:
                 print(f"PASS: {'NHWC' if nhwc else 'NCHW'}, fixed batch={batch_size}, 3 faces, max error={(actual - expected).abs().max().item():.3g}")
                 if nhwc and torch.cuda.is_available():
                     gpu_native = swapper.FaceSwapper(str(checkpoint_path), device="cuda")
+                    assert gpu_native.bf16 == torch.cuda.is_bf16_supported(including_emulation=False)
                     gpu_output = gpu_native.swap_faces(faces, identity).cpu()
                     torch.testing.assert_close(gpu_output, expected, atol=5e-3, rtol=5e-3)
                     gpu_onnx = swapper.FaceSwapper(str(exported_path), device="cuda")
@@ -118,33 +123,51 @@ def main() -> None:
                     torch.testing.assert_close(gpu_onnx_output, expected, atol=2e-4, rtol=2e-4)
                     print(f"PASS: CUDA PyTorch (BF16={gpu_native.bf16}) and ONNX IOBinding")
 
-            # PyTorch/ONNX 都需经过遮罩和原帧还原，且无脸帧仍交给预览。
-            for engine in (native, runtime):
+            # PyTorch/ONNX 都经过遮罩和原帧还原；检测缩放可关闭，小帧无需放大。
+            for engine, full_resolution, detection_size in ((native, False, 840), (native, False, 16), (runtime, True, 16)):
                 original = torch.full((1, 3, 32, 32), 127.5)
                 crop = (faces[:1] + 1) * 127.5
                 theta = torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]])
-                fake_extractor = Mock()
-                fake_extractor.__iter__ = Mock(
-                    return_value=iter([
-                        (original.clone(), crop.clone(), theta, [1], 1),
-                        (original.clone(), crop[:0], theta[:0], [0], 1),
-                    ])
-                )
+                decoder = Mock()
+                decoder.__len__ = Mock(return_value=2)
+                decoder.__getitem__ = Mock(side_effect=[Mock(data=original.clone()), Mock(data=original.clone())])
                 context = Mock()
                 context.Process.return_value.is_alive.return_value = False
+                engine.face_detector.config = {"image_size": detection_size}
                 with (
                     patch.object(engine, "extract_identity_embedding", return_value=identity),
-                    patch.object(swapper, "VideoFaceExtractor", return_value=fake_extractor),
+                    patch.object(swapper, "VideoDecoder", return_value=decoder),
+                    patch.object(engine.face_detector, "detect", side_effect=[(None, [1]), (None, [0])]) as detect,
+                    patch.object(swapper, "extract_landmarks", return_value=torch.empty(1, 5, 2)),
+                    patch.object(swapper, "align_faces", side_effect=[(crop.clone(), theta), (crop[:0], theta[:0])]) as align,
                     patch.object(swapper.mp, "get_context", return_value=context),
                     patch.object(swapper, "restore_faces_to_original", wraps=swapper.restore_faces_to_original) as restore,
                 ):
-                    engine.swap_video("unused.mp4", "unused.png")
+                    engine.swap_video("unused.mp4", "unused.png", batch_size=1, full_resolution_detection=full_resolution)
                     assert restore.call_count == 1
-                torch.testing.assert_close(fake_extractor.alignment_template, engine.alignment_template)
+                    assert isinstance(detect.call_args_list[0].args[0], list) == (not full_resolution and detection_size < 32)
+                    assert detect.call_args_list[0].kwargs == {"confidence_threshold": 0.99, "iou_threshold": 0.2, "min_face_size": (256, 256)}
+                    torch.testing.assert_close(align.call_args_list[0].args[3], engine.alignment_template)
                 queue = context.Queue.return_value
                 assert queue.put.call_count == 3  # 两批视频帧 + 结束标记。
                 assert queue.put.call_args_list[0].args[0].shape == (1, 8, 16, 3)
                 assert queue.put.call_args_list[-1].args == (None,)
+
+            # 预览减复制不能改变像素：覆盖非 4 整除宽度、重叠人脸、无脸帧。
+            for width in (32, 33, 34, 35):
+                original = torch.rand(3, 3, 31, width) * 2 - 1
+                theta = torch.tensor([[[0.8, 0.1, -0.1], [-0.1, 0.8, 0.1]], [[0.6, -0.1, 0.2], [0.1, 0.6, 0.0]], [[0.9, 0.1, 0.8], [-0.1, 0.9, 0.7]]])
+                for test_faces, test_theta, lengths in ((faces, theta, [2, 0, 1]), (faces[:0], theta[:0], [0, 0, 0])):
+                    restored = restore_faces_to_original(original.clone(), test_faces, test_theta, lengths)
+                    expected_preview = NF.interpolate(torch.cat((original, restored), dim=3), scale_factor=0.25, mode="bilinear", align_corners=False)
+                    actual_preview = swapper.FaceSwapper._make_preview(original.clone(), test_faces, test_theta, lengths)
+                    torch.testing.assert_close(actual_preview, expected_preview, atol=0, rtol=0)
+            try:
+                native.swap_video("unused.mp4", "unused.png", batch_size=0)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Invalid video batch size was accepted")
 
             # 缺少新约定的 ONNX 必须明确拒绝，不能猜 provider 或 alignment。
             del onnx_model.metadata_props[:]

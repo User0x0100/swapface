@@ -9,9 +9,10 @@ import torch
 import torch.nn.functional as NF
 import torchvision.transforms.functional as F
 from torch import Tensor
+from torchcodec.decoders import VideoDecoder
 from torchvision.io import ImageReadMode, decode_image
 
-from misc.face_alignment import VideoFaceExtractor, make_alignment_grid_theta, make_ffhq_to_arcface_112_grid, restore_faces_to_original, transform_sampling_grid
+from misc.face_alignment import align_faces, make_alignment_grid_theta, make_ffhq_to_arcface_112_grid, restore_faces_to_original, transform_sampling_grid
 from misc.models import ImageInputRange
 from misc.models.face_mask import FaceMasker
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
@@ -41,7 +42,8 @@ class FaceSwapper:
         self.bf16 = False
         if self.device.type == "cuda":
             with torch.cuda.device(self.device):
-                self.bf16 = torch.cuda.is_bf16_supported()
+                # Turing 等设备的软件 BF16 模拟比 FP32 更慢，仅启用原生 BF16。
+                self.bf16 = torch.cuda.is_bf16_supported(including_emulation=False)
         self.is_onnx = str(model_path).lower().endswith(".onnx")
 
         if self.is_onnx:
@@ -101,7 +103,7 @@ class FaceSwapper:
             self.net_g = net_g.to(self.device).eval()
 
         print(f"Loaded iter={self.training_iteration}, provider={self.id_encoder_provider.name}, alignment=FFHQ")
-        self.face_detector = RetinaFace(input_range=ImageInputRange.MINUS_ONE_TO_ONE).to(self.device).eval()
+        self.face_detector = RetinaFace(input_range=ImageInputRange.ZERO_TO_255).to(self.device).eval()
         self.id_encoder = IDEncoder(self.id_encoder_provider).to(self.device).eval()
         self.face_masker = FaceMasker(input_range=ImageInputRange.MINUS_ONE_TO_ONE, mode="occlusion").to(self.device)  # occ 模型在 eval 模式下无法正常推理
         self.alignment_template = get_ffhq_alignment_template(self.img_resolution, self.device)
@@ -112,7 +114,7 @@ class FaceSwapper:
         """使用训练端相同的 FFHQ -> ArcFace 112 映射提取 [1,512] 身份特征。"""
         image = decode_image(str(image_path), mode=ImageReadMode.RGB).to(device=self.device, dtype=torch.float32).unsqueeze(0)
         normalized = image / 127.5 - 1.0
-        detections, segment_lengths = self.face_detector.detect(normalized)
+        detections, segment_lengths = self.face_detector.detect(image)
         face_count = segment_lengths[0]
         if face_count == 0:
             raise ValueError(f"未从 {image_path} 检测到任何面部")
@@ -230,30 +232,52 @@ class FaceSwapper:
                 cv2.waitKey(max(1, int(1000 / fps)))
         cv2.destroyAllWindows()
 
+    @staticmethod
+    def _make_preview(original_frames: Tensor, swapped_faces: Tensor, grid_theta: Tensor, segment_lengths: list[int]) -> Tensor:
+        """保留全分辨率还原，先缩小左右两侧再拼接，避免复制/拼接全尺寸视频。"""
+        if original_frames.shape[-1] % 4:
+            # 原实现的左右分界可能落在 bilinear 采样点上，奇数预览宽度保留原采样方式。
+            restored = original_frames.clone()
+            if swapped_faces.size(0):
+                restored = restore_faces_to_original(restored, swapped_faces, grid_theta, segment_lengths)
+            return NF.interpolate(torch.cat((original_frames, restored), dim=3), scale_factor=0.25, mode="bilinear", align_corners=False)
+        original_preview = NF.interpolate(original_frames, scale_factor=0.25, mode="bilinear", align_corners=False)
+        if not swapped_faces.size(0):
+            return torch.cat((original_preview, original_preview), dim=3)
+        restored = restore_faces_to_original(original_frames, swapped_faces, grid_theta, segment_lengths)
+        swapped_preview = NF.interpolate(restored, scale_factor=0.25, mode="bilinear", align_corners=False)
+        return torch.cat((original_preview, swapped_preview), dim=3)
+
     @torch.inference_mode()
-    def swap_video(self, video_path: str | Path, identity_image_path: str | Path) -> None:
+    def swap_video(self, video_path: str | Path, identity_image_path: str | Path, batch_size: int = 8, full_resolution_detection: bool = False) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size 必须为正数")
         identity_embedding = self.extract_identity_embedding(identity_image_path)
-        extractor = VideoFaceExtractor(video_path, batch_size=8, output_size=self.img_resolution, device=self.device)
-        # 源脸和目标脸使用同一 FFHQ 坐标；复用提取器的检测、采样及逆变换。
-        extractor.alignment_template = self.alignment_template
+        decoder = VideoDecoder(str(video_path), device=self.device)
         context = mp.get_context("spawn")
         display_queue = context.Queue(maxsize=15)
         display_process = context.Process(target=self._display_worker, args=(display_queue,), daemon=True)
         display_process.start()
         try:
-            for original_frames, faces, grid_theta, segment_lengths, _frame_count in extractor:
+            for start in range(0, len(decoder), batch_size):
+                original_frames = decoder[start : start + batch_size].data.to(device=self.device, dtype=torch.float32)
+                # 大帧复用检测器原生 resize/padding 路径；检测结果已还原到原图坐标。
+                # 小帧直接检测，避免上采样或 padding 反而增加工作量。
+                height, width = original_frames.shape[-2:]
+                resize_detection = not full_resolution_detection and height * width > self.face_detector.config["image_size"] ** 2
+                detection_input = list(original_frames) if resize_detection else original_frames
+                detections, segment_lengths = self.face_detector.detect(detection_input, confidence_threshold=0.99, iou_threshold=0.2, min_face_size=(256, 256))
+                faces, grid_theta = align_faces(original_frames, extract_landmarks(detections), segment_lengths, self.alignment_template, self.img_resolution)
                 original_frames.div_(127.5).sub_(1.0)
                 faces.div_(127.5).sub_(1.0)
-                swapped_frames = original_frames.clone()
+                swapped_faces = faces
                 if faces.size(0):
                     swapped_faces = self.swap_faces(faces, identity_embedding)
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.bf16):
                         face_mask = self.face_masker(faces)
                     face_mask = F.gaussian_blur(face_mask.float(), [7, 7], [13.0, 13.0])
                     swapped_faces = faces * (1.0 - face_mask) + swapped_faces * face_mask
-                    swapped_frames = restore_faces_to_original(swapped_frames, swapped_faces, grid_theta, segment_lengths)
-                frames = torch.cat((original_frames, swapped_frames), dim=3)
-                frames = torch.nn.functional.interpolate(frames, scale_factor=0.25, mode="bilinear", align_corners=False)
+                frames = self._make_preview(original_frames, swapped_faces, grid_theta, segment_lengths)
                 frames = frames.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)[:, [2, 1, 0]]
                 display_queue.put(frames.permute(0, 2, 3, 1).to(device="cpu", dtype=torch.uint8).numpy())
             display_queue.put(None)
@@ -272,8 +296,10 @@ def main() -> None:
     parser.add_argument("--video", required=True)
     parser.add_argument("--identity", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--batch-size", type=int, default=8, help="每批解码和检测的视频帧数")
+    parser.add_argument("--full-resolution-detection", action="store_true", help="按原视频分辨率检测，保留原有检测精度；默认大帧使用检测器原生缩放")
     args = parser.parse_args()
-    FaceSwapper(args.model, device=args.device).swap_video(args.video, args.identity)
+    FaceSwapper(args.model, device=args.device).swap_video(args.video, args.identity, batch_size=args.batch_size, full_resolution_detection=args.full_resolution_detection)
 
 
 if __name__ == "__main__":

@@ -109,9 +109,9 @@ class RetinaFace(nn.Module):
         self.ssh2 = SSH(out_channels, out_channels)
         self.ssh3 = SSH(out_channels, out_channels)
 
-        self.class_heads = self._make_class_heads(fpn_num=3, inchannels=config["out_channel"])
-        self.box_heads = self._make_box_heads(fpn_num=3, inchannels=config["out_channel"])
-        self.landmark_heads = self._make_landmark_heads(fpn_num=3, inchannels=config["out_channel"])
+        self.ClassHead = self._make_class_head(fpn_num=3, inchannels=config["out_channel"])
+        self.BboxHead = self._make_bbox_head(fpn_num=3, inchannels=config["out_channel"])
+        self.LandmarkHead = self._make_landmark_head(fpn_num=3, inchannels=config["out_channel"])
 
         state_dict: dict[str, Tensor] = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
@@ -120,19 +120,19 @@ class RetinaFace(nn.Module):
         self.config = config
         self._priors_cache: OrderedDict[tuple[int, int, str], Tensor] = OrderedDict()
 
-    def _make_class_heads(self, fpn_num: int = 3, inchannels: int = 64, anchor_num: int = 2) -> nn.ModuleList:
+    def _make_class_head(self, fpn_num: int = 3, inchannels: int = 64, anchor_num: int = 2) -> nn.ModuleList:
         heads = nn.ModuleList()
         for _ in range(fpn_num):
             heads.append(ClassHead(inchannels, anchor_num))
         return heads
 
-    def _make_box_heads(self, fpn_num: int = 3, inchannels: int = 64, anchor_num: int = 2) -> nn.ModuleList:
+    def _make_bbox_head(self, fpn_num: int = 3, inchannels: int = 64, anchor_num: int = 2) -> nn.ModuleList:
         heads = nn.ModuleList()
         for _ in range(fpn_num):
             heads.append(BboxHead(inchannels, anchor_num))
         return heads
 
-    def _make_landmark_heads(self, fpn_num: int = 3, inchannels: int = 64, anchor_num: int = 2) -> nn.ModuleList:
+    def _make_landmark_head(self, fpn_num: int = 3, inchannels: int = 64, anchor_num: int = 2) -> nn.ModuleList:
         heads = nn.ModuleList()
         for _ in range(fpn_num):
             heads.append(LandmarkHead(inchannels, anchor_num))
@@ -215,17 +215,18 @@ class RetinaFace(nn.Module):
         feature3 = self.ssh3(fpn[2])
         features = [feature1, feature2, feature3]
 
-        box_regression = torch.cat([self.box_heads[i](feature) for i, feature in enumerate(features)], dim=1)
-        class_logits = torch.cat([self.class_heads[i](feature) for i, feature in enumerate(features)], dim=1)
+        box_regression = torch.cat([self.BboxHead[i](feature) for i, feature in enumerate(features)], dim=1)
+        class_logits = torch.cat([self.ClassHead[i](feature) for i, feature in enumerate(features)], dim=1)
+        class_probabilities = F.softmax(class_logits, dim=-1)
         landmark_regression = torch.cat(
-            [self.landmark_heads[i](feature) for i, feature in enumerate(features)],
+            [self.LandmarkHead[i](feature) for i, feature in enumerate(features)],
             dim=1,
         )
 
         height, width = batch.shape[-2:]
         detections = self._postprocess(
             box_regression,
-            class_logits,
+            class_probabilities,
             landmark_regression,
             (height, width),
             scales=scales,
@@ -239,7 +240,7 @@ class RetinaFace(nn.Module):
     def _postprocess(
         self,
         box_regression: Tensor,
-        class_logits: Tensor,
+        class_probabilities: Tensor,
         landmark_regression: Tensor,
         image_shape: tuple[int, int],
         confidence_threshold: float,
@@ -262,7 +263,7 @@ class RetinaFace(nn.Module):
         segment_lengths: list[int] = []
 
         for batch_index in range(batch_size):
-            scores = class_logits[batch_index, :, 1]
+            scores = class_probabilities[batch_index, :, 1]
             confidence_mask = scores > confidence_threshold
             if not confidence_mask.any():
                 segment_lengths.append(0)
