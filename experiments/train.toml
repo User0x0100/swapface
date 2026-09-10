@@ -67,7 +67,7 @@ loss_weight = 10.0
 enable_rec_loss = true
 
 # Reconstruction Loss 权重。
-rec_loss_weight = 5.0
+rec_loss_weight = 1.0
 
 
 [loss.vgg]
@@ -85,7 +85,7 @@ conv4_3 = 2.5
 [loss.wfm]
 # 是否启用判别器中间特征的 Weighted Feature Matching Loss。
 # fake 分支保留梯度，real 分支在 no_grad 下作为目标特征。
-enable = true
+enable = false
 
 # WFM 使用的判别器特征层索引及对应权重。
 # 键是 Discriminator down_blocks 的 0-based 索引。
