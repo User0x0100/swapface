@@ -131,7 +131,7 @@ saturation = 0.2
 flip_prob = 0.5
 
 # dst 随机旋转角范围，单位：度。
-rotation_range = [-10.0, 10.0]
+rotation_range = [-3.0, 3.0]
 
 # dst 实际缩放倍数范围，必须为正数。
 scale_factor_range = [0.75, 1.25]
