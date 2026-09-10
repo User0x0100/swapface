@@ -62,6 +62,11 @@ def main() -> None:
         for key, value in loaded.state_dict().items():
             torch.testing.assert_close(value, model.state_dict()[key])
 
+        checkpoint_with_step = directory / "with-step.pth"
+        torch.save({**checkpoint, "step": 124}, checkpoint_with_step)
+        _, _, completed_step = load_generator(checkpoint_with_step)
+        assert completed_step == 124
+
         # 五点目标经训练端 affine 映射后必须回到原 ArcFace 112 坐标。
         affine = torch.tensor(FFHQ_TO_ARCFACE_112_AFFINE_512)
         for resolution in (256, 512, 1024):

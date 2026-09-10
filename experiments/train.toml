@@ -1,20 +1,19 @@
-# FaceSwap 训练配置示例
+# FaceSwap 训练配置
 # 详细的 run / checkpoint / resume 约定见 docs/training.md。
 #
 # 使用方式：
-#   新训练：uv run python -m faceswap.train --config faceswap/train.example.toml [--name NAME]
+#   新训练：uv run python -m faceswap.train --config experiments/train.toml [--name NAME]
 #   恢复训练：uv run python -m faceswap.train --resume experiments/runs/<run_id> [--strict-bf16]
 #
 # 说明：
 # - 本文件只描述训练实验本身，不保存 checkpoint/output 路径等运行时状态。
 # - 每次新训练会自动创建唯一 run 目录，并冻结原始配置、resolved config 与运行元数据。
 # - 未显式配置的参数会使用 Trainer / 模型 / dataloader 的默认值，并写入 run/config.resolved.json。
-# - 训练输入图像默认要求使用 FFHQ canonical alignment；Identity Loss 前固定映射到 112x112 canonical 坐标系。
 # - checkpoint 仅支持当前 v2 格式；恢复时使用原 run 的冻结配置，不重新读取本文件。
 
 [train]
 # 每个训练 batch 的样本数。当前判别器的 minibatch group_size 必须能整除该值。
-batch_size = 16
+batch_size = 8
 
 # Generator / Discriminator 的 Adam 初始学习率。
 lr = 1.0e-4
@@ -68,7 +67,7 @@ loss_weight = 10.0
 enable_rec_loss = true
 
 # Reconstruction Loss 权重。
-rec_loss_weight = 10.0
+rec_loss_weight = 5.0
 
 
 [loss.vgg]
@@ -93,10 +92,10 @@ enable = true
 # 当前 512 模型共有 0..6 共 7 层特征。
 # 注意：越浅的层特征图越大，显存/带宽开销也越高。
 [loss.wfm.weights]
-0 = 0.1
-1 = 0.1
-2 = 0.1
-3 = 0.1
+0 = 1.0
+1 = 1.0
+2 = 1.0
+3 = 1.0
 
 
 [dataloader]
@@ -104,7 +103,7 @@ enable = true
 num_threads = 16
 
 # DALI 整体 pipeline 预取深度。值越大可能提高吞吐，也会增加内存/显存占用。
-prefetch_queue_depth = 4
+prefetch_queue_depth = 2
 
 # parallel external_source 的 Python worker 数量。
 py_num_workers = 8
@@ -115,13 +114,11 @@ py_start_method = "spawn"
 # external_source 每个 worker 的读取预取深度。
 reader_prefetch_queue_depth = 2
 
-# Hugging Face 在线数据集代理。取消注释后仅用于 Hugging Face Hub 请求。
+# Hugging Face 在线数据集代理；不需要时保持注释。
 # 支持 HTTP/HTTPS/SOCKS5/SOCKS5H 代理 URL。
 # huggingface_proxy = "socks5h://127.0.0.1:1080"
 
-# ModelScope 在线数据集的单文件下载 cache。
-# 已访问图片会复用该目录中的 Hub cache；留空时使用 ModelScope SDK 默认 cache。
-# 云端训练建议指向持久化磁盘，例如：
+# ModelScope 在线数据集单文件 cache。云端可指向持久化磁盘。
 # modelscope_cache_dir = "/mnt/workspace/.cache/modelscope"
 
 # 图像解码后端："mixed" 或 "cpu"。
@@ -144,7 +141,7 @@ flip_prob = 0.5
 rotation_range = [-10.0, 10.0]
 
 # dst 实际缩放倍数范围，必须为正数。
-scale_factor_range = [0.7692307692307693, 1.25]
+scale_factor_range = [0.75, 1.25]
 
 # dst 水平/垂直平移范围，单位为图像宽高的比例。
 # 例如 0.15 表示最多平移 15%。
@@ -154,7 +151,7 @@ ty_range = [-0.15, 0.15]
 
 [generator]
 # Generator 输入/输出正方形分辨率。
-img_resolution = 512
+img_resolution = 256
 
 # RGB 图像为 3 通道。
 img_channels = 3
@@ -183,7 +180,7 @@ aad_skip_layers = [0, 1, 2, 3, 4]
 
 [discriminator]
 # 必须与 Generator img_resolution 一致。
-img_resolution = 512
+img_resolution = 256
 img_channels = 3
 
 # 判别器基础/最大通道数。
@@ -195,54 +192,16 @@ max_ch = 512
 group_size = 4
 
 
-# 身份来源数据池。
-# 每项必须显式设置 backend，可选：local、huggingface、modelscope。
-# local 使用 path；huggingface/modelscope 使用 repo_id，并可选 revision/path_prefix。
-# 远程 backend 在训练进程启动时枚举一次当前 revision 的图片清单；训练运行期间
-# 仓库新增文件不会动态加入本次数据池，重新启动训练后会重新枚举。
-# 每项可以单独设置 adjustment；实际数据源采样权重为：
-#   sqrt(file_count) * 2**adjustment
-#
-# Hugging Face 在线 FFHQ 示例（按需下载并复用 HF cache）：
-# [[src]]
-# backend = "huggingface"
-# repo_id = "marcosv/ffhq-dataset"
-# revision = "main"
-# # 可选：只使用仓库中的某个子目录，例如 "Part1"。留空表示整个仓库。
-# path_prefix = ""
-# adjustment = 0.0
-#
-# ModelScope 独立图片仓库示例（按需下载并复用 ModelScope cache）：
-# [[src]]
-# backend = "modelscope"
-# repo_id = "liaohaixun/FFHQ1024"
-# revision = "master"
-# path_prefix = "images"
-# adjustment = 0.0
 [[src]]
-backend = "local"
-path = "/path/to/source_faces_a"
-adjustment = 0.0
-
-[[src]]
-backend = "local"
-path = "/path/to/source_faces_b"
-adjustment = 0.0
-
-
-# 目标/姿态/表情数据池，语义与 [[src]] 相同。
-[[dst]]
-backend = "local"
-path = "/path/to/target_faces_a"
+backend = "modelscope"
+repo_id = "liaohaixun/FFHQ1024"
+revision = "master"
+path_prefix = "images"
 adjustment = 0.0
 
 [[dst]]
-backend = "local"
-path = "/path/to/target_faces_b"
+backend = "modelscope"
+repo_id = "liaohaixun/FFHQ1024"
+revision = "master"
+path_prefix = "images"
 adjustment = 0.0
-
-# adjustment=1.0 表示相对基础权重乘 2，可用于提高特定困难数据的采样概率。
-[[dst]]
-backend = "local"
-path = "/path/to/occlusion_faces"
-adjustment = 1.0

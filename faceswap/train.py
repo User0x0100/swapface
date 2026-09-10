@@ -1,5 +1,6 @@
 import argparse
 import copy
+import inspect
 import itertools
 import tomllib
 from collections.abc import Mapping, Sequence
@@ -34,6 +35,7 @@ from models.networks import Generator
 
 from .contracts import CHECKPOINT_VERSION
 from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, HuggingFaceImageSource, ImageDecoderBackend, ImageSource, ModelScopeImageSource, create_dataloader_pipeline
+from .experiment import RunLock, RunPaths, append_resume_event, config_sha256, create_run, load_resolved_config, read_json, resolve_resume_target, update_metadata, write_latest
 
 EPS = 1e-8
 DEFAULT_GENERATOR_ID_ENCODER_PROVIDER = IDEncoderProvider.BLENDFACE
@@ -45,7 +47,9 @@ DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
     "conv4_3": 2.5,
 }
 DEFAULT_WFM_LOSS_WEIGHT: dict[int, float] = {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.1}
-DEFAULT_TRAIN_CONFIG_PATH = Path(__file__).resolve().parents[1] / "experiments" / "train.toml"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
+DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -78,8 +82,6 @@ class Trainer:
         bf16: bool = True,
         device: str = "cuda",
         compile_module: bool = True,
-        ckpt: str | None = None,
-        log_path: str = "train_log/exper_0",
         log_interval: int = 10,
         sample_save_every: int = 1000,
         weight_save_every: int = 10000,
@@ -101,6 +103,11 @@ class Trainer:
         # 判别器浅层/中层特征的弱特征匹配
         enable_wfm_loss: bool = True,
         wfm_loss_weight: dict[int, float] | None = None,
+        run_dir: str | Path = "train_log/exper_0",
+        resume_checkpoint: str | Path | None = None,
+        run_id: str | None = None,
+        resolved_config_sha256: str | None = None,
+        strict_bf16_resume: bool = False,
     ):
         if dataloader_cfg is None:
             dataloader_cfg = dict(DEFAULT_DATALOADER_CONFIG)
@@ -190,26 +197,38 @@ class Trainer:
 
         checkpoint: dict[str, Any] | None = None
         training_state: dict[str, Any] | None = None
-        if ckpt is not None:
-            checkpoint_path = Path(ckpt)
+        if resume_checkpoint is not None:
+            checkpoint_path = Path(resume_checkpoint)
             if not checkpoint_path.exists():
-                raise FileNotFoundError(f"找不到检查点文件：{ckpt}")
+                raise FileNotFoundError(f"找不到检查点文件：{resume_checkpoint}")
 
-            print(f"正在加载检查点：{ckpt}")
+            print(f"正在加载检查点：{resume_checkpoint}")
             checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             checkpoint_version = int(checkpoint["version"])
             if checkpoint_version != CHECKPOINT_VERSION:
                 raise ValueError(f"不支持的检查点版本：{checkpoint_version}，当前仅支持 v{CHECKPOINT_VERSION}")
 
             completed_iter = int(checkpoint["iter"])
+            completed_step = int(checkpoint.get("step", completed_iter + 1))
             self.iter = int(checkpoint["next_iter"])
 
-            print(f"检查点信息：\n  {'版本':25}: {checkpoint_version}\n  {'已完成迭代':25}: {completed_iter}\n  {'恢复起始迭代':25}: {self.iter}")
+            print(f"检查点信息：\n  {'版本':25}: {checkpoint_version}\n  {'已完成 step':25}: {completed_step}\n  {'恢复内部 iter':25}: {self.iter}")
             print_mapping("net_g", checkpoint["net_g"]["network_cfg"])
             print_mapping("net_d", checkpoint["net_d"]["network_cfg"])
 
+            checkpoint_run = checkpoint.get("run")
+            if resolved_config_sha256 is not None or run_id is not None:
+                if not isinstance(checkpoint_run, dict):
+                    raise ValueError("标准 run 的 checkpoint 缺少 run 元数据，不能安全 resume")
+                saved_digest = checkpoint_run.get("config_sha256")
+                if resolved_config_sha256 is not None and saved_digest != resolved_config_sha256:
+                    raise ValueError(f"检查点与 run 的 resolved config 不一致：{saved_digest} != {resolved_config_sha256}")
+                saved_run_id = checkpoint_run.get("id")
+                if run_id is not None and saved_run_id != run_id:
+                    raise ValueError(f"检查点所属 run 不匹配：{saved_run_id} != {run_id}")
+
             saved_training_config = checkpoint["training_config"]
-            strict_resume_keys = (
+            strict_resume_keys = [
                 "lr",
                 "lr_scheduler_t_max",
                 "r1_reg_step",
@@ -221,7 +240,9 @@ class Trainer:
                 "perceptual_loss_weight",
                 "enable_wfm_loss",
                 "wfm_loss_weight",
-            )
+            ]
+            if strict_bf16_resume:
+                strict_resume_keys.append("bf16")
             mismatches = {key: (saved_training_config[key], self.training_config[key]) for key in strict_resume_keys if saved_training_config[key] != self.training_config[key]}
             if mismatches:
                 raise ValueError(f"检查点训练目标配置与当前配置不一致：{mismatches}")
@@ -313,17 +334,16 @@ class Trainer:
             self.wfm_loss = WeightedFeatureMatchingLoss(layer_weights=wfm_loss_weight, criterion="l1").to(self.device)
             self.wfm_max_layer = max(wfm_loss_weight)
 
-        # ========================= 日志 =========================
-        base_log_path = Path(log_path)
-        self.ckpt_dir = base_log_path / "ckpt"
-        self.sample_dir = base_log_path / "sample"
-        self.tensorboard_dir = base_log_path / "tensorboard"
+        # ========================= Run 输出 =========================
+        self.run_paths = RunPaths.from_root(run_dir)
+        self.run_id = run_id
+        self.resolved_config_sha256 = resolved_config_sha256
+        self.ckpt_dir = self.run_paths.checkpoints
+        self.sample_dir = self.run_paths.samples
+        self.tensorboard_dir = self.run_paths.tensorboard
 
         for path in (self.ckpt_dir, self.sample_dir, self.tensorboard_dir):
             path.mkdir(exist_ok=True, parents=True)
-
-        self.log_writer = SummaryWriter(self.tensorboard_dir)
-        self._log_buffer: dict[str, Tensor] = {}
 
         # ========================= 数据采样 =========================
 
@@ -354,9 +374,22 @@ class Trainer:
             if self.enable_wfm_loss:
                 self.train_d_features = self.net_d.get_feats
 
+        # TensorBoard writer 最后创建，避免初始化模型/数据管线失败时遗留后台资源。
+        tensorboard_purge_step = None
+        if checkpoint is not None:
+            checkpoint_step = int(checkpoint.get("step", int(checkpoint["iter"]) + 1))
+            tensorboard_purge_step = checkpoint_step + 1
+        self.log_writer = SummaryWriter(self.tensorboard_dir, purge_step=tensorboard_purge_step)
+        self._log_buffer: dict[str, Tensor] = {}
+
+    @property
+    def completed_step(self) -> int:
+        """已完成的优化 step 数；内部 iter 仍保持 0-based 以兼容 checkpoint v2。"""
+        return self.iter + 1
+
     @torch.no_grad()
     def log(self, key: str, value: Tensor) -> None:
-        if self.iter % self.log_interval == 0:
+        if self.completed_step % self.log_interval == 0:
             self._log_buffer[key] = value.detach().mean()
 
     @torch.no_grad()
@@ -367,7 +400,7 @@ class Trainer:
         values = torch.stack(tuple(self._log_buffer[key] for key in keys)).float().cpu().tolist()
         self._log_buffer.clear()
         for key, value in zip(keys, values):
-            self.log_writer.add_scalar(f"Loss/{key}", value, self.iter)
+            self.log_writer.add_scalar(f"Loss/{key}", value, self.completed_step)
 
     @torch.no_grad()
     def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor]:
@@ -407,10 +440,16 @@ class Trainer:
             "lr_scheduler_g": self.lr_scheduler_g.state_dict() if self.use_cosine_lr else None,
             "lr_scheduler_d": self.lr_scheduler_d.state_dict() if self.use_cosine_lr else None,
         }
+        completed_step = self.completed_step
         state_dict = {
             "version": CHECKPOINT_VERSION,
             "iter": self.iter,
             "next_iter": self.iter + 1,
+            "step": completed_step,
+            "run": {
+                "id": self.run_id,
+                "config_sha256": self.resolved_config_sha256,
+            },
             "identity_encoders": {
                 "generator": self.generator_id_encoder_provider.name,
                 "identity_loss": self.identity_loss_provider.name,
@@ -421,14 +460,15 @@ class Trainer:
             "training_state": training_state,
         }
 
-        ckpt_file = self.ckpt_dir / f"{self.iter}.pth"
+        ckpt_file = self.ckpt_dir / f"step_{completed_step:09d}.pth"
         temp_file = ckpt_file.with_suffix(".pth.tmp")
         try:
             torch.save(state_dict, temp_file)
             temp_file.replace(ckpt_file)
+            write_latest(self.run_paths, ckpt_file, completed_step)
         except (OSError, RuntimeError) as e:
             temp_file.unlink(missing_ok=True)
-            print(f"保存检查点失败：{e}")
+            raise RuntimeError(f"保存检查点失败：{e}") from e
 
     def loss_grad_map(self, loss: Tensor, x: Tensor) -> Tensor:
         (grad,) = torch.autograd.grad(outputs=loss.sum(), inputs=x, retain_graph=False, create_graph=False)
@@ -548,10 +588,10 @@ class Trainer:
             self.update_ema()
             self.flush_logs()
 
-            if self.iter % self.weight_save_every == 0:
+            if self.completed_step % self.weight_save_every == 0:
                 self.save_ckpt()
 
-            if self.iter % self.sample_save_every == 0:
+            if self.completed_step % self.sample_save_every == 0:
                 with torch.no_grad():
                     half = self.batch_size // 2
                     src_vis = torch.cat((sample_src[:half], src[: self.batch_size - half]), dim=0)
@@ -600,181 +640,368 @@ class Trainer:
                     grid = make_grid(grid, nrow=self.batch_size)[[2, 1, 0], :, :]  # RGB → BGR
                     grid = grid.permute(1, 2, 0)  # CHW → HWC
                     grid_cpu = grid.to(device="cpu", dtype=torch.uint8).numpy()
-                cv2.imwrite(self.sample_dir / f"{self.iter}.png", grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+                sample_file = self.sample_dir / f"step_{self.completed_step:09d}.png"
+                if not cv2.imwrite(sample_file, grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
+                    raise OSError(f"保存训练 sample 失败：{sample_file}")
 
 
-def _load_image_sources(entries: object, section: str) -> list[ImageSource]:
+TRAIN_SECTION_PARAMETERS = (
+    "batch_size",
+    "lr",
+    "lr_scheduler_t_max",
+    "r1_reg_step",
+    "r1_gamma",
+    "bf16",
+    "device",
+    "compile_module",
+    "log_interval",
+    "sample_save_every",
+    "weight_save_every",
+)
+DATALOADER_RANGE_KEYS = ("rotation_range", "scale_factor_range", "tx_range", "ty_range")
+
+
+def _parameter_defaults(callable_obj: Any, values: dict[str, Any], names: Sequence[str], section: str) -> dict[str, Any]:
+    parameters = inspect.signature(callable_obj).parameters
+    unknown = set(values) - set(names)
+    if unknown:
+        raise ValueError(f"{section} 包含未知字段：{sorted(unknown)}")
+
+    resolved: dict[str, Any] = {}
+    for name in names:
+        if name in values:
+            resolved[name] = values[name]
+            continue
+        default = parameters[name].default
+        if default is inspect.Parameter.empty:
+            raise ValueError(f"{section}.{name} 必须显式配置")
+        resolved[name] = default
+    return resolved
+
+
+def _resolve_model_config(model_type: type[Any], values: dict[str, Any], section: str) -> dict[str, Any]:
+    parameters = inspect.signature(model_type.__init__).parameters
+    names = tuple(name for name in parameters if name != "self")
+    return _parameter_defaults(model_type.__init__, values, names, section)
+
+
+def _normalize_image_sources(entries: object, section: str) -> list[dict[str, Any]]:
     if not isinstance(entries, list) or not entries:
-        raise ValueError(f"TOML [{section}] 数据源不能为空")
+        raise ValueError(f"[[{section}]] 数据源不能为空")
 
-    sources: list[ImageSource] = []
+    normalized: list[dict[str, Any]] = []
     allowed_fields = {"backend", "path", "repo_id", "revision", "path_prefix", "adjustment"}
-    for index, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            raise TypeError(f"TOML [[{section}]] 第 {index} 项必须是表")
+    for index, raw_entry in enumerate(entries):
+        if not isinstance(raw_entry, dict):
+            raise TypeError(f"[[{section}]] 第 {index} 项必须是表/对象")
+        entry = dict(raw_entry)
         unknown = set(entry) - allowed_fields
         if unknown:
-            raise ValueError(f"TOML [[{section}]] 第 {index} 项包含未知字段：{sorted(unknown)}")
+            raise ValueError(f"[[{section}]] 第 {index} 项包含未知字段：{sorted(unknown)}")
 
         backend = entry.get("backend")
-        if not isinstance(backend, str) or not backend:
-            raise ValueError(f"TOML [[{section}]] 第 {index} 项 backend 必须为非空字符串")
-        if backend not in {"local", "huggingface", "modelscope"}:
-            raise ValueError(f"TOML [[{section}]] 第 {index} 项 backend={backend!r} 无效，可选：local, huggingface, modelscope")
+        if not isinstance(backend, str) or backend not in {"local", "huggingface", "modelscope"}:
+            raise ValueError(f"[[{section}]] 第 {index} 项 backend 无效，可选：local, huggingface, modelscope")
+        try:
+            adjustment = float(entry.get("adjustment", 0.0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"[[{section}]] 第 {index} 项 adjustment 必须为数值") from exc
 
-        adjustment = float(entry.get("adjustment", 0.0))
         if backend == "local":
-            if "repo_id" in entry or "revision" in entry or "path_prefix" in entry:
-                raise ValueError(f"TOML [[{section}]] 第 {index} 项 local backend 只能设置 path/adjustment")
+            if set(entry).intersection({"repo_id", "revision", "path_prefix"}):
+                raise ValueError(f"[[{section}]] 第 {index} 项 local backend 只能设置 path/adjustment")
             path = entry.get("path")
             if not isinstance(path, str) or not path:
-                raise ValueError(f"TOML [[{section}]] 第 {index} 项 local backend 的 path 必须为非空字符串")
-            sources.append(path if "adjustment" not in entry else (path, adjustment))
+                raise ValueError(f"[[{section}]] 第 {index} 项 local backend 的 path 必须为非空字符串")
+            normalized.append({"backend": backend, "path": path, "adjustment": adjustment})
             continue
 
         if "path" in entry:
-            raise ValueError(f"TOML [[{section}]] 第 {index} 项 {backend} backend 不能设置 path")
+            raise ValueError(f"[[{section}]] 第 {index} 项 {backend} backend 不能设置 path")
         repo_id = entry.get("repo_id")
         if not isinstance(repo_id, str) or not repo_id:
-            raise ValueError(f"TOML [[{section}]] 第 {index} 项 {backend} backend 的 repo_id 必须为非空字符串")
-        default_revision = "main" if backend == "huggingface" else "master"
-        revision = entry.get("revision", default_revision)
+            raise ValueError(f"[[{section}]] 第 {index} 项 {backend} backend 的 repo_id 必须为非空字符串")
+        revision = entry.get("revision", "main" if backend == "huggingface" else "master")
         path_prefix = entry.get("path_prefix", "")
         if not isinstance(revision, str) or not revision:
-            raise ValueError(f"TOML [[{section}]] 第 {index} 项 revision 必须为非空字符串")
+            raise ValueError(f"[[{section}]] 第 {index} 项 revision 必须为非空字符串")
         if not isinstance(path_prefix, str):
-            raise TypeError(f"TOML [[{section}]] 第 {index} 项 path_prefix 必须为字符串")
+            raise TypeError(f"[[{section}]] 第 {index} 项 path_prefix 必须为字符串")
+        normalized.append({
+            "backend": backend,
+            "repo_id": repo_id,
+            "revision": revision,
+            "path_prefix": path_prefix,
+            "adjustment": adjustment,
+        })
+    return normalized
 
+
+def _load_image_sources(entries: list[dict[str, Any]]) -> list[ImageSource]:
+    sources: list[ImageSource] = []
+    for entry in entries:
+        backend = entry["backend"]
+        adjustment = float(entry["adjustment"])
+        if backend == "local":
+            path = str(entry["path"])
+            sources.append((path, adjustment))
+            continue
         source_type = HuggingFaceImageSource if backend == "huggingface" else ModelScopeImageSource
-        sources.append(source_type(repo_id=repo_id, revision=revision, path_prefix=path_prefix, adjustment=adjustment))
-
+        sources.append(
+            source_type(
+                repo_id=str(entry["repo_id"]),
+                revision=str(entry["revision"]),
+                path_prefix=str(entry["path_prefix"]),
+                adjustment=adjustment,
+            )
+        )
     return sources
 
 
-def _load_range(config: dict[str, Any], key: str) -> None:
-    if key not in config:
-        return
-    value = config[key]
-    if not isinstance(value, list) or len(value) != 2:
-        raise ValueError(f"dataloader.{key} 必须为包含两个数值的 TOML 数组")
-    config[key] = (float(value[0]), float(value[1]))
+def _normalize_dataloader(values: dict[str, Any]) -> dict[str, Any]:
+    unknown = set(values) - set(DEFAULT_DATALOADER_CONFIG)
+    if unknown:
+        raise ValueError(f"[dataloader] 包含未知字段：{sorted(unknown)}")
+    config = dict(DEFAULT_DATALOADER_CONFIG) | values
+
+    for key in ("huggingface_proxy", "modelscope_cache_dir"):
+        value = config[key]
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"dataloader.{key} 必须为非空字符串；不使用时请删除该配置")
+
+    try:
+        decoder_backend = config["decoder_backend"]
+        if not isinstance(decoder_backend, ImageDecoderBackend):
+            decoder_backend = ImageDecoderBackend(decoder_backend)
+    except ValueError as exc:
+        supported = ", ".join(backend.value for backend in ImageDecoderBackend)
+        raise ValueError(f"dataloader.decoder_backend={config['decoder_backend']!r} 无效，可选：{supported}") from exc
+    config["decoder_backend"] = decoder_backend.value
+
+    for key in DATALOADER_RANGE_KEYS:
+        value = config[key]
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(f"dataloader.{key} 必须为包含两个数值的数组")
+        config[key] = [float(value[0]), float(value[1])]
+    return config
 
 
-def load_train_config(path: str | Path) -> dict[str, Any]:
-    """读取外部 TOML，并转换为 ``Trainer`` 构造参数。"""
-    config_path = Path(path)
-    with config_path.open("rb") as file:
-        config = tomllib.load(file)
-
+def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
+    """校验配置并展开所有代码默认值，得到可哈希、可持久化的规范配置。"""
     allowed_sections = {"train", "identity", "loss", "dataloader", "generator", "discriminator", "src", "dst"}
     unknown_sections = set(config) - allowed_sections
     if unknown_sections:
-        raise ValueError(f"TOML 包含未知顶层配置：{sorted(unknown_sections)}")
+        raise ValueError(f"配置包含未知顶层字段：{sorted(unknown_sections)}")
 
-    train = dict(config.get("train", {}))
+    for section in ("train", "identity", "loss", "dataloader", "generator", "discriminator"):
+        value = config.get(section, {})
+        if not isinstance(value, dict):
+            raise TypeError(f"[{section}] 必须为表/对象")
+
+    train = _parameter_defaults(Trainer.__init__, dict(config.get("train", {})), TRAIN_SECTION_PARAMETERS, "[train]")
+
     identity = dict(config.get("identity", {}))
-    loss = dict(config.get("loss", {}))
-    dataloader = dict(config.get("dataloader", {}))
-    generator = dict(config.get("generator", {}))
-    discriminator = dict(config.get("discriminator", {}))
-
-    generator_provider = identity.pop("generator_provider", DEFAULT_GENERATOR_ID_ENCODER_PROVIDER.name)
-    loss_provider = identity.pop("loss_provider", DEFAULT_IDENTITY_LOSS_PROVIDER.name)
-    id_loss_weight = identity.pop("loss_weight", 10.0)
-    if identity:
-        raise ValueError(f"[identity] 包含未知字段：{sorted(identity)}")
-
-    vgg = loss.pop("vgg", {})
-    if not isinstance(vgg, dict):
-        raise TypeError("[loss.vgg] 必须为 TOML 表")
-    enable_perceptual_loss = vgg.pop("enable", True)
-    raw_perceptual_weights = vgg.pop("weights", None)
-    if vgg:
-        raise ValueError(f"[loss.vgg] 包含未知字段：{sorted(vgg)}")
-
-    if raw_perceptual_weights is None:
-        perceptual_loss_weight: dict[str, float] | None = None
-    else:
-        if not isinstance(raw_perceptual_weights, dict):
-            raise TypeError("[loss.vgg.weights] 必须为 TOML 表")
-        try:
-            perceptual_loss_weight = {str(layer): float(weight) for layer, weight in raw_perceptual_weights.items()}
-        except (TypeError, ValueError) as exc:
-            raise ValueError("[loss.vgg.weights] 的键必须是 VGG 层名，值必须是数值") from exc
-
-    wfm = loss.pop("wfm", {})
-    if not isinstance(wfm, dict):
-        raise TypeError("[loss.wfm] 必须为 TOML 表")
-    enable_wfm_loss = wfm.pop("enable", True)
-    raw_wfm_weights = wfm.pop("weights", None)
-    if wfm:
-        raise ValueError(f"[loss.wfm] 包含未知字段：{sorted(wfm)}")
-
-    if raw_wfm_weights is None:
-        wfm_loss_weight: dict[int, float] | None = None
-    else:
-        if not isinstance(raw_wfm_weights, dict):
-            raise TypeError("[loss.wfm.weights] 必须为 TOML 表")
-        try:
-            wfm_loss_weight = {int(index): float(weight) for index, weight in raw_wfm_weights.items()}
-        except (TypeError, ValueError) as exc:
-            raise ValueError("[loss.wfm.weights] 的键必须是整数层索引，值必须是数值") from exc
-
-    unknown_dataloader = set(dataloader) - set(DEFAULT_DATALOADER_CONFIG)
-    if unknown_dataloader:
-        raise ValueError(f"[dataloader] 包含未知字段：{sorted(unknown_dataloader)}")
-
-    huggingface_proxy = dataloader.get("huggingface_proxy")
-    if huggingface_proxy is not None and (not isinstance(huggingface_proxy, str) or not huggingface_proxy.strip()):
-        raise ValueError("dataloader.huggingface_proxy 必须为非空字符串；不使用代理时请删除该配置")
-
-    modelscope_cache_dir = dataloader.get("modelscope_cache_dir")
-    if modelscope_cache_dir is not None and (not isinstance(modelscope_cache_dir, str) or not modelscope_cache_dir.strip()):
-        raise ValueError("dataloader.modelscope_cache_dir 必须为非空字符串；使用默认 cache 时请删除该配置")
-
-    decoder_backend = dataloader.get("decoder_backend")
-    if decoder_backend is not None:
-        try:
-            dataloader["decoder_backend"] = ImageDecoderBackend(decoder_backend)
-        except ValueError as exc:
-            supported = ", ".join(backend.value for backend in ImageDecoderBackend)
-            raise ValueError(f"dataloader.decoder_backend={decoder_backend!r} 无效，可选：{supported}") from exc
-    for key in ("rotation_range", "scale_factor_range", "tx_range", "ty_range"):
-        _load_range(dataloader, key)
-
+    unknown_identity = set(identity) - {"generator_provider", "loss_provider", "loss_weight"}
+    if unknown_identity:
+        raise ValueError(f"[identity] 包含未知字段：{sorted(unknown_identity)}")
+    generator_provider = str(identity.get("generator_provider", DEFAULT_GENERATOR_ID_ENCODER_PROVIDER.name))
+    loss_provider = str(identity.get("loss_provider", DEFAULT_IDENTITY_LOSS_PROVIDER.name))
     try:
-        generator_id_encoder_provider = IDEncoderProvider[str(generator_provider)]
-        identity_loss_provider = IDEncoderProvider[str(loss_provider)]
+        IDEncoderProvider[generator_provider]
+        IDEncoderProvider[loss_provider]
     except KeyError as exc:
         supported = ", ".join(provider.name for provider in IDEncoderProvider)
         raise ValueError(f"身份编码器类型无效，可选：{supported}") from exc
 
-    trainer_config: dict[str, Any] = {
-        **train,
-        **loss,
-        "src": _load_image_sources(config.get("src"), "src"),
-        "dst": _load_image_sources(config.get("dst"), "dst"),
-        "generator_id_encoder_provider": generator_id_encoder_provider,
-        "identity_loss_provider": identity_loss_provider,
-        "id_loss_weight": float(id_loss_weight),
-        "enable_perceptual_loss": bool(enable_perceptual_loss),
-        "perceptual_loss_weight": perceptual_loss_weight,
-        "enable_wfm_loss": bool(enable_wfm_loss),
-        "wfm_loss_weight": wfm_loss_weight,
-        "dataloader_cfg": dataloader,
-        "net_g_cfg": generator,
-        "net_d_cfg": discriminator,
+    loss = dict(config.get("loss", {}))
+    unknown_loss = set(loss) - {"enable_rec_loss", "rec_loss_weight", "vgg", "wfm"}
+    if unknown_loss:
+        raise ValueError(f"[loss] 包含未知字段：{sorted(unknown_loss)}")
+
+    trainer_parameters = inspect.signature(Trainer.__init__).parameters
+    enable_rec_loss = bool(loss.get("enable_rec_loss", trainer_parameters["enable_rec_loss"].default))
+    rec_loss_weight = float(loss.get("rec_loss_weight", trainer_parameters["rec_loss_weight"].default))
+
+    vgg = loss.get("vgg", {})
+    if not isinstance(vgg, dict):
+        raise TypeError("[loss.vgg] 必须为表/对象")
+    unknown_vgg = set(vgg) - {"enable", "weights"}
+    if unknown_vgg:
+        raise ValueError(f"[loss.vgg] 包含未知字段：{sorted(unknown_vgg)}")
+    enable_vgg = bool(vgg.get("enable", trainer_parameters["enable_perceptual_loss"].default))
+    raw_vgg_weights = vgg.get("weights", DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)
+    if not isinstance(raw_vgg_weights, dict) or (enable_vgg and not raw_vgg_weights):
+        raise ValueError("[loss.vgg.weights] 必须为非空表/对象")
+    vgg_weights = {str(layer): float(weight) for layer, weight in raw_vgg_weights.items()}
+
+    wfm = loss.get("wfm", {})
+    if not isinstance(wfm, dict):
+        raise TypeError("[loss.wfm] 必须为表/对象")
+    unknown_wfm = set(wfm) - {"enable", "weights"}
+    if unknown_wfm:
+        raise ValueError(f"[loss.wfm] 包含未知字段：{sorted(unknown_wfm)}")
+    enable_wfm = bool(wfm.get("enable", trainer_parameters["enable_wfm_loss"].default))
+    raw_wfm_weights = wfm.get("weights", DEFAULT_WFM_LOSS_WEIGHT)
+    if not isinstance(raw_wfm_weights, dict) or (enable_wfm and not raw_wfm_weights):
+        raise ValueError("[loss.wfm.weights] 必须为非空表/对象")
+    try:
+        wfm_weights = {str(int(index)): float(weight) for index, weight in raw_wfm_weights.items()}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("[loss.wfm.weights] 的键必须是整数层索引，值必须是数值") from exc
+
+    return {
+        "train": train,
+        "identity": {
+            "generator_provider": generator_provider,
+            "loss_provider": loss_provider,
+            "loss_weight": float(identity.get("loss_weight", trainer_parameters["id_loss_weight"].default)),
+        },
+        "loss": {
+            "enable_rec_loss": enable_rec_loss,
+            "rec_loss_weight": rec_loss_weight,
+            "vgg": {"enable": enable_vgg, "weights": vgg_weights},
+            "wfm": {"enable": enable_wfm, "weights": wfm_weights},
+        },
+        "dataloader": _normalize_dataloader(dict(config.get("dataloader", {}))),
+        "generator": _resolve_model_config(Generator, dict(config.get("generator", {})), "[generator]"),
+        "discriminator": _resolve_model_config(Discriminator, dict(config.get("discriminator", {})), "[discriminator]"),
+        "src": _normalize_image_sources(config.get("src"), "src"),
+        "dst": _normalize_image_sources(config.get("dst"), "dst"),
     }
-    return trainer_config
+
+
+def _runtime_train_config(resolved: dict[str, Any]) -> dict[str, Any]:
+    dataloader = dict(resolved["dataloader"])
+    dataloader["decoder_backend"] = ImageDecoderBackend(dataloader["decoder_backend"])
+    for key in DATALOADER_RANGE_KEYS:
+        dataloader[key] = tuple(float(value) for value in dataloader[key])
+
+    identity = resolved["identity"]
+    loss = resolved["loss"]
+    return {
+        **resolved["train"],
+        "src": _load_image_sources(resolved["src"]),
+        "dst": _load_image_sources(resolved["dst"]),
+        "generator_id_encoder_provider": IDEncoderProvider[identity["generator_provider"]],
+        "identity_loss_provider": IDEncoderProvider[identity["loss_provider"]],
+        "id_loss_weight": float(identity["loss_weight"]),
+        "enable_rec_loss": bool(loss["enable_rec_loss"]),
+        "rec_loss_weight": float(loss["rec_loss_weight"]),
+        "enable_perceptual_loss": bool(loss["vgg"]["enable"]),
+        "perceptual_loss_weight": {str(layer): float(weight) for layer, weight in loss["vgg"]["weights"].items()},
+        "enable_wfm_loss": bool(loss["wfm"]["enable"]),
+        "wfm_loss_weight": {int(index): float(weight) for index, weight in loss["wfm"]["weights"].items()},
+        "dataloader_cfg": dataloader,
+        "net_g_cfg": dict(resolved["generator"]),
+        "net_d_cfg": dict(resolved["discriminator"]),
+    }
+
+
+def load_train_config(path: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """读取用户 TOML，返回 Trainer 参数与完整 resolved config。"""
+    config_path = Path(path)
+    with config_path.open("rb") as file:
+        raw_config = tomllib.load(file)
+    resolved = resolve_train_config(raw_config)
+    return _runtime_train_config(resolved), resolved
+
+
+def _load_run_config(paths: RunPaths) -> tuple[dict[str, Any], dict[str, Any]]:
+    resolved = load_resolved_config(paths)
+    canonical = resolve_train_config(resolved)
+    if canonical != resolved:
+        raise ValueError(f"run 的 resolved config 不是当前格式的规范表示：{paths.resolved_config}")
+    return _runtime_train_config(canonical), canonical
+
+
+def _framework_metadata(requested_device: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "torch": torch.__version__,
+        "torch_cuda": torch.version.cuda,
+        "cuda_available": torch.cuda.is_available(),
+        "requested_device": requested_device,
+    }
+    try:
+        device = torch.device(requested_device)
+    except (TypeError, RuntimeError):
+        return result
+    if device.type == "cuda" and torch.cuda.is_available():
+        device_id = device.index if device.index is not None else torch.cuda.current_device()
+        if 0 <= device_id < torch.cuda.device_count():
+            result["cuda_device"] = torch.cuda.get_device_name(device_id)
+            result["compute_capability"] = list(torch.cuda.get_device_capability(device_id))
+    return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="FaceSwap 训练")
-    parser.add_argument("--config", type=Path, default=DEFAULT_TRAIN_CONFIG_PATH, help=f"训练 TOML 配置文件，默认：{DEFAULT_TRAIN_CONFIG_PATH}")
+    parser.add_argument("--config", type=Path, default=None, help=f"新 run 的训练 TOML；未指定 --resume 时默认：{DEFAULT_TRAIN_CONFIG_PATH}")
+    parser.add_argument("--name", type=str, default=None, help="新 run 的可选短标签；run ID 仍包含唯一时间戳")
+    parser.add_argument("--runs-root", type=Path, default=None, help=f"新 run 根目录，默认：{DEFAULT_RUNS_ROOT}")
+    parser.add_argument("--resume", type=Path, default=None, help="恢复标准 run 目录，或其中 checkpoints/*.pth；恢复时使用 run 冻结配置")
+    parser.add_argument("--strict-bf16", action="store_true", help="仅用于 resume：要求当前实际 BF16/FP32 模式与 checkpoint 一致；默认允许变化")
     args = parser.parse_args()
 
-    trainer = Trainer(**load_train_config(args.config))
-    trainer.train()
+    if args.resume is not None and args.config is not None:
+        parser.error("--resume 与 --config 不能同时使用；resume 必须使用原 run 的冻结配置")
+    if args.resume is not None and args.name is not None:
+        parser.error("--resume 与 --name 不能同时使用；resume 继续写入原 run")
+    if args.resume is not None and args.runs_root is not None:
+        parser.error("--resume 与 --runs-root 不能同时使用；resume 继续写入原 run")
+    if args.strict_bf16 and args.resume is None:
+        parser.error("--strict-bf16 仅用于 --resume；fresh training 无需设置 resume 兼容策略")
+
+    is_resume = args.resume is not None
+    if not is_resume:
+        config_path = args.config or DEFAULT_TRAIN_CONFIG_PATH
+        runs_root = args.runs_root or DEFAULT_RUNS_ROOT
+        trainer_config, resolved = load_train_config(config_path)
+        run_paths = create_run(runs_root, config_path, resolved, name=args.name, project_root=PROJECT_ROOT)
+        resume_checkpoint = None
+    else:
+        run_paths, resume_checkpoint = resolve_resume_target(args.resume)
+        trainer_config, resolved = _load_run_config(run_paths)
+
+    run_metadata = read_json(run_paths.metadata)
+    if not isinstance(run_metadata, dict) or not isinstance(run_metadata.get("run_id"), str):
+        raise TypeError(f"无效的 run_id：{run_paths.metadata}")
+    run_id = run_metadata["run_id"]
+    digest = config_sha256(resolved)
+    framework = _framework_metadata(str(resolved["train"]["device"]))
+
+    with RunLock(run_paths):
+        if is_resume:
+            if resume_checkpoint is None:
+                raise AssertionError("resume checkpoint 未解析")
+            append_resume_event(run_paths, resume_checkpoint)
+            update_metadata(run_paths, framework=framework)
+        else:
+            update_metadata(run_paths, status="running", framework=framework)
+
+        trainer: Trainer | None = None
+        try:
+            trainer = Trainer(
+                **trainer_config,
+                run_dir=run_paths.root,
+                resume_checkpoint=resume_checkpoint,
+                run_id=run_id,
+                resolved_config_sha256=digest,
+                strict_bf16_resume=args.strict_bf16,
+            )
+            print(f"Run 目录：{run_paths.root}")
+            trainer.train()
+        except KeyboardInterrupt:
+            update_metadata(run_paths, status="interrupted")
+            print("训练已中断；可使用 --resume 继续该 run")
+            raise SystemExit(130) from None
+        except BaseException as exc:
+            update_metadata(run_paths, status="failed", error={"type": type(exc).__name__, "message": str(exc)})
+            raise
+        else:
+            update_metadata(run_paths, status="completed")
+        finally:
+            if trainer is not None:
+                trainer.log_writer.close()
 
 
 if __name__ == "__main__":

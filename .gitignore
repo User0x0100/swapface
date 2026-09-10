@@ -11,4 +11,5 @@ onnx_export/
 *.jpeg
 *.engine
 .venv/
-experiments/
+# 实验根目录中的 TOML 配置需要进入版本控制；run/旧实验子目录均为生成物。
+experiments/*/

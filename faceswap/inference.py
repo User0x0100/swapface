@@ -26,7 +26,8 @@ def load_generator(checkpoint_path: str | Path) -> tuple[Generator, IDEncoderPro
     model = Generator(**config)
     # train.py 将用于推理的 EMA 权重存入 net_g；training_state.net_g 是训练权重。
     model.load_state_dict(checkpoint["net_g"]["state_dict"])
-    return model.eval(), provider, int(checkpoint["iter"])
+    completed_step = int(checkpoint.get("step", checkpoint["iter"]))
+    return model.eval(), provider, completed_step
 
 
 def get_ffhq_alignment_template(output_size: int, device: torch.device) -> Tensor:
