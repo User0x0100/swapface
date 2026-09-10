@@ -34,7 +34,7 @@ from models.discriminator.upfirdn2d import initialize_upfirdn2d
 from models.networks import Generator
 
 from .contracts import CHECKPOINT_VERSION
-from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, HuggingFaceImageSource, ImageDecoderBackend, ImageSource, ModelScopeImageSource, create_dataloader_pipeline
+from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, ImageDecoderBackend, ImageSource, create_dataloader_pipeline
 from .experiment import RunLock, RunPaths, append_resume_event, config_sha256, create_run, load_resolved_config, read_json, resolve_resume_target, update_metadata, write_latest
 
 EPS = 1e-8
@@ -690,72 +690,28 @@ def _normalize_image_sources(entries: object, section: str) -> list[dict[str, An
         raise ValueError(f"[[{section}]] 数据源不能为空")
 
     normalized: list[dict[str, Any]] = []
-    allowed_fields = {"backend", "path", "repo_id", "revision", "path_prefix", "adjustment"}
+    allowed_fields = {"path", "adjustment"}
     for index, raw_entry in enumerate(entries):
         if not isinstance(raw_entry, dict):
             raise TypeError(f"[[{section}]] 第 {index} 项必须是表/对象")
         entry = dict(raw_entry)
         unknown = set(entry) - allowed_fields
         if unknown:
-            raise ValueError(f"[[{section}]] 第 {index} 项包含未知字段：{sorted(unknown)}")
+            raise ValueError(f"[[{section}]] 第 {index} 项包含未知字段：{sorted(unknown)}；训练数据源仅支持本地 path/adjustment")
 
-        backend = entry.get("backend")
-        if not isinstance(backend, str) or backend not in {"local", "huggingface", "modelscope"}:
-            raise ValueError(f"[[{section}]] 第 {index} 项 backend 无效，可选：local, huggingface, modelscope")
+        path = entry.get("path")
+        if not isinstance(path, str) or not path:
+            raise ValueError(f"[[{section}]] 第 {index} 项 path 必须为非空字符串")
         try:
             adjustment = float(entry.get("adjustment", 0.0))
         except (TypeError, ValueError) as exc:
             raise ValueError(f"[[{section}]] 第 {index} 项 adjustment 必须为数值") from exc
-
-        if backend == "local":
-            if set(entry).intersection({"repo_id", "revision", "path_prefix"}):
-                raise ValueError(f"[[{section}]] 第 {index} 项 local backend 只能设置 path/adjustment")
-            path = entry.get("path")
-            if not isinstance(path, str) or not path:
-                raise ValueError(f"[[{section}]] 第 {index} 项 local backend 的 path 必须为非空字符串")
-            normalized.append({"backend": backend, "path": path, "adjustment": adjustment})
-            continue
-
-        if "path" in entry:
-            raise ValueError(f"[[{section}]] 第 {index} 项 {backend} backend 不能设置 path")
-        repo_id = entry.get("repo_id")
-        if not isinstance(repo_id, str) or not repo_id:
-            raise ValueError(f"[[{section}]] 第 {index} 项 {backend} backend 的 repo_id 必须为非空字符串")
-        revision = entry.get("revision", "main" if backend == "huggingface" else "master")
-        path_prefix = entry.get("path_prefix", "")
-        if not isinstance(revision, str) or not revision:
-            raise ValueError(f"[[{section}]] 第 {index} 项 revision 必须为非空字符串")
-        if not isinstance(path_prefix, str):
-            raise TypeError(f"[[{section}]] 第 {index} 项 path_prefix 必须为字符串")
-        normalized.append({
-            "backend": backend,
-            "repo_id": repo_id,
-            "revision": revision,
-            "path_prefix": path_prefix,
-            "adjustment": adjustment,
-        })
+        normalized.append({"path": path, "adjustment": adjustment})
     return normalized
 
 
 def _load_image_sources(entries: list[dict[str, Any]]) -> list[ImageSource]:
-    sources: list[ImageSource] = []
-    for entry in entries:
-        backend = entry["backend"]
-        adjustment = float(entry["adjustment"])
-        if backend == "local":
-            path = str(entry["path"])
-            sources.append((path, adjustment))
-            continue
-        source_type = HuggingFaceImageSource if backend == "huggingface" else ModelScopeImageSource
-        sources.append(
-            source_type(
-                repo_id=str(entry["repo_id"]),
-                revision=str(entry["revision"]),
-                path_prefix=str(entry["path_prefix"]),
-                adjustment=adjustment,
-            )
-        )
-    return sources
+    return [(str(entry["path"]), float(entry["adjustment"])) for entry in entries]
 
 
 def _normalize_dataloader(values: dict[str, Any]) -> dict[str, Any]:
@@ -763,11 +719,6 @@ def _normalize_dataloader(values: dict[str, Any]) -> dict[str, Any]:
     if unknown:
         raise ValueError(f"[dataloader] 包含未知字段：{sorted(unknown)}")
     config = dict(DEFAULT_DATALOADER_CONFIG) | values
-
-    for key in ("huggingface_proxy", "modelscope_cache_dir"):
-        value = config[key]
-        if value is not None and (not isinstance(value, str) or not value.strip()):
-            raise ValueError(f"dataloader.{key} 必须为非空字符串；不使用时请删除该配置")
 
     try:
         decoder_backend = config["decoder_backend"]

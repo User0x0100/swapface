@@ -35,6 +35,22 @@ uv run python -m faceswap.train \
 
 `--name` 只参与 run ID，不改变实验配置。默认结果根目录为 `experiments/runs`；如确有需要，可用 `--runs-root PATH` 覆盖。
 
+## 训练数据源
+
+训练数据只支持本地图片目录，不再由训练进程访问 Hugging Face、ModelScope 或其他在线数据集。`[[src]]` / `[[dst]]` 的 schema 只包含：
+
+```toml
+[[src]]
+path = "/path/to/source_faces"
+adjustment = 0.0
+
+[[dst]]
+path = "/path/to/target_faces"
+adjustment = 0.0
+```
+
+多个目录仍按 `sqrt(file_count) * 2**adjustment` 分配目录采样权重。`backend`、`repo_id`、`revision`、`path_prefix`、在线数据集 proxy/cache 等旧字段均不再接受。模型权重仍可由各模型模块通过 Hugging Face Hub 获取；这与训练数据源是两个独立职责。
+
 ## Run 目录
 
 每次 fresh training 都创建新的唯一 run：
@@ -138,7 +154,7 @@ uv run python -m faceswap.train \
 
 ## 配置冻结与哈希
 
-TOML 适合人写，但 TOML 没有 `null`，而 dataloader 中存在 `huggingface_proxy = None` 之类有效默认状态。因此 run 同时保存：
+run 同时保存用户原始 TOML 与展开默认值后的规范 JSON：
 
 ```text
 config.toml           # 用户输入原文
@@ -152,7 +168,7 @@ config.resolved.json  # 完整、显式、可哈希的规范配置
 - dataloader 默认值；
 - Identity encoder 默认值；
 - VGG / WFM 默认权重；
-- 远程数据源默认 revision/path_prefix/adjustment。
+- 本地数据源 path/adjustment。
 
 其规范 JSON 内容计算 SHA-256 并写入 `metadata.json`。新 checkpoint 也记录同一摘要与 run ID；resume 时若摘要或 run ID 不一致，会拒绝继续训练。
 

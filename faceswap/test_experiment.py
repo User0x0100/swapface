@@ -10,8 +10,8 @@ from faceswap.experiment import RunLock, RunPaths, append_resume_event, config_s
 def main() -> None:
     resolved = {
         "train": {"batch_size": 8},
-        "dataloader": {"huggingface_proxy": None},
-        "src": [{"backend": "local", "path": "/data/src", "adjustment": 0.0}],
+        "dataloader": {},
+        "src": [{"path": "/data/src", "adjustment": 0.0}],
     }
 
     with tempfile.TemporaryDirectory(prefix="faceswap-run-check-") as temporary:

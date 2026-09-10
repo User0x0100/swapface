@@ -115,15 +115,6 @@ py_start_method = "spawn"
 # external_source 每个 worker 的读取预取深度。
 reader_prefetch_queue_depth = 2
 
-# Hugging Face 在线数据集代理。取消注释后仅用于 Hugging Face Hub 请求。
-# 支持 HTTP/HTTPS/SOCKS5/SOCKS5H 代理 URL。
-# huggingface_proxy = "socks5h://127.0.0.1:1080"
-
-# ModelScope 在线数据集的单文件下载 cache。
-# 已访问图片会复用该目录中的 Hub cache；留空时使用 ModelScope SDK 默认 cache。
-# 云端训练建议指向持久化磁盘，例如：
-# modelscope_cache_dir = "/mnt/workspace/.cache/modelscope"
-
 # 图像解码后端："mixed" 或 "cpu"。
 # mixed 通常是 CUDA 训练的推荐路径。
 decoder_backend = "mixed"
@@ -195,54 +186,28 @@ max_ch = 512
 group_size = 4
 
 
-# 身份来源数据池。
-# 每项必须显式设置 backend，可选：local、huggingface、modelscope。
-# local 使用 path；huggingface/modelscope 使用 repo_id，并可选 revision/path_prefix。
-# 远程 backend 在训练进程启动时枚举一次当前 revision 的图片清单；训练运行期间
-# 仓库新增文件不会动态加入本次数据池，重新启动训练后会重新枚举。
+# 身份来源数据池。训练数据仅支持本地图片目录。
 # 每项可以单独设置 adjustment；实际数据源采样权重为：
 #   sqrt(file_count) * 2**adjustment
-#
-# Hugging Face 在线 FFHQ 示例（按需下载并复用 HF cache）：
-# [[src]]
-# backend = "huggingface"
-# repo_id = "marcosv/ffhq-dataset"
-# revision = "main"
-# # 可选：只使用仓库中的某个子目录，例如 "Part1"。留空表示整个仓库。
-# path_prefix = ""
-# adjustment = 0.0
-#
-# ModelScope 独立图片仓库示例（按需下载并复用 ModelScope cache）：
-# [[src]]
-# backend = "modelscope"
-# repo_id = "liaohaixun/FFHQ1024"
-# revision = "master"
-# path_prefix = "images"
-# adjustment = 0.0
 [[src]]
-backend = "local"
 path = "/path/to/source_faces_a"
 adjustment = 0.0
 
 [[src]]
-backend = "local"
 path = "/path/to/source_faces_b"
 adjustment = 0.0
 
 
 # 目标/姿态/表情数据池，语义与 [[src]] 相同。
 [[dst]]
-backend = "local"
 path = "/path/to/target_faces_a"
 adjustment = 0.0
 
 [[dst]]
-backend = "local"
 path = "/path/to/target_faces_b"
 adjustment = 0.0
 
 # adjustment=1.0 表示相对基础权重乘 2，可用于提高特定困难数据的采样概率。
 [[dst]]
-backend = "local"
 path = "/path/to/occlusion_faces"
 adjustment = 1.0

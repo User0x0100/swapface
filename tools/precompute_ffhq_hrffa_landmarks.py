@@ -1,12 +1,12 @@
-"""从 Hugging Face FFHQ WebDataset 流式预计算 HRFFA 关键点。
+"""从本地 FFHQ WebDataset tar shards 预计算 HRFFA 关键点。
 
 默认只处理少量样本并生成可视化预览，避免误触发 70k 全量任务。只有显式传入
 ``--all`` 才会处理选中 shard 的全部图像。
 
 示例:
-    uv run python tools/precompute_ffhq_hrffa_landmarks.py
-    uv run python tools/precompute_ffhq_hrffa_landmarks.py --limit 8 --preview-count 8
-    uv run python tools/precompute_ffhq_hrffa_landmarks.py --all --preview-count 0
+    uv run python tools/precompute_ffhq_hrffa_landmarks.py --input-dir /path/to/ffhq-wds
+    uv run python tools/precompute_ffhq_hrffa_landmarks.py --input-dir /path/to/ffhq-wds --limit 8 --preview-count 8
+    uv run python tools/precompute_ffhq_hrffa_landmarks.py --input-dir /path/to/ffhq-wds --all --preview-count 0
 """
 
 import argparse
@@ -19,7 +19,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from huggingface_hub import HfFileSystem
 from torch import Tensor
 from torchvision.io import decode_image
 from torchvision.io.image import ImageReadMode
@@ -31,7 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from misc.models import ImageInputRange
 from misc.models.hrffa import HRFFALandmarkModel, HRFFAModelVariant, HRFFAScheme, HRFFAVisibility
 
-DEFAULT_REPO_ID = "gaunernst/ffhq-1024-wds"
+DEFAULT_INPUT_DIR = PROJECT_ROOT / "datasets" / "ffhq-1024-wds"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "datasets" / "ffhq_hrffa_landmarks"
 DEFAULT_SAMPLE_LIMIT = 8
 
@@ -50,9 +49,8 @@ VISIBILITY_COLORS = {
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="从 Hugging Face FFHQ WebDataset 流式预计算 HRFFA 关键点")
-    parser.add_argument("--repo-id", default=DEFAULT_REPO_ID, help=f"Hugging Face dataset repo，默认 {DEFAULT_REPO_ID}")
-    parser.add_argument("--revision", default="main", help="dataset revision，默认 main")
+    parser = argparse.ArgumentParser(description="从本地 FFHQ WebDataset tar shards 预计算 HRFFA 关键点")
+    parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR, help=f"本地 tar shard 目录，默认 {DEFAULT_INPUT_DIR}")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help=f"输出目录，默认 {DEFAULT_OUTPUT_DIR}")
     parser.add_argument("--scheme", choices=[scheme.value for scheme in HRFFAScheme], default=HRFFAScheme.IBUG68.value, help="HRFFA 关键点拓扑")
     parser.add_argument("--variant", choices=[variant.value for variant in HRFFAModelVariant], default=HRFFAModelVariant.VITT_256.value, help="HRFFA 模型版本，默认 vitt-256")
@@ -82,18 +80,13 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
-def _dataset_root(repo_id: str, revision: str) -> str:
-    root = f"datasets/{repo_id}"
-    if revision != "main":
-        root += f"@{revision}"
-    return root
-
-
-def _discover_shards(fs: HfFileSystem, repo_id: str, revision: str, start: int, count: int | None) -> list[str]:
-    root = _dataset_root(repo_id, revision)
-    shards = sorted(fs.glob(f"{root}/*.tar"))
+def _discover_shards(input_dir: Path, start: int, count: int | None) -> list[Path]:
+    root = input_dir.resolve(strict=True)
+    if not root.is_dir():
+        raise NotADirectoryError(f"input-dir 不是目录: {root}")
+    shards = sorted(root.glob("*.tar"))
     if not shards:
-        raise FileNotFoundError(f"未在 Hugging Face dataset 中找到 tar shard: {root}")
+        raise FileNotFoundError(f"本地目录中没有 tar shard: {root}")
     if start >= len(shards):
         raise ValueError(f"start_shard_index={start} 超出 shard 数量 {len(shards)}")
     return shards[start:] if count is None else shards[start : start + count]
@@ -172,8 +165,7 @@ def _save_shard_landmarks(
     visibility: list[np.ndarray],
     image_sizes: list[tuple[int, int]],
     *,
-    repo_id: str,
-    revision: str,
+    source_dir: Path,
     scheme: HRFFAScheme,
     variant: HRFFAModelVariant,
     complete: bool,
@@ -191,8 +183,7 @@ def _save_shard_landmarks(
         landmarks=np.stack(landmarks).astype(np.float32, copy=False),
         visibility=np.stack(visibility).astype(np.uint8, copy=False),
         image_sizes=np.asarray(image_sizes, dtype=np.int32),
-        repo_id=np.asarray(repo_id),
-        revision=np.asarray(revision),
+        source_dir=np.asarray(str(source_dir)),
         shard=np.asarray(shard_name),
         scheme=np.asarray(scheme.value),
         variant=np.asarray(variant.value),
@@ -216,11 +207,11 @@ def main() -> None:
     if args.preview_count > 0:
         preview_dir.mkdir(parents=True, exist_ok=True)
 
-    fs = HfFileSystem()
-    shards = _discover_shards(fs, args.repo_id, args.revision, args.start_shard_index, args.num_shards)
+    input_dir = args.input_dir.resolve(strict=True)
+    shards = _discover_shards(input_dir, args.start_shard_index, args.num_shards)
     global_limit = None if args.process_all else args.limit
 
-    print(f"repo={args.repo_id} revision={args.revision}")
+    print(f"input={input_dir}")
     print(f"scheme={scheme.value} variant={variant.value} device={device} batch_size={args.batch_size}")
     print(f"selected_shards={len(shards)} limit={'all' if global_limit is None else global_limit}")
     print(f"output={output_dir}")
@@ -245,7 +236,7 @@ def main() -> None:
         shard_complete = True
 
         print(f"processing {shard_name} ...")
-        with fs.open(shard_path, "rb") as remote_file, tarfile.open(fileobj=remote_file, mode="r:") as archive:
+        with tarfile.open(shard_path, mode="r:") as archive:
             for member in archive:
                 if not member.isfile() or not member.name.lower().endswith(".webp"):
                     continue
@@ -305,8 +296,7 @@ def main() -> None:
             shard_landmarks,
             shard_visibility,
             shard_sizes,
-            repo_id=args.repo_id,
-            revision=args.revision,
+            source_dir=input_dir,
             scheme=scheme,
             variant=variant,
             complete=shard_complete,
@@ -319,8 +309,7 @@ def main() -> None:
         _save_contact_sheet(previews, preview_dir / "contact_sheet.jpg")
 
     manifest = {
-        "repo_id": args.repo_id,
-        "revision": args.revision,
+        "input_dir": str(input_dir),
         "scheme": scheme.value,
         "variant": variant.value,
         "device": str(device),

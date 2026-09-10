@@ -114,13 +114,6 @@ py_start_method = "spawn"
 # external_source 每个 worker 的读取预取深度。
 reader_prefetch_queue_depth = 2
 
-# Hugging Face 在线数据集代理；不需要时保持注释。
-# 支持 HTTP/HTTPS/SOCKS5/SOCKS5H 代理 URL。
-# huggingface_proxy = "socks5h://127.0.0.1:1080"
-
-# ModelScope 在线数据集单文件 cache。云端可指向持久化磁盘。
-# modelscope_cache_dir = "/mnt/workspace/.cache/modelscope"
-
 # 图像解码后端："mixed" 或 "cpu"。
 # mixed 通常是 CUDA 训练的推荐路径。
 decoder_backend = "mixed"
@@ -192,16 +185,11 @@ max_ch = 512
 group_size = 4
 
 
+# 训练数据仅支持本地图片目录。请按实际机器修改路径。
 [[src]]
-backend = "modelscope"
-repo_id = "liaohaixun/FFHQ1024"
-revision = "master"
-path_prefix = "images"
+path = "/path/to/ffhq"
 adjustment = 0.0
 
 [[dst]]
-backend = "modelscope"
-repo_id = "liaohaixun/FFHQ1024"
-revision = "master"
-path_prefix = "images"
+path = "/path/to/ffhq"
 adjustment = 0.0
