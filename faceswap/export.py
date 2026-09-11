@@ -128,8 +128,8 @@ def export_face_swap(
 
     if batch_size <= 0:
         raise ValueError("batch_size 必须为正数")
-    model, provider, training_iteration = load_generator(checkpoint_path)
-    print(f"Loading EMA checkpoint: {checkpoint_path}, iter={training_iteration}, provider={provider.name}")
+    model, provider, training_step = load_generator(checkpoint_path)
+    print(f"Loading EMA checkpoint: {checkpoint_path}, step={training_step}, provider={provider.name}")
 
     network_config = model.network_cfg
     image_resolution, image_channels, identity_dim = network_config["img_resolution"], network_config["img_channels"], network_config["id_dim"]
@@ -146,8 +146,8 @@ def export_face_swap(
         wrapped,
         (x, identity_embedding),
         output_dir=output_dir,
-        file_prefix=f"{file_prefix}-{training_iteration}",
-        metadata=ONNX_CONTRACT | {"faceswap.kind": "generator", "faceswap.provider": provider.name, "faceswap.layout": "NHWC" if nhwc else "NCHW", "faceswap.iter": str(training_iteration)},
+        file_prefix=f"{file_prefix}-{training_step}",
+        metadata=ONNX_CONTRACT | {"faceswap.kind": "generator", "faceswap.provider": provider.name, "faceswap.layout": "NHWC" if nhwc else "NCHW", "faceswap.step": str(training_step)},
         input_names=["faces", "identity"],
         output_name="swapped_faces",
     )

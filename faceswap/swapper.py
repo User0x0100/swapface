@@ -75,9 +75,9 @@ class FaceSwapper:
                     raise ValueError(f"ONNX 推理约定不匹配：{key}={metadata.get(key)!r}，请用当前 export.py 重新导出")
             try:
                 self.id_encoder_provider = IDEncoderProvider[metadata["faceswap.provider"]]
-                self.training_iteration = int(metadata["faceswap.iter"])
+                self.training_step = int(metadata["faceswap.step"])
             except (KeyError, ValueError) as error:
-                raise ValueError("ONNX 缺少有效的身份编码器或迭代信息，请重新导出") from error
+                raise ValueError("ONNX 缺少有效的身份编码器或 step 信息，请重新导出") from error
             self.ort_layout = metadata.get("faceswap.layout")
             if self.ort_layout not in {"NHWC", "NCHW"}:
                 raise ValueError("ONNX 缺少有效的图像布局，请重新导出")
@@ -98,11 +98,11 @@ class FaceSwapper:
                 raise ValueError("ONNX 要求 FP32 输入输出，且输出图像形状与输入一致")
             self.img_resolution = height
         else:
-            net_g, self.id_encoder_provider, self.training_iteration = load_generator(model_path)
+            net_g, self.id_encoder_provider, self.training_step = load_generator(model_path)
             self.img_resolution = net_g.network_cfg["img_resolution"]
             self.net_g = net_g.to(self.device).eval()
 
-        print(f"Loaded iter={self.training_iteration}, provider={self.id_encoder_provider.name}, alignment=FFHQ")
+        print(f"Loaded step={self.training_step}, provider={self.id_encoder_provider.name}, alignment=FFHQ")
         self.face_detector = RetinaFace(input_range=ImageInputRange.ZERO_TO_255).to(self.device).eval()
         self.id_encoder = IDEncoder(self.id_encoder_provider).to(self.device).eval()
         self.face_masker = FaceMasker(input_range=ImageInputRange.MINUS_ONE_TO_ONE, mode="occlusion").to(self.device)  # occ 模型在 eval 模式下无法正常推理

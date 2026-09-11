@@ -51,21 +51,16 @@ def main() -> None:
         checkpoint_path = directory / "current.pth"
         checkpoint = {
             "version": CHECKPOINT_VERSION,
-            "iter": 123,
+            "step": 123,
             "identity_encoders": {"generator": provider.name, "identity_loss": "BLENDFACE"},
             "net_g": {"network_cfg": model.network_cfg, "state_dict": model.state_dict()},
             "training_state": {"net_g": {key: torch.zeros_like(value) for key, value in model.state_dict().items()}},
         }
         torch.save(checkpoint, checkpoint_path)
-        loaded, saved_provider, iteration = load_generator(checkpoint_path)
-        assert saved_provider is provider and iteration == 123
+        loaded, saved_provider, completed_step = load_generator(checkpoint_path)
+        assert saved_provider is provider and completed_step == 123
         for key, value in loaded.state_dict().items():
             torch.testing.assert_close(value, model.state_dict()[key])
-
-        checkpoint_with_step = directory / "with-step.pth"
-        torch.save({**checkpoint, "step": 124}, checkpoint_with_step)
-        _, _, completed_step = load_generator(checkpoint_with_step)
-        assert completed_step == 124
 
         # 五点目标经训练端 affine 映射后必须回到原 ArcFace 112 坐标。
         affine = torch.tensor(FFHQ_TO_ARCFACE_112_AFFINE_512)
@@ -108,6 +103,10 @@ def main() -> None:
                 assert exported_provider is provider
                 onnx_model = onnx.load(exported_path)
                 onnx.checker.check_model(onnx_model)
+                exported_metadata = {item.key: item.value for item in onnx_model.metadata_props}
+                assert exported_metadata["faceswap.format"] == "2"
+                assert exported_metadata["faceswap.step"] == "123"
+                assert "faceswap.iter" not in exported_metadata
                 runtime = swapper.FaceSwapper(str(exported_path), device="cpu")
                 assert runtime.id_encoder.provider is provider
                 actual = runtime.swap_faces(faces, identity)
@@ -174,10 +173,24 @@ def main() -> None:
             else:
                 raise AssertionError("Invalid video batch size was accepted")
 
-            # 缺少新约定的 ONNX 必须明确拒绝，不能猜 provider 或 alignment。
-            del onnx_model.metadata_props[:]
+            # 旧 format 与缺失 metadata 都必须明确拒绝。
+            legacy_model = onnx.load(exported_path)
+            for item in legacy_model.metadata_props:
+                if item.key == "faceswap.format":
+                    item.value = "1"
+            legacy_path = directory / "legacy-format.onnx"
+            onnx.save(legacy_model, legacy_path)
+            try:
+                swapper.FaceSwapper(str(legacy_path), device="cpu")
+            except ValueError as error:
+                assert "约定不匹配" in str(error)
+            else:
+                raise AssertionError("Legacy ONNX format was accepted")
+
+            missing_metadata_model = onnx.load(exported_path)
+            del missing_metadata_model.metadata_props[:]
             old_path = directory / "missing-metadata.onnx"
-            onnx.save(onnx_model, old_path)
+            onnx.save(missing_metadata_model, old_path)
             try:
                 swapper.FaceSwapper(str(old_path), device="cpu")
             except ValueError as error:
@@ -199,6 +212,7 @@ def main() -> None:
                 encoded_path = export.export_id_encoder(provider.name, nhwc=nhwc, device="cpu", output_dir=temporary, file_prefix=f"encoder-{nhwc}")
                 session = ort.InferenceSession(str(encoded_path), providers=["CPUExecutionProvider"])
                 metadata = session.get_modelmeta().custom_metadata_map
+                assert metadata["faceswap.format"] == "2"
                 assert metadata["faceswap.face_alignment"] == "arcface112"
                 assert metadata["faceswap.provider"] == provider.name
                 inputs = torch.rand(1, 3, 112, 112) * 2 - 1
@@ -207,7 +221,11 @@ def main() -> None:
                 actual_identity = session.run(["identity"], {"faces": inputs_np})[0]
                 np.testing.assert_allclose(actual_identity, expected_identity, atol=1e-5, rtol=1e-5)
 
-        for invalid in ({**checkpoint, "version": CHECKPOINT_VERSION - 1}, {key: value for key, value in checkpoint.items() if key != "identity_encoders"}):
+        for invalid in (
+            {**checkpoint, "version": CHECKPOINT_VERSION - 1},
+            {key: value for key, value in checkpoint.items() if key != "identity_encoders"},
+            {key: value for key, value in checkpoint.items() if key != "step"},
+        ):
             torch.save(invalid, directory / "invalid.pth")
             try:
                 load_generator(directory / "invalid.pth")

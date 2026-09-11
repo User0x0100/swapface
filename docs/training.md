@@ -78,7 +78,7 @@ experiments/
 
 - `config.toml`：启动该 run 时用户提供的 TOML 原文快照，便于人工阅读。
 - `config.resolved.json`：展开 Trainer、模型和 dataloader 默认值后的规范配置；这是 run 的机器可读事实来源。
-- `metadata.json`：run ID、状态、Git commit/dirty、Python/平台信息、PyTorch/CUDA 信息和 resume 历史。
+- `metadata.json`：只记录 run ID、状态、配置摘要和可选的 branch 父来源。
 - `latest.json`：很小的最新 checkpoint 指针，不复制大模型文件，适合本地文件系统和对象存储。
 - `checkpoints/`：完整训练状态。
 - `samples/`：与 completed step 对齐的训练可视化。
@@ -88,9 +88,9 @@ experiments/
 
 ## Step 与文件命名
 
-内部 checkpoint v2 继续保留 0-based `iter` / `next_iter` 字段，以避免仅因目录重构破坏推理兼容。
+当前 checkpoint 只保存一个权威的 `step`，表示已经完整完成的训练更新次数。
 
-对用户可见的文件名统一使用 **completed step**：
+文件名统一使用 **completed step**：
 
 ```text
 step_000000001.pth
@@ -102,6 +102,8 @@ step_000010000.png
 
 checkpoint 仍通过临时文件写入后原子 `replace`；只有 checkpoint 成功落盘后才原子更新 `latest.json`。
 
+`completed step` 只在一轮完整的 Discriminator 更新、Generator 更新、scheduler（若启用）和 EMA 更新全部完成后推进。checkpoint 内部 `step` 与文件名中的 step 必须完全一致。因此从 `step_000050000.pth` 恢复后，在下一轮更新真正完成前，completed step 仍是 50,000，不会把正在执行的 partial iteration 标记成 50,001。
+
 ## 中途恢复训练
 
 推荐直接指定 run：
@@ -111,14 +113,7 @@ uv run python -m faceswap.train \
   --resume experiments/runs/20260910-162600_blendface-vgg
 ```
 
-程序会：
-
-1. 校验该目录是标准 run；
-2. 从 `latest.json` 找到最新 checkpoint；
-3. 校验 `config.resolved.json` 与 `metadata.json` 中的 SHA-256；
-4. 使用 run 冻结的 resolved config；
-5. 恢复 Generator、Discriminator、EMA、optimizer、scheduler 与迭代状态；
-6. 继续写入原 run 的 `checkpoints/`、`samples/` 和 `tensorboard/`。
+程序会从 `latest.json` 找到 checkpoint，读取该 run 冻结的 resolved config，然后直接恢复 Generator、Discriminator、EMA、optimizer、scheduler 与 step，继续写入原 run。模型/优化器/scheduler 的 state dict 是否可加载由 PyTorch 自己校验。
 
 也可以显式指定同一 run 的 **latest checkpoint**：
 
@@ -127,16 +122,44 @@ uv run python -m faceswap.train \
   --resume experiments/runs/20260910-162600_blendface-vgg/checkpoints/step_000070000.pth
 ```
 
-显式文件必须位于标准 `run/checkpoints/` 目录中，并且必须与 `latest.json` 指向同一文件。`--resume` 不允许从历史 checkpoint 回滚后继续写入原 run，否则会产生分叉历史并覆盖同 step 的 checkpoint/sample。若确实要从历史 checkpoint 开新分支，应使用未来独立的 `--init-from` 语义并创建新 run。
+显式文件必须位于标准 `run/checkpoints/` 目录中，并且必须与 `latest.json` 指向同一文件。`--resume` 不允许从历史 checkpoint 回滚后继续写入原 run，否则会产生分叉历史并覆盖同 step 的 checkpoint/sample。历史 checkpoint 应通过 branch 创建新的 run。
 
-## Resume 与修改配置
+## Branch：从已有 checkpoint 派生新实验
 
-`--resume` 不能与 `--config`、`--name` 或 `--runs-root` 同时使用。这是刻意设计的约束：
+Branch 从已有完整训练状态创建一个新的 run。它不会修改父 run，可以从父 run 的 latest 或任意历史 checkpoint 分叉：
 
-- **resume**：同一个实验、同一个 run、同一个冻结配置继续执行。
-- **修改 loss / 数据集 / 模型后继续训练**：语义上已经是新的实验分支，不应伪装成 resume。
+```bash
+uv run python -m faceswap.train \
+  --branch-from experiments/runs/20260910-162600-blendface-vgg/checkpoints/step_000050000.pth \
+  --config experiments/train.toml \
+  --name lower-id-loss
+```
 
-如果以后需要“从旧模型权重初始化一个新实验”，应单独实现 `--init-from` 一类接口，并创建新 run、记录 lineage；不要复用 `--resume`。
+`--branch-from` 必须显式提供 `--config`。Branch 只在创建新 run 前比较父 run 与新配置的模型定义；通过后立即创建新 run，并在 `metadata.json.parent` 中记录父 `run_id`、checkpoint、step 和配置摘要。checkpoint 权重、optimizer 和 scheduler 是否真的可恢复，直接交给 PyTorch 的 `load_state_dict()`；失败时使用原始错误并将新 run 标记为 `failed`。
+
+Branch 允许修改训练配置，例如：
+
+- loss 类型、开关和权重；
+- Generator Identity provider 与 Identity Loss provider；
+- 学习率与 scheduler；
+- batch size、R1、BF16/compile；
+- 数据源、数据增强、DALI 参数；
+- 日志、sample 和 checkpoint 间隔。
+
+但 Branch 的目的仍是**继续训练同一个模型定义**，因此以下配置必须与父 run 完全一致，否则在创建新 run 前直接拒绝：
+
+- 整个 `[generator]`；
+- 整个 `[discriminator]`。
+
+若要修改这些模型定义，应创建 fresh run，而不是 branch。Branch 不做 partial load。
+
+Branch 继承 Generator、Discriminator、EMA 和 Adam moments/step。optimizer 的学习率等运行超参数以新配置为准；当 `lr` 与 `lr_scheduler_t_max` 都与父 checkpoint 一致时继承 scheduler 进度，否则 scheduler 按新配置重新初始化。
+
+因此三种入口具有明确语义：
+
+- **fresh**：新模型、新配置、新 run；
+- **resume**：原 run、原冻结配置、latest checkpoint，严格线性继续；
+- **branch**：新 run、父 checkpoint 的已训练模型状态、新训练配置，但模型定义不可改变。
 
 ### 可选严格校验 BF16
 
@@ -182,7 +205,7 @@ created -> running -> interrupted
                    -> completed
 ```
 
-Ctrl+C 属于 `interrupted`，后续可直接 `--resume`。初始化或训练异常会记录错误类型与消息并标记为 `failed`，避免留下无法判断来源的空目录。训练进程因 Ctrl+C 退出时返回非零状态码 130，便于 shell/调度系统正确识别中断。
+Ctrl+C 属于 `interrupted`，后续可直接 `--resume`。训练开始后第一次 Ctrl+C 会请求在当前完整 step 结束后退出，从而保存一致的 checkpoint；再次 Ctrl+C 会立即中断，如果此时不在完整 step 边界则拒绝保存 partial checkpoint，并保持已有 `latest.json` 不变。初始化或训练异常会记录错误类型与消息并标记为 `failed`。训练进程因 Ctrl+C 退出时返回非零状态码 130。
 
 同一个 run 还会持有 `.run.lock` 的 Linux advisory lock。若另一个训练进程同时尝试 resume 同一 run，会立即拒绝启动；锁由内核绑定到进程/文件描述符，进程崩溃后会自动释放，因此不会出现“残留 lockfile 导致永久锁死”的问题。
 
@@ -195,16 +218,3 @@ uv run tensorboard --logdir experiments/runs
 ```
 
 恢复同一个 run 后，TensorBoard 目录可能出现多个 `events.out.tfevents.*`。它们仍属于同一逻辑 run；恢复时会设置 `purge_step`，让 TensorBoard 隐藏上次进程在最后 checkpoint 之后写出的失效 future steps，避免回滚恢复后出现重复曲线。
-
-## 旧目录
-
-旧实现使用：
-
-```text
-experiments/my_experiment/
-├── ckpt/
-├── sample/
-└── tensorboard/
-```
-
-这些目录没有 `config.resolved.json`、`metadata.json` 和 `latest.json`，因此不会被新的 `--resume` 当成标准 run。保留旧文件用于人工迁移或推理即可；新的训练结果不要继续写入旧目录。

@@ -1,4 +1,4 @@
-"""当前训练 checkpoint 与 ONNX 推理共用的输入约定（不兼容旧预处理）。"""
+"""当前训练 checkpoint 与 ONNX 推理共用的输入约定。"""
 
 from pathlib import Path
 
@@ -14,8 +14,12 @@ from .contracts import CHECKPOINT_VERSION
 
 def load_generator(checkpoint_path: str | Path) -> tuple[Generator, IDEncoderProvider, int]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if checkpoint.get("version") != CHECKPOINT_VERSION:
-        raise ValueError(f"仅支持当前 train.py 保存的 v{CHECKPOINT_VERSION} checkpoint，请使用当前训练权重")
+    try:
+        version = checkpoint["version"]
+    except KeyError as error:
+        raise ValueError("checkpoint 缺少 version") from error
+    if version != CHECKPOINT_VERSION:
+        raise ValueError(f"仅支持当前 train.py 保存的 v{CHECKPOINT_VERSION} checkpoint")
     try:
         provider = IDEncoderProvider[checkpoint["identity_encoders"]["generator"]]
     except (KeyError, TypeError) as error:
@@ -26,7 +30,12 @@ def load_generator(checkpoint_path: str | Path) -> tuple[Generator, IDEncoderPro
     model = Generator(**config)
     # train.py 将用于推理的 EMA 权重存入 net_g；training_state.net_g 是训练权重。
     model.load_state_dict(checkpoint["net_g"]["state_dict"])
-    completed_step = int(checkpoint.get("step", checkpoint["iter"]))
+    try:
+        completed_step = checkpoint["step"]
+    except KeyError as error:
+        raise ValueError("checkpoint 缺少 step") from error
+    if not isinstance(completed_step, int) or isinstance(completed_step, bool) or completed_step <= 0:
+        raise ValueError(f"checkpoint.step 必须是正整数：{completed_step!r}")
     return model.eval(), provider, completed_step
 
 
