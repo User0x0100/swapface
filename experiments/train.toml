@@ -1,19 +1,20 @@
-# FaceSwap 训练配置
+# FaceSwap 训练配置示例
 # 详细的 run / checkpoint / resume 约定见 docs/training.md。
 #
 # 使用方式：
-#   新训练：uv run python -m faceswap.train --config experiments/train.toml [--name NAME]
+#   新训练：uv run python -m faceswap.train --config faceswap/train.example.toml [--name NAME]
 #   恢复训练：uv run python -m faceswap.train --resume experiments/runs/<run_id> [--strict-bf16]
 #
 # 说明：
 # - 本文件只描述训练实验本身，不保存 checkpoint/output 路径等运行时状态。
 # - 每次新训练会自动创建唯一 run 目录，并冻结原始配置、resolved config 与运行元数据。
 # - 未显式配置的参数会使用 Trainer / 模型 / dataloader 的默认值，并写入 run/config.resolved.json。
+# - 训练输入图像默认要求使用 FFHQ canonical alignment；Identity Loss 前固定映射到 112x112 canonical 坐标系。
 # - checkpoint 仅支持当前 v2 格式；恢复时使用原 run 的冻结配置，不重新读取本文件。
 
 [train]
 # 每个训练 batch 的样本数。当前判别器的 minibatch group_size 必须能整除该值。
-batch_size = 8
+batch_size = 12
 
 # Generator / Discriminator 的 Adam 初始学习率。
 lr = 1.0e-4
@@ -56,7 +57,7 @@ generator_provider = "BLENDFACE"
 
 # Identity Loss 使用的身份编码器。
 # 当前训练设计固定使用 MS1MV3 ArcFace R50 FP16 权重。
-loss_provider = "MS1MV3_ARCFACE_R50_FP16"
+loss_provider = "BLENDFACE"
 
 # Identity Loss 的总权重。
 loss_weight = 10.0
@@ -67,7 +68,7 @@ loss_weight = 10.0
 enable_rec_loss = true
 
 # Reconstruction Loss 权重。
-rec_loss_weight = 1.0
+rec_loss_weight = 8.0
 
 
 [loss.vgg]
@@ -92,10 +93,10 @@ enable = false
 # 当前 512 模型共有 0..6 共 7 层特征。
 # 注意：越浅的层特征图越大，显存/带宽开销也越高。
 [loss.wfm.weights]
-0 = 1.0
-1 = 1.0
-2 = 1.0
-3 = 1.0
+0 = 0.1
+1 = 0.1
+2 = 0.1
+3 = 0.1
 
 
 [dataloader]
@@ -103,7 +104,7 @@ enable = false
 num_threads = 16
 
 # DALI 整体 pipeline 预取深度。值越大可能提高吞吐，也会增加内存/显存占用。
-prefetch_queue_depth = 2
+prefetch_queue_depth = 4
 
 # parallel external_source 的 Python worker 数量。
 py_num_workers = 8
@@ -134,12 +135,12 @@ flip_prob = 0.5
 rotation_range = [-3.0, 3.0]
 
 # dst 实际缩放倍数范围，必须为正数。
-scale_factor_range = [0.75, 1.25]
+scale_factor_range = [0.95, 1.05]
 
 # dst 水平/垂直平移范围，单位为图像宽高的比例。
 # 例如 0.15 表示最多平移 15%。
-tx_range = [-0.15, 0.15]
-ty_range = [-0.15, 0.15]
+tx_range = [-0.05, 0.05]
+ty_range = [-0.05, 0.05]
 
 
 [generator]
@@ -150,16 +151,16 @@ img_resolution = 256
 img_channels = 3
 
 # Encoder/Decoder 下采样深度。
-num_depth = 5
+num_depth = 4
 
 # 身份 latent 数量。
-num_latent = 6
+num_latent = 8
 
 # Generator 基础通道数。
-base_ch = 16
+base_ch = 64
 
 # Generator 最大通道数。
-max_ch = 2048
+max_ch = 512
 
 # Generator 身份条件向量维度。BlendFace 输出为 512。
 id_dim = 512
@@ -168,7 +169,7 @@ id_dim = 512
 # 0 表示最深的第一个 decoder 层，num_depth-1 表示最终全分辨率 decoder 层。
 # 配置某层即启用对应 encoder -> decoder 的 AAD skip；不配置则不连接。
 # num_depth = 5 时 [0, 1, 2, 3, 4] 表示完整 U-Net。
-aad_skip_layers = [0, 1, 2, 3, 4]
+aad_skip_layers = []
 
 
 [discriminator]
@@ -185,11 +186,28 @@ max_ch = 512
 group_size = 4
 
 
-# 训练数据仅支持本地图片目录。请按实际机器修改路径。
+# 身份来源数据池。训练数据仅支持本地图片目录。
+# 每项可以单独设置 adjustment；实际数据源采样权重为：
+#   sqrt(file_count) * 2**adjustment
 [[src]]
-path = "/path/to/ffhq"
+path = "/path/to/source_faces_a"
+adjustment = 0.0
+
+[[src]]
+path = "/path/to/source_faces_b"
+adjustment = 0.0
+
+
+# 目标/姿态/表情数据池，语义与 [[src]] 相同。
+[[dst]]
+path = "/path/to/target_faces_a"
 adjustment = 0.0
 
 [[dst]]
-path = "/path/to/ffhq"
+path = "/path/to/target_faces_b"
 adjustment = 0.0
+
+# adjustment=1.0 表示相对基础权重乘 2，可用于提高特定困难数据的采样概率。
+[[dst]]
+path = "/path/to/occlusion_faces"
+adjustment = 1.0
