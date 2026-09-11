@@ -268,11 +268,11 @@ if __name__ == "__main__":
         "img_resolution": 256,
         "img_channels": 3,
         "num_depth": 4,
-        "num_latent": 6,
-        "base_ch": 32,
+        "num_latent": 8,
+        "base_ch": 64,
         "max_ch": 2048,
         "id_dim": 512,
-        "aad_skip_layers": [0, 1, 2],
+        "aad_skip_layers": [],
     }
 
     model = Generator(**network_cfg).to(device)

@@ -592,7 +592,7 @@ class Trainer:
                 self.save_ckpt()
 
             if self.completed_step % self.sample_save_every == 0:
-                with torch.no_grad():
+                with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
                     half = self.batch_size // 2
                     src_vis = torch.cat((sample_src[:half], src[: self.batch_size - half]), dim=0)
                     dst_vis = torch.cat((sample_dst[:half], dst[: self.batch_size - half]), dim=0)
@@ -609,12 +609,7 @@ class Trainer:
                     # Identity Loss 编码器真正接收的图像；直接组合 restore + FFHQ->112，
                     # 避免先恢复到全分辨率再二次重采样。仅为 sample grid 显示再放大回训练分辨率。
                     identity_encoder_input_vis = self.prepare_identity_encoder_faces(fake_vis, theta_restore_vis)
-                    identity_encoder_input_display_vis = NF.interpolate(
-                        identity_encoder_input_vis,
-                        size=fake_vis.shape[2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
+                    identity_encoder_input_display_vis = NF.interpolate(identity_encoder_input_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
 
                     grid = [src_vis, dst_vis, fake_vis, dst_restored_vis, identity_encoder_input_display_vis]
 
