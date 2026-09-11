@@ -68,7 +68,7 @@ loss_weight = 10.0
 enable_rec_loss = true
 
 # Reconstruction Loss 权重。
-rec_loss_weight = 5.0
+rec_loss_weight = 8.0
 
 
 [loss.vgg]
