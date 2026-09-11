@@ -14,7 +14,7 @@
 
 [train]
 # 每个训练 batch 的样本数。当前判别器的 minibatch group_size 必须能整除该值。
-batch_size = 16
+batch_size = 12
 
 # Generator / Discriminator 的 Adam 初始学习率。
 lr = 1.0e-4
@@ -57,7 +57,7 @@ generator_provider = "BLENDFACE"
 
 # Identity Loss 使用的身份编码器。
 # 当前训练设计固定使用 MS1MV3 ArcFace R50 FP16 权重。
-loss_provider = "MS1MV3_ARCFACE_R50_FP16"
+loss_provider = "BLENDFACE"
 
 # Identity Loss 的总权重。
 loss_weight = 10.0
@@ -68,7 +68,7 @@ loss_weight = 10.0
 enable_rec_loss = true
 
 # Reconstruction Loss 权重。
-rec_loss_weight = 10.0
+rec_loss_weight = 5.0
 
 
 [loss.vgg]
@@ -86,7 +86,7 @@ conv4_3 = 2.5
 [loss.wfm]
 # 是否启用判别器中间特征的 Weighted Feature Matching Loss。
 # fake 分支保留梯度，real 分支在 no_grad 下作为目标特征。
-enable = true
+enable = false
 
 # WFM 使用的判别器特征层索引及对应权重。
 # 键是 Discriminator down_blocks 的 0-based 索引。
@@ -132,35 +132,35 @@ saturation = 0.2
 flip_prob = 0.5
 
 # dst 随机旋转角范围，单位：度。
-rotation_range = [-10.0, 10.0]
+rotation_range = [-3.0, 3.0]
 
 # dst 实际缩放倍数范围，必须为正数。
-scale_factor_range = [0.7692307692307693, 1.25]
+scale_factor_range = [0.95, 1.05]
 
 # dst 水平/垂直平移范围，单位为图像宽高的比例。
 # 例如 0.15 表示最多平移 15%。
-tx_range = [-0.15, 0.15]
-ty_range = [-0.15, 0.15]
+tx_range = [-0.05, 0.05]
+ty_range = [-0.05, 0.05]
 
 
 [generator]
 # Generator 输入/输出正方形分辨率。
-img_resolution = 512
+img_resolution = 256
 
 # RGB 图像为 3 通道。
 img_channels = 3
 
 # Encoder/Decoder 下采样深度。
-num_depth = 5
+num_depth = 4
 
 # 身份 latent 数量。
-num_latent = 6
+num_latent = 8
 
 # Generator 基础通道数。
-base_ch = 16
+base_ch = 64
 
 # Generator 最大通道数。
-max_ch = 2048
+max_ch = 512
 
 # Generator 身份条件向量维度。BlendFace 输出为 512。
 id_dim = 512
@@ -169,12 +169,12 @@ id_dim = 512
 # 0 表示最深的第一个 decoder 层，num_depth-1 表示最终全分辨率 decoder 层。
 # 配置某层即启用对应 encoder -> decoder 的 AAD skip；不配置则不连接。
 # num_depth = 5 时 [0, 1, 2, 3, 4] 表示完整 U-Net。
-aad_skip_layers = [0, 1, 2, 3, 4]
+aad_skip_layers = []
 
 
 [discriminator]
 # 必须与 Generator img_resolution 一致。
-img_resolution = 512
+img_resolution = 256
 img_channels = 3
 
 # 判别器基础/最大通道数。

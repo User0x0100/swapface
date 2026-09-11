@@ -270,7 +270,7 @@ if __name__ == "__main__":
         "num_depth": 4,
         "num_latent": 8,
         "base_ch": 64,
-        "max_ch": 2048,
+        "max_ch": 512,
         "id_dim": 512,
         "aad_skip_layers": [],
     }
