@@ -347,14 +347,7 @@ class Trainer:
 
         # ========================= 数据采样 =========================
 
-        pipe = create_dataloader_pipeline(
-            batch_size=self.batch_size,
-            device_id=device_id,
-            img_resolution=self.img_resolution,
-            src=src,
-            dst=dst,
-            **dataloader_cfg,
-        )
+        pipe = create_dataloader_pipeline(batch_size=self.batch_size, device_id=device_id, img_resolution=self.img_resolution, src=src, dst=dst, **dataloader_cfg)
 
         self.sample_output_map = ["src", "dst", "theta_restore"]
         self.dataset = DALIGenericIterator(pipelines=pipe, output_map=self.sample_output_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
@@ -495,12 +488,11 @@ class Trainer:
             torch.compiler.cudagraph_mark_step_begin()
 
             # ========================= 生成器前向 =========================
-            with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
-                with torch.no_grad():
-                    source_identity_faces = self.prepare_identity_encoder_faces(src)
-                    generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
-                    source_identity_embeddings = self.id_loss.extract_identity_embeddings(source_identity_faces)
-                fake: Tensor = net_g(dst, generator_identity_embeddings)
+            with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16), torch.no_grad():
+                source_identity_faces = self.prepare_identity_encoder_faces(src)
+                generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
+                source_identity_embeddings = self.id_loss.extract_identity_embeddings(source_identity_faces)
+            fake: Tensor = net_g(dst, generator_identity_embeddings)
 
             # ========================= 训练判别器 =========================
             self.net_d.requires_grad_(True)
@@ -937,8 +929,10 @@ def main() -> None:
             print(f"Run 目录：{run_paths.root}")
             trainer.train()
         except KeyboardInterrupt:
+            if trainer is not None:
+                trainer.save_ckpt()
             update_metadata(run_paths, status="interrupted")
-            print("训练已中断；可使用 --resume 继续该 run")
+            print("训练已中断；已保存当前 checkpoint，可使用 --resume 继续该 run")
             raise SystemExit(130) from None
         except BaseException as exc:
             update_metadata(run_paths, status="failed", error={"type": type(exc).__name__, "message": str(exc)})
