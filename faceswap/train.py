@@ -11,7 +11,6 @@ from typing import Any, Literal
 import cv2
 import torch
 import torch.nn.functional as NF
-from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 from torch import Tensor, optim
 from torch.amp import autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -35,7 +34,7 @@ from models.discriminator.upfirdn2d import initialize_upfirdn2d
 from models.networks import Generator
 
 from .contracts import CHECKPOINT_VERSION
-from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, ImageDecoderBackend, ImageSource, create_dataloader_pipeline
+from .dataloader_common import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, ImageDecoderBackend, ImageSource
 from .experiment import (
     RunLock,
     RunPaths,
@@ -174,7 +173,7 @@ class Trainer:
 
         self.device = torch.device(device)
         if self.device.type != "cuda" or not torch.cuda.is_available():
-            raise RuntimeError("Trainer 仅支持 NVIDIA CUDA 设备")
+            raise RuntimeError("Trainer 仅支持 PyTorch CUDA/HIP GPU 设备")
 
         self.batch_size = batch_size
         self.generator_id_encoder_provider = generator_id_encoder_provider
@@ -351,10 +350,20 @@ class Trainer:
 
         # ========================= 数据采样 =========================
 
-        pipe = create_dataloader_pipeline(batch_size=self.batch_size, device_id=device_id, img_resolution=self.img_resolution, src=src, dst=dst, **dataloader_cfg)
+        if torch.version.hip is not None:
+            from .dataloader_native import NativeTrainingDataLoader
 
-        self.sample_output_map = ["src", "dst", "theta_restore"]
-        self.dataset = DALIGenericIterator(pipelines=pipe, output_map=self.sample_output_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
+            self.data_backend = "pytorch"
+            self.dataset = NativeTrainingDataLoader(batch_size=self.batch_size, device=self.device, img_resolution=self.img_resolution, src=src, dst=dst, **dataloader_cfg)
+        else:
+            from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
+
+            from .dataloader import create_dataloader_pipeline
+
+            self.data_backend = "dali"
+            pipe = create_dataloader_pipeline(batch_size=self.batch_size, device_id=device_id, img_resolution=self.img_resolution, src=src, dst=dst, **dataloader_cfg)
+            self.sample_output_map = ["src", "dst", "theta_restore"]
+            self.dataset = DALIGenericIterator(pipelines=pipe, output_map=self.sample_output_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
 
         # ========================= 编译模型 =========================
         if compile_module:
@@ -410,6 +419,9 @@ class Trainer:
 
     @torch.no_grad()
     def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor]:
+        if self.data_backend == "pytorch":
+            return self.dataset.next()
+
         data: dict[str, Tensor] = self.dataset.next()[0]
         src, dst, theta_restore = (data[k] for k in self.sample_output_map)
         return src, dst, theta_restore

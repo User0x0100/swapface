@@ -143,7 +143,7 @@ Branch 允许修改训练配置，例如：
 - Generator Identity provider 与 Identity Loss provider；
 - 学习率与 scheduler；
 - batch size、R1、BF16/compile；
-- 数据源、数据增强、DALI 参数；
+- 数据源、数据增强与数据管线参数（NVIDIA 使用 DALI，ROCm 使用原生 PyTorch 管线）；
 - 日志、sample 和 checkpoint 间隔。
 
 但 Branch 的目的仍是**继续训练同一个模型定义**，因此以下配置必须与父 run 完全一致，否则在创建新 run 前直接拒绝：

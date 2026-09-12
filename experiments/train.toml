@@ -100,26 +100,25 @@ enable = false
 
 
 [dataloader]
-# DALI pipeline CPU worker/thread 数量。
+# NVIDIA DALI pipeline CPU thread 数；ROCm 原生 PyTorch 管线不使用该项。
 num_threads = 16
 
-# DALI 整体 pipeline 预取深度。值越大可能提高吞吐，也会增加内存/显存占用。
+# NVIDIA DALI 整体 pipeline 预取深度；ROCm 原生 PyTorch 管线不使用该项。
 prefetch_queue_depth = 4
 
-# parallel external_source 的 Python worker 数量。
+# Python 图像读取 worker 数。NVIDIA 下用于 DALI external_source，ROCm 下用于 torch DataLoader。
 py_num_workers = 8
 
-# Python worker multiprocessing 启动方式。
+# Python worker multiprocessing 启动方式，两种数据管线共用。
 py_start_method = "spawn"
 
-# external_source 每个 worker 的读取预取深度。
+# 每个 Python worker 的读取预取深度；ROCm 下映射为 DataLoader prefetch_factor。
 reader_prefetch_queue_depth = 2
 
-# 图像解码后端："mixed" 或 "cpu"。
-# mixed 通常是 CUDA 训练的推荐路径。
+# NVIDIA DALI 图像解码后端："mixed" 或 "cpu"。ROCm 固定使用 CPU Pillow 解码。
 decoder_backend = "mixed"
 
-# mixed decoder 尝试交给硬件 JPEG decoder 的负载比例，范围 [0, 1]。
+# NVIDIA DALI mixed decoder 的硬件 JPEG decoder 负载比例；ROCm 不使用。
 decoder_hw_load = 0.75
 
 # 以下三项只应用于 dst。

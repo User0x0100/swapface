@@ -28,9 +28,6 @@
 
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass
-from enum import Enum
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -39,90 +36,18 @@ from nvidia.dali import fn, pipeline_def
 from nvidia.dali.math import clamp
 from nvidia.dali.types import DALIDataType, DALIImageType, DALIInterpType
 
-type ImagePath = str | os.PathLike[str]
-type FloatRange = tuple[float, float]
-type ImageSource = ImagePath | tuple[ImagePath, float]
-
-
-@dataclass(frozen=True, slots=True)
-class _LocalImagePool:
-    root: str
-    file_names: tuple[str, ...]
-
-
-IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp")
-DATALOADER_RESERVED_KEYS = frozenset({"batch_size", "device_id", "img_resolution", "src", "dst"})
-
-
-class ImageDecoderBackend(Enum):
-    """DALI 图像解码后端。
-
-    ``MIXED`` 是默认高性能路径，解码结果直接驻留 GPU；即使 GPU 没有专用 JPEG
-    硬件解码单元，也可使用 nvJPEG 的 mixed backend。``CPU`` 主要用于兼容性、
-    定位 decoder 问题或做 A/B 对照，解码后会显式复制到 GPU。
-    """
-
-    MIXED = "mixed"
-    CPU = "cpu"
-
-
-# 默认配置同时包含两类参数：
-# - DALI Pipeline 构造参数：num_threads、prefetch_queue_depth、py_num_workers、
-#   py_start_method，由 @pipeline_def 生成的工厂直接消费。
-# - 图内数据参数：reader_prefetch_queue_depth、decoder、颜色/几何增强参数，
-#   传入 create_dataloader_pipeline() 的函数体。
-# Trainer 会先将用户覆盖项合并到这份完整默认配置，因此日志中的 dataloader_cfg
-# 就是本次实验实际生效的数据管线配置。
-#
-# prefetch_queue_depth 控制整个 DALI pipeline 的 CPU/GPU 预取深度；
-# reader_prefetch_queue_depth 仅控制 parallel external_source 的 Python worker 预取。
-# 两者都不是越大越快，尤其高分辨率/大 batch 时 pipeline 预取会直接增加显存占用。
-DEFAULT_DATALOADER_CONFIG: dict[str, Any] = {
-    "num_threads": 16,
-    "prefetch_queue_depth": 4,
-    "py_num_workers": 8,
-    "py_start_method": "spawn",
-    "reader_prefetch_queue_depth": 2,
-    "decoder_backend": ImageDecoderBackend.MIXED,
-    "decoder_hw_load": 0.75,
-    "brightness": 0.2,
-    "contrast": 0.2,
-    "saturation": 0.2,
-    "flip_prob": 0.5,
-    "rotation_range": (-10.0, 10.0),
-    "scale_factor_range": (1.0 / 1.3, 1.25),
-    "tx_range": (-0.15, 0.15),
-    "ty_range": (-0.15, 0.15),
-}
-
-
-def _validate_range(name: str, value: FloatRange) -> FloatRange:
-    if len(value) != 2:
-        raise ValueError(f"{name} 必须包含两个值，实际为 {value!r}")
-    low, high = float(value[0]), float(value[1])
-    if not np.isfinite((low, high)).all() or low > high:
-        raise ValueError(f"{name} 必须是有限且递增的范围，实际为 {value!r}")
-    return low, high
-
-
-def _scan_image_files(directory: ImagePath) -> _LocalImagePool:
-    folder = Path(directory).resolve(strict=True)
-    with os.scandir(folder) as entries:
-        file_names = tuple(entry.name for entry in entries if entry.is_file() and entry.name.lower().endswith(IMAGE_EXTENSIONS))
-    if not file_names:
-        raise FileNotFoundError(f"目录中没有支持的图片文件: {folder}")
-    return _LocalImagePool(str(folder), file_names)
+from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, validate_range
 
 
 class _RandomImagePairSource:
     """为 DALI parallel external_source 提供本地 source/target 编码图像。"""
 
     def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource]) -> None:
-        self.src_pools, self.src_cdf, src_info = self._build_pool(src)
-        self.dst_pools, self.dst_cdf, dst_info = self._build_pool(dst)
+        self.src_pools, self.src_cdf, src_info = build_image_pools(src)
+        self.dst_pools, self.dst_cdf, dst_info = build_image_pools(dst)
         self.rng = np.random.default_rng()
-        self._print_pool("SRC Sources", src_info)
-        self._print_pool("DST Sources", dst_info)
+        print_image_pools("SRC Sources", src_info)
+        print_image_pools("DST Sources", dst_info)
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -133,51 +58,7 @@ class _RandomImagePairSource:
         self.__dict__.update(state)
         self.rng = np.random.default_rng()
 
-    @staticmethod
-    def _build_pool(sources: Sequence[ImageSource]) -> tuple[tuple[_LocalImagePool, ...], ndarray, tuple[tuple[str, int, float], ...]]:
-        if isinstance(sources, (str, os.PathLike)):
-            raise TypeError(f"图片源必须是路径序列；单个目录请写成 [{os.fspath(sources)!r}]")
-        if not sources:
-            raise ValueError("图片源列表不能为空")
-
-        pools: list[_LocalImagePool] = []
-        counts: list[int] = []
-        adjustments: list[float] = []
-
-        for source in sources:
-            if isinstance(source, (str, os.PathLike)):
-                path, adjustment = source, 0.0
-            elif isinstance(source, tuple) and len(source) == 2 and isinstance(source[0], (str, os.PathLike)):
-                path, adjustment = source
-            else:
-                raise TypeError(f"图片源必须为路径或 (路径, 权重调整)，实际为 {source!r}")
-
-            adjustment = float(adjustment)
-            if not np.isfinite(adjustment):
-                raise ValueError(f"权重调整必须为有限数值，实际为 {adjustment!r}")
-
-            pool = _scan_image_files(path)
-            pools.append(pool)
-            counts.append(len(pool.file_names))
-            adjustments.append(adjustment)
-
-        # source_weight ∝ sqrt(file_count) * 2**adjustment。
-        log_weights = 0.5 * np.log(np.asarray(counts, dtype=np.float64)) + np.asarray(adjustments, dtype=np.float64) * np.log(2.0)
-        weights = np.exp(log_weights - log_weights.max())
-        weights /= weights.sum()
-        cdf = np.cumsum(weights)
-        cdf[-1] = 1.0
-
-        info = tuple((pool.root, count, float(weight)) for pool, count, weight in zip(pools, counts, weights, strict=True))
-        return tuple(pools), cdf, info
-
-    @staticmethod
-    def _print_pool(title: str, info: tuple[tuple[str, int, float], ...]) -> None:
-        print(title + ":")
-        for label, count, weight in info:
-            print(f"    {label}\n        count: {count:<7d} weight: {weight:<6.3f}")
-
-    def _sample_encoded(self, pools: tuple[_LocalImagePool, ...], cdf: ndarray) -> ndarray:
+    def _sample_encoded(self, pools: tuple[LocalImagePool, ...], cdf: ndarray) -> ndarray:
         pool_index = min(int(np.searchsorted(cdf, self.rng.random(), side="right")), len(pools) - 1)
         pool = pools[pool_index]
         file_name = pool.file_names[int(self.rng.integers(len(pool.file_names)))]
@@ -188,10 +69,10 @@ class _RandomImagePairSource:
 
 
 def _random_affine_matrices(img_resolution: int, rotation_range: FloatRange, scale_factor_range: FloatRange, tx_range: FloatRange, ty_range: FloatRange):
-    rotation_range = _validate_range("rotation_range", rotation_range)
-    scale_factor_range = _validate_range("scale_factor_range", scale_factor_range)
-    tx_range = _validate_range("tx_range", tx_range)
-    ty_range = _validate_range("ty_range", ty_range)
+    rotation_range = validate_range("rotation_range", rotation_range)
+    scale_factor_range = validate_range("scale_factor_range", scale_factor_range)
+    tx_range = validate_range("tx_range", tx_range)
+    ty_range = validate_range("ty_range", ty_range)
 
     if scale_factor_range[0] <= 0.0:
         raise ValueError(f"scale_factor_range 必须为正数范围，实际为 {scale_factor_range}")
