@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 
@@ -107,6 +108,62 @@ def setup_filter(f, normalize: bool = True, flip_filter: bool = False, gain: int
     return f
 
 
+def _upfirdn2d_native_2d(
+    x: Tensor,
+    f: Tensor,
+    upx: int,
+    upy: int,
+    downx: int,
+    downy: int,
+    padx0: int,
+    padx1: int,
+    pady0: int,
+    pady1: int,
+    flip_filter: bool,
+    gain: float,
+) -> Tensor:
+    """使用标准 PyTorch 算子实现二维 UpFirDn，供 ROCm/CPU 后端使用。"""
+    n, c, h, w = x.shape
+
+    if upx != 1 or upy != 1:
+        x = x.reshape(n, c, h, 1, w, 1)
+        x = F.pad(x, (0, upx - 1, 0, 0, 0, upy - 1))
+        x = x.reshape(n, c, h * upy, w * upx)
+
+    x = F.pad(x, (max(padx0, 0), max(padx1, 0), max(pady0, 0), max(pady1, 0)))
+    crop_x0, crop_x1 = max(-padx0, 0), max(-padx1, 0)
+    crop_y0, crop_y1 = max(-pady0, 0), max(-pady1, 0)
+    if crop_x0 or crop_x1 or crop_y0 or crop_y1:
+        x = x[:, :, crop_y0 : x.shape[2] - crop_y1, crop_x0 : x.shape[3] - crop_x1]
+
+    kernel = f if flip_filter else f.flip((0, 1))
+    kernel = kernel.to(device=x.device, dtype=x.dtype).mul(gain).reshape(1, 1, f.shape[0], f.shape[1])
+    x = x.reshape(n * c, 1, x.shape[2], x.shape[3])
+    x = F.conv2d(x, kernel, stride=(downy, downx))
+    return x.reshape(n, c, x.shape[2], x.shape[3])
+
+
+def _upfirdn2d_native(
+    x: Tensor,
+    f: Tensor,
+    upx: int,
+    upy: int,
+    downx: int,
+    downy: int,
+    padx0: int,
+    padx1: int,
+    pady0: int,
+    pady1: int,
+    flip_filter: bool,
+    gain: float,
+) -> Tensor:
+    if f.ndim == 2:
+        return _upfirdn2d_native_2d(x, f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain)
+
+    x = _upfirdn2d_native_2d(x, f.unsqueeze(0), upx, 1, downx, 1, padx0, padx1, 0, 0, flip_filter, np.sqrt(gain))
+    return _upfirdn2d_native_2d(x, f.unsqueeze(1), 1, upy, 1, downy, 0, 0, pady0, pady1, flip_filter, np.sqrt(gain))
+
+
 def upfirdn2d(
     x: Tensor,
     f: Tensor,
@@ -179,6 +236,11 @@ def upfirdn2d(
         - This operator is fully differentiable (custom backward registered)
         - Critical for preventing aliasing in downsampling
     """
+
+    # PyTorch ROCm 保持 CUDA 设备 API 兼容，因此通过 torch.version.hip 区分后端。
+    # NVIDIA 保留原 fused CUDA kernel；ROCm/CPU 使用标准 PyTorch 实现。
+    if x.device.type != "cuda" or torch.version.hip is not None:
+        return _upfirdn2d_native(x, f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain)
 
     initialize_upfirdn2d()
 
@@ -393,13 +455,16 @@ _kernel_init_lock = threading.Lock()
 
 
 def initialize_upfirdn2d() -> None:
-    """在当前 Python 进程中仅加载并注册一次 CUDA 算子。
+    """在 NVIDIA CUDA 环境中加载 fused 扩展；ROCm 使用原生 PyTorch 路径。
 
     初始化完成后的快速路径不加锁。锁同时覆盖扩展加载与 autograd 注册，
     避免并发首次调用观察到或发布未完整初始化的算子。若初始化抛出异常，
     已加载标志保持为 false，后续调用仍可再次尝试。
     """
     global _kernel_loaded
+
+    if torch.version.hip is not None:
+        return
 
     if _kernel_loaded:
         return
