@@ -4,41 +4,71 @@ version = "0.1.0"
 description = "Experimental face-swap training workspace"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "nvidia-dali-cuda120",
-    "torch",
-    "torchvision",
-    "torchcodec",
     "huggingface-hub",
     "numpy",
     "onnx",
     "onnxscript",
-    "onnxruntime-gpu",
     "opencv-python",
     "tensorboard",
     "tqdm",
     "segmentation-models-pytorch",
     "fvcore",
-    "xformers",
     "torchinfo",
     "ninja",
     "scipy",
-    "tensorrt-cu12",
     "httpx[socks]>=0.28.1",
+]
+
+[dependency-groups]
+cuda = [
+    "torch",
+    "torchvision",
+    "torchcodec",
+    "nvidia-dali-cuda120",
+    "onnxruntime-gpu",
+    "xformers",
+    "tensorrt-cu12",
+]
+rocm = [
+    "torch",
+    "torchvision",
+    "pytorch-triton-rocm",
+    "triton-rocm",
 ]
 
 [tool.uv]
 package = false
+default-groups = ["cuda"]
+conflicts = [
+    [
+        { group = "cuda" },
+        { group = "rocm" },
+    ],
+]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu126" }
-torchvision = { index = "pytorch-cu126" }
-torchcodec = { index = "pytorch-cu126" }
+torch = [
+    { index = "pytorch-cu126", group = "cuda" },
+    { index = "pytorch-rocm", group = "rocm" },
+]
+torchvision = [
+    { index = "pytorch-cu126", group = "cuda" },
+    { index = "pytorch-rocm", group = "rocm" },
+]
+torchcodec = { index = "pytorch-cu126", group = "cuda" }
+pytorch-triton-rocm = { index = "pytorch-rocm", group = "rocm" }
+triton-rocm = { index = "pytorch-rocm", group = "rocm" }
 nvidia-dali-cuda120 = { index = "nvidia" }
 tensorrt-cu12 = { index = "nvidia" }
 
 [[tool.uv.index]]
 name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.2"
 explicit = true
 
 [[tool.uv.index]]

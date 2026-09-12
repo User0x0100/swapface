@@ -11,6 +11,24 @@
 
 因此 `ckpt`、`log_path` 不再是 `[train]` 配置项。真正的 resume 必须继续原 run，并使用该 run 在创建时冻结的配置。
 
+## 安装 GPU 后端
+
+项目使用同一个 `pyproject.toml` / `uv.lock` 管理 CUDA 与 ROCm，但两组 GPU 依赖互斥。CUDA 是默认 dependency group，因此 NVIDIA 环境保持原有用法：
+
+```bash
+uv sync
+```
+
+当前 CUDA group 使用 PyTorch cu126，并包含 DALI、TorchCodec、ONNX Runtime GPU、xFormers 与 TensorRT。
+
+AMD ROCm 环境显式关闭默认 CUDA group 并启用 ROCm group：
+
+```bash
+uv sync --no-default-groups --group rocm
+```
+
+当前 ROCm group 使用 PyTorch ROCm 7.2，并包含 PyTorch 官方 ROCm Triton 包。ROCm 训练不安装 DALI、TorchCodec、ONNX Runtime GPU、xFormers 或 TensorRT；这些依赖对应的推理/导出功能需单独完成 AMD 兼容后再加入。`cuda` 与 `rocm` group 被声明为冲突，不能同时启用。
+
 ## 新建训练
 
 使用默认配置：

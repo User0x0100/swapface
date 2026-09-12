@@ -5,7 +5,6 @@ from typing import overload
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torchcodec.decoders import VideoDecoder
 
 from .models.id_encoder import get_alignment_template
 from .models.retinaface import RetinaFace, extract_landmarks
@@ -475,6 +474,8 @@ class VideoFaceExtractor(_FaceExtractorBase):
         )
         if not Path(video_path).exists():
             raise FileNotFoundError(video_path)
+
+        from torchcodec.decoders import VideoDecoder
 
         self.decoder = VideoDecoder(video_path, device=self.device)
 

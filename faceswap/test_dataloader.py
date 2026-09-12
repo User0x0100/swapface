@@ -1,5 +1,6 @@
 """无需 DALI/GPU 的训练数据管线回归检查：uv run python -m faceswap.test_dataloader"""
 
+import builtins
 import sys
 import tempfile
 from pathlib import Path
@@ -111,9 +112,21 @@ def main() -> None:
 
     # Trainer 的配置解析不再依赖导入 nvidia.dali；ROCm 环境可以在未安装 DALI 时导入训练入口。
     assert "nvidia.dali.plugin.pytorch" not in sys.modules
-    from faceswap import train
+
+    # ROCm 训练环境不安装 CUDA-only 依赖；训练入口必须仍可独立导入。
+    blocked_optional_imports = ("nvidia.dali", "torchcodec", "onnxruntime", "xformers", "tensorrt")
+    real_import = builtins.__import__
+
+    def import_without_cuda_optional(name, *args, **kwargs):
+        if any(name == prefix or name.startswith(prefix + ".") for prefix in blocked_optional_imports):
+            raise ModuleNotFoundError(name)
+        return real_import(name, *args, **kwargs)
+
+    with patch("builtins.__import__", side_effect=import_without_cuda_optional):
+        from faceswap import train
 
     assert "nvidia.dali.plugin.pytorch" not in sys.modules
+    assert "torchcodec" not in sys.modules
     assert set(train.DEFAULT_DATALOADER_CONFIG) == set(DEFAULT_DATALOADER_CONFIG)
     train_source = Path(train.__file__).read_text(encoding="utf-8")
     assert "DALIGenericIterator" not in train_source
