@@ -211,20 +211,20 @@ def checkpoint_step_from_name(name: str) -> int:
     return int(match.group(1))
 
 
-def resolve_branch_target(target: str | os.PathLike[str]) -> tuple[RunPaths, Path]:
-    """目录使用 latest；显式 checkpoint 允许历史版本。"""
+def resolve_branch_target(target: str | os.PathLike[str]) -> Path:
+    """目录使用标准 run 的 latest；显式 checkpoint 文件可直接作为 branch 来源。"""
     requested = Path(target).resolve()
     if requested.is_dir():
         paths = RunPaths.from_root(requested)
         _validate_run(paths)
-        return paths, _checkpoint_from_latest(paths)
-
-    if not requested.is_file() or requested.parent.name != "checkpoints":
+        checkpoint = _checkpoint_from_latest(paths)
+    elif requested.is_file():
+        checkpoint = requested
+    else:
         raise ValueError(f"无效的 branch checkpoint：{requested}")
-    paths = RunPaths.from_root(requested.parent.parent)
-    _validate_run(paths)
-    checkpoint_step_from_name(requested.name)
-    return paths, requested
+
+    checkpoint_step_from_name(checkpoint.name)
+    return checkpoint
 
 
 def resolve_resume_target(target: str | os.PathLike[str]) -> tuple[RunPaths, Path]:

@@ -9,8 +9,9 @@ import torch
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
+from faceswap.contracts import CHECKPOINT_VERSION
 from faceswap.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
-from faceswap.train import _assert_branch_model_compatible, _load_branch_optimizer_state, _supports_compiled_bf16
+from faceswap.train import _assert_branch_model_compatible, _load_branch_checkpoint, _load_branch_optimizer_state, _supports_compiled_bf16
 
 
 def main() -> None:
@@ -63,7 +64,29 @@ def main() -> None:
             pass
         else:
             raise AssertionError("resume 错误接受了历史 checkpoint")
-        assert resolve_branch_target(historical)[1] == historical
+        assert resolve_branch_target(first.root) == latest
+        assert resolve_branch_target(historical) == historical
+
+        standalone = root / "step_000007500.pth"
+        torch.save(
+            {
+                "version": CHECKPOINT_VERSION,
+                "step": 7500,
+                "run": {"id": metadata["run_id"], "config_sha256": metadata["config_sha256"]},
+                "net_g": {"network_cfg": resolved["generator"]},
+                "net_d": {"network_cfg": resolved["discriminator"]},
+            },
+            standalone,
+        )
+        assert resolve_branch_target(standalone) == standalone
+        loaded, standalone_parent = _load_branch_checkpoint(standalone, resolved)
+        assert loaded["step"] == 7500
+        assert standalone_parent == {
+            "run_id": metadata["run_id"],
+            "checkpoint": standalone.name,
+            "step": 7500,
+            "config_sha256": metadata["config_sha256"],
+        }
 
         parent = {"run_id": metadata["run_id"], "checkpoint": historical.name, "step": 5000, "config_sha256": metadata["config_sha256"]}
         branch = create_run(runs_root, source_config, resolved, name="branch", parent=parent)

@@ -29,6 +29,8 @@ uv sync --no-default-groups --group rocm
 
 当前 ROCm group 使用 PyTorch ROCm 7.2，并包含 PyTorch 官方 ROCm Triton 包。ROCm 训练不安装 DALI、TorchCodec、ONNX Runtime GPU、xFormers 或 TensorRT；这些依赖对应的推理/导出功能需单独完成 AMD 兼容后再加入。`cuda` 与 `rocm` group 被声明为冲突，不能同时启用。
 
+ROCm 环境完成同步后，运行训练命令使用 `uv run --no-sync ...`（或先激活 `.venv` 后直接运行 Python），避免裸 `uv run` 按项目默认 `cuda` group 重新同步依赖。
+
 ## 新建训练
 
 使用默认配置：
@@ -144,7 +146,7 @@ uv run python -m faceswap.train \
 
 ## Branch：从已有 checkpoint 派生新实验
 
-Branch 从已有完整训练状态创建一个新的 run。它不会修改父 run，可以从父 run 的 latest 或任意历史 checkpoint 分叉：
+Branch 从已有完整训练状态创建一个新的 run。它不会修改父 run，可以从标准 run 的 latest、其中任意历史 checkpoint，或单独保存的 v3 checkpoint 文件分叉：
 
 ```bash
 uv run python -m faceswap.train \
@@ -153,7 +155,16 @@ uv run python -m faceswap.train \
   --name lower-id-loss
 ```
 
-`--branch-from` 必须显式提供 `--config`。Branch 只在创建新 run 前比较父 run 与新配置的模型定义；通过后立即创建新 run，并在 `metadata.json.parent` 中记录父 `run_id`、checkpoint、step 和配置摘要。checkpoint 权重、optimizer 和 scheduler 是否真的可恢复，直接交给 PyTorch 的 `load_state_dict()`；失败时使用原始错误并将新 run 标记为 `failed`。
+独立 checkpoint 不需要保留原 run 目录；只要文件名保持 `step_<step>.pth`，其内部 v3 元数据、step 与 Generator/Discriminator 架构有效即可：
+
+```bash
+uv run --no-sync python -m faceswap.train \
+  --branch-from /mnt/workspace/step_000208939.pth \
+  --config /mnt/workspace/train.toml \
+  --name lower-id-loss
+```
+
+`--branch-from` 必须显式提供 `--config`。Branch 以 checkpoint 自身保存的 v3 元数据和 Generator/Discriminator `network_cfg` 为准，在创建新 run 前与新配置比较模型定义；通过后立即创建新 run，并在 `metadata.json.parent` 中记录父 `run_id`、checkpoint、step 和配置摘要。checkpoint 权重、optimizer 和 scheduler 是否真的可恢复，直接交给 PyTorch 的 `load_state_dict()`；失败时使用原始错误并将新 run 标记为 `failed`。
 
 Branch 允许修改训练配置，例如：
 

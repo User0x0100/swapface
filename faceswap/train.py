@@ -137,6 +137,7 @@ class Trainer:
         resolved_config_sha256: str | None = None,
         strict_bf16_resume: bool = False,
         checkpoint_mode: Literal["resume", "branch"] = "resume",
+        preloaded_checkpoint: dict[str, Any] | None = None,
     ):
         if dataloader_cfg is None:
             dataloader_cfg = dict(DEFAULT_DATALOADER_CONFIG)
@@ -173,7 +174,7 @@ class Trainer:
             raise ValueError("enable_wfm_loss=True 时 wfm_loss_weight 不能为空")
 
         args = locals().copy()
-        for k in ["src", "dst", "self"]:
+        for k in ["src", "dst", "self", "preloaded_checkpoint"]:
             args.pop(k)
 
         print_mapping("训练信息", args)
@@ -217,7 +218,7 @@ class Trainer:
         self._step_in_progress = False
         self._stop_requested = False
 
-        checkpoint: dict[str, Any] | None = None
+        checkpoint: dict[str, Any] | None = preloaded_checkpoint
         training_state: dict[str, Any] | None = None
         saved_training_config: dict[str, Any] | None = None
         if resume_checkpoint is not None:
@@ -226,7 +227,8 @@ class Trainer:
                 raise FileNotFoundError(f"找不到检查点文件：{resume_checkpoint}")
 
             print(f"正在加载检查点：{resume_checkpoint}")
-            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            if checkpoint is None:
+                checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             checkpoint_version = checkpoint["version"]
             if checkpoint_version != CHECKPOINT_VERSION:
                 raise ValueError(f"不支持的 checkpoint version：{checkpoint_version}，当前仅支持 v{CHECKPOINT_VERSION}")
@@ -890,6 +892,34 @@ def _assert_branch_model_compatible(parent: dict[str, Any], branch: dict[str, An
         raise ValueError("branch 不能修改 Generator/Discriminator 架构")
 
 
+def _load_branch_checkpoint(checkpoint_path: Path, resolved: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint_version = checkpoint["version"]
+    if checkpoint_version != CHECKPOINT_VERSION:
+        raise ValueError(f"不支持的 checkpoint version：{checkpoint_version}，当前仅支持 v{CHECKPOINT_VERSION}")
+
+    checkpoint_step = int(checkpoint["step"])
+    filename_step = checkpoint_step_from_name(checkpoint_path.name)
+    if filename_step != checkpoint_step:
+        raise ValueError(f"checkpoint 文件名 step 与内部状态不一致：filename={filename_step}, checkpoint={checkpoint_step}")
+
+    _assert_branch_model_compatible(
+        {
+            "generator": dict(checkpoint["net_g"]["network_cfg"]),
+            "discriminator": dict(checkpoint["net_d"]["network_cfg"]),
+        },
+        resolved,
+    )
+    checkpoint_run = checkpoint["run"]
+    parent = {
+        "run_id": checkpoint_run["id"],
+        "checkpoint": checkpoint_path.name,
+        "step": checkpoint_step,
+        "config_sha256": checkpoint_run["config_sha256"],
+    }
+    return checkpoint, parent
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FaceSwap 训练")
     parser.add_argument("--config", type=Path, default=None, help=f"fresh/branch 的训练 TOML；fresh 默认：{DEFAULT_TRAIN_CONFIG_PATH}")
@@ -897,7 +927,7 @@ def main() -> None:
     parser.add_argument("--runs-root", type=Path, default=None, help=f"新 run 根目录，默认：{DEFAULT_RUNS_ROOT}")
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument("--resume", type=Path, default=None, help="严格恢复原 run，只允许 latest checkpoint，并使用原 run 冻结配置")
-    source_group.add_argument("--branch-from", type=Path, default=None, help="从标准 run 或其中任意 checkpoint 创建新 run；允许修改训练配置，但禁止修改模型架构")
+    source_group.add_argument("--branch-from", type=Path, default=None, help="从标准 run 或独立 checkpoint 创建新 run；允许修改训练配置，但禁止修改模型架构")
     parser.add_argument("--strict-bf16", action="store_true", help="仅用于 resume：要求当前实际 BF16/FP32 模式与 checkpoint 一致；默认允许变化")
     args = parser.parse_args()
 
@@ -916,6 +946,7 @@ def main() -> None:
         parser.error("--strict-bf16 仅用于 --resume")
 
     checkpoint_mode: Literal["resume", "branch"] = "resume"
+    preloaded_checkpoint: dict[str, Any] | None = None
 
     if is_resume:
         assert args.resume is not None
@@ -923,18 +954,11 @@ def main() -> None:
         trainer_config, resolved = _load_run_config(run_paths)
     elif is_branch:
         assert args.branch_from is not None and args.config is not None
-        parent_paths, resume_checkpoint = resolve_branch_target(args.branch_from)
-        _, parent_resolved = _load_run_config(parent_paths)
+        resume_checkpoint = resolve_branch_target(args.branch_from)
         trainer_config, resolved = load_train_config(args.config)
-        _assert_branch_model_compatible(parent_resolved, resolved)
 
-        parent_metadata = load_metadata(parent_paths)
-        parent = {
-            "run_id": parent_metadata["run_id"],
-            "checkpoint": resume_checkpoint.name,
-            "step": checkpoint_step_from_name(resume_checkpoint.name),
-            "config_sha256": parent_metadata["config_sha256"],
-        }
+        preloaded_checkpoint, parent = _load_branch_checkpoint(resume_checkpoint, resolved)
+
         run_paths = create_run(args.runs_root or DEFAULT_RUNS_ROOT, args.config, resolved, name=args.name, parent=parent)
         checkpoint_mode = "branch"
     else:
@@ -964,7 +988,9 @@ def main() -> None:
                 resolved_config_sha256=digest,
                 strict_bf16_resume=args.strict_bf16,
                 checkpoint_mode=checkpoint_mode,
+                preloaded_checkpoint=preloaded_checkpoint,
             )
+            preloaded_checkpoint = None
             if is_branch:
                 print(f"Branch 来源：{resume_checkpoint}")
             print(f"Run 目录：{run_paths.root}")
