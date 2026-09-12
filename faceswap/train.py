@@ -72,6 +72,13 @@ torch.set_float32_matmul_precision("high")
 torch.manual_seed(42)
 
 
+def _supports_compiled_bf16(device_id: int) -> bool:
+    """ROCm 由 PyTorch 报告 BF16 能力；NVIDIA 继续要求 Ampere(SM80)+。"""
+    if torch.version.hip is not None:
+        return True
+    return torch.cuda.get_device_capability(device_id)[0] >= 8
+
+
 def _load_branch_optimizer_state(optimizer: optim.Optimizer, state: dict[str, Any], *, lr: float, reset_lr: bool) -> None:
     """恢复 Adam 状态；仅在 branch 启动新 LR/scheduler 时覆盖 param-group LR。"""
     optimizer.load_state_dict(state)
@@ -185,13 +192,13 @@ class Trainer:
         self.enable_wfm_loss = enable_wfm_loss
 
         device_id = self.device.index if self.device.index is not None else torch.cuda.current_device()
-        compute_capability = torch.cuda.get_device_capability(device_id)
         bf16_runtime_supported = torch.cuda.is_bf16_supported()
-        bf16_compile_supported = compute_capability[0] >= 8
+        bf16_compile_supported = _supports_compiled_bf16(device_id)
         self.bf16 = bool(bf16 and bf16_runtime_supported and (not compile_module or bf16_compile_supported))
         if bf16 and not self.bf16:
             if compile_module and bf16_runtime_supported and not bf16_compile_supported:
-                print(f"警告：当前 GPU SM{compute_capability[0]}{compute_capability[1]} 可运行 BF16，但 torch.compile 不支持该架构的 BF16，训练自动回退 FP32")
+                major, minor = torch.cuda.get_device_capability(device_id)
+                print(f"警告：当前 GPU SM{major}{minor} 可运行 BF16，但 torch.compile 不支持该架构的 BF16，训练自动回退 FP32")
             else:
                 print("警告：当前显卡不支持 BF16，训练自动回退 FP32")
 

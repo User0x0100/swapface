@@ -163,7 +163,7 @@ Branch 继承 Generator、Discriminator、EMA 和 Adam moments/step。optimizer 
 
 ### 可选严格校验 BF16
 
-BF16 是否实际生效不仅由 TOML 的 `bf16 = true` 决定，还取决于当前 GPU 与 `torch.compile` 能力。默认 resume **不要求**当前实际 BF16/FP32 模式与 checkpoint 一致，因为设备和软件环境不属于严格训练配置约束。
+BF16 是否实际生效不仅由 TOML 的 `bf16 = true` 决定，还取决于当前 GPU 与 `torch.compile` 能力。ROCm 使用 PyTorch 报告的 BF16 能力；NVIDIA 在启用 `torch.compile` 时继续要求 SM80+。默认 resume **不要求**当前实际 BF16/FP32 模式与 checkpoint 一致，因为设备和软件环境不属于严格训练配置约束。
 
 如果某次恢复训练需要把数值精度模式也视为严格条件，可显式使用：
 

@@ -32,8 +32,8 @@ r1_gamma = 10.0
 # 是否启用 BF16 autocast。若 GPU 不支持 BF16，会自动回退。
 bf16 = true
 
-# 当前 Trainer 仅支持 NVIDIA CUDA 设备。
-# 可写 "cuda"、"cuda:0" 等。
+# Trainer 支持 PyTorch CUDA/HIP GPU。ROCm 也沿用 PyTorch 的 "cuda" 设备命名。
+# 可写 "cuda"、"cuda:0" 等，不使用 "rocm" 或 "hip" 设备名。
 device = "cuda"
 
 # 是否使用 torch.compile 编译 Generator、Discriminator 和 BlendFace 条件编码器。

@@ -118,7 +118,8 @@ def main() -> None:
     train_source = Path(train.__file__).read_text(encoding="utf-8")
     assert "DALIGenericIterator" not in train_source
     assert "data_backend" not in train_source
-    assert "torch.version.hip" not in train_source
+    assert "dataloader_native" not in train_source
+    assert "dataloader_dali" not in train_source
     print("PASS: unified dataloader facade, affine semantics, sampling weights and lazy DALI import")
 
 

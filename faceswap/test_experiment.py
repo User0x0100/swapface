@@ -3,16 +3,28 @@
 import json
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from faceswap.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
-from faceswap.train import _assert_branch_model_compatible, _load_branch_optimizer_state
+from faceswap.train import _assert_branch_model_compatible, _load_branch_optimizer_state, _supports_compiled_bf16
 
 
 def main() -> None:
+    # ROCm 不使用 NVIDIA compute capability；CUDA 继续保持 SM80+ 的 compile-BF16 限制。
+    with (
+        patch("faceswap.train.torch.version.hip", "7.0.0"),
+        patch("faceswap.train.torch.cuda.get_device_capability", side_effect=AssertionError("ROCm 不应查询 NVIDIA SM")),
+    ):
+        assert _supports_compiled_bf16(0)
+    with patch("faceswap.train.torch.version.hip", None), patch("faceswap.train.torch.cuda.get_device_capability", return_value=(7, 5)):
+        assert not _supports_compiled_bf16(0)
+    with patch("faceswap.train.torch.version.hip", None), patch("faceswap.train.torch.cuda.get_device_capability", return_value=(8, 0)):
+        assert _supports_compiled_bf16(0)
+
     resolved = {"train": {"batch_size": 8}, "generator": {"depth": 5}, "discriminator": {"base_ch": 64}, "identity": {"generator_provider": "BLENDFACE"}}
 
     with tempfile.TemporaryDirectory(prefix="faceswap-run-check-") as temporary:
