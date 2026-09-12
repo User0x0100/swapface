@@ -34,7 +34,7 @@ from models.discriminator.upfirdn2d import initialize_upfirdn2d
 from models.networks import Generator
 
 from .contracts import CHECKPOINT_VERSION
-from .dataloader_common import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, ImageDecoderBackend, ImageSource
+from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, ImageDecoderBackend, ImageSource, TrainingDataLoader
 from .experiment import (
     RunLock,
     RunPaths,
@@ -350,20 +350,14 @@ class Trainer:
 
         # ========================= 数据采样 =========================
 
-        if torch.version.hip is not None:
-            from .dataloader_native import NativeTrainingDataLoader
-
-            self.data_backend = "pytorch"
-            self.dataset = NativeTrainingDataLoader(batch_size=self.batch_size, device=self.device, img_resolution=self.img_resolution, src=src, dst=dst, **dataloader_cfg)
-        else:
-            from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
-
-            from .dataloader import create_dataloader_pipeline
-
-            self.data_backend = "dali"
-            pipe = create_dataloader_pipeline(batch_size=self.batch_size, device_id=device_id, img_resolution=self.img_resolution, src=src, dst=dst, **dataloader_cfg)
-            self.sample_output_map = ["src", "dst", "theta_restore"]
-            self.dataset = DALIGenericIterator(pipelines=pipe, output_map=self.sample_output_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
+        self.dataset = TrainingDataLoader(
+            batch_size=self.batch_size,
+            device=self.device,
+            img_resolution=self.img_resolution,
+            src=src,
+            dst=dst,
+            **dataloader_cfg,
+        )
 
         # ========================= 编译模型 =========================
         if compile_module:
@@ -419,12 +413,7 @@ class Trainer:
 
     @torch.no_grad()
     def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor]:
-        if self.data_backend == "pytorch":
-            return self.dataset.next()
-
-        data: dict[str, Tensor] = self.dataset.next()[0]
-        src, dst, theta_restore = (data[k] for k in self.sample_output_map)
-        return src, dst, theta_restore
+        return self.dataset.next()
 
     def prepare_identity_encoder_faces(self, faces: Tensor, theta_restore: Tensor | None = None) -> Tensor:
         """将 FFHQ canonical 训练人脸映射为身份编码器使用的 ArcFace 112 canonical 输入。"""

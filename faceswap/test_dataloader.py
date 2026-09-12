@@ -1,14 +1,18 @@
 """无需 DALI/GPU 的训练数据管线回归检查：uv run python -m faceswap.test_dataloader"""
 
+import sys
 import tempfile
 from pathlib import Path
+from types import ModuleType
+from unittest.mock import patch
 
 import numpy as np
 import torch
 from PIL import Image
 
-from faceswap.dataloader_common import DEFAULT_DATALOADER_CONFIG, build_image_pools
-from faceswap.dataloader_native import NativeTrainingDataLoader, make_affine_thetas
+from faceswap.dataloader import DEFAULT_DATALOADER_CONFIG, TrainingDataLoader
+from faceswap.dataloader_common import build_image_pools
+from faceswap.dataloader_native import make_affine_thetas
 
 
 def _write_image(path: Path, value: int, size: tuple[int, int] = (48, 40)) -> None:
@@ -66,7 +70,8 @@ def main() -> None:
             tx_range=(-0.05, 0.05),
             ty_range=(-0.05, 0.05),
         )
-        loader = NativeTrainingDataLoader(
+        # CPU 也通过统一 facade 走 native 后端，并验证实际输出契约。
+        loader = TrainingDataLoader(
             batch_size=2,
             device=torch.device("cpu"),
             img_resolution=32,
@@ -82,15 +87,39 @@ def main() -> None:
         assert -1.0 <= float(target.min()) <= float(target.max()) <= 1.0
         assert torch.isfinite(theta).all()
 
-    # Trainer 的配置解析不再依赖导入 nvidia.dali；ROCm 环境可以在未安装 DALI 时导入训练入口。
-    import sys
+    # backend selector 必须真正区分同一个 CUDA device 上的 HIP 与 NVIDIA build。
+    selected: list[str] = []
 
+    class FakeNativeLoader:
+        def __init__(self, **_kwargs) -> None:
+            selected.append("native")
+
+    class FakeDaliLoader:
+        def __init__(self, **_kwargs) -> None:
+            selected.append("dali")
+
+    native_module = ModuleType("faceswap.dataloader_native")
+    native_module._NativeTrainingDataLoader = FakeNativeLoader
+    dali_module = ModuleType("faceswap.dataloader_dali")
+    dali_module._DALITrainingDataLoader = FakeDaliLoader
+    with patch.dict(sys.modules, {"faceswap.dataloader_native": native_module, "faceswap.dataloader_dali": dali_module}):
+        with patch("faceswap.dataloader.torch.version.hip", "6.4.0"):
+            TrainingDataLoader(batch_size=1, device=torch.device("cuda"), img_resolution=32, src=[], dst=[])
+        with patch("faceswap.dataloader.torch.version.hip", None):
+            TrainingDataLoader(batch_size=1, device=torch.device("cuda"), img_resolution=32, src=[], dst=[])
+    assert selected == ["native", "dali"]
+
+    # Trainer 的配置解析不再依赖导入 nvidia.dali；ROCm 环境可以在未安装 DALI 时导入训练入口。
     assert "nvidia.dali.plugin.pytorch" not in sys.modules
     from faceswap import train
 
     assert "nvidia.dali.plugin.pytorch" not in sys.modules
     assert set(train.DEFAULT_DATALOADER_CONFIG) == set(DEFAULT_DATALOADER_CONFIG)
-    print("PASS: portable dataloader contract, affine semantics, sampling weights and lazy DALI import")
+    train_source = Path(train.__file__).read_text(encoding="utf-8")
+    assert "DALIGenericIterator" not in train_source
+    assert "data_backend" not in train_source
+    assert "torch.version.hip" not in train_source
+    print("PASS: unified dataloader facade, affine semantics, sampling weights and lazy DALI import")
 
 
 if __name__ == "__main__":

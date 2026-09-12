@@ -134,7 +134,7 @@ def _color_twist(images: Tensor, brightness: float, contrast: float, saturation:
     return images * brightness_factor
 
 
-class NativeTrainingDataLoader:
+class _NativeTrainingDataLoader:
     """CPU 并行解码 + GPU 批量增强的数据加载器。"""
 
     def __init__(

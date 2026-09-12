@@ -22,7 +22,7 @@ class LocalImagePool:
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp")
-DATALOADER_RESERVED_KEYS = frozenset({"batch_size", "device_id", "img_resolution", "src", "dst"})
+DATALOADER_RESERVED_KEYS = frozenset({"batch_size", "device", "device_id", "img_resolution", "src", "dst"})
 
 
 class ImageDecoderBackend(Enum):
