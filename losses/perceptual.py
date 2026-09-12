@@ -270,11 +270,7 @@ class VGGPerceptualLoss(nn.Module):
 
         self.input_range = input_range
 
-    @torch.compile(
-        fullgraph=True,
-        dynamic=False,
-        options={"epilogue_fusion": True, "max_autotune": True},
-    )
+    @torch.compile(fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
     def forward(self, prediction: Tensor, target: Tensor) -> Tensor:
         """计算预测图像和目标图像的多层 VGG 感知损失。
 

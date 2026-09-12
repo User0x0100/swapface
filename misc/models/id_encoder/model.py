@@ -101,12 +101,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     id_encoder = IDEncoder(IDEncoderProvider.MS1MV3_ADAFACE_R100).to(device)
 
-    id_encoder = torch.compile(
-        id_encoder,
-        fullgraph=True,
-        dynamic=False,
-        options={"max_autotune": True, "epilogue_fusion": True},
-    )
+    id_encoder = torch.compile(id_encoder, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
 
     x = torch.randn((2, 3, 112, 112), device=device, dtype=torch.float)
     feat = id_encoder(x)

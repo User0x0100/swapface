@@ -371,11 +371,11 @@ class Trainer:
         # ========================= 编译模型 =========================
         if compile_module:
             initialize_upfirdn2d()
-            self.train_g = torch.compile(self.net_g, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
-            self.train_d = torch.compile(self.net_d, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
-            self.generator_id_encoder_forward = torch.compile(self.generator_id_encoder, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
+            self.train_g = torch.compile(self.net_g, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
+            self.train_d = torch.compile(self.net_d, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
+            self.generator_id_encoder_forward = torch.compile(self.generator_id_encoder, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
             if self.enable_wfm_loss:
-                self.train_d_features = torch.compile(self.net_d.get_feats, fullgraph=True, dynamic=False, options={"max_autotune": True, "epilogue_fusion": True})
+                self.train_d_features = torch.compile(self.net_d.get_feats, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
         else:
             self.train_g = self.net_g
             self.train_d = self.net_d
@@ -513,7 +513,7 @@ class Trainer:
             src, dst, theta_restore = self.fetch_sample()
             self._step_in_progress = True
 
-            torch.compiler.cudagraph_mark_step_begin()
+            # torch.compiler.cudagraph_mark_step_begin()
 
             # ========================= 生成器前向 =========================
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
