@@ -1,7 +1,9 @@
 """训练 run / branch / scheduler 的无 GPU 回归检查。"""
 
+import copy
 import json
 import tempfile
+import tomllib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,7 +13,50 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from faceswap.contracts import CHECKPOINT_VERSION
 from faceswap.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
-from faceswap.train import _assert_branch_model_compatible, _load_branch_checkpoint, _load_branch_optimizer_state, _supports_compiled_bf16
+from faceswap.train import _assert_branch_model_compatible, _load_branch_checkpoint, _load_branch_optimizer_state, _supports_compiled_bf16, load_train_config, resolve_train_config
+
+
+def _check_train_config(root: Path) -> None:
+    source = root / "canonical.toml"
+    source.write_text(
+        '[train]\nbatch_size = 8\ncompile_module = false\n'
+        '[generator]\naad_skip_layers = []\n'
+        '[identity]\ngenerator_provider = "MS1MV3_ARCFACE_R50_FP16"\nloss_provider = "BLENDFACE"\n'
+        '[dataloader]\nrotation_range = [-3, 3]\n'
+        '[loss.wfm.weights]\n2 = 0.25\n'
+        '[[src]]\npath = "source"\nadjustment = 1\n'
+        '[[dst]]\npath = "target"\nadjustment = -1\n',
+        encoding="utf-8",
+    )
+    raw = tomllib.loads(source.read_text(encoding="utf-8"))
+    original = copy.deepcopy(raw)
+    resolved = resolve_train_config(raw)
+    assert raw == original
+    assert resolve_train_config(resolved) == resolved
+    _, loaded = load_train_config(source)
+    assert loaded == resolved
+    assert resolved["train"]["batch_size"] == 8
+    assert resolved["train"]["compile_module"] is False
+    assert resolved["identity"]["generator_provider"] == raw["identity"]["generator_provider"]
+    assert resolved["identity"]["loss_provider"] == raw["identity"]["loss_provider"]
+    assert resolved["dataloader"]["rotation_range"] == [-3.0, 3.0]
+    assert resolved["loss"]["wfm"]["weights"] == {"2": 0.25}
+    assert resolved["src"][0]["adjustment"] == 1 and resolved["dst"][0]["adjustment"] == -1
+
+    paths = create_run(root / "config-runs", source, resolved, name="canonical")
+    assert load_resolved_config(paths) == resolved
+    metadata = json.loads(paths.metadata.read_text(encoding="utf-8"))
+    assert metadata["config_sha256"] == config_sha256(resolved)
+
+    invalid = copy.deepcopy(raw)
+    invalid["train"]["unknown_field"] = True
+    try:
+        resolve_train_config(invalid)
+    except ValueError as error:
+        assert "unknown_field" in str(error)
+    else:
+        raise AssertionError("配置错误接受了未知字段")
+    print("PASS: TOML fields, canonical config persistence and unknown-field rejection")
 
 
 def main() -> None:
@@ -30,6 +75,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="faceswap-run-check-") as temporary:
         root = Path(temporary)
+        _check_train_config(root)
         source_config = root / "train.toml"
         source_config.write_text("[train]\nbatch_size = 8\n", encoding="utf-8")
         runs_root = root / "runs"
@@ -58,6 +104,7 @@ def main() -> None:
 
         paths, checkpoint = resolve_resume_target(first.root)
         assert paths == RunPaths.from_root(first.root) and checkpoint == latest
+        assert resolve_resume_target(latest) == (paths, latest)
         try:
             resolve_resume_target(historical)
         except ValueError:
@@ -93,14 +140,15 @@ def main() -> None:
         assert json.loads(branch.metadata.read_text(encoding="utf-8"))["parent"] == parent
 
         _assert_branch_model_compatible(resolved, dict(resolved))
-        changed = json.loads(json.dumps(resolved))
-        changed["generator"]["depth"] = 6
-        try:
-            _assert_branch_model_compatible(resolved, changed)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("branch 错误接受了模型架构变更")
+        for section, key, value in (("generator", "depth", 6), ("discriminator", "base_ch", 128)):
+            changed = copy.deepcopy(resolved)
+            changed[section][key] = value
+            try:
+                _assert_branch_model_compatible(resolved, changed)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"branch 错误接受了 {section} 架构变更")
 
         changed_provider = json.loads(json.dumps(resolved))
         changed_provider["identity"]["generator_provider"] = "MS1MV3_ARCFACE_R50_FP16"

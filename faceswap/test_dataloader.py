@@ -88,6 +88,19 @@ def main() -> None:
         assert -1.0 <= float(target.min()) <= float(target.max()) <= 1.0
         assert torch.isfinite(theta).all()
 
+        # 无损、通道值不同的图像直接保护 RGB 顺序与归一化，随机图像的值域检查无法发现 BGR 回归。
+        rgb_src, rgb_dst = root / "rgb_src", root / "rgb_dst"
+        for folder, color in ((rgb_src, (255, 128, 0)), (rgb_dst, (0, 64, 255))):
+            folder.mkdir()
+            Image.new("RGB", (8, 8), color).save(folder / "color.png")
+        config.update(brightness=0.0, contrast=0.0, saturation=0.0, flip_prob=0.0, rotation_range=(0.0, 0.0), scale_factor_range=(1.0, 1.0), tx_range=(0.0, 0.0), ty_range=(0.0, 0.0))
+        rgb_loader = TrainingDataLoader(batch_size=1, device=torch.device("cpu"), img_resolution=8, src=[rgb_src], dst=[rgb_dst], **config)
+        src, target, theta = rgb_loader.next()
+        for actual, color in ((src, (255, 128, 0)), (target, (0, 64, 255))):
+            expected = (torch.tensor(color, dtype=torch.float32) / 127.5 - 1.0).view(1, 3, 1, 1).expand(1, 3, 8, 8)
+            torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0)
+        torch.testing.assert_close(theta, torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]), atol=0, rtol=0)
+
     # backend selector 必须真正区分同一个 CUDA device 上的 HIP 与 NVIDIA build。
     selected: list[str] = []
 
