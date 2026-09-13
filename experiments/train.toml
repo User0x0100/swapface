@@ -58,8 +58,8 @@ weight_save_every = 10000
 generator_provider = "BLENDFACE"
 
 # Identity Loss 使用的身份编码器。
-# 当前示例显式配置为 BLENDFACE；未配置时使用 faceswap/config.py 中的协议默认值。
-loss_provider = "BLENDFACE"
+# 当前使用 MS1MV3 ArcFace R50 FP16；Generator 条件编码器仍独立使用 BLENDFACE。
+loss_provider = "MS1MV3_ARCFACE_R50_FP16"
 
 # Identity Loss 的总权重。
 loss_weight = 10.0
