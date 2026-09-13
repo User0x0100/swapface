@@ -38,7 +38,7 @@ device = "cuda"
 
 # 是否启用训练路径的 torch.compile。
 # Trainer 统一编译 Generator、Discriminator、Generator 身份编码与 Identity Loss embedding 提取，
-# 以及启用的 VGG/WFM 热路径；关闭后训练路径保持 eager。
+# 以及启用的 Gaze/VGG/WFM 热路径；关闭后训练路径保持 eager。
 compile_module = true
 
 # TensorBoard loss 写入间隔，单位为 completed step。
@@ -71,6 +71,20 @@ enable_rec_loss = true
 
 # Reconstruction Loss 权重。
 rec_loss_weight = 8.0
+
+
+[loss.gaze]
+# L2CS-Net gaze consistency loss：约束 fake 保持增强后 dst 的视线方向。
+enable = true
+
+# Gaze Loss 总权重。
+weight = 1.0
+
+# L2CS 两个角度 logits 分布 KL 项相对于 3D gaze direction cosine loss 的权重。
+distribution_weight = 0.1
+
+# 使用参考视线预测熵降低低置信样本的权重。
+confidence_weighted = true
 
 
 [loss.vgg]

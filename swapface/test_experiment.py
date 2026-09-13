@@ -25,6 +25,7 @@ def _check_train_config(root: Path) -> None:
         '[generator]\naad_skip_layers = []\n'
         '[identity]\ngenerator_provider = "MS1MV3_ARCFACE_R50_FP16"\nloss_provider = "BLENDFACE"\n'
         '[dataloader]\nrotation_range = [-3, 3]\n'
+        '[loss.gaze]\nenable = true\nweight = 0.75\ndistribution_weight = 0.2\nconfidence_weighted = false\n'
         '[loss.wfm.weights]\n2 = 0.25\n'
         '[[src]]\npath = "source"\nadjustment = 1\n'
         '[[dst]]\npath = "target"\nadjustment = -1\n',
@@ -43,6 +44,7 @@ def _check_train_config(root: Path) -> None:
     assert resolved["identity"]["generator_provider"] == raw["identity"]["generator_provider"]
     assert resolved["identity"]["loss_provider"] == raw["identity"]["loss_provider"]
     assert resolved["dataloader"]["rotation_range"] == [-3.0, 3.0]
+    assert resolved["loss"]["gaze"] == {"enable": True, "weight": 0.75, "distribution_weight": 0.2, "confidence_weighted": False}
     assert resolved["loss"]["wfm"]["weights"] == {"2": 0.25}
     assert resolved["src"][0]["adjustment"] == 1 and resolved["dst"][0]["adjustment"] == -1
 

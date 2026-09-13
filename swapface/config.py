@@ -55,6 +55,7 @@ DEFAULT_IDENTITY_CONFIG: dict[str, Any] = {
 DEFAULT_LOSS_CONFIG: dict[str, Any] = {
     "enable_rec_loss": True,
     "rec_loss_weight": 10.0,
+    "gaze": {"enable": False, "weight": 1.0, "distribution_weight": 0.1, "confidence_weighted": True},
     "vgg": {"enable": True, "weights": DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT},
     "wfm": {"enable": True, "weights": DEFAULT_WFM_LOSS_WEIGHT},
 }
@@ -155,6 +156,19 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
     enable_rec_loss = bool(loss.get("enable_rec_loss", DEFAULT_LOSS_CONFIG["enable_rec_loss"]))
     rec_loss_weight = float(loss.get("rec_loss_weight", DEFAULT_LOSS_CONFIG["rec_loss_weight"]))
 
+    gaze = loss.get("gaze", {})
+    if not isinstance(gaze, dict):
+        raise TypeError("[loss.gaze] 必须为表/对象")
+    unknown_gaze = set(gaze) - set(DEFAULT_LOSS_CONFIG["gaze"])
+    if unknown_gaze:
+        raise ValueError(f"[loss.gaze] 包含未知字段：{sorted(unknown_gaze)}")
+    gaze_config = {
+        "enable": bool(gaze.get("enable", DEFAULT_LOSS_CONFIG["gaze"]["enable"])),
+        "weight": float(gaze.get("weight", DEFAULT_LOSS_CONFIG["gaze"]["weight"])),
+        "distribution_weight": float(gaze.get("distribution_weight", DEFAULT_LOSS_CONFIG["gaze"]["distribution_weight"])),
+        "confidence_weighted": bool(gaze.get("confidence_weighted", DEFAULT_LOSS_CONFIG["gaze"]["confidence_weighted"])),
+    }
+
     vgg = loss.get("vgg", {})
     if not isinstance(vgg, dict):
         raise TypeError("[loss.vgg] 必须为表/对象")
@@ -192,6 +206,7 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
         "loss": {
             "enable_rec_loss": enable_rec_loss,
             "rec_loss_weight": rec_loss_weight,
+            "gaze": gaze_config,
             "vgg": {"enable": enable_vgg, "weights": vgg_weights},
             "wfm": {"enable": enable_wfm, "weights": wfm_weights},
         },
@@ -220,6 +235,10 @@ def _runtime_train_config(resolved: dict[str, Any]) -> dict[str, Any]:
         "id_loss_weight": float(identity["loss_weight"]),
         "enable_rec_loss": bool(loss["enable_rec_loss"]),
         "rec_loss_weight": float(loss["rec_loss_weight"]),
+        "enable_gaze_loss": bool(loss["gaze"]["enable"]),
+        "gaze_loss_weight": float(loss["gaze"]["weight"]),
+        "gaze_distribution_weight": float(loss["gaze"]["distribution_weight"]),
+        "gaze_confidence_weighted": bool(loss["gaze"]["confidence_weighted"]),
         "enable_perceptual_loss": bool(loss["vgg"]["enable"]),
         "perceptual_loss_weight": {str(layer): float(weight) for layer, weight in loss["vgg"]["weights"].items()},
         "enable_wfm_loss": bool(loss["wfm"]["enable"]),

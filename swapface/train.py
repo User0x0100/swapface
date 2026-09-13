@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 from losses import (
     DiscriminatorAdversarialLoss,
+    GazeLoss,
     GeneratorAdversarialLoss,
     IdentityLoss,
     VGGPerceptualLoss,
@@ -129,6 +130,11 @@ class Trainer:
         # 重建损失
         enable_rec_loss: bool = True,
         rec_loss_weight: float = 10.0,
+        # L2CS-Net gaze consistency loss
+        enable_gaze_loss: bool = False,
+        gaze_loss_weight: float = 1.0,
+        gaze_distribution_weight: float = 0.1,
+        gaze_confidence_weighted: bool = True,
         # VGG19 感知特征损失
         enable_perceptual_loss: bool = True,
         perceptual_loss_weight: dict[str, float] | None = None,
@@ -193,6 +199,7 @@ class Trainer:
         self.r1_reg_step = r1_reg_step
         self.r1_gamma = r1_gamma
         self.enable_rec_loss = enable_rec_loss
+        self.enable_gaze_loss = enable_gaze_loss
         self.enable_perceptual_loss = enable_perceptual_loss
         self.enable_wfm_loss = enable_wfm_loss
 
@@ -338,6 +345,13 @@ class Trainer:
         if self.enable_rec_loss:
             self.rec_loss = make_l1_loss(weight=rec_loss_weight, reduction="mean")
 
+        if self.enable_gaze_loss:
+            self.gaze_loss = GazeLoss(
+                weight=gaze_loss_weight,
+                distribution_weight=gaze_distribution_weight,
+                confidence_weighted=gaze_confidence_weighted,
+            ).to(self.device)
+
         if self.enable_perceptual_loss:
             self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
 
@@ -378,6 +392,8 @@ class Trainer:
             self.train_d = _compile_training_callable(self.net_d)
             self.generator_id_encoder_forward = _compile_training_callable(self.generator_id_encoder)
             self.identity_embeddings_forward = _compile_training_callable(self.id_loss.extract_identity_embeddings)
+            if self.enable_gaze_loss:
+                self.gaze_loss_forward = _compile_training_callable(self.gaze_loss)
             if self.enable_perceptual_loss:
                 self.perceptual_loss_forward = _compile_training_callable(self.perceptual_loss)
             if self.enable_wfm_loss:
@@ -387,6 +403,8 @@ class Trainer:
             self.train_d = self.net_d
             self.generator_id_encoder_forward = self.generator_id_encoder
             self.identity_embeddings_forward = self.id_loss.extract_identity_embeddings
+            if self.enable_gaze_loss:
+                self.gaze_loss_forward = self.gaze_loss
             if self.enable_perceptual_loss:
                 self.perceptual_loss_forward = self.perceptual_loss
             if self.enable_wfm_loss:
@@ -643,6 +661,12 @@ class Trainer:
                 id_loss = self.id_loss(generated_identity_embeddings, source_identity_embeddings)
                 self.log("id_loss", id_loss)
                 g_loss = g_loss + id_loss
+
+                # gaze_loss：生成结果保持增强后 dst 的视线方向。
+                if self.enable_gaze_loss:
+                    gaze_loss = self.gaze_loss_forward(fake, dst)
+                    self.log("gaze_loss", gaze_loss)
+                    g_loss = g_loss + gaze_loss
 
                 # perceptual_loss
                 if self.enable_perceptual_loss:
