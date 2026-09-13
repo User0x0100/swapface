@@ -65,7 +65,7 @@ DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 def _configure_training_runtime() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = torch.version.hip is None
     torch.backends.cudnn.deterministic = False
     torch.set_float32_matmul_precision("high")
     torch.manual_seed(42)
