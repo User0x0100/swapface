@@ -141,7 +141,6 @@ class LabStyleLoss(nn.Module):
         target_mean, target_std = self._mean_std(target)
         return F.l1_loss(prediction_mean, target_mean) + F.l1_loss(prediction_std, target_std)
 
-    @torch.compile(fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
     def forward(self, prediction_rgb: Tensor, target_rgb: Tensor) -> Tensor:
         """计算两组 RGB 图像之间的 Lab 风格损失。
 

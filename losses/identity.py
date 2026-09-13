@@ -1,6 +1,5 @@
 from collections.abc import Mapping
 
-import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -33,7 +32,6 @@ class IdentityLoss(nn.Module):
         self.id_encoder = IDEncoder(provider=provider).eval().requires_grad_(False)
         self.eval()
 
-    @torch.compile(fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
     def extract_identity_embeddings(self, faces: Tensor) -> Tensor:
         """从人脸图像提取 L2 归一化身份嵌入向量。
 
@@ -118,7 +116,6 @@ class IFSRLoss(nn.Module):
 
         self.net = feature_modules[: max_layer_index + 1].eval().requires_grad_(False)
 
-    @torch.compile(fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
     def extract_features(self, x: Tensor) -> dict[str, Tensor]:
         """提取 IFSR 配置要求的中间特征。
 

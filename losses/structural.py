@@ -87,7 +87,6 @@ class DSSIMLoss(nn.Module):
         ssim_map = ((2 * mu_cross + c1) * (2 * sigma_cross + c2)) / ((mu_prediction2 + mu_target2 + c1) * (sigma_prediction2 + sigma_target2 + c2) + EPS)
         return ssim_map.mean(dim=1, keepdim=True)
 
-    @torch.compile(fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
     def forward(self, prediction: Tensor, target: Tensor) -> Tensor:
         """计算预测图像与目标图像的 DSSIM。
 

@@ -135,7 +135,10 @@ def main() -> None:
             raise ModuleNotFoundError(name)
         return real_import(name, *args, **kwargs)
 
-    with patch("builtins.__import__", side_effect=import_without_cuda_optional):
+    with (
+        patch("builtins.__import__", side_effect=import_without_cuda_optional),
+        patch.object(torch, "compile", side_effect=AssertionError("训练库导入不应隐式编译")),
+    ):
         from faceswap import train
 
     assert "nvidia.dali.plugin.pytorch" not in sys.modules

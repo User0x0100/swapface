@@ -79,6 +79,10 @@ def _supports_compiled_bf16(device_id: int) -> bool:
     return torch.cuda.get_device_capability(device_id)[0] >= 8
 
 
+def _compile_training_callable(fn: Any) -> Any:
+    return torch.compile(fn, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
+
+
 def _load_branch_optimizer_state(optimizer: optim.Optimizer, state: dict[str, Any], *, lr: float, reset_lr: bool) -> None:
     """恢复 Adam 状态；仅在 branch 启动新 LR/scheduler 时覆盖 param-group LR。"""
     optimizer.load_state_dict(state)
@@ -371,15 +375,21 @@ class Trainer:
         # ========================= 编译模型 =========================
         if compile_module:
             initialize_upfirdn2d()
-            self.train_g = torch.compile(self.net_g, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
-            self.train_d = torch.compile(self.net_d, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
-            self.generator_id_encoder_forward = torch.compile(self.generator_id_encoder, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
+            self.train_g = _compile_training_callable(self.net_g)
+            self.train_d = _compile_training_callable(self.net_d)
+            self.generator_id_encoder_forward = _compile_training_callable(self.generator_id_encoder)
+            self.identity_embeddings_forward = _compile_training_callable(self.id_loss.extract_identity_embeddings)
+            if self.enable_perceptual_loss:
+                self.perceptual_loss_forward = _compile_training_callable(self.perceptual_loss)
             if self.enable_wfm_loss:
-                self.train_d_features = torch.compile(self.net_d.get_feats, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
+                self.train_d_features = _compile_training_callable(self.net_d.get_feats)
         else:
             self.train_g = self.net_g
             self.train_d = self.net_d
             self.generator_id_encoder_forward = self.generator_id_encoder
+            self.identity_embeddings_forward = self.id_loss.extract_identity_embeddings
+            if self.enable_perceptual_loss:
+                self.perceptual_loss_forward = self.perceptual_loss
             if self.enable_wfm_loss:
                 self.train_d_features = self.net_d.get_feats
 
@@ -520,7 +530,7 @@ class Trainer:
                 with torch.no_grad():
                     source_identity_faces = self.prepare_identity_encoder_faces(src)
                     generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
-                    source_identity_embeddings = self.id_loss.extract_identity_embeddings(source_identity_faces)
+                    source_identity_embeddings = self.identity_embeddings_forward(source_identity_faces)
                 fake: Tensor = net_g(dst, generator_identity_embeddings)
 
             # ========================= 训练判别器 =========================
@@ -583,14 +593,14 @@ class Trainer:
                     g_loss = g_loss + wfm_loss
 
                 # id_loss
-                generated_identity_embeddings = self.id_loss.extract_identity_embeddings(self.prepare_identity_encoder_faces(fake, theta_restore))
+                generated_identity_embeddings = self.identity_embeddings_forward(self.prepare_identity_encoder_faces(fake, theta_restore))
                 id_loss = self.id_loss(generated_identity_embeddings, source_identity_embeddings)
                 self.log("id_loss", id_loss)
                 g_loss = g_loss + id_loss
 
                 # perceptual_loss
                 if self.enable_perceptual_loss:
-                    perceptual_loss = self.perceptual_loss(fake, dst)
+                    perceptual_loss = self.perceptual_loss_forward(fake, dst)
                     self.log("perceptual_loss", perceptual_loss)
                     g_loss = g_loss + perceptual_loss
 
@@ -629,7 +639,7 @@ class Trainer:
 
                     source_identity_faces_vis = self.prepare_identity_encoder_faces(src_vis)
                     generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
-                    source_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(source_identity_faces_vis)
+                    source_identity_embeddings_vis = self.identity_embeddings_forward(source_identity_faces_vis)
                     fake_vis: Tensor = self.net_g_ema(dst_vis, generator_identity_embeddings_vis)
 
                     # Identity Loss 编码器真正接收的图像；直接组合 restore + FFHQ->112，
@@ -650,7 +660,7 @@ class Trainer:
                     # ========================= 身份损失梯度图 =========================
                     with torch.enable_grad():
                         fake_for_id_grad = fake_vis.detach().requires_grad_(True)
-                        generated_identity_embeddings_vis = self.id_loss.extract_identity_embeddings(self.prepare_identity_encoder_faces(fake_for_id_grad, theta_restore_vis))
+                        generated_identity_embeddings_vis = self.identity_embeddings_forward(self.prepare_identity_encoder_faces(fake_for_id_grad, theta_restore_vis))
                         id_loss_vis = self.id_loss(generated_identity_embeddings_vis, source_identity_embeddings_vis.detach())
                         id_grad_map = self.loss_grad_map(id_loss_vis, fake_for_id_grad)
 
