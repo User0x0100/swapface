@@ -1,5 +1,6 @@
 """无需下载权重的回归检查：.venv/bin/python -m faceswap.test_inference"""
 
+import random
 import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -11,7 +12,6 @@ import torch.nn.functional as NF
 from torch import nn
 from torchvision.io import write_png
 
-from faceswap import export, swapper
 from faceswap.contracts import CHECKPOINT_VERSION
 from faceswap.inference import get_ffhq_alignment_template, load_generator
 from misc.face_alignment import FFHQ_TO_ARCFACE_112_AFFINE_512, make_alignment_grid_theta, restore_faces_to_original, transform_sampling_grid
@@ -39,6 +39,15 @@ class Detector(nn.Module):
 
 
 def main() -> None:
+    backend_before = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32, torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic)
+    with (
+        patch.object(random, "seed", side_effect=AssertionError("推理库导入不应修改 Python 随机种子")),
+        patch.object(torch, "manual_seed", side_effect=AssertionError("推理库导入不应修改 Torch 随机种子")),
+        patch.object(torch, "set_float32_matmul_precision", side_effect=AssertionError("推理库导入不应修改矩阵乘精度")),
+    ):
+        from faceswap import export, swapper
+    assert (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32, torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic) == backend_before
+
     torch.manual_seed(7)
     torch.set_num_threads(2)
     device = torch.device("cpu")

@@ -135,11 +135,15 @@ def main() -> None:
             raise ModuleNotFoundError(name)
         return real_import(name, *args, **kwargs)
 
+    backend_before = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32, torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic)
     with (
         patch("builtins.__import__", side_effect=import_without_cuda_optional),
         patch.object(torch, "compile", side_effect=AssertionError("训练库导入不应隐式编译")),
+        patch.object(torch, "manual_seed", side_effect=AssertionError("训练库导入不应修改随机种子")),
+        patch.object(torch, "set_float32_matmul_precision", side_effect=AssertionError("训练库导入不应修改矩阵乘精度")),
     ):
         from faceswap import train
+    assert (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32, torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic) == backend_before
 
     assert "nvidia.dali.plugin.pytorch" not in sys.modules
     assert "torchcodec" not in sys.modules

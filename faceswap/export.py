@@ -20,13 +20,14 @@ DEFAULT_ID_ENCODER_PROVIDER_NAME = IDEncoderProvider.BLENDFACE.name
 # ──────────────────────────────────────────────────────────────────────────────
 # Reproducibility
 # ──────────────────────────────────────────────────────────────────────────────
-random.seed(42)
-torch.manual_seed(42)
-torch.set_float32_matmul_precision("highest")
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.allow_tf32 = False
-torch.backends.cudnn.deterministic = True
-torch.backends.cuda.matmul.allow_tf32 = False
+def _configure_export_runtime() -> None:
+    random.seed(42)
+    torch.manual_seed(42)
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -232,6 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    _configure_export_runtime()
     parser = build_parser()
     args = parser.parse_args()
 

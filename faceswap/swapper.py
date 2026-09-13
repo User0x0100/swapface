@@ -21,13 +21,15 @@ from misc.models.retinaface import RetinaFace, extract_landmarks
 from .contracts import ONNX_CONTRACT
 from .inference import get_ffhq_alignment_template, load_generator
 
-random.seed(42)
-torch.manual_seed(42)
-torch.set_float32_matmul_precision("highest")
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.allow_tf32 = False
-torch.backends.cudnn.deterministic = True
-torch.backends.cuda.matmul.allow_tf32 = False
+
+def _configure_swapper_runtime() -> None:
+    random.seed(42)
+    torch.manual_seed(42)
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
 
 
 class FaceSwapper:
@@ -291,6 +293,7 @@ class FaceSwapper:
 
 
 def main() -> None:
+    _configure_swapper_runtime()
     parser = argparse.ArgumentParser(description="使用当前 checkpoint 或配套 ONNX 预览视频换脸")
     parser.add_argument("--model", required=True, help="当前训练 checkpoint，或当前 export.py 导出的 ONNX")
     parser.add_argument("--video", required=True)

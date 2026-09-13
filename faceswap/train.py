@@ -63,13 +63,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.deterministic = False
-torch.set_float32_matmul_precision("high")
 
-torch.manual_seed(42)
+def _configure_training_runtime() -> None:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.set_float32_matmul_precision("high")
+    torch.manual_seed(42)
 
 
 def _supports_compiled_bf16(device_id: int) -> bool:
@@ -931,6 +932,7 @@ def _load_branch_checkpoint(checkpoint_path: Path, resolved: dict[str, Any]) -> 
 
 
 def main() -> None:
+    _configure_training_runtime()
     parser = argparse.ArgumentParser(description="FaceSwap 训练")
     parser.add_argument("--config", type=Path, default=None, help=f"fresh/branch 的训练 TOML；fresh 默认：{DEFAULT_TRAIN_CONFIG_PATH}")
     parser.add_argument("--name", type=str, default=None, help="新 run 的可选短标签；run ID 仍包含唯一时间戳")
