@@ -240,7 +240,6 @@ class Trainer:
             filename_step = checkpoint_step_from_name(checkpoint_path.name)
             if filename_step != completed_step:
                 raise ValueError(f"checkpoint 文件名 step 与内部状态不一致：filename={filename_step}, checkpoint={completed_step}")
-            self.iter = completed_step
             self._completed_step = completed_step
 
             print(f"检查点信息：\n  {'版本':25}: {checkpoint_version}\n  {'已完成 step':25}: {completed_step}")
@@ -279,7 +278,7 @@ class Trainer:
                 raise ValueError("branch 必须提供父 checkpoint")
             if net_g_cfg is None or net_d_cfg is None:
                 raise ValueError("net_g_cfg 和 net_d_cfg 在未提供 ckpt 时不能为空")
-            self.iter, self.img_resolution = 0, net_g_cfg["img_resolution"]
+            self.img_resolution = net_g_cfg["img_resolution"]
             net_g = Generator(**net_g_cfg)
             net_d = Discriminator(**net_d_cfg)
 
@@ -415,7 +414,7 @@ class Trainer:
 
     @torch.no_grad()
     def log(self, key: str, value: Tensor) -> None:
-        current_step = self.iter + 1
+        current_step = self.completed_step + 1
         if current_step % self.log_interval == 0:
             self._log_buffer[key] = value.detach().mean()
 
@@ -443,7 +442,7 @@ class Trainer:
     @torch.no_grad()
     def update_ema(self, decay: float = 0.999) -> None:
 
-        decay = min(decay, 1 - 1 / (self.iter + 1))
+        decay = min(decay, 1 - 1 / (self.completed_step + 1))
         alpha = 1.0 - decay
 
         torch._foreach_lerp_(self._ema_params, self._train_g_params, alpha)
@@ -509,16 +508,65 @@ class Trainer:
 
         return h
 
+    def _save_sample(self, sample_batch: tuple[Tensor, Tensor, Tensor], current_batch: tuple[Tensor, Tensor, Tensor]) -> None:
+        sample_src, sample_dst, sample_theta_restore = sample_batch
+        src, dst, theta_restore = current_batch
+        with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
+            half = self.batch_size // 2
+            src_vis = torch.cat((sample_src[:half], src[: self.batch_size - half]), dim=0)
+            dst_vis = torch.cat((sample_dst[:half], dst[: self.batch_size - half]), dim=0)
+
+            theta_restore_vis = torch.cat((sample_theta_restore[:half], theta_restore[: self.batch_size - half]), dim=0)
+            grid_vis = NF.affine_grid(theta_restore_vis, size=list(dst_vis.shape), align_corners=False)
+            dst_restored_vis = NF.grid_sample(dst_vis, grid_vis, mode="bilinear", padding_mode="reflection", align_corners=False)
+
+            source_identity_faces_vis = self.prepare_identity_encoder_faces(src_vis)
+            generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
+            source_identity_embeddings_vis = self.identity_embeddings_forward(source_identity_faces_vis)
+            fake_vis: Tensor = self.net_g_ema(dst_vis, generator_identity_embeddings_vis)
+
+            # Identity Loss 编码器真正接收的图像；直接组合 restore + FFHQ->112，
+            # 避免先恢复到全分辨率再二次重采样。仅为 sample grid 显示再放大回训练分辨率。
+            identity_encoder_input_vis = self.prepare_identity_encoder_faces(fake_vis, theta_restore_vis)
+            identity_encoder_input_display_vis = NF.interpolate(identity_encoder_input_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
+
+            grid = [src_vis, dst_vis, fake_vis, dst_restored_vis, identity_encoder_input_display_vis]
+
+            # ========================= GAN 损失梯度图 =========================
+            fake_for_gan_grad = fake_vis.detach().requires_grad_(True)
+            with torch.enable_grad():
+                fake_score_vis = self.train_d(fake_for_gan_grad)
+                gan_loss_vis = self.gan_loss(fake_score_vis)
+                gan_grad_map = self.loss_grad_map(gan_loss_vis, fake_for_gan_grad)
+            grid.append(gan_grad_map)
+
+            # ========================= 身份损失梯度图 =========================
+            with torch.enable_grad():
+                fake_for_id_grad = fake_vis.detach().requires_grad_(True)
+                generated_identity_embeddings_vis = self.identity_embeddings_forward(self.prepare_identity_encoder_faces(fake_for_id_grad, theta_restore_vis))
+                id_loss_vis = self.id_loss(generated_identity_embeddings_vis, source_identity_embeddings_vis.detach())
+                id_grad_map = self.loss_grad_map(id_loss_vis, fake_for_id_grad)
+
+            grid.append(id_grad_map)
+
+            grid = torch.cat(grid, dim=0)
+            grid.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)
+            grid = make_grid(grid, nrow=self.batch_size)[[2, 1, 0], :, :]  # RGB → BGR
+            grid = grid.permute(1, 2, 0)  # CHW → HWC
+            grid_cpu = grid.to(device="cpu", dtype=torch.uint8).numpy()
+        sample_file = self.sample_dir / f"step_{self.completed_step:09d}.png"
+        if not cv2.imwrite(sample_file, grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
+            raise OSError(f"保存训练 sample 失败：{sample_file}")
+
     def train(self) -> None:
 
         net_g, net_d = self.train_g, self.train_d
-        sample_src, sample_dst, sample_theta_restore = self.fetch_sample()
+        sample_batch = self.fetch_sample()
 
-        for iteration in tqdm(itertools.count(start=self.iter), initial=self.completed_step, mininterval=1.0, bar_format="{n_fmt:7} | 速度 {rate_fmt:3} | 训练时间 {elapsed}"):
+        for _ in tqdm(itertools.count(start=self.completed_step), initial=self.completed_step, mininterval=1.0, bar_format="{n_fmt:7} | 速度 {rate_fmt:3} | 训练时间 {elapsed}"):
             if self._stop_requested:
                 raise KeyboardInterrupt
 
-            self.iter = iteration
             src, dst, theta_restore = self.fetch_sample()
             self._step_in_progress = True
 
@@ -535,7 +583,7 @@ class Trainer:
             # ========================= 训练判别器 =========================
             self.net_d.requires_grad_(True)
             self.optim_d.zero_grad(set_to_none=True)
-            is_r1_reg_step = self.iter % self.r1_reg_step == 0
+            is_r1_reg_step = self.completed_step % self.r1_reg_step == 0
 
             if is_r1_reg_step:
                 with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=False):
@@ -616,7 +664,7 @@ class Trainer:
                 self.lr_scheduler_g.step()
 
             self.update_ema()
-            self._completed_step = iteration + 1
+            self._completed_step += 1
             self._step_in_progress = False
             self.flush_logs()
 
@@ -627,52 +675,7 @@ class Trainer:
                 self.save_ckpt()
 
             if self.completed_step % self.sample_save_every == 0:
-                with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
-                    half = self.batch_size // 2
-                    src_vis = torch.cat((sample_src[:half], src[: self.batch_size - half]), dim=0)
-                    dst_vis = torch.cat((sample_dst[:half], dst[: self.batch_size - half]), dim=0)
-
-                    theta_restore_vis = torch.cat((sample_theta_restore[:half], theta_restore[: self.batch_size - half]), dim=0)
-                    grid_vis = NF.affine_grid(theta_restore_vis, size=list(fake.shape), align_corners=False)
-                    dst_restored_vis = NF.grid_sample(dst_vis, grid_vis, mode="bilinear", padding_mode="reflection", align_corners=False)
-
-                    source_identity_faces_vis = self.prepare_identity_encoder_faces(src_vis)
-                    generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
-                    source_identity_embeddings_vis = self.identity_embeddings_forward(source_identity_faces_vis)
-                    fake_vis: Tensor = self.net_g_ema(dst_vis, generator_identity_embeddings_vis)
-
-                    # Identity Loss 编码器真正接收的图像；直接组合 restore + FFHQ->112，
-                    # 避免先恢复到全分辨率再二次重采样。仅为 sample grid 显示再放大回训练分辨率。
-                    identity_encoder_input_vis = self.prepare_identity_encoder_faces(fake_vis, theta_restore_vis)
-                    identity_encoder_input_display_vis = NF.interpolate(identity_encoder_input_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
-
-                    grid = [src_vis, dst_vis, fake_vis, dst_restored_vis, identity_encoder_input_display_vis]
-
-                    # ========================= GAN 损失梯度图 =========================
-                    fake_for_gan_grad = fake_vis.detach().requires_grad_(True)
-                    with torch.enable_grad():
-                        fake_score_vis = net_d(fake_for_gan_grad)
-                        gan_loss_vis = self.gan_loss(fake_score_vis)
-                        gan_grad_map = self.loss_grad_map(gan_loss_vis, fake_for_gan_grad)
-                    grid.append(gan_grad_map)
-
-                    # ========================= 身份损失梯度图 =========================
-                    with torch.enable_grad():
-                        fake_for_id_grad = fake_vis.detach().requires_grad_(True)
-                        generated_identity_embeddings_vis = self.identity_embeddings_forward(self.prepare_identity_encoder_faces(fake_for_id_grad, theta_restore_vis))
-                        id_loss_vis = self.id_loss(generated_identity_embeddings_vis, source_identity_embeddings_vis.detach())
-                        id_grad_map = self.loss_grad_map(id_loss_vis, fake_for_id_grad)
-
-                    grid.append(id_grad_map)
-
-                    grid = torch.cat(grid, dim=0)
-                    grid.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)
-                    grid = make_grid(grid, nrow=self.batch_size)[[2, 1, 0], :, :]  # RGB → BGR
-                    grid = grid.permute(1, 2, 0)  # CHW → HWC
-                    grid_cpu = grid.to(device="cpu", dtype=torch.uint8).numpy()
-                sample_file = self.sample_dir / f"step_{self.completed_step:09d}.png"
-                if not cv2.imwrite(sample_file, grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
-                    raise OSError(f"保存训练 sample 失败：{sample_file}")
+                self._save_sample(sample_batch, (src, dst, theta_restore))
 
 
 def _load_run_config(paths: RunPaths) -> tuple[dict[str, Any], dict[str, Any]]:

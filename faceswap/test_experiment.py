@@ -15,7 +15,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from faceswap.config import load_train_config, resolve_train_config
 from faceswap.contracts import CHECKPOINT_VERSION
 from faceswap.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
-from faceswap.train import _assert_branch_model_compatible, _load_branch_checkpoint, _load_branch_optimizer_state, _supports_compiled_bf16
+from faceswap.train import Trainer, _assert_branch_model_compatible, _load_branch_checkpoint, _load_branch_optimizer_state, _supports_compiled_bf16
 
 
 def _check_train_config(root: Path) -> None:
@@ -62,7 +62,29 @@ def _check_train_config(root: Path) -> None:
     print("PASS: TOML fields, canonical config persistence and unknown-field rejection")
 
 
+def _check_step_boundary() -> None:
+    # 只构造进度边界，不创建模型、优化器或 GPU Trainer。
+    trainer = Trainer.__new__(Trainer)
+    trainer._completed_step = 0
+    trainer._step_in_progress = False
+    assert not trainer.can_save_checkpoint
+
+    trainer._completed_step = 1
+    assert trainer.completed_step == 1 and trainer.can_save_checkpoint
+
+    trainer._step_in_progress = True
+    assert trainer.completed_step == 1 and not trainer.can_save_checkpoint
+    try:
+        trainer.save_ckpt()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("未完成的 step 不应允许保存 checkpoint")
+    print("PASS: fresh/completed/partial step checkpoint boundary")
+
+
 def main() -> None:
+    _check_step_boundary()
     # ROCm 不使用 NVIDIA compute capability；CUDA 继续保持 SM80+ 的 compile-BF16 限制。
     with (
         patch("faceswap.train.torch.version.hip", "7.0.0"),
