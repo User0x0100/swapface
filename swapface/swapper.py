@@ -32,7 +32,7 @@ def _configure_swapper_runtime() -> None:
     torch.backends.cuda.matmul.allow_tf32 = False
 
 
-class FaceSwapper:
+class SwapFace:
     def __init__(self, model_path: str, device: str = "cuda") -> None:
         if not Path(model_path).is_file():
             raise FileNotFoundError(model_path)
@@ -72,15 +72,15 @@ class FaceSwapper:
                 ]
             self.ort_session = ort.InferenceSession(str(model_path), providers=providers, sess_options=sess_options)
             metadata = self.ort_session.get_modelmeta().custom_metadata_map
-            for key, expected in (ONNX_CONTRACT | {"faceswap.kind": "generator"}).items():
+            for key, expected in (ONNX_CONTRACT | {"swapface.kind": "generator"}).items():
                 if metadata.get(key) != expected:
                     raise ValueError(f"ONNX 推理约定不匹配：{key}={metadata.get(key)!r}，请用当前 export.py 重新导出")
             try:
-                self.id_encoder_provider = IDEncoderProvider[metadata["faceswap.provider"]]
-                self.training_step = int(metadata["faceswap.step"])
+                self.id_encoder_provider = IDEncoderProvider[metadata["swapface.provider"]]
+                self.training_step = int(metadata["swapface.step"])
             except (KeyError, ValueError) as error:
                 raise ValueError("ONNX 缺少有效的身份编码器或 step 信息，请重新导出") from error
-            self.ort_layout = metadata.get("faceswap.layout")
+            self.ort_layout = metadata.get("swapface.layout")
             if self.ort_layout not in {"NHWC", "NCHW"}:
                 raise ValueError("ONNX 缺少有效的图像布局，请重新导出")
             inputs = {item.name: item for item in self.ort_session.get_inputs()}
@@ -302,7 +302,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8, help="每批解码和检测的视频帧数")
     parser.add_argument("--full-resolution-detection", action="store_true", help="按原视频分辨率检测，保留原有检测精度；默认大帧使用检测器原生缩放")
     args = parser.parse_args()
-    FaceSwapper(args.model, device=args.device).swap_video(args.video, args.identity, batch_size=args.batch_size, full_resolution_detection=args.full_resolution_detection)
+    SwapFace(args.model, device=args.device).swap_video(args.video, args.identity, batch_size=args.batch_size, full_resolution_detection=args.full_resolution_detection)
 
 
 if __name__ == "__main__":

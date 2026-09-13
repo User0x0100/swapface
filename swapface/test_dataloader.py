@@ -1,4 +1,4 @@
-"""无需 DALI/GPU 的训练数据管线回归检查：uv run python -m faceswap.test_dataloader"""
+"""无需 DALI/GPU 的训练数据管线回归检查：uv run python -m swapface.test_dataloader"""
 
 import builtins
 import sys
@@ -11,9 +11,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-from faceswap.dataloader import DEFAULT_DATALOADER_CONFIG, TrainingDataLoader
-from faceswap.dataloader_common import build_image_pools
-from faceswap.dataloader_native import make_affine_thetas
+from swapface.dataloader import DEFAULT_DATALOADER_CONFIG, TrainingDataLoader
+from swapface.dataloader_common import build_image_pools
+from swapface.dataloader_native import make_affine_thetas
 
 
 def _write_image(path: Path, value: int, size: tuple[int, int] = (48, 40)) -> None:
@@ -40,7 +40,7 @@ def main() -> None:
     expected = torch.tensor([[[1.0832886, 0.1910130, 0.23285627], [-0.1910130, 1.0832886, -0.11826712]]])
     torch.testing.assert_close(theta_restore, expected, atol=2e-7, rtol=0)
 
-    with tempfile.TemporaryDirectory(prefix="faceswap-dataloader-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="swapface-dataloader-") as temporary:
         root = Path(temporary)
         src_a, src_b, dst = root / "src_a", root / "src_b", root / "dst"
         src_a.mkdir()
@@ -112,14 +112,14 @@ def main() -> None:
         def __init__(self, **_kwargs) -> None:
             selected.append("dali")
 
-    native_module = ModuleType("faceswap.dataloader_native")
+    native_module = ModuleType("swapface.dataloader_native")
     native_module._NativeTrainingDataLoader = FakeNativeLoader
-    dali_module = ModuleType("faceswap.dataloader_dali")
+    dali_module = ModuleType("swapface.dataloader_dali")
     dali_module._DALITrainingDataLoader = FakeDaliLoader
-    with patch.dict(sys.modules, {"faceswap.dataloader_native": native_module, "faceswap.dataloader_dali": dali_module}):
-        with patch("faceswap.dataloader.torch.version.hip", "6.4.0"):
+    with patch.dict(sys.modules, {"swapface.dataloader_native": native_module, "swapface.dataloader_dali": dali_module}):
+        with patch("swapface.dataloader.torch.version.hip", "6.4.0"):
             TrainingDataLoader(batch_size=1, device=torch.device("cuda"), img_resolution=32, src=[], dst=[])
-        with patch("faceswap.dataloader.torch.version.hip", None):
+        with patch("swapface.dataloader.torch.version.hip", None):
             TrainingDataLoader(batch_size=1, device=torch.device("cuda"), img_resolution=32, src=[], dst=[])
     assert selected == ["native", "dali"]
 
@@ -142,7 +142,7 @@ def main() -> None:
         patch.object(torch, "manual_seed", side_effect=AssertionError("训练库导入不应修改随机种子")),
         patch.object(torch, "set_float32_matmul_precision", side_effect=AssertionError("训练库导入不应修改矩阵乘精度")),
     ):
-        from faceswap import train
+        from swapface import train
     assert (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32, torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic) == backend_before
 
     assert "nvidia.dali.plugin.pytorch" not in sys.modules

@@ -1,4 +1,4 @@
-"""无需下载权重的回归检查：.venv/bin/python -m faceswap.test_inference"""
+"""无需下载权重的回归检查：.venv/bin/python -m swapface.test_inference"""
 
 import random
 import tempfile
@@ -12,11 +12,11 @@ import torch.nn.functional as NF
 from torch import nn
 from torchvision.io import write_png
 
-from faceswap.contracts import CHECKPOINT_VERSION
-from faceswap.inference import get_ffhq_alignment_template, load_generator
 from misc.face_alignment import FFHQ_TO_ARCFACE_112_AFFINE_512, make_alignment_grid_theta, restore_faces_to_original, transform_sampling_grid
 from misc.models.id_encoder import IDEncoderProvider, get_alignment_template
 from models.networks import Generator
+from swapface.contracts import CHECKPOINT_VERSION
+from swapface.inference import get_ffhq_alignment_template, load_generator
 
 
 class RecordingEncoder(nn.Module):
@@ -45,7 +45,7 @@ def main() -> None:
         patch.object(torch, "manual_seed", side_effect=AssertionError("推理库导入不应修改 Torch 随机种子")),
         patch.object(torch, "set_float32_matmul_precision", side_effect=AssertionError("推理库导入不应修改矩阵乘精度")),
     ):
-        from faceswap import export, swapper
+        from swapface import export, swapper
     assert (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32, torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic) == backend_before
 
     torch.manual_seed(7)
@@ -55,7 +55,7 @@ def main() -> None:
     model = Generator(img_resolution=16, num_depth=1, num_latent=1, base_ch=4, max_ch=8, aad_skip_layers=[0]).eval()
     faces = torch.rand(3, 3, 16, 16) * 2 - 1
     identity = torch.nn.functional.normalize(torch.randn(1, 512), dim=1)
-    with tempfile.TemporaryDirectory(prefix="faceswap-check-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="swapface-check-") as temporary:
         directory = Path(temporary)
         checkpoint_path = directory / "current.pth"
         checkpoint = {
@@ -79,7 +79,7 @@ def main() -> None:
             torch.testing.assert_close(mapped, torch.tensor(get_alignment_template(112)), atol=2e-5, rtol=0)
 
         with patch.object(swapper, "RetinaFace", return_value=Detector()), patch.object(swapper, "IDEncoder", RecordingEncoder), patch.object(swapper, "FaceMasker", return_value=nn.Identity()):
-            native = swapper.FaceSwapper(str(checkpoint_path), device="cpu")
+            native = swapper.SwapFace(str(checkpoint_path), device="cpu")
             assert native.id_encoder.provider is provider
             with torch.inference_mode():
                 expected = model(faces, identity.expand(3, -1))
@@ -108,26 +108,26 @@ def main() -> None:
 
             for nhwc, batch_size in ((True, 2), (False, 2)):
                 export_device = "cuda" if nhwc and torch.cuda.is_available() else "cpu"
-                exported_path, exported_provider = export.export_face_swap(str(checkpoint_path), batch_size=batch_size, nhwc=nhwc, device=export_device, output_dir=temporary, file_prefix=f"swap-{nhwc}")
+                exported_path, exported_provider = export.export_swapface(str(checkpoint_path), batch_size=batch_size, nhwc=nhwc, device=export_device, output_dir=temporary, file_prefix=f"swap-{nhwc}")
                 assert exported_provider is provider
                 onnx_model = onnx.load(exported_path)
                 onnx.checker.check_model(onnx_model)
                 exported_metadata = {item.key: item.value for item in onnx_model.metadata_props}
-                assert exported_metadata["faceswap.format"] == "2"
-                assert exported_metadata["faceswap.step"] == "123"
-                assert "faceswap.iter" not in exported_metadata
-                runtime = swapper.FaceSwapper(str(exported_path), device="cpu")
+                assert exported_metadata["swapface.format"] == "2"
+                assert exported_metadata["swapface.step"] == "123"
+                assert "swapface.iter" not in exported_metadata
+                runtime = swapper.SwapFace(str(exported_path), device="cpu")
                 assert runtime.id_encoder.provider is provider
                 actual = runtime.swap_faces(faces, identity)
                 torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
                 assert runtime.swap_faces(faces[:0], identity).shape == (0, 3, 16, 16)
                 print(f"PASS: {'NHWC' if nhwc else 'NCHW'}, fixed batch={batch_size}, 3 faces, max error={(actual - expected).abs().max().item():.3g}")
                 if nhwc and torch.cuda.is_available():
-                    gpu_native = swapper.FaceSwapper(str(checkpoint_path), device="cuda")
+                    gpu_native = swapper.SwapFace(str(checkpoint_path), device="cuda")
                     assert gpu_native.bf16 == torch.cuda.is_bf16_supported(including_emulation=False)
                     gpu_output = gpu_native.swap_faces(faces, identity).cpu()
                     torch.testing.assert_close(gpu_output, expected, atol=5e-3, rtol=5e-3)
-                    gpu_onnx = swapper.FaceSwapper(str(exported_path), device="cuda")
+                    gpu_onnx = swapper.SwapFace(str(exported_path), device="cuda")
                     assert "CUDAExecutionProvider" in gpu_onnx.ort_session.get_providers()
                     assert gpu_onnx.ort_session.get_session_options().get_session_config_entry("session.disable_cpu_ep_fallback") == "1"
                     # CUDA ORT 热路径不得经过旧的 NumPy batch 复制。
@@ -173,7 +173,7 @@ def main() -> None:
                 for test_faces, test_theta, lengths in ((faces, theta, [2, 0, 1]), (faces[:0], theta[:0], [0, 0, 0])):
                     restored = restore_faces_to_original(original.clone(), test_faces, test_theta, lengths)
                     expected_preview = NF.interpolate(torch.cat((original, restored), dim=3), scale_factor=0.25, mode="bilinear", align_corners=False)
-                    actual_preview = swapper.FaceSwapper._make_preview(original.clone(), test_faces, test_theta, lengths)
+                    actual_preview = swapper.SwapFace._make_preview(original.clone(), test_faces, test_theta, lengths)
                     torch.testing.assert_close(actual_preview, expected_preview, atol=0, rtol=0)
             try:
                 native.swap_video("unused.mp4", "unused.png", batch_size=0)
@@ -185,12 +185,12 @@ def main() -> None:
             # 旧 format 与缺失 metadata 都必须明确拒绝。
             legacy_model = onnx.load(exported_path)
             for item in legacy_model.metadata_props:
-                if item.key == "faceswap.format":
+                if item.key == "swapface.format":
                     item.value = "1"
             legacy_path = directory / "legacy-format.onnx"
             onnx.save(legacy_model, legacy_path)
             try:
-                swapper.FaceSwapper(str(legacy_path), device="cpu")
+                swapper.SwapFace(str(legacy_path), device="cpu")
             except ValueError as error:
                 assert "约定不匹配" in str(error)
             else:
@@ -201,14 +201,14 @@ def main() -> None:
             old_path = directory / "missing-metadata.onnx"
             onnx.save(missing_metadata_model, old_path)
             try:
-                swapper.FaceSwapper(str(old_path), device="cpu")
+                swapper.SwapFace(str(old_path), device="cpu")
             except ValueError as error:
                 assert "重新导出" in str(error)
             else:
                 raise AssertionError("ONNX without metadata was accepted")
 
         # all 必须使用 checkpoint 的生成器编码器；不能误用身份损失编码器或默认 provider。
-        with patch.object(export, "export_face_swap", return_value=(directory / "model.onnx", provider)), patch.object(export, "export_id_encoder") as export_encoder:
+        with patch.object(export, "export_swapface", return_value=(directory / "model.onnx", provider)), patch.object(export, "export_id_encoder") as export_encoder:
             with patch("sys.argv", ["export", "all", "--checkpoint", str(checkpoint_path), "--device", "cpu"]):
                 export.main()
             assert export_encoder.call_args.kwargs["provider_name"] == provider.name
@@ -221,9 +221,9 @@ def main() -> None:
                 encoded_path = export.export_id_encoder(provider.name, nhwc=nhwc, device="cpu", output_dir=temporary, file_prefix=f"encoder-{nhwc}")
                 session = ort.InferenceSession(str(encoded_path), providers=["CPUExecutionProvider"])
                 metadata = session.get_modelmeta().custom_metadata_map
-                assert metadata["faceswap.format"] == "2"
-                assert metadata["faceswap.face_alignment"] == "arcface112"
-                assert metadata["faceswap.provider"] == provider.name
+                assert metadata["swapface.format"] == "2"
+                assert metadata["swapface.face_alignment"] == "arcface112"
+                assert metadata["swapface.provider"] == provider.name
                 inputs = torch.rand(1, 3, 112, 112) * 2 - 1
                 expected_identity = RecordingEncoder(provider)(inputs).numpy()
                 inputs_np = inputs.permute(0, 2, 3, 1).numpy() if nhwc else inputs.numpy()

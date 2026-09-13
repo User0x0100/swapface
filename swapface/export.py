@@ -33,7 +33,7 @@ def _configure_export_runtime() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Wrappers
 # ──────────────────────────────────────────────────────────────────────────────
-class FaceSwapNHWCAdapter(nn.Module):
+class SwapFaceNHWCAdapter(nn.Module):
     def __init__(self, model: Generator) -> None:
         super().__init__()
         self.model = model
@@ -117,13 +117,13 @@ def export_to_onnx(
 # ──────────────────────────────────────────────────────────────────────────────
 # Export functions
 # ──────────────────────────────────────────────────────────────────────────────
-def export_face_swap(
+def export_swapface(
     checkpoint_path: str,
     batch_size: int = 1,
     nhwc: bool = True,
     device: str = "cuda",
     output_dir: str = "onnx_export",
-    file_prefix: str = "faceswap",
+    file_prefix: str = "swapface",
 ) -> tuple[Path, IDEncoderProvider]:
     target_device = torch.device(device)
 
@@ -136,7 +136,7 @@ def export_face_swap(
     image_resolution, image_channels, identity_dim = network_config["img_resolution"], network_config["img_channels"], network_config["id_dim"]
 
     if nhwc:
-        wrapped = FaceSwapNHWCAdapter(model).to(target_device)
+        wrapped = SwapFaceNHWCAdapter(model).to(target_device)
         x = torch.randn((batch_size, image_resolution, image_resolution, image_channels), device=target_device, dtype=torch.float32)
     else:
         wrapped = model.to(target_device)
@@ -148,7 +148,7 @@ def export_face_swap(
         (x, identity_embedding),
         output_dir=output_dir,
         file_prefix=f"{file_prefix}-{training_step}",
-        metadata=ONNX_CONTRACT | {"faceswap.kind": "generator", "faceswap.provider": provider.name, "faceswap.layout": "NHWC" if nhwc else "NCHW", "faceswap.step": str(training_step)},
+        metadata=ONNX_CONTRACT | {"swapface.kind": "generator", "swapface.provider": provider.name, "swapface.layout": "NHWC" if nhwc else "NCHW", "swapface.step": str(training_step)},
         input_names=["faces", "identity"],
         output_name="swapped_faces",
     )
@@ -182,7 +182,7 @@ def export_id_encoder(
         (x,),
         output_dir=output_dir,
         file_prefix=f"{file_prefix}-id-encoder-{provider_name}",
-        metadata=ONNX_CONTRACT | {"faceswap.kind": "id_encoder", "faceswap.face_alignment": "arcface112", "faceswap.provider": provider.name, "faceswap.layout": "NHWC" if nhwc else "NCHW"},
+        metadata=ONNX_CONTRACT | {"swapface.kind": "id_encoder", "swapface.face_alignment": "arcface112", "swapface.provider": provider.name, "swapface.layout": "NHWC" if nhwc else "NCHW"},
         input_names=["faces"],
         output_name="identity",
     )
@@ -196,7 +196,7 @@ ID_ENCODER_PROVIDER_CHOICES = [p.name for p in IDEncoderProvider]
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="将 FaceSwap / IDEncoder 模型导出为 ONNX 格式",
+        description="将 SwapFace / IDEncoder 模型导出为 ONNX 格式",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -207,10 +207,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--nchw", action="store_true", help="使用 NCHW 布局（默认 NHWC）")
         p.add_argument("--device", default="cuda", help="推理设备，如 cuda / cuda:1 / cpu")
         p.add_argument("--output-dir", default="onnx_export", help="ONNX 文件输出目录")
-        p.add_argument("--file-prefix", default="faceswap", help="ONNX 文件名")
+        p.add_argument("--file-prefix", default="swapface", help="ONNX 文件名")
 
-    # ── faceswap 子命令 ───────────────────────────────────────────────────────
-    p_fs = sub.add_parser("faceswap", help="导出 Generator（换脸模型）")
+    # ── swapface 子命令 ───────────────────────────────────────────────────────
+    p_fs = sub.add_parser("swapface", help="导出 Generator（换脸模型）")
     p_fs.add_argument("--checkpoint", required=True, metavar="PATH", help="当前 train.py 保存的检查点路径（.pth）")
     add_common(p_fs)
 
@@ -225,7 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(p_id)
 
     # ── all 子命令（两者一起导出）────────────────────────────────────────────
-    p_all = sub.add_parser("all", help="同时导出 FaceSwap 与 IDEncoder")
+    p_all = sub.add_parser("all", help="同时导出 SwapFace 与 IDEncoder")
     p_all.add_argument("--checkpoint", required=True, metavar="PATH", help="Generator 检查点；自动导出其配套身份编码器")
     add_common(p_all)
 
@@ -246,8 +246,8 @@ def main() -> None:
         "file_prefix": args.file_prefix,
     }
 
-    if args.command in ("faceswap", "all"):
-        _, provider = export_face_swap(checkpoint_path=args.checkpoint, **kwargs)
+    if args.command in ("swapface", "all"):
+        _, provider = export_swapface(checkpoint_path=args.checkpoint, **kwargs)
 
     if args.command == "id-encoder":
         export_id_encoder(provider_name=args.provider, **kwargs)

@@ -720,7 +720,7 @@ def _load_branch_checkpoint(checkpoint_path: Path, resolved: dict[str, Any]) -> 
 
 def main() -> None:
     _configure_training_runtime()
-    parser = argparse.ArgumentParser(description="FaceSwap 训练")
+    parser = argparse.ArgumentParser(description="SwapFace 训练")
     parser.add_argument("--config", type=Path, default=None, help=f"fresh/branch 的训练 TOML；fresh 默认：{DEFAULT_TRAIN_CONFIG_PATH}")
     parser.add_argument("--name", type=str, default=None, help="新 run 的可选短标签；run ID 仍包含唯一时间戳")
     parser.add_argument("--runs-root", type=Path, default=None, help=f"新 run 根目录，默认：{DEFAULT_RUNS_ROOT}")

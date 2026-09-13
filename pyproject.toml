@@ -1,7 +1,7 @@
 [project]
 name = "swap"
 version = "0.1.0"
-description = "Experimental face-swap training workspace"
+description = "Experimental SwapFace training workspace"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "huggingface-hub",

@@ -12,10 +12,10 @@ import torch
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from faceswap.config import load_train_config, resolve_train_config
-from faceswap.contracts import CHECKPOINT_VERSION
-from faceswap.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
-from faceswap.train import Trainer, _assert_branch_model_compatible, _load_branch_checkpoint, _load_branch_optimizer_state, _supports_compiled_bf16
+from swapface.config import load_train_config, resolve_train_config
+from swapface.contracts import CHECKPOINT_VERSION
+from swapface.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
+from swapface.train import Trainer, _assert_branch_model_compatible, _load_branch_checkpoint, _load_branch_optimizer_state, _supports_compiled_bf16
 
 
 def _check_train_config(root: Path) -> None:
@@ -87,18 +87,18 @@ def main() -> None:
     _check_step_boundary()
     # ROCm 不使用 NVIDIA compute capability；CUDA 继续保持 SM80+ 的 compile-BF16 限制。
     with (
-        patch("faceswap.train.torch.version.hip", "7.0.0"),
-        patch("faceswap.train.torch.cuda.get_device_capability", side_effect=AssertionError("ROCm 不应查询 NVIDIA SM")),
+        patch("swapface.train.torch.version.hip", "7.0.0"),
+        patch("swapface.train.torch.cuda.get_device_capability", side_effect=AssertionError("ROCm 不应查询 NVIDIA SM")),
     ):
         assert _supports_compiled_bf16(0)
-    with patch("faceswap.train.torch.version.hip", None), patch("faceswap.train.torch.cuda.get_device_capability", return_value=(7, 5)):
+    with patch("swapface.train.torch.version.hip", None), patch("swapface.train.torch.cuda.get_device_capability", return_value=(7, 5)):
         assert not _supports_compiled_bf16(0)
-    with patch("faceswap.train.torch.version.hip", None), patch("faceswap.train.torch.cuda.get_device_capability", return_value=(8, 0)):
+    with patch("swapface.train.torch.version.hip", None), patch("swapface.train.torch.cuda.get_device_capability", return_value=(8, 0)):
         assert _supports_compiled_bf16(0)
 
     resolved = {"train": {"batch_size": 8}, "generator": {"depth": 5}, "discriminator": {"base_ch": 64}, "identity": {"generator_provider": "BLENDFACE"}}
 
-    with tempfile.TemporaryDirectory(prefix="faceswap-run-check-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="swapface-run-check-") as temporary:
         root = Path(temporary)
         _check_train_config(root)
         source_config = root / "train.toml"

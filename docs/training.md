@@ -1,4 +1,4 @@
-# FaceSwap 训练运行与结果目录
+# SwapFace 训练运行与结果目录
 
 本文描述训练配置、run 生命周期、checkpoint 保存与中途恢复的约定。目标是让一次训练具备明确边界、可恢复、可审计，并避免运行时路径污染实验配置。
 
@@ -36,19 +36,19 @@ ROCm 环境完成同步后，运行训练命令使用 `uv run --no-sync ...`（�
 使用默认配置：
 
 ```bash
-uv run python -m faceswap.train
+uv run python -m swapface.train
 ```
 
 显式指定配置：
 
 ```bash
-uv run python -m faceswap.train --config experiments/train.toml
+uv run python -m swapface.train --config experiments/train.toml
 ```
 
 添加便于识别的短标签：
 
 ```bash
-uv run python -m faceswap.train \
+uv run python -m swapface.train \
   --config experiments/train.toml \
   --name blendface-vgg
 ```
@@ -131,7 +131,7 @@ checkpoint 仍通过临时文件写入后原子 `replace`；只有 checkpoint �
 推荐直接指定 run：
 
 ```bash
-uv run python -m faceswap.train \
+uv run python -m swapface.train \
   --resume experiments/runs/20260910-162600_blendface-vgg
 ```
 
@@ -140,7 +140,7 @@ uv run python -m faceswap.train \
 也可以显式指定同一 run 的 **latest checkpoint**：
 
 ```bash
-uv run python -m faceswap.train \
+uv run python -m swapface.train \
   --resume experiments/runs/20260910-162600_blendface-vgg/checkpoints/step_000070000.pth
 ```
 
@@ -151,7 +151,7 @@ uv run python -m faceswap.train \
 Branch 从已有完整训练状态创建一个新的 run。它不会修改父 run，可以从标准 run 的 latest、其中任意历史 checkpoint，或单独保存的 v3 checkpoint 文件分叉：
 
 ```bash
-uv run python -m faceswap.train \
+uv run python -m swapface.train \
   --branch-from experiments/runs/20260910-162600-blendface-vgg/checkpoints/step_000050000.pth \
   --config experiments/train.toml \
   --name lower-id-loss
@@ -160,7 +160,7 @@ uv run python -m faceswap.train \
 独立 checkpoint 不需要保留原 run 目录；只要文件名保持 `step_<step>.pth`，其内部 v3 元数据、step 与 Generator/Discriminator 架构有效即可：
 
 ```bash
-uv run --no-sync python -m faceswap.train \
+uv run --no-sync python -m swapface.train \
   --branch-from /mnt/workspace/step_000208939.pth \
   --config /mnt/workspace/train.toml \
   --name lower-id-loss
@@ -199,7 +199,7 @@ BF16 是否实际生效不仅由 TOML 的 `bf16 = true` 决定，还取决于当
 如果某次恢复训练需要把数值精度模式也视为严格条件，可显式使用：
 
 ```bash
-uv run python -m faceswap.train \
+uv run python -m swapface.train \
   --resume experiments/runs/20260910-162600_blendface-vgg \
   --strict-bf16
 ```
@@ -208,7 +208,7 @@ uv run python -m faceswap.train \
 
 ## 配置冻结与哈希
 
-run 同时保存用户原始 TOML 与由 `faceswap/config.py` 按显式训练配置协议展开的规范 JSON：
+run 同时保存用户原始 TOML 与由 `swapface/config.py` 按显式训练配置协议展开的规范 JSON：
 
 ```text
 config.toml           # 用户输入原文

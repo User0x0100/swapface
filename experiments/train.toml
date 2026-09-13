@@ -1,14 +1,14 @@
-# FaceSwap 训练配置示例
+# SwapFace 训练配置示例
 # 详细的 run / checkpoint / resume 约定见 docs/training.md。
 #
 # 使用方式：
-#   新训练：uv run python -m faceswap.train --config experiments/train.toml [--name NAME]
-#   恢复训练：uv run python -m faceswap.train --resume experiments/runs/<run_id> [--strict-bf16]
+#   新训练：uv run python -m swapface.train --config experiments/train.toml [--name NAME]
+#   恢复训练：uv run python -m swapface.train --resume experiments/runs/<run_id> [--strict-bf16]
 #
 # 说明：
 # - 本文件只描述训练实验本身，不保存 checkpoint/output 路径等运行时状态。
 # - 每次新训练会自动创建唯一 run 目录，并冻结原始配置、resolved config 与运行元数据。
-# - 未显式配置的参数由 faceswap/config.py 按显式训练配置协议补齐，并写入 run/config.resolved.json。
+# - 未显式配置的参数由 swapface/config.py 按显式训练配置协议补齐，并写入 run/config.resolved.json。
 # - 训练输入图像默认要求使用 FFHQ canonical alignment；Identity Loss 前固定映射到 112x112 canonical 坐标系。
 # - checkpoint 仅支持当前 v3 格式；恢复时使用原 run 的冻结配置，不重新读取本文件。
 
