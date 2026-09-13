@@ -32,7 +32,6 @@ cuda = [
 rocm = [
     "torch",
     "torchvision",
-    "pytorch-triton-rocm",
     "triton-rocm",
 ]
 
@@ -56,7 +55,6 @@ torchvision = [
     { index = "pytorch-rocm", group = "rocm" },
 ]
 torchcodec = { index = "pytorch-cu126", group = "cuda" }
-pytorch-triton-rocm = { index = "pytorch-rocm", group = "rocm" }
 triton-rocm = { index = "pytorch-rocm", group = "rocm" }
 nvidia-dali-cuda120 = { index = "nvidia" }
 tensorrt-cu12 = { index = "nvidia" }

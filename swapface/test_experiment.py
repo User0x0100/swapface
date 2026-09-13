@@ -15,7 +15,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from swapface.config import load_train_config, resolve_train_config
 from swapface.contracts import CHECKPOINT_VERSION
 from swapface.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
-from swapface.train import Trainer, _assert_branch_model_compatible, _load_branch_checkpoint, _load_branch_optimizer_state, _supports_compiled_bf16
+from swapface.train import Trainer, _assert_branch_model_compatible, _compile_training_callable, _load_branch_checkpoint, _load_branch_optimizer_state, _supports_compiled_bf16
 
 
 def _check_train_config(root: Path) -> None:
@@ -95,6 +95,14 @@ def main() -> None:
         assert not _supports_compiled_bf16(0)
     with patch("swapface.train.torch.version.hip", None), patch("swapface.train.torch.cuda.get_device_capability", return_value=(8, 0)):
         assert _supports_compiled_bf16(0)
+
+    compile_target = object()
+    with patch("swapface.train.torch.version.hip", "7.2.0"), patch("swapface.train.torch.compile", return_value=compile_target) as compile_mock:
+        assert _compile_training_callable(object()) is compile_target
+        assert compile_mock.call_args.kwargs["mode"] == "default"
+    with patch("swapface.train.torch.version.hip", None), patch("swapface.train.torch.compile", return_value=compile_target) as compile_mock:
+        assert _compile_training_callable(object()) is compile_target
+        assert compile_mock.call_args.kwargs["mode"] == "max-autotune-no-cudagraphs"
 
     resolved = {"train": {"batch_size": 8}, "generator": {"depth": 5}, "discriminator": {"base_ch": 64}, "identity": {"generator_provider": "BLENDFACE"}}
 

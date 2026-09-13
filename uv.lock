@@ -1102,14 +1102,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pytorch-triton-rocm"
-version = "3.5.1"
-source = { registry = "https://download.pytorch.org/whl/rocm7.2" }
-wheels = [
-    { url = "https://download-r2.pytorch.org/whl/pytorch_triton_rocm-3.5.1-cp312-cp312-linux_x86_64.whl", upload-time = "2025-11-11T19:18:19Z" },
-]
-
-[[package]]
 name = "pyyaml"
 version = "6.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1253,7 +1245,6 @@ cuda = [
     { name = "xformers" },
 ]
 rocm = [
-    { name = "pytorch-triton-rocm" },
     { name = "torch", version = "2.14.0+rocm7.2", source = { registry = "https://download.pytorch.org/whl/rocm7.2" } },
     { name = "torchvision", version = "0.29.0+rocm7.2", source = { registry = "https://download.pytorch.org/whl/rocm7.2" } },
     { name = "triton-rocm" },
@@ -1287,7 +1278,6 @@ cuda = [
     { name = "xformers" },
 ]
 rocm = [
-    { name = "pytorch-triton-rocm", index = "https://download.pytorch.org/whl/rocm7.2", conflict = { package = "swap", group = "rocm" } },
     { name = "torch", index = "https://download.pytorch.org/whl/rocm7.2", conflict = { package = "swap", group = "rocm" } },
     { name = "torchvision", index = "https://download.pytorch.org/whl/rocm7.2", conflict = { package = "swap", group = "rocm" } },
     { name = "triton-rocm", index = "https://download.pytorch.org/whl/rocm7.2", conflict = { package = "swap", group = "rocm" } },
