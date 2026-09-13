@@ -11,7 +11,6 @@ dependencies = [
     "opencv-python",
     "tensorboard",
     "tqdm",
-    "segmentation-models-pytorch",
     "fvcore",
     "torchinfo",
     "ninja",
@@ -21,6 +20,7 @@ dependencies = [
 
 [dependency-groups]
 cuda = [
+    "segmentation-models-pytorch",
     "torch",
     "torchvision",
     "torchcodec",
@@ -30,6 +30,7 @@ cuda = [
     "tensorrt-cu12",
 ]
 rocm = [
+    "segmentation-models-pytorch",
     "torch",
     "torchvision",
     "triton-rocm",
@@ -37,7 +38,7 @@ rocm = [
 
 [tool.uv]
 package = false
-default-groups = ["cuda"]
+default-groups = []
 conflicts = [
     [
         { group = "cuda" },
