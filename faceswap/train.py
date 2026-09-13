@@ -570,8 +570,6 @@ class Trainer:
             src, dst, theta_restore = self.fetch_sample()
             self._step_in_progress = True
 
-            # torch.compiler.cudagraph_mark_step_begin()
-
             # ========================= 生成器前向 =========================
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
                 with torch.no_grad():

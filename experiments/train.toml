@@ -2,15 +2,15 @@
 # 详细的 run / checkpoint / resume 约定见 docs/training.md。
 #
 # 使用方式：
-#   新训练：uv run python -m faceswap.train --config faceswap/train.example.toml [--name NAME]
+#   新训练：uv run python -m faceswap.train --config experiments/train.toml [--name NAME]
 #   恢复训练：uv run python -m faceswap.train --resume experiments/runs/<run_id> [--strict-bf16]
 #
 # 说明：
 # - 本文件只描述训练实验本身，不保存 checkpoint/output 路径等运行时状态。
 # - 每次新训练会自动创建唯一 run 目录，并冻结原始配置、resolved config 与运行元数据。
-# - 未显式配置的参数会使用 Trainer / 模型 / dataloader 的默认值，并写入 run/config.resolved.json。
+# - 未显式配置的参数由 faceswap/config.py 按显式训练配置协议补齐，并写入 run/config.resolved.json。
 # - 训练输入图像默认要求使用 FFHQ canonical alignment；Identity Loss 前固定映射到 112x112 canonical 坐标系。
-# - checkpoint 仅支持当前 v2 格式；恢复时使用原 run 的冻结配置，不重新读取本文件。
+# - checkpoint 仅支持当前 v3 格式；恢复时使用原 run 的冻结配置，不重新读取本文件。
 
 [train]
 # 每个训练 batch 的样本数。当前判别器的 minibatch group_size 必须能整除该值。
@@ -23,7 +23,7 @@ lr = 1.0e-4
 # 设为 0 表示禁用余弦学习率调度器。
 lr_scheduler_t_max = 0
 
-# Lazy R1：每隔多少个 iteration 执行一次 R1 正则。
+# Lazy R1：每隔多少个训练 step 执行一次 R1 正则；首个 step 即执行。
 r1_reg_step = 16
 
 # R1 正则 gamma。实际 lazy R1 会再乘以 r1_reg_step 进行间隔补偿。
@@ -36,7 +36,9 @@ bf16 = true
 # 可写 "cuda"、"cuda:0" 等，不使用 "rocm" 或 "hip" 设备名。
 device = "cuda"
 
-# 是否使用 torch.compile 编译 Generator、Discriminator 和 BlendFace 条件编码器。
+# 是否启用训练路径的 torch.compile。
+# Trainer 统一编译 Generator、Discriminator、Generator 身份编码与 Identity Loss embedding 提取，
+# 以及启用的 VGG/WFM 热路径；关闭后训练路径保持 eager。
 compile_module = true
 
 # TensorBoard loss 写入间隔，单位为 completed step。
@@ -56,7 +58,7 @@ weight_save_every = 10000
 generator_provider = "BLENDFACE"
 
 # Identity Loss 使用的身份编码器。
-# 当前训练设计固定使用 MS1MV3 ArcFace R50 FP16 权重。
+# 当前示例显式配置为 BLENDFACE；未配置时使用 faceswap/config.py 中的协议默认值。
 loss_provider = "BLENDFACE"
 
 # Identity Loss 的总权重。
@@ -90,7 +92,7 @@ enable = false
 
 # WFM 使用的判别器特征层索引及对应权重。
 # 键是 Discriminator down_blocks 的 0-based 索引。
-# 当前 512 模型共有 0..6 共 7 层特征。
+# 索引必须小于当前判别器实际 down_blocks 数量。
 # 注意：越浅的层特征图越大，显存/带宽开销也越高。
 [loss.wfm.weights]
 0 = 0.1

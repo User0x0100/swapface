@@ -55,6 +55,8 @@ uv run python -m faceswap.train \
 
 `--name` 只参与 run ID，不改变实验配置。默认结果根目录为 `experiments/runs`；如确有需要，可用 `--runs-root PATH` 覆盖。
 
+`compile_module` 控制训练路径的 `torch.compile`：启用时，由 Trainer 统一编译 Generator、Discriminator、Generator 身份编码与 Identity Loss embedding 提取，以及启用的 VGG/WFM 热路径；设为 `false` 时，训练路径全部保持 eager。
+
 ## 训练数据源
 
 训练数据只支持本地图片目录，不再由训练进程访问 Hugging Face、ModelScope 或其他在线数据集。`[[src]]` / `[[dst]]` 的 schema 只包含：
@@ -97,7 +99,7 @@ experiments/
 各文件职责如下：
 
 - `config.toml`：启动该 run 时用户提供的 TOML 原文快照，便于人工阅读。
-- `config.resolved.json`：展开 Trainer、模型和 dataloader 默认值后的规范配置；这是 run 的机器可读事实来源。
+- `config.resolved.json`：展开显式训练配置协议默认值后的规范配置；这是 run 的机器可读事实来源。
 - `metadata.json`：只记录 run ID、状态、配置摘要和可选的 branch 父来源。
 - `latest.json`：很小的最新 checkpoint 指针，不复制大模型文件，适合本地文件系统和对象存储。
 - `checkpoints/`：完整训练状态。
@@ -118,11 +120,11 @@ step_000010000.pth
 step_000010000.png
 ```
 
-例如 `step_000010000.pth` 表示已经完成 10,000 次训练更新。`weight_save_every = 10000` 会在 completed step 10,000、20,000、30,000... 保存，而不是在内部 `iter == 0` 时额外保存一个易误解的 `0.pth`。
+例如 `step_000010000.pth` 表示已经完成 10,000 次训练更新。`weight_save_every = 10000` 会在 completed step 10,000、20,000、30,000... 保存。
 
 checkpoint 仍通过临时文件写入后原子 `replace`；只有 checkpoint 成功落盘后才原子更新 `latest.json`。
 
-`completed step` 只在一轮完整的 Discriminator 更新、Generator 更新、scheduler（若启用）和 EMA 更新全部完成后推进。checkpoint 内部 `step` 与文件名中的 step 必须完全一致。因此从 `step_000050000.pth` 恢复后，在下一轮更新真正完成前，completed step 仍是 50,000，不会把正在执行的 partial iteration 标记成 50,001。
+`completed step` 只在一轮完整的 Discriminator 更新、Generator 更新、scheduler（若启用）和 EMA 更新全部完成后推进。checkpoint 内部 `step` 与文件名中的 step 必须完全一致。因此从 `step_000050000.pth` 恢复后，在下一轮更新真正完成前，completed step 仍是 50,000，不会把正在执行的 partial step 标记成 50,001。
 
 ## 中途恢复训练
 
@@ -206,7 +208,7 @@ uv run python -m faceswap.train \
 
 ## 配置冻结与哈希
 
-run 同时保存用户原始 TOML 与展开默认值后的规范 JSON：
+run 同时保存用户原始 TOML 与由 `faceswap/config.py` 按显式训练配置协议展开的规范 JSON：
 
 ```text
 config.toml           # 用户输入原文
@@ -215,11 +217,11 @@ config.resolved.json  # 完整、显式、可哈希的规范配置
 
 `config.resolved.json` 会显式记录：
 
-- `[train]` 的默认参数；
-- Generator / Discriminator 构造器默认值；
-- dataloader 默认值；
-- Identity encoder 默认值；
-- VGG / WFM 默认权重；
+- `[train]` 的协议默认值；
+- Generator / Discriminator 的协议默认值；
+- dataloader 的协议默认值；
+- Identity encoder 的协议默认值；
+- VGG / WFM 的协议默认权重；
 - 本地数据源 path/adjustment。
 
 其规范 JSON 内容计算 SHA-256 并写入 `metadata.json`。新 checkpoint 也记录同一摘要与 run ID；resume 时若摘要或 run ID 不一致，会拒绝继续训练。
