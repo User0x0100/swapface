@@ -1,6 +1,7 @@
 """训练 run / branch / scheduler 的无 GPU 回归检查。"""
 
 import copy
+import inspect
 import json
 import tempfile
 import tomllib
@@ -11,9 +12,10 @@ import torch
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
+from faceswap.config import load_train_config, resolve_train_config
 from faceswap.contracts import CHECKPOINT_VERSION
 from faceswap.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
-from faceswap.train import _assert_branch_model_compatible, _load_branch_checkpoint, _load_branch_optimizer_state, _supports_compiled_bf16, load_train_config, resolve_train_config
+from faceswap.train import _assert_branch_model_compatible, _load_branch_checkpoint, _load_branch_optimizer_state, _supports_compiled_bf16
 
 
 def _check_train_config(root: Path) -> None:
@@ -30,7 +32,8 @@ def _check_train_config(root: Path) -> None:
     )
     raw = tomllib.loads(source.read_text(encoding="utf-8"))
     original = copy.deepcopy(raw)
-    resolved = resolve_train_config(raw)
+    with patch.object(inspect, "signature", side_effect=AssertionError("配置协议不应依赖 constructor signature")):
+        resolved = resolve_train_config(raw)
     assert raw == original
     assert resolve_train_config(resolved) == resolved
     _, loaded = load_train_config(source)
