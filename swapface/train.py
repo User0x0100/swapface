@@ -414,6 +414,9 @@ class Trainer:
             self.identity_embeddings_forward = _compile_training_callable(self.id_loss.extract_identity_embeddings)
             if self.enable_gaze_loss:
                 self.gaze_loss_forward = _compile_training_callable(self.gaze_loss)
+            if self.enable_hrffa_loss:
+                # 只编译 HRFFA 的神经网络主体；输入/visibility 与 FP32 几何求解保持 eager。
+                self.hrffa_loss.hrffa.network = _compile_training_callable(self.hrffa_loss.hrffa.network)
             if self.enable_perceptual_loss:
                 self.perceptual_loss_forward = _compile_training_callable(self.perceptual_loss)
             if self.enable_wfm_loss:
@@ -689,7 +692,7 @@ class Trainer:
                     g_loss = g_loss + gaze_loss
 
                 # HRFFA：姿态、眼睑、嘴部开合和 target 外轮廓。
-                # 首轮实验保持 eager；内部包含动态 visibility mask 与 linalg 求解，暂不随 compile_module 编译。
+                # compile_module 仅编译 HRFFA 神经网络主体；FP32 几何求解保持 eager。
                 if self.enable_hrffa_loss:
                     hrffa_components = self.hrffa_loss.forward_components(fake, dst)
                     for name, component in hrffa_components.items():
