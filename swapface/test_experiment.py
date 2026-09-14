@@ -15,7 +15,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from swapface.config import load_train_config, resolve_train_config
 from swapface.contracts import CHECKPOINT_VERSION
 from swapface.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
-from swapface.train import Trainer, _assert_branch_model_compatible, _compile_training_callable, _load_branch_checkpoint, _load_branch_optimizer_state, _supports_compiled_bf16
+from swapface.train import Trainer, _assert_branch_model_compatible, _compile_training_callable, _load_branch_checkpoint, _load_branch_optimizer_state, _load_run_config, _supports_compiled_bf16
 
 
 def _check_train_config(root: Path) -> None:
@@ -26,6 +26,7 @@ def _check_train_config(root: Path) -> None:
         '[identity]\ngenerator_provider = "MS1MV3_ARCFACE_R50_FP16"\nloss_provider = "BLENDFACE"\n'
         '[dataloader]\nrotation_range = [-3, 3]\n'
         '[loss.gaze]\nenable = true\nweight = 0.75\ndistribution_weight = 0.2\nconfidence_weighted = false\n'
+        '[loss.hrffa]\nenable = true\npose_weight = 0.5\neye_weight = 1.25\nmouth_weight = 1.5\ncontour_weight = 2.0\ncontour_shape_weight = 0.4\noccluded_geometry_weight = 0.1\n'
         '[loss.wfm.weights]\n2 = 0.25\n'
         '[[src]]\npath = "source"\nadjustment = 1\n'
         '[[dst]]\npath = "target"\nadjustment = -1\n',
@@ -45,6 +46,15 @@ def _check_train_config(root: Path) -> None:
     assert resolved["identity"]["loss_provider"] == raw["identity"]["loss_provider"]
     assert resolved["dataloader"]["rotation_range"] == [-3.0, 3.0]
     assert resolved["loss"]["gaze"] == {"enable": True, "weight": 0.75, "distribution_weight": 0.2, "confidence_weighted": False}
+    assert resolved["loss"]["hrffa"] == {
+        "enable": True,
+        "pose_weight": 0.5,
+        "eye_weight": 1.25,
+        "mouth_weight": 1.5,
+        "contour_weight": 2.0,
+        "contour_shape_weight": 0.4,
+        "occluded_geometry_weight": 0.1,
+    }
     assert resolved["loss"]["wfm"]["weights"] == {"2": 0.25}
     assert resolved["src"][0]["adjustment"] == 1 and resolved["dst"][0]["adjustment"] == -1
 
@@ -52,6 +62,15 @@ def _check_train_config(root: Path) -> None:
     assert load_resolved_config(paths) == resolved
     metadata = json.loads(paths.metadata.read_text(encoding="utf-8"))
     assert metadata["config_sha256"] == config_sha256(resolved)
+
+    # 旧 v3 run 没有 loss.hrffa；resume 时仅 runtime 补 enable=false，冻结配置/hash 不变。
+    legacy_resolved = copy.deepcopy(resolved)
+    legacy_resolved["loss"].pop("hrffa")
+    legacy_paths = create_run(root / "legacy-runs", source, legacy_resolved, name="legacy")
+    legacy_runtime, legacy_frozen = _load_run_config(legacy_paths)
+    assert legacy_frozen == legacy_resolved
+    assert legacy_runtime["enable_hrffa_loss"] is False
+    assert config_sha256(legacy_frozen) == json.loads(legacy_paths.metadata.read_text(encoding="utf-8"))["config_sha256"]
 
     invalid = copy.deepcopy(raw)
     invalid["train"]["unknown_field"] = True
@@ -61,6 +80,16 @@ def _check_train_config(root: Path) -> None:
         assert "unknown_field" in str(error)
     else:
         raise AssertionError("配置错误接受了未知字段")
+
+    for key, value in (("pose_weight", float("nan")), ("eye_weight", float("inf")), ("occluded_geometry_weight", float("nan"))):
+        invalid = copy.deepcopy(raw)
+        invalid["loss"]["hrffa"][key] = value
+        try:
+            resolve_train_config(invalid)
+        except ValueError as error:
+            assert "有限" in str(error)
+        else:
+            raise AssertionError(f"配置错误接受了 HRFFA 非有限数值：{key}={value}")
     print("PASS: TOML fields, canonical config persistence and unknown-field rejection")
 
 

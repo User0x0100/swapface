@@ -10,6 +10,7 @@ from .functional import (
     r1_reg_loss,
 )
 from .gaze import GazeLoss
+from .hrffa import HRFFAFacialGeometryLoss
 from .identity import IdentityLoss, IFSRLoss
 from .perceptual import (
     DINOv2PerceptualLoss,
@@ -25,6 +26,7 @@ __all__ = [
     "DiscriminatorAdversarialLoss",
     "GazeLoss",
     "GeneratorAdversarialLoss",
+    "HRFFAFacialGeometryLoss",
     "IFSRLoss",
     "IdentityLoss",
     "LabStyleLoss",

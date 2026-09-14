@@ -87,6 +87,26 @@ distribution_weight = 0.1
 confidence_weighted = true
 
 
+[loss.hrffa]
+# HRFFA vitt-256 面部几何一致性损失。
+# 约束 fake 保持增强后 dst 的头部朝向、左右眼睑开合、嘴部开合和面部外轮廓。
+# 当前处于实验阶段，默认关闭；启用前应先在实际训练数据上检查 HRFFA landmarks/visibility。
+enable = false
+
+# 以下权重分别作用于已经归一化的几何子损失；建议实验时逐项开启做 ablation。
+pose_weight = 1.0
+eye_weight = 1.0
+mouth_weight = 1.0
+contour_weight = 1.0
+
+# 相邻 contour segment 方向/长度约束相对于 contour 点坐标项的权重。
+contour_shape_weight = 0.5
+
+# target contour 被 HRFFA 标记为 OCCLUDED 时仍保留的几何权重；OUTSIDE 始终为 0。
+# pose / eye / mouth 只使用明确 VISIBLE 的 target 点。
+occluded_geometry_weight = 0.25
+
+
 [loss.vgg]
 # VGG19 感知特征损失。默认开启；配置与 2026-06-29 训练版本一致。
 # 比较 fake 与增强后的 dst，使用 L1 匹配以下冻结 VGG19 中间特征。

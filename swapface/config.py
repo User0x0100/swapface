@@ -1,5 +1,6 @@
 """训练实验配置协议：显式默认值、TOML 解析与 runtime 参数转换。"""
 
+import math
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,15 @@ DEFAULT_LOSS_CONFIG: dict[str, Any] = {
     "enable_rec_loss": True,
     "rec_loss_weight": 10.0,
     "gaze": {"enable": False, "weight": 1.0, "distribution_weight": 0.1, "confidence_weighted": True},
+    "hrffa": {
+        "enable": False,
+        "pose_weight": 1.0,
+        "eye_weight": 1.0,
+        "mouth_weight": 1.0,
+        "contour_weight": 1.0,
+        "contour_shape_weight": 0.5,
+        "occluded_geometry_weight": 0.25,
+    },
     "vgg": {"enable": True, "weights": DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT},
     "wfm": {"enable": True, "weights": DEFAULT_WFM_LOSS_WEIGHT},
 }
@@ -169,6 +179,26 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
         "confidence_weighted": bool(gaze.get("confidence_weighted", DEFAULT_LOSS_CONFIG["gaze"]["confidence_weighted"])),
     }
 
+    hrffa = loss.get("hrffa", {})
+    if not isinstance(hrffa, dict):
+        raise TypeError("[loss.hrffa] 必须为表/对象")
+    unknown_hrffa = set(hrffa) - set(DEFAULT_LOSS_CONFIG["hrffa"])
+    if unknown_hrffa:
+        raise ValueError(f"[loss.hrffa] 包含未知字段：{sorted(unknown_hrffa)}")
+    hrffa_config = {
+        key: bool(hrffa.get(key, default)) if key == "enable" else float(hrffa.get(key, default))
+        for key, default in DEFAULT_LOSS_CONFIG["hrffa"].items()
+    }
+    hrffa_numeric = {key: value for key, value in hrffa_config.items() if key != "enable"}
+    non_finite_hrffa = {key: value for key, value in hrffa_numeric.items() if not math.isfinite(value)}
+    if non_finite_hrffa:
+        raise ValueError(f"[loss.hrffa] 数值必须为有限值：{non_finite_hrffa}")
+    negative_hrffa = {key: value for key, value in hrffa_numeric.items() if value < 0.0}
+    if negative_hrffa:
+        raise ValueError(f"[loss.hrffa] 权重必须非负：{negative_hrffa}")
+    if hrffa_config["occluded_geometry_weight"] > 1.0:
+        raise ValueError(f"loss.hrffa.occluded_geometry_weight 必须位于 [0, 1]，实际为 {hrffa_config['occluded_geometry_weight']}")
+
     vgg = loss.get("vgg", {})
     if not isinstance(vgg, dict):
         raise TypeError("[loss.vgg] 必须为表/对象")
@@ -207,6 +237,7 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
             "enable_rec_loss": enable_rec_loss,
             "rec_loss_weight": rec_loss_weight,
             "gaze": gaze_config,
+            "hrffa": hrffa_config,
             "vgg": {"enable": enable_vgg, "weights": vgg_weights},
             "wfm": {"enable": enable_wfm, "weights": wfm_weights},
         },
@@ -239,6 +270,13 @@ def _runtime_train_config(resolved: dict[str, Any]) -> dict[str, Any]:
         "gaze_loss_weight": float(loss["gaze"]["weight"]),
         "gaze_distribution_weight": float(loss["gaze"]["distribution_weight"]),
         "gaze_confidence_weighted": bool(loss["gaze"]["confidence_weighted"]),
+        "enable_hrffa_loss": bool(loss["hrffa"]["enable"]),
+        "hrffa_pose_weight": float(loss["hrffa"]["pose_weight"]),
+        "hrffa_eye_weight": float(loss["hrffa"]["eye_weight"]),
+        "hrffa_mouth_weight": float(loss["hrffa"]["mouth_weight"]),
+        "hrffa_contour_weight": float(loss["hrffa"]["contour_weight"]),
+        "hrffa_contour_shape_weight": float(loss["hrffa"]["contour_shape_weight"]),
+        "hrffa_occluded_geometry_weight": float(loss["hrffa"]["occluded_geometry_weight"]),
         "enable_perceptual_loss": bool(loss["vgg"]["enable"]),
         "perceptual_loss_weight": {str(layer): float(weight) for layer, weight in loss["vgg"]["weights"].items()},
         "enable_wfm_loss": bool(loss["wfm"]["enable"]),
