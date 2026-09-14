@@ -409,7 +409,7 @@ class Trainer:
         if compile_module:
             initialize_upfirdn2d()
             self.train_g = _compile_training_callable(self.net_g)
-            self.train_d = self.net_d if torch.version.hip is not None else _compile_training_callable(self.net_d)
+            self.train_d = _compile_training_callable(self.net_d)
             self.generator_id_encoder_forward = _compile_training_callable(self.generator_id_encoder)
             self.identity_embeddings_forward = _compile_training_callable(self.id_loss.extract_identity_embeddings)
             if self.enable_gaze_loss:
@@ -420,7 +420,7 @@ class Trainer:
             if self.enable_perceptual_loss:
                 self.perceptual_loss_forward = _compile_training_callable(self.perceptual_loss)
             if self.enable_wfm_loss:
-                self.train_d_features = self.net_d.get_feats if torch.version.hip is not None else _compile_training_callable(self.net_d.get_feats)
+                self.train_d_features = _compile_training_callable(self.net_d.get_feats)
         else:
             self.train_g = self.net_g
             self.train_d = self.net_d
