@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 from losses import (
     DiscriminatorAdversarialLoss,
+    FACSConsistencyLoss,
     GazeLoss,
     GeneratorAdversarialLoss,
     HRFFAFacialGeometryLoss,
@@ -144,6 +145,15 @@ class Trainer:
         hrffa_contour_weight: float = 1.0,
         hrffa_contour_shape_weight: float = 0.5,
         hrffa_occluded_geometry_weight: float = 0.25,
+        # OpenGraphAU / FACS 表情动作一致性损失
+        enable_facs_loss: bool = False,
+        facs_loss_weight: float = 1.0,
+        facs_brow_weight: float = 1.0,
+        facs_eye_weight: float = 1.0,
+        facs_nose_weight: float = 1.0,
+        facs_mouth_weight: float = 1.0,
+        facs_lower_face_weight: float = 1.0,
+        facs_asymmetry_weight: float = 1.0,
         # VGG19 感知特征损失
         enable_perceptual_loss: bool = True,
         perceptual_loss_weight: dict[str, float] | None = None,
@@ -210,6 +220,7 @@ class Trainer:
         self.enable_rec_loss = enable_rec_loss
         self.enable_gaze_loss = enable_gaze_loss
         self.enable_hrffa_loss = enable_hrffa_loss
+        self.enable_facs_loss = enable_facs_loss
         self.enable_perceptual_loss = enable_perceptual_loss
         self.enable_wfm_loss = enable_wfm_loss
 
@@ -370,6 +381,17 @@ class Trainer:
                 contour_weight=hrffa_contour_weight,
                 contour_shape_weight=hrffa_contour_shape_weight,
                 occluded_geometry_weight=hrffa_occluded_geometry_weight,
+            ).to(self.device)
+
+        if self.enable_facs_loss:
+            self.facs_loss = FACSConsistencyLoss(
+                weight=facs_loss_weight,
+                brow_weight=facs_brow_weight,
+                eye_weight=facs_eye_weight,
+                nose_weight=facs_nose_weight,
+                mouth_weight=facs_mouth_weight,
+                lower_face_weight=facs_lower_face_weight,
+                asymmetry_weight=facs_asymmetry_weight,
             ).to(self.device)
 
         if self.enable_perceptual_loss:
@@ -699,6 +721,13 @@ class Trainer:
                         self.log(f"hrffa_{name}_loss", component)
                     g_loss = g_loss + torch.stack(tuple(hrffa_components.values())).sum()
 
+                # FACS：保持 dst 的连续 Action Unit 激活状态与左右非对称表情。
+                if self.enable_facs_loss:
+                    facs_components = self.facs_loss.forward_components(fake, dst)
+                    for name, component in facs_components.items():
+                        self.log(f"facs_{name}_loss", component)
+                    g_loss = g_loss + torch.stack(tuple(facs_components.values())).sum()
+
                 # perceptual_loss
                 if self.enable_perceptual_loss:
                     perceptual_loss = self.perceptual_loss_forward(fake, dst)
@@ -736,12 +765,12 @@ def _load_run_config(paths: RunPaths) -> tuple[dict[str, Any], dict[str, Any]]:
     resolved = load_resolved_config(paths)
     canonical = resolve_train_config(resolved)
 
-    # HRFFA loss 是 v3 resolved-config 上的向后兼容新增项。旧 run 缺少该节时仅在
-    # runtime 补默认 enable=false；冻结配置和 config_sha256 保持原样，确保 resume
-    # 继续严格对应原实验。除此之外的规范差异仍然拒绝。
+    # 新增 loss section 对旧 resolved-config 保持向后兼容：runtime 使用默认关闭，
+    # 冻结配置和 config_sha256 保持原样，确保 resume 继续严格对应原实验。
     comparable = copy.deepcopy(canonical)
-    if "hrffa" not in resolved.get("loss", {}):
-        comparable["loss"].pop("hrffa", None)
+    for section in ("hrffa", "facs"):
+        if section not in resolved.get("loss", {}):
+            comparable["loss"].pop(section, None)
     if comparable != resolved:
         raise ValueError(f"run 的 resolved config 不是当前格式的规范表示：{paths.resolved_config}")
     return _runtime_train_config(canonical), resolved

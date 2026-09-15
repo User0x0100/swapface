@@ -1,5 +1,6 @@
 from .adversarial import DiscriminatorAdversarialLoss, GeneratorAdversarialLoss
 from .color import LabStyleLoss
+from .facs import FACSConsistencyLoss
 from .functional import (
     make_bce_loss,
     make_bce_with_logits_loss,
@@ -24,6 +25,7 @@ __all__ = [
     "DINOv2PerceptualLoss",
     "DSSIMLoss",
     "DiscriminatorAdversarialLoss",
+    "FACSConsistencyLoss",
     "GazeLoss",
     "GeneratorAdversarialLoss",
     "HRFFAFacialGeometryLoss",

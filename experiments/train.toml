@@ -107,6 +107,25 @@ contour_shape_weight = 0.5
 occluded_geometry_weight = 0.25
 
 
+[loss.facs]
+# OpenGraphAU / MEFARG Stage-2 的连续 FACS Action Unit 一致性损失。
+# reference 为增强后的 dst；模型参数冻结，仅 fake 分支保留到 Generator 的梯度。
+# 当前处于实验阶段，默认关闭。
+enable = false
+
+# 总权重。区域权重全部为 1 时，总损失是 27 个主 AU + 7 个左右差异，共 34 个语义信号的 mean L1。
+weight = 1.0
+
+# 分区域权重。lower_face 包含 chin raiser / tongue show / jaw drop；
+# asymmetry 使用 14 个左右侧 AU 组成的 7 个 (L-R) 差异，不重复匹配左右绝对激活。
+brow_weight = 1.0
+eye_weight = 1.0
+nose_weight = 1.0
+mouth_weight = 1.0
+lower_face_weight = 1.0
+asymmetry_weight = 1.0
+
+
 [loss.vgg]
 # VGG19 感知特征损失。默认开启；配置与 2026-06-29 训练版本一致。
 # 比较 fake 与增强后的 dst，使用 L1 匹配以下冻结 VGG19 中间特征。

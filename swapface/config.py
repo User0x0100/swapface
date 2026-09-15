@@ -66,6 +66,16 @@ DEFAULT_LOSS_CONFIG: dict[str, Any] = {
         "contour_shape_weight": 0.5,
         "occluded_geometry_weight": 0.25,
     },
+    "facs": {
+        "enable": False,
+        "weight": 1.0,
+        "brow_weight": 1.0,
+        "eye_weight": 1.0,
+        "nose_weight": 1.0,
+        "mouth_weight": 1.0,
+        "lower_face_weight": 1.0,
+        "asymmetry_weight": 1.0,
+    },
     "vgg": {"enable": True, "weights": DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT},
     "wfm": {"enable": True, "weights": DEFAULT_WFM_LOSS_WEIGHT},
 }
@@ -199,6 +209,24 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
     if hrffa_config["occluded_geometry_weight"] > 1.0:
         raise ValueError(f"loss.hrffa.occluded_geometry_weight 必须位于 [0, 1]，实际为 {hrffa_config['occluded_geometry_weight']}")
 
+    facs = loss.get("facs", {})
+    if not isinstance(facs, dict):
+        raise TypeError("[loss.facs] 必须为表/对象")
+    unknown_facs = set(facs) - set(DEFAULT_LOSS_CONFIG["facs"])
+    if unknown_facs:
+        raise ValueError(f"[loss.facs] 包含未知字段：{sorted(unknown_facs)}")
+    facs_config = {
+        key: bool(facs.get(key, default)) if key == "enable" else float(facs.get(key, default))
+        for key, default in DEFAULT_LOSS_CONFIG["facs"].items()
+    }
+    invalid_facs = {
+        key: value
+        for key, value in facs_config.items()
+        if key != "enable" and (not math.isfinite(value) or value < 0.0)
+    }
+    if invalid_facs:
+        raise ValueError(f"[loss.facs] 权重必须为有限非负数：{invalid_facs}")
+
     vgg = loss.get("vgg", {})
     if not isinstance(vgg, dict):
         raise TypeError("[loss.vgg] 必须为表/对象")
@@ -238,6 +266,7 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
             "rec_loss_weight": rec_loss_weight,
             "gaze": gaze_config,
             "hrffa": hrffa_config,
+            "facs": facs_config,
             "vgg": {"enable": enable_vgg, "weights": vgg_weights},
             "wfm": {"enable": enable_wfm, "weights": wfm_weights},
         },
@@ -277,6 +306,14 @@ def _runtime_train_config(resolved: dict[str, Any]) -> dict[str, Any]:
         "hrffa_contour_weight": float(loss["hrffa"]["contour_weight"]),
         "hrffa_contour_shape_weight": float(loss["hrffa"]["contour_shape_weight"]),
         "hrffa_occluded_geometry_weight": float(loss["hrffa"]["occluded_geometry_weight"]),
+        "enable_facs_loss": bool(loss["facs"]["enable"]),
+        "facs_loss_weight": float(loss["facs"]["weight"]),
+        "facs_brow_weight": float(loss["facs"]["brow_weight"]),
+        "facs_eye_weight": float(loss["facs"]["eye_weight"]),
+        "facs_nose_weight": float(loss["facs"]["nose_weight"]),
+        "facs_mouth_weight": float(loss["facs"]["mouth_weight"]),
+        "facs_lower_face_weight": float(loss["facs"]["lower_face_weight"]),
+        "facs_asymmetry_weight": float(loss["facs"]["asymmetry_weight"]),
         "enable_perceptual_loss": bool(loss["vgg"]["enable"]),
         "perceptual_loss_weight": {str(layer): float(weight) for layer, weight in loss["vgg"]["weights"].items()},
         "enable_wfm_loss": bool(loss["wfm"]["enable"]),

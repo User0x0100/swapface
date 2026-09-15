@@ -27,6 +27,7 @@ def _check_train_config(root: Path) -> None:
         '[dataloader]\nrotation_range = [-3, 3]\n'
         '[loss.gaze]\nenable = true\nweight = 0.75\ndistribution_weight = 0.2\nconfidence_weighted = false\n'
         '[loss.hrffa]\nenable = true\npose_weight = 0.5\neye_weight = 1.25\nmouth_weight = 1.5\ncontour_weight = 2.0\ncontour_shape_weight = 0.4\noccluded_geometry_weight = 0.1\n'
+        '[loss.facs]\nenable = true\nweight = 0.8\nbrow_weight = 1.1\neye_weight = 1.2\nnose_weight = 0.9\nmouth_weight = 1.3\nlower_face_weight = 0.7\nasymmetry_weight = 1.4\n'
         '[loss.wfm.weights]\n2 = 0.25\n'
         '[[src]]\npath = "source"\nadjustment = 1\n'
         '[[dst]]\npath = "target"\nadjustment = -1\n',
@@ -55,6 +56,16 @@ def _check_train_config(root: Path) -> None:
         "contour_shape_weight": 0.4,
         "occluded_geometry_weight": 0.1,
     }
+    assert resolved["loss"]["facs"] == {
+        "enable": True,
+        "weight": 0.8,
+        "brow_weight": 1.1,
+        "eye_weight": 1.2,
+        "nose_weight": 0.9,
+        "mouth_weight": 1.3,
+        "lower_face_weight": 0.7,
+        "asymmetry_weight": 1.4,
+    }
     assert resolved["loss"]["wfm"]["weights"] == {"2": 0.25}
     assert resolved["src"][0]["adjustment"] == 1 and resolved["dst"][0]["adjustment"] == -1
 
@@ -63,13 +74,15 @@ def _check_train_config(root: Path) -> None:
     metadata = json.loads(paths.metadata.read_text(encoding="utf-8"))
     assert metadata["config_sha256"] == config_sha256(resolved)
 
-    # 旧 v3 run 没有 loss.hrffa；resume 时仅 runtime 补 enable=false，冻结配置/hash 不变。
+    # 旧 v3 run 没有后续新增的 loss section；resume 时仅 runtime 补 enable=false。
     legacy_resolved = copy.deepcopy(resolved)
     legacy_resolved["loss"].pop("hrffa")
+    legacy_resolved["loss"].pop("facs")
     legacy_paths = create_run(root / "legacy-runs", source, legacy_resolved, name="legacy")
     legacy_runtime, legacy_frozen = _load_run_config(legacy_paths)
     assert legacy_frozen == legacy_resolved
     assert legacy_runtime["enable_hrffa_loss"] is False
+    assert legacy_runtime["enable_facs_loss"] is False
     assert config_sha256(legacy_frozen) == json.loads(legacy_paths.metadata.read_text(encoding="utf-8"))["config_sha256"]
 
     invalid = copy.deepcopy(raw)
