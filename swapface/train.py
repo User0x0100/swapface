@@ -439,6 +439,9 @@ class Trainer:
             if self.enable_hrffa_loss:
                 # 只编译 HRFFA 的神经网络主体；输入/visibility 与 FP32 几何求解保持 eager。
                 self.hrffa_loss.hrffa.network = _compile_training_callable(self.hrffa_loss.hrffa.network)
+            if self.enable_facs_loss:
+                # 编译冻结的 OpenGraphAU teacher；FACS 分组与损失归约保持 eager。
+                self.facs_loss.au_model = _compile_training_callable(self.facs_loss.au_model)
             if self.enable_perceptual_loss:
                 self.perceptual_loss_forward = _compile_training_callable(self.perceptual_loss)
             if self.enable_wfm_loss:
