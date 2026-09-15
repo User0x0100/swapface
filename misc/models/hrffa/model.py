@@ -289,13 +289,9 @@ class HRFFALandmarkModel(nn.Module):
             x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False, antialias=True)
         return x, height
 
-    def forward(self, images: Tensor, return_visibility: bool = False) -> Tensor | tuple[Tensor, Tensor]:
-        """Predict pixel-space landmarks for square whole-head crops."""
+    def forward(self, images: Tensor) -> tuple[Tensor, Tensor]:
+        """返回输入尺寸下的关键点坐标与 visibility logits。"""
         x, original_size = self._prepare_input(images)
         normalized_points, visibility_logits = self.network(x, self.scheme)
         landmarks = normalized_points * float(original_size)
-
-        if return_visibility:
-            visibility = visibility_logits.argmax(dim=-1)
-            return landmarks, visibility
-        return landmarks
+        return landmarks, visibility_logits

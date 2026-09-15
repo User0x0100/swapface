@@ -102,8 +102,8 @@ contour_weight = 1.0
 # 相邻 contour segment 方向/长度约束相对于 contour 点坐标项的权重。
 contour_shape_weight = 0.5
 
-# target contour 被 HRFFA 标记为 OCCLUDED 时仍保留的几何权重；OUTSIDE 始终为 0。
-# pose / eye / mouth 只使用明确 VISIBLE 的 target 点。
+# pose / contour 使用 reference 的连续 visibility 概率：P(VISIBLE) + 此权重 * P(OCCLUDED)。
+# eye / mouth 仅使用 P(VISIBLE)，避免把不可见五官的推断坐标当作动作真值。
 occluded_geometry_weight = 0.25
 
 
