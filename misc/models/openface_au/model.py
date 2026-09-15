@@ -336,7 +336,10 @@ class OpenFaceAU(nn.Module):
             case ImageInputRange.MINUS_ONE_TO_ONE:
                 x = x.add(1.0).mul(0.5)
 
-        if x.shape[-2:] != (self.INPUT_SIZE, self.INPUT_SIZE):
+        if x.shape[-2:] == (256, 256):
+            offset = (256 - self.INPUT_SIZE) // 2
+            x = x[:, :, offset : offset + self.INPUT_SIZE, offset : offset + self.INPUT_SIZE]
+        elif x.shape[-2:] != (self.INPUT_SIZE, self.INPUT_SIZE):
             x = F.interpolate(x, size=(self.INPUT_SIZE, self.INPUT_SIZE), mode="bilinear", align_corners=False, antialias=True)
         return (x - self.get_buffer("image_mean")) / self.get_buffer("image_std")
 
