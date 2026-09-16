@@ -710,23 +710,30 @@ class Trainer:
                 self.log("id_loss", id_loss)
                 g_loss = g_loss + id_loss
 
-                # gaze_loss：生成结果保持增强后 dst 的视线方向。
+                # Gaze / HRFFA / FACS 依赖真实面部几何与表情状态，先恢复到增强前的 canonical 坐标系。
+                if self.enable_gaze_loss or self.enable_hrffa_loss or self.enable_facs_loss:
+                    with autocast(device_type="cuda", enabled=False):
+                        restore_grid = NF.affine_grid(theta_restore.float(), size=list(fake.shape), align_corners=False)
+                        fake_restored = NF.grid_sample(fake.float(), restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+                        dst_restored = NF.grid_sample(dst.float(), restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+
+                # gaze_loss：生成结果保持 canonical dst 的视线方向。
                 if self.enable_gaze_loss:
-                    gaze_loss = self.gaze_loss_forward(fake, dst)
+                    gaze_loss = self.gaze_loss_forward(fake_restored, dst_restored)
                     self.log("gaze_loss", gaze_loss)
                     g_loss = g_loss + gaze_loss
 
                 # HRFFA：姿态、眼睑、嘴部开合和 target 外轮廓。
                 # compile_module 仅编译 HRFFA 神经网络主体；FP32 几何求解保持 eager。
                 if self.enable_hrffa_loss:
-                    hrffa_components = self.hrffa_loss.forward_components(fake, dst)
+                    hrffa_components = self.hrffa_loss.forward_components(fake_restored, dst_restored)
                     for name, component in hrffa_components.items():
                         self.log(f"hrffa_{name}_loss", component)
                     g_loss = g_loss + torch.stack(tuple(hrffa_components.values())).sum()
 
-                # FACS：保持 dst 的连续 Action Unit 激活状态与左右非对称表情。
+                # FACS：保持 canonical dst 的连续 Action Unit 激活状态与左右非对称表情。
                 if self.enable_facs_loss:
-                    facs_components = self.facs_loss.forward_components(fake, dst)
+                    facs_components = self.facs_loss.forward_components(fake_restored, dst_restored)
                     for name, component in facs_components.items():
                         self.log(f"facs_{name}_loss", component)
                     g_loss = g_loss + torch.stack(tuple(facs_components.values())).sum()

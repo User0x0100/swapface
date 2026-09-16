@@ -74,7 +74,7 @@ rec_loss_weight = 8.0
 
 
 [loss.gaze]
-# L2CS-Net gaze consistency loss：约束 fake 保持增强后 dst 的视线方向。
+# L2CS-Net gaze consistency loss：restore 后约束 fake 保持 canonical dst 的视线方向。
 enable = true
 
 # Gaze Loss 总权重。
@@ -89,7 +89,7 @@ confidence_weighted = true
 
 [loss.hrffa]
 # HRFFA vitt-256 面部几何一致性损失。
-# 约束 fake 保持增强后 dst 的头部朝向、左右眼睑开合、嘴部开合和面部外轮廓。
+# restore 后约束 fake 保持 canonical dst 的头部朝向、左右眼睑开合、嘴部开合和面部外轮廓。
 # 当前处于实验阶段，默认关闭；启用前应先在实际训练数据上检查 HRFFA landmarks/visibility。
 enable = false
 
@@ -109,7 +109,7 @@ occluded_geometry_weight = 0.25
 
 [loss.facs]
 # OpenGraphAU / MEFARG Stage-2 的连续 FACS Action Unit 一致性损失。
-# reference 为增强后的 dst；模型参数冻结，仅 fake 分支保留到 Generator 的梯度。
+# reference 为 restore 后的 canonical dst；模型参数冻结，仅 fake 分支保留到 Generator 的梯度。
 # 当前处于实验阶段，默认关闭。
 enable = false
 
