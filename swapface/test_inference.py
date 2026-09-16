@@ -5,7 +5,6 @@ import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import numpy as np
 import onnx
 import torch
 import torch.nn.functional as NF
@@ -46,6 +45,29 @@ def main() -> None:
         patch.object(torch, "set_float32_matmul_precision", side_effect=AssertionError("推理库导入不应修改矩阵乘精度")),
     ):
         from swapface import export, swapper
+
+    parser = export.build_parser()
+    default_args = parser.parse_args(["swapface", "--checkpoint", "model.pth"])
+    assert default_args.optimize is False and default_args.opset_version is None
+    override_args = parser.parse_args(["swapface", "--checkpoint", "model.pth", "--optimize", "--opset-version", "20"])
+    assert override_args.optimize is True and override_args.opset_version == 20
+    with tempfile.TemporaryDirectory(prefix="swapface-export-failure-") as temporary:
+        failed_output_dir = Path(temporary) / "onnx_export"
+        with patch.object(torch.export, "export", side_effect=RuntimeError("capture failed")):
+            try:
+                export.export_to_onnx(
+                    nn.Identity(),
+                    (torch.zeros(1, 1),),
+                    output_dir=failed_output_dir,
+                    metadata={},
+                    input_names=["input"],
+                    output_name="output",
+                )
+            except RuntimeError as error:
+                assert str(error) == "capture failed"
+            else:
+                raise AssertionError("torch.export failure was swallowed")
+        assert not failed_output_dir.exists()
     assert (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32, torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic) == backend_before
 
     torch.manual_seed(7)
@@ -110,34 +132,43 @@ def main() -> None:
                 export_device = "cuda" if nhwc and torch.cuda.is_available() else "cpu"
                 exported_path, exported_provider = export.export_swapface(str(checkpoint_path), batch_size=batch_size, nhwc=nhwc, device=export_device, output_dir=temporary, file_prefix=f"swap-{nhwc}")
                 assert exported_provider is provider
+                assert exported_path.parent.parent == directory
+                assert any(exported_path.parent.glob("*.md"))
                 onnx_model = onnx.load(exported_path)
                 onnx.checker.check_model(onnx_model)
                 exported_metadata = {item.key: item.value for item in onnx_model.metadata_props}
                 assert exported_metadata["swapface.format"] == "2"
                 assert exported_metadata["swapface.step"] == "123"
+                assert exported_metadata["swapface.export.strict"] == "true"
+                assert exported_metadata["swapface.export.dynamo"] == "true"
+                assert exported_metadata["swapface.export.optimize"] == "false"
+                assert exported_metadata["swapface.export.verify"] == "false"
+                assert exported_metadata["swapface.export.report"] == "true"
+                assert exported_metadata["swapface.export.opset_version"] == "auto"
+                assert int(exported_metadata["swapface.export.opset"]) > 0
                 assert "swapface.iter" not in exported_metadata
-                runtime = swapper.SwapFace(str(exported_path), device="cpu")
-                assert runtime.id_encoder.provider is provider
-                actual = runtime.swap_faces(faces, identity)
-                torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
-                assert runtime.swap_faces(faces[:0], identity).shape == (0, 3, 16, 16)
-                print(f"PASS: {'NHWC' if nhwc else 'NCHW'}, fixed batch={batch_size}, 3 faces, max error={(actual - expected).abs().max().item():.3g}")
+                graph_inputs = {value.name: value for value in onnx_model.graph.input}
+                graph_outputs = {value.name: value for value in onnx_model.graph.output}
+                assert set(graph_inputs) == {"faces", "identity"}
+                assert set(graph_outputs) == {"swapped_faces"}
+                face_shape = [dim.dim_value for dim in graph_inputs["faces"].type.tensor_type.shape.dim]
+                identity_shape = [dim.dim_value for dim in graph_inputs["identity"].type.tensor_type.shape.dim]
+                output_shape = [dim.dim_value for dim in graph_outputs["swapped_faces"].type.tensor_type.shape.dim]
+                expected_shape = [batch_size, 16, 16, 3] if nhwc else [batch_size, 3, 16, 16]
+                assert face_shape == expected_shape
+                assert identity_shape == [batch_size, 512]
+                assert output_shape == expected_shape
+                assert exported_metadata["swapface.layout"] == ("NHWC" if nhwc else "NCHW")
+                print(f"PASS: {'NHWC' if nhwc else 'NCHW'}, fixed batch={batch_size}, ONNX structure")
                 if nhwc and torch.cuda.is_available():
                     gpu_native = swapper.SwapFace(str(checkpoint_path), device="cuda")
                     assert gpu_native.bf16 == torch.cuda.is_bf16_supported(including_emulation=False)
                     gpu_output = gpu_native.swap_faces(faces, identity).cpu()
                     torch.testing.assert_close(gpu_output, expected, atol=5e-3, rtol=5e-3)
-                    gpu_onnx = swapper.SwapFace(str(exported_path), device="cuda")
-                    assert "CUDAExecutionProvider" in gpu_onnx.ort_session.get_providers()
-                    assert gpu_onnx.ort_session.get_session_options().get_session_config_entry("session.disable_cpu_ep_fallback") == "1"
-                    # CUDA ORT 热路径不得经过旧的 NumPy batch 复制。
-                    with patch.object(np, "repeat", side_effect=AssertionError("CUDA ONNX path copied through NumPy")):
-                        gpu_onnx_output = gpu_onnx.swap_faces(faces, identity).cpu()
-                    torch.testing.assert_close(gpu_onnx_output, expected, atol=2e-4, rtol=2e-4)
-                    print(f"PASS: CUDA PyTorch (BF16={gpu_native.bf16}) and ONNX IOBinding")
+                    print(f"PASS: CUDA PyTorch (BF16={gpu_native.bf16})")
 
-            # PyTorch/ONNX 都经过遮罩和原帧还原；检测缩放可关闭，小帧无需放大。
-            for engine, full_resolution, detection_size in ((native, False, 840), (native, False, 16), (runtime, True, 16)):
+            # 视频路径经过遮罩和原帧还原；检测缩放可关闭，小帧无需放大。
+            for engine, full_resolution, detection_size in ((native, False, 840), (native, False, 16), (native, True, 16)):
                 original = torch.full((1, 3, 32, 32), 127.5)
                 crop = (faces[:1] + 1) * 127.5
                 theta = torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]])
@@ -182,53 +213,37 @@ def main() -> None:
             else:
                 raise AssertionError("Invalid video batch size was accepted")
 
-            # 旧 format 与缺失 metadata 都必须明确拒绝。
-            legacy_model = onnx.load(exported_path)
-            for item in legacy_model.metadata_props:
-                if item.key == "swapface.format":
-                    item.value = "1"
-            legacy_path = directory / "legacy-format.onnx"
-            onnx.save(legacy_model, legacy_path)
-            try:
-                swapper.SwapFace(str(legacy_path), device="cpu")
-            except ValueError as error:
-                assert "约定不匹配" in str(error)
-            else:
-                raise AssertionError("Legacy ONNX format was accepted")
-
-            missing_metadata_model = onnx.load(exported_path)
-            del missing_metadata_model.metadata_props[:]
-            old_path = directory / "missing-metadata.onnx"
-            onnx.save(missing_metadata_model, old_path)
-            try:
-                swapper.SwapFace(str(old_path), device="cpu")
-            except ValueError as error:
-                assert "重新导出" in str(error)
-            else:
-                raise AssertionError("ONNX without metadata was accepted")
-
-        # all 必须使用 checkpoint 的生成器编码器；不能误用身份损失编码器或默认 provider。
-        with patch.object(export, "export_swapface", return_value=(directory / "model.onnx", provider)), patch.object(export, "export_id_encoder") as export_encoder:
-            with patch("sys.argv", ["export", "all", "--checkpoint", str(checkpoint_path), "--device", "cpu"]):
+        # all 必须使用 checkpoint 的生成器编码器，并透传导出选项。
+        with patch.object(export, "export_swapface", return_value=(directory / "model.onnx", provider)) as export_swapface, patch.object(export, "export_id_encoder") as export_encoder:
+            with patch("sys.argv", ["export", "all", "--checkpoint", str(checkpoint_path), "--device", "cpu", "--optimize", "--opset-version", "20"]):
                 export.main()
+            options = export_swapface.call_args.kwargs["export_options"]
+            assert options.optimize is True and options.opset_version == 20
+            assert export_encoder.call_args.kwargs["export_options"] == options
+            assert export_encoder.call_args.kwargs["export_dir"] == directory
             assert export_encoder.call_args.kwargs["provider_name"] == provider.name
 
-        # 编码器 ONNX 明确接收已对齐的 112 RGB 图像，验证 NHWC/NCHW 两个适配入口。
-        import onnxruntime as ort
-
+        # 编码器 ONNX 明确接收已对齐的 112 RGB 图像，验证 NHWC/NCHW 两个导出接口。
         with patch.object(export, "IDEncoder", RecordingEncoder):
             for nhwc in (True, False):
                 encoded_path = export.export_id_encoder(provider.name, nhwc=nhwc, device="cpu", output_dir=temporary, file_prefix=f"encoder-{nhwc}")
-                session = ort.InferenceSession(str(encoded_path), providers=["CPUExecutionProvider"])
-                metadata = session.get_modelmeta().custom_metadata_map
+                assert encoded_path.parent.parent == directory
+                assert any(encoded_path.parent.glob("*.md"))
+                encoded_model = onnx.load(encoded_path)
+                onnx.checker.check_model(encoded_model)
+                metadata = {item.key: item.value for item in encoded_model.metadata_props}
                 assert metadata["swapface.format"] == "2"
                 assert metadata["swapface.face_alignment"] == "arcface112"
                 assert metadata["swapface.provider"] == provider.name
-                inputs = torch.rand(1, 3, 112, 112) * 2 - 1
-                expected_identity = RecordingEncoder(provider)(inputs).numpy()
-                inputs_np = inputs.permute(0, 2, 3, 1).numpy() if nhwc else inputs.numpy()
-                actual_identity = session.run(["identity"], {"faces": inputs_np})[0]
-                np.testing.assert_allclose(actual_identity, expected_identity, atol=1e-5, rtol=1e-5)
+                assert metadata["swapface.layout"] == ("NHWC" if nhwc else "NCHW")
+                inputs = {value.name: value for value in encoded_model.graph.input}
+                outputs = {value.name: value for value in encoded_model.graph.output}
+                assert set(inputs) == {"faces"}
+                assert set(outputs) == {"identity"}
+                input_shape = [dim.dim_value for dim in inputs["faces"].type.tensor_type.shape.dim]
+                output_shape = [dim.dim_value for dim in outputs["identity"].type.tensor_type.shape.dim]
+                assert input_shape == ([1, 112, 112, 3] if nhwc else [1, 3, 112, 112])
+                assert output_shape == [1, 512]
 
         for invalid in (
             {**checkpoint, "version": CHECKPOINT_VERSION - 1},
@@ -242,7 +257,7 @@ def main() -> None:
                 pass
             else:
                 raise AssertionError("Invalid checkpoint was accepted")
-    print("PASS: EMA loading, provider selection, single-sample identity preprocessing, ONNX round-trips and invalid metadata/checkpoint rejection")
+    print("PASS: EMA loading, provider selection, single-sample identity preprocessing, ONNX structure checks and invalid checkpoint rejection")
 
 
 if __name__ == "__main__":

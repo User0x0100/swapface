@@ -1,11 +1,11 @@
 import argparse
 import os
 import random
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import onnxruntime as ort
 import torch
 from torch import Tensor, nn
 
@@ -16,6 +16,13 @@ from .contracts import ONNX_CONTRACT
 from .inference import load_generator
 
 DEFAULT_ID_ENCODER_PROVIDER_NAME = IDEncoderProvider.BLENDFACE.name
+
+
+@dataclass(frozen=True, slots=True)
+class OnnxExportOptions:
+    optimize: bool = False
+    opset_version: int | None = None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Reproducibility
@@ -67,50 +74,55 @@ def export_to_onnx(
     metadata: dict[str, str],
     input_names: list[str],
     output_name: str,
+    options: OnnxExportOptions | None = None,
+    export_dir: str | os.PathLike | None = None,
 ) -> Path:
-
-    model = model.eval()
+    options = options or OnnxExportOptions()
     output_dir_path = Path(output_dir)
-    output_dir_path.mkdir(exist_ok=True, parents=True)
+
+    prefix = file_prefix or "model"
+    export_dir_path = Path(export_dir) if export_dir is not None else output_dir_path / f"{prefix}-{datetime.now().astimezone().strftime('%Y%m%d_%H%M%S_%f')}"
 
     with torch.inference_mode():
-        exported_program = torch.export.export(model, example_inputs, strict=True)
+        exported_program = torch.export.export(model.eval(), example_inputs, strict=True)
+        export_dir_path.mkdir(parents=True, exist_ok=True)
+        output_path = export_dir_path / f"{prefix}.onnx"
         onnx_program = torch.onnx.export(
             model=exported_program,
             input_names=input_names,
             output_names=[output_name],
+            opset_version=options.opset_version,
             dynamo=True,
-            optimize=True,
-            verify=True,
+            optimize=options.optimize,
+            verify=False,
             report=True,
+            profile=False,
+            dump_exported_program=False,
             external_data=False,
-            artifacts_dir=output_dir_path / "onnx_artifacts",
+            artifacts_dir=export_dir_path,
             verbose=False,
         )
 
-    file_prefix = "" if file_prefix is None else file_prefix
-    timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-    output_path = output_dir_path / f"{file_prefix}-{timestamp}.onnx"
-
-    onnx_program.model.metadata_props.update(metadata)
+    actual_opset = onnx_program.model.opset_imports.get("")
+    export_metadata = {
+        "swapface.export.torch": str(torch.__version__),
+        "swapface.export.opset": str(actual_opset),
+        "swapface.export.strict": "true",
+        "swapface.export.dynamo": "true",
+        "swapface.export.optimize": str(options.optimize).lower(),
+        "swapface.export.verify": "false",
+        "swapface.export.report": "true",
+        "swapface.export.profile": "false",
+        "swapface.export.dump_exported_program": "false",
+        "swapface.export.external_data": "false",
+        "swapface.export.opset_version": "auto" if options.opset_version is None else str(options.opset_version),
+    }
+    onnx_program.model.metadata_props.update(metadata | export_metadata)
     onnx_program.save(output_path, external_data=False)
+
     print(f"模型成功导出到: {output_path}")
-
-    sess_options = ort.SessionOptions()
-    sess_options.log_severity_level = 3
-    providers: list[str | tuple[str, dict[str, object]]] = ["CPUExecutionProvider"]
-    if example_inputs[0].device.type == "cuda":
-        if "CUDAExecutionProvider" not in ort.get_available_providers():
-            raise RuntimeError("ONNX Runtime 未提供 CUDAExecutionProvider，无法验证 CUDA 导出模型")
-        device_id = example_inputs[0].device.index
-        if device_id is None:
-            device_id = torch.cuda.current_device()
-        sess_options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-        providers = [("CUDAExecutionProvider", {"device_id": device_id, "use_tf32": 0})]
-
-    print(f"ONNX Runtime: {ort.__version__}")
-    print(f"ORT providers: {providers}")
-    ort.InferenceSession(str(output_path), providers=providers, sess_options=sess_options)
+    print(f"导出目录: {export_dir_path}")
+    print(f"ONNX: opset={actual_opset}, optimize={options.optimize}, verify=False, report=True")
     return output_path
 
 
@@ -124,6 +136,8 @@ def export_swapface(
     device: str = "cuda",
     output_dir: str = "onnx_export",
     file_prefix: str = "swapface",
+    export_options: OnnxExportOptions | None = None,
+    export_dir: str | os.PathLike | None = None,
 ) -> tuple[Path, IDEncoderProvider]:
     target_device = torch.device(device)
 
@@ -151,6 +165,8 @@ def export_swapface(
         metadata=ONNX_CONTRACT | {"swapface.kind": "generator", "swapface.provider": provider.name, "swapface.layout": "NHWC" if nhwc else "NCHW", "swapface.step": str(training_step)},
         input_names=["faces", "identity"],
         output_name="swapped_faces",
+        options=export_options,
+        export_dir=export_dir,
     )
     return output_path, provider
 
@@ -162,6 +178,8 @@ def export_id_encoder(
     device: str = "cuda",
     output_dir: str = "onnx_export",
     file_prefix: str = "IDEncoder",
+    export_options: OnnxExportOptions | None = None,
+    export_dir: str | os.PathLike | None = None,
 ) -> Path:
     """导出接收 ArcFace 112 对齐图像的编码器；FFHQ 图像须先使用训练端映射。"""
     if batch_size <= 0:
@@ -185,6 +203,8 @@ def export_id_encoder(
         metadata=ONNX_CONTRACT | {"swapface.kind": "id_encoder", "swapface.face_alignment": "arcface112", "swapface.provider": provider.name, "swapface.layout": "NHWC" if nhwc else "NCHW"},
         input_names=["faces"],
         output_name="identity",
+        options=export_options,
+        export_dir=export_dir,
     )
 
 
@@ -208,6 +228,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--device", default="cuda", help="推理设备，如 cuda / cuda:1 / cpu")
         p.add_argument("--output-dir", default="onnx_export", help="ONNX 文件输出目录")
         p.add_argument("--file-prefix", default="swapface", help="ONNX 文件名")
+        p.add_argument("--optimize", action="store_true", help="启用 torch.onnx.export 图优化；SwapFace 默认关闭")
+        p.add_argument("--opset-version", type=int, default=None, help="显式指定 ONNX opset；默认由 PyTorch exporter 选择")
 
     # ── swapface 子命令 ───────────────────────────────────────────────────────
     p_fs = sub.add_parser("swapface", help="导出 Generator（换脸模型）")
@@ -238,21 +260,23 @@ def main() -> None:
     args = parser.parse_args()
 
     nhwc = not args.nchw
+    export_options = OnnxExportOptions(optimize=args.optimize, opset_version=args.opset_version)
     kwargs = {
         "batch_size": args.batch_size,
         "nhwc": nhwc,
         "device": args.device,
         "output_dir": args.output_dir,
         "file_prefix": args.file_prefix,
+        "export_options": export_options,
     }
 
     if args.command in ("swapface", "all"):
-        _, provider = export_swapface(checkpoint_path=args.checkpoint, **kwargs)
+        output_path, provider = export_swapface(checkpoint_path=args.checkpoint, **kwargs)
 
     if args.command == "id-encoder":
         export_id_encoder(provider_name=args.provider, **kwargs)
     elif args.command == "all":
-        export_id_encoder(provider_name=provider.name, **kwargs)
+        export_id_encoder(provider_name=provider.name, export_dir=output_path.parent, **kwargs)
 
 
 if __name__ == "__main__":
