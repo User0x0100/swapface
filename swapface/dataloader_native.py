@@ -204,7 +204,7 @@ class _NativeTrainingDataLoader:
         print(f"PyTorch 数据管线：CPU Pillow/Lanczos 解码缩放，workers={py_num_workers}, prefetch_factor={reader_prefetch_queue_depth}；批量增强在 {device} 执行")
 
     @torch.no_grad()
-    def next(self) -> tuple[Tensor, Tensor, Tensor]:
+    def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         src, dst = next(self.iterator)
         src = src.to(device=self.device, dtype=torch.float32, non_blocking=True)
         dst = dst.to(device=self.device, dtype=torch.float32, non_blocking=True)
@@ -217,6 +217,8 @@ class _NativeTrainingDataLoader:
             dst = torch.where(dst_flip, dst.flip(-1), dst)
 
         dst = _color_twist(dst, self.brightness, self.contrast, self.saturation)
+        # semantic losses 使用与训练目标相同 flip/color、但尚未做几何仿射的 canonical reference。
+        dst_canonical = dst
         theta_augment, theta_restore = make_affine_thetas(
             batch_size,
             self.img_resolution,
@@ -231,4 +233,5 @@ class _NativeTrainingDataLoader:
 
         src = src.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
         dst = dst.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
-        return src, dst, theta_restore
+        dst_canonical = dst_canonical.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
+        return src, dst, dst_canonical, theta_restore

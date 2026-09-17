@@ -496,7 +496,7 @@ class Trainer:
             self.log_writer.add_scalar(f"Loss/{key}", value, self.completed_step)
 
     @torch.no_grad()
-    def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor]:
+    def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         return self.dataset.next()
 
     def prepare_identity_encoder_faces(self, faces: Tensor, theta_restore: Tensor | None = None) -> Tensor:
@@ -575,17 +575,16 @@ class Trainer:
 
         return h
 
-    def _save_sample(self, sample_batch: tuple[Tensor, Tensor, Tensor], current_batch: tuple[Tensor, Tensor, Tensor]) -> None:
-        sample_src, sample_dst, sample_theta_restore = sample_batch
-        src, dst, theta_restore = current_batch
+    def _save_sample(self, sample_batch: tuple[Tensor, Tensor, Tensor, Tensor], current_batch: tuple[Tensor, Tensor, Tensor, Tensor]) -> None:
+        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore = sample_batch
+        src, dst, dst_canonical, theta_restore = current_batch
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
             half = self.batch_size // 2
             src_vis = torch.cat((sample_src[:half], src[: self.batch_size - half]), dim=0)
             dst_vis = torch.cat((sample_dst[:half], dst[: self.batch_size - half]), dim=0)
 
+            dst_canonical_vis = torch.cat((sample_dst_canonical[:half], dst_canonical[: self.batch_size - half]), dim=0)
             theta_restore_vis = torch.cat((sample_theta_restore[:half], theta_restore[: self.batch_size - half]), dim=0)
-            grid_vis = NF.affine_grid(theta_restore_vis, size=list(dst_vis.shape), align_corners=False)
-            dst_restored_vis = NF.grid_sample(dst_vis, grid_vis, mode="bilinear", padding_mode="reflection", align_corners=False)
 
             source_identity_faces_vis = self.prepare_identity_encoder_faces(src_vis)
             generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
@@ -597,7 +596,7 @@ class Trainer:
             identity_encoder_input_vis = self.prepare_identity_encoder_faces(fake_vis, theta_restore_vis)
             identity_encoder_input_display_vis = NF.interpolate(identity_encoder_input_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
 
-            grid = [src_vis, dst_vis, fake_vis, dst_restored_vis, identity_encoder_input_display_vis]
+            grid = [src_vis, dst_vis, fake_vis, dst_canonical_vis, identity_encoder_input_display_vis]
 
             # ========================= GAN 损失梯度图 =========================
             fake_for_gan_grad = fake_vis.detach().requires_grad_(True)
@@ -634,7 +633,7 @@ class Trainer:
             if self._stop_requested:
                 raise KeyboardInterrupt
 
-            src, dst, theta_restore = self.fetch_sample()
+            src, dst, dst_canonical, theta_restore = self.fetch_sample()
             self._step_in_progress = True
 
             # ========================= 生成器前向 =========================
@@ -710,30 +709,29 @@ class Trainer:
                 self.log("id_loss", id_loss)
                 g_loss = g_loss + id_loss
 
-                # Gaze / HRFFA / FACS 依赖真实面部几何与表情状态，先恢复到增强前的 canonical 坐标系。
+                # Gaze / HRFFA / FACS：只将 fake 恢复到 canonical 坐标系，reference 直接使用 dst_canonical。
                 if self.enable_gaze_loss or self.enable_hrffa_loss or self.enable_facs_loss:
                     with autocast(device_type="cuda", enabled=False):
                         restore_grid = NF.affine_grid(theta_restore.float(), size=list(fake.shape), align_corners=False)
                         fake_restored = NF.grid_sample(fake.float(), restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
-                        dst_restored = NF.grid_sample(dst.float(), restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
 
                 # gaze_loss：生成结果保持 canonical dst 的视线方向。
                 if self.enable_gaze_loss:
-                    gaze_loss = self.gaze_loss_forward(fake_restored, dst_restored)
+                    gaze_loss = self.gaze_loss_forward(fake_restored, dst_canonical)
                     self.log("gaze_loss", gaze_loss)
                     g_loss = g_loss + gaze_loss
 
                 # HRFFA：姿态、眼睑、嘴部开合和 target 外轮廓。
                 # compile_module 仅编译 HRFFA 神经网络主体；FP32 几何求解保持 eager。
                 if self.enable_hrffa_loss:
-                    hrffa_components = self.hrffa_loss.forward_components(fake_restored, dst_restored)
+                    hrffa_components = self.hrffa_loss.forward_components(fake_restored, dst_canonical)
                     for name, component in hrffa_components.items():
                         self.log(f"hrffa_{name}_loss", component)
                     g_loss = g_loss + torch.stack(tuple(hrffa_components.values())).sum()
 
                 # FACS：保持 canonical dst 的连续 Action Unit 激活状态与左右非对称表情。
                 if self.enable_facs_loss:
-                    facs_components = self.facs_loss.forward_components(fake_restored, dst_restored)
+                    facs_components = self.facs_loss.forward_components(fake_restored, dst_canonical)
                     for name, component in facs_components.items():
                         self.log(f"facs_{name}_loss", component)
                     g_loss = g_loss + torch.stack(tuple(facs_components.values())).sum()
@@ -768,7 +766,7 @@ class Trainer:
                 self.save_ckpt()
 
             if self.completed_step % self.sample_save_every == 0:
-                self._save_sample(sample_batch, (src, dst, theta_restore))
+                self._save_sample(sample_batch, (src, dst, dst_canonical, theta_restore))
 
 
 def _load_run_config(paths: RunPaths) -> tuple[dict[str, Any], dict[str, Any]]:

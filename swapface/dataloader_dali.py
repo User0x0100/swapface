@@ -3,9 +3,10 @@
 数据流:
     1. ``src`` 与 ``dst`` 从两个独立图片池随机采样编码图像。
     2. DALI 解码后在 GPU 上执行 resize 与随机水平翻转。
-    3. ``dst`` 额外执行亮度、对比度、饱和度和随机仿射增强。
-    4. 图像统一归一化到 ``[-1, 1]`` 并转换为 NCHW。
-    5. 同时返回 ``theta_restore``，供 PyTorch ``affine_grid``/``grid_sample``
+    3. ``dst`` 额外执行亮度、对比度、饱和度增强，并保留几何增强前的 ``dst_canonical``。
+    4. ``dst`` 再执行随机仿射增强。
+    5. 图像统一归一化到 ``[-1, 1]`` 并转换为 NCHW。
+    6. 同时返回 ``theta_restore``，供 PyTorch ``affine_grid``/``grid_sample``
        将生成结果映射回仿射增强前的目标坐标系。
 
 图片源:
@@ -22,6 +23,7 @@
 输出契约:
     ``src``: ``float32``，形状 ``(B, 3, H, W)``，RGB，值域 ``[-1, 1]``。
     ``dst``: ``float32``，形状 ``(B, 3, H, W)``，RGB，值域 ``[-1, 1]``。
+    ``dst_canonical``: ``float32``，与 ``dst`` 相同的 flip/color，但未做几何仿射。
     ``theta_restore``: ``float32``，形状 ``(B, 2, 3)``，可直接传给
     ``torch.nn.functional.affine_grid(..., align_corners=False)``。
 """
@@ -166,8 +168,9 @@ def create_dataloader_pipeline(
         ty_range: ``dst`` 垂直平移范围，相对于图像高度。
 
     返回:
-        三个 DALI DataNode：``src``、``dst`` 和 ``theta_restore``。图像输出均为
-        RGB/NCHW/float32/``[-1, 1]``；``theta_restore`` 为 ``(2, 3)`` 每样本矩阵，
+        四个 DALI DataNode：``src``、``dst``、``dst_canonical`` 和 ``theta_restore``。
+        图像输出均为 RGB/NCHW/float32/``[-1, 1]``；``dst_canonical`` 保留与 ``dst``
+        相同的 flip/color，但未做几何仿射；``theta_restore`` 为 ``(2, 3)`` 每样本矩阵，
         batch 经 DALIGenericIterator 后形状为 ``(B, 2, 3)``。
 
     说明:
@@ -215,10 +218,11 @@ def create_dataloader_pipeline(
         saturation=fn.random.uniform(range=(1.0 - saturation, 1.0 + saturation)),
     )
 
+    dst_canonical = _normalize_chw(dst_image)
     affine_matrix, theta_restore = _random_affine_matrices(img_resolution, rotation_range, scale_factor_range, tx_range, ty_range)
     dst_image = fn.warp_affine(dst_image, affine_matrix, device="gpu", inverse_map=False, fill_value=-1.0)
 
-    return _normalize_chw(src_image), _normalize_chw(dst_image), theta_restore
+    return _normalize_chw(src_image), _normalize_chw(dst_image), dst_canonical, theta_restore
 
 
 class _DALITrainingDataLoader:
@@ -246,7 +250,7 @@ class _DALITrainingDataLoader:
             dst=dst,
             **config,
         )
-        self._output_map = ["src", "dst", "theta_restore"]
+        self._output_map = ["src", "dst", "dst_canonical", "theta_restore"]
         self._iterator = DALIGenericIterator(
             pipelines=pipe,
             output_map=self._output_map,
