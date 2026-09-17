@@ -480,9 +480,9 @@ class Trainer:
         self._stop_requested = True
 
     @torch.no_grad()
-    def log(self, key: str, value: Tensor) -> None:
+    def log(self, key: str, value: Tensor, *, force: bool = False) -> None:
         current_step = self.completed_step + 1
-        if current_step % self.log_interval == 0:
+        if force or current_step % self.log_interval == 0:
             self._log_buffer[key] = value.detach().mean()
 
     @torch.no_grad()
@@ -662,9 +662,9 @@ class Trainer:
                     self.log("d_loss", d_loss)
 
                     r1_loss_raw = r1_reg_loss(real_score, real_img, gamma=self.r1_gamma)
-                    self.log("r1_loss_raw", r1_loss_raw)
+                    self.log("r1_loss_raw", r1_loss_raw, force=True)
                     r1_loss = r1_loss_raw * self.r1_reg_step
-                    self.log("r1_loss", r1_loss)
+                    self.log("r1_loss", r1_loss, force=True)
                     d_loss = d_loss + r1_loss
             else:
                 with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
