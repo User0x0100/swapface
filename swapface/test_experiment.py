@@ -39,9 +39,8 @@ def _check_train_config(root: Path) -> None:
         resolved = resolve_train_config(raw)
     assert raw == original
     assert resolve_train_config(resolved) == resolved
-    runtime, loaded = load_train_config(source)
+    _, loaded = load_train_config(source)
     assert loaded == resolved
-    assert runtime["rec_same_only"] is True
     assert resolved["train"]["batch_size"] == 8
     assert resolved["train"]["compile_module"] is False
     assert resolved["identity"]["generator_provider"] == raw["identity"]["generator_provider"]
@@ -76,19 +75,16 @@ def _check_train_config(root: Path) -> None:
     metadata = json.loads(paths.metadata.read_text(encoding="utf-8"))
     assert metadata["config_sha256"] == config_sha256(resolved)
 
-    # 旧 v3 run 没有后续新增的 loss section；resume 时仅 runtime 补 enable=false。
+    # 旧 schema 不再兼容；缺少当前必需字段的 run 必须拒绝 resume。
     legacy_resolved = copy.deepcopy(resolved)
-    legacy_resolved["loss"].pop("hrffa")
-    legacy_resolved["loss"].pop("facs")
     legacy_resolved["dataloader"].pop("same_prob")
     legacy_paths = create_run(root / "legacy-runs", source, legacy_resolved, name="legacy")
-    legacy_runtime, legacy_frozen = _load_run_config(legacy_paths)
-    assert legacy_frozen == legacy_resolved
-    assert legacy_runtime["enable_hrffa_loss"] is False
-    assert legacy_runtime["enable_facs_loss"] is False
-    assert abs(legacy_runtime["dataloader_cfg"]["same_prob"]) < 1e-12
-    assert legacy_runtime["rec_same_only"] is False
-    assert config_sha256(legacy_frozen) == json.loads(legacy_paths.metadata.read_text(encoding="utf-8"))["config_sha256"]
+    try:
+        _load_run_config(legacy_paths)
+    except ValueError as error:
+        assert "不是当前格式" in str(error)
+    else:
+        raise AssertionError("旧 run schema 被错误接受")
 
     invalid = copy.deepcopy(raw)
     invalid["train"]["unknown_field"] = True

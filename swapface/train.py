@@ -132,7 +132,6 @@ class Trainer:
         # 重建损失
         enable_rec_loss: bool = True,
         rec_loss_weight: float = 10.0,
-        rec_same_only: bool = True,
         # L2CS-Net gaze consistency loss
         enable_gaze_loss: bool = False,
         gaze_loss_weight: float = 1.0,
@@ -219,7 +218,6 @@ class Trainer:
         self.r1_reg_step = r1_reg_step
         self.r1_gamma = r1_gamma
         self.enable_rec_loss = enable_rec_loss
-        self.rec_same_only = rec_same_only
         self.enable_gaze_loss = enable_gaze_loss
         self.enable_hrffa_loss = enable_hrffa_loss
         self.enable_facs_loss = enable_facs_loss
@@ -747,12 +745,8 @@ class Trainer:
                 # rec_loss：只约束 src/dst 来自同一张原图的 self-reconstruction 样本。
                 if self.enable_rec_loss:
                     rec_per_sample = self.rec_loss(fake, dst).flatten(1).mean(dim=1)
-                    if self.rec_same_only:
-                        same_weight = same_mask.to(dtype=rec_per_sample.dtype)
-                        rec_loss = (rec_per_sample * same_weight).sum() / same_weight.sum().clamp_min(1.0)
-                    else:
-                        # 旧 run 在引入 same 之前对全 batch 使用 reconstruction loss；resume 保持历史语义。
-                        rec_loss = rec_per_sample.mean()
+                    same_weight = same_mask.to(dtype=rec_per_sample.dtype)
+                    rec_loss = (rec_per_sample * same_weight).sum() / same_weight.sum().clamp_min(1.0)
                     self.log("rec_loss", rec_loss)
                     g_loss = g_loss + rec_loss
 
@@ -780,21 +774,9 @@ class Trainer:
 def _load_run_config(paths: RunPaths) -> tuple[dict[str, Any], dict[str, Any]]:
     resolved = load_resolved_config(paths)
     canonical = resolve_train_config(resolved)
-
-    # 新增配置字段对旧 resolved-config 保持向后兼容；冻结配置和 config_sha256 保持原样。
-    # same_prob 缺失的旧 run 继续沿用历史的全 batch reconstruction 语义。
-    runtime = _runtime_train_config(canonical)
-    comparable = copy.deepcopy(canonical)
-    for section in ("hrffa", "facs"):
-        if section not in resolved.get("loss", {}):
-            comparable["loss"].pop(section, None)
-    if "same_prob" not in resolved.get("dataloader", {}):
-        comparable["dataloader"].pop("same_prob", None)
-        runtime["dataloader_cfg"]["same_prob"] = 0.0
-        runtime["rec_same_only"] = False
-    if comparable != resolved:
+    if canonical != resolved:
         raise ValueError(f"run 的 resolved config 不是当前格式的规范表示：{paths.resolved_config}")
-    return runtime, resolved
+    return _runtime_train_config(canonical), resolved
 
 
 def _assert_branch_model_compatible(parent: dict[str, Any], branch: dict[str, Any]) -> None:

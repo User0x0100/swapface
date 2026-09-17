@@ -290,7 +290,6 @@ def _runtime_train_config(resolved: dict[str, Any]) -> dict[str, Any]:
         "id_loss_weight": float(identity["loss_weight"]),
         "enable_rec_loss": bool(loss["enable_rec_loss"]),
         "rec_loss_weight": float(loss["rec_loss_weight"]),
-        "rec_same_only": True,
         "enable_gaze_loss": bool(loss["gaze"]["enable"]),
         "gaze_loss_weight": float(loss["gaze"]["weight"]),
         "gaze_distribution_weight": float(loss["gaze"]["distribution_weight"]),

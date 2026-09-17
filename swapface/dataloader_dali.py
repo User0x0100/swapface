@@ -147,7 +147,7 @@ def create_dataloader_pipeline(
     contrast: float = 0.2,
     saturation: float = 0.2,
     flip_prob: float = 0.5,
-    same_prob: float = 0.0,
+    same_prob: float = 0.2,
     rotation_range: FloatRange = (-10.0, 10.0),
     scale_factor_range: FloatRange = (1.0 / 1.3, 1.25),
     tx_range: FloatRange = (-0.15, 0.15),

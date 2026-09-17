@@ -66,6 +66,7 @@ def main() -> None:
             contrast=0.2,
             saturation=0.2,
             flip_prob=0.5,
+            same_prob=0.0,
             rotation_range=(-3.0, 3.0),
             scale_factor_range=(0.95, 1.05),
             tx_range=(-0.05, 0.05),

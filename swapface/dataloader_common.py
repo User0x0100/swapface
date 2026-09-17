@@ -32,7 +32,7 @@ class ImageDecoderBackend(Enum):
     CPU = "cpu"
 
 
-# 数据管线默认配置；旧 run 缺少后续新增字段时由 resume 兼容逻辑补默认值。
+# 数据管线默认配置。
 DEFAULT_DATALOADER_CONFIG: dict[str, Any] = {
     "num_threads": 16,
     "prefetch_queue_depth": 4,
