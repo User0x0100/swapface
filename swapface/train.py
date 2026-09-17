@@ -132,6 +132,7 @@ class Trainer:
         # 重建损失
         enable_rec_loss: bool = True,
         rec_loss_weight: float = 10.0,
+        rec_same_only: bool = True,
         # L2CS-Net gaze consistency loss
         enable_gaze_loss: bool = False,
         gaze_loss_weight: float = 1.0,
@@ -218,6 +219,7 @@ class Trainer:
         self.r1_reg_step = r1_reg_step
         self.r1_gamma = r1_gamma
         self.enable_rec_loss = enable_rec_loss
+        self.rec_same_only = rec_same_only
         self.enable_gaze_loss = enable_gaze_loss
         self.enable_hrffa_loss = enable_hrffa_loss
         self.enable_facs_loss = enable_facs_loss
@@ -364,7 +366,7 @@ class Trainer:
         self.identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.img_resolution, self.batch_size, self.device)
 
         if self.enable_rec_loss:
-            self.rec_loss = make_l1_loss(weight=rec_loss_weight, reduction="mean")
+            self.rec_loss = make_l1_loss(weight=rec_loss_weight, reduction="none")
 
         if self.enable_gaze_loss:
             self.gaze_loss = GazeLoss(
@@ -496,7 +498,7 @@ class Trainer:
             self.log_writer.add_scalar(f"Loss/{key}", value, self.completed_step)
 
     @torch.no_grad()
-    def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         return self.dataset.next()
 
     def prepare_identity_encoder_faces(self, faces: Tensor, theta_restore: Tensor | None = None) -> Tensor:
@@ -575,9 +577,9 @@ class Trainer:
 
         return h
 
-    def _save_sample(self, sample_batch: tuple[Tensor, Tensor, Tensor, Tensor], current_batch: tuple[Tensor, Tensor, Tensor, Tensor]) -> None:
-        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore = sample_batch
-        src, dst, dst_canonical, theta_restore = current_batch
+    def _save_sample(self, sample_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor], current_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor]) -> None:
+        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, _sample_same_mask = sample_batch
+        src, dst, dst_canonical, theta_restore, _same_mask = current_batch
         with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
             half = self.batch_size // 2
             src_vis = torch.cat((sample_src[:half], src[: self.batch_size - half]), dim=0)
@@ -633,7 +635,7 @@ class Trainer:
             if self._stop_requested:
                 raise KeyboardInterrupt
 
-            src, dst, dst_canonical, theta_restore = self.fetch_sample()
+            src, dst, dst_canonical, theta_restore, same_mask = self.fetch_sample()
             self._step_in_progress = True
 
             # ========================= 生成器前向 =========================
@@ -742,9 +744,15 @@ class Trainer:
                     self.log("perceptual_loss", perceptual_loss)
                     g_loss = g_loss + perceptual_loss
 
-                # rec_loss
+                # rec_loss：只约束 src/dst 来自同一张原图的 self-reconstruction 样本。
                 if self.enable_rec_loss:
-                    rec_loss = self.rec_loss(fake, dst)
+                    rec_per_sample = self.rec_loss(fake, dst).flatten(1).mean(dim=1)
+                    if self.rec_same_only:
+                        same_weight = same_mask.to(dtype=rec_per_sample.dtype)
+                        rec_loss = (rec_per_sample * same_weight).sum() / same_weight.sum().clamp_min(1.0)
+                    else:
+                        # 旧 run 在引入 same 之前对全 batch 使用 reconstruction loss；resume 保持历史语义。
+                        rec_loss = rec_per_sample.mean()
                     self.log("rec_loss", rec_loss)
                     g_loss = g_loss + rec_loss
 
@@ -766,22 +774,27 @@ class Trainer:
                 self.save_ckpt()
 
             if self.completed_step % self.sample_save_every == 0:
-                self._save_sample(sample_batch, (src, dst, dst_canonical, theta_restore))
+                self._save_sample(sample_batch, (src, dst, dst_canonical, theta_restore, same_mask))
 
 
 def _load_run_config(paths: RunPaths) -> tuple[dict[str, Any], dict[str, Any]]:
     resolved = load_resolved_config(paths)
     canonical = resolve_train_config(resolved)
 
-    # 新增 loss section 对旧 resolved-config 保持向后兼容：runtime 使用默认关闭，
-    # 冻结配置和 config_sha256 保持原样，确保 resume 继续严格对应原实验。
+    # 新增配置字段对旧 resolved-config 保持向后兼容；冻结配置和 config_sha256 保持原样。
+    # same_prob 缺失的旧 run 继续沿用历史的全 batch reconstruction 语义。
+    runtime = _runtime_train_config(canonical)
     comparable = copy.deepcopy(canonical)
     for section in ("hrffa", "facs"):
         if section not in resolved.get("loss", {}):
             comparable["loss"].pop(section, None)
+    if "same_prob" not in resolved.get("dataloader", {}):
+        comparable["dataloader"].pop("same_prob", None)
+        runtime["dataloader_cfg"]["same_prob"] = 0.0
+        runtime["rec_same_only"] = False
     if comparable != resolved:
         raise ValueError(f"run 的 resolved config 不是当前格式的规范表示：{paths.resolved_config}")
-    return _runtime_train_config(canonical), resolved
+    return runtime, resolved
 
 
 def _assert_branch_model_compatible(parent: dict[str, Any], branch: dict[str, Any]) -> None:

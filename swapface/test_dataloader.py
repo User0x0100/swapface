@@ -80,10 +80,13 @@ def main() -> None:
             dst=[str(dst)],
             **config,
         )
-        src, target, canonical, theta = loader.next()
+        src, target, canonical, theta, same_mask = loader.next()
         assert src.shape == target.shape == canonical.shape == (2, 3, 32, 32)
         assert theta.shape == (2, 2, 3)
+        assert same_mask.shape == (2,)
         assert src.dtype == target.dtype == canonical.dtype == theta.dtype == torch.float32
+        assert same_mask.dtype == torch.bool
+        assert not same_mask.any()
         assert -1.0 <= float(src.min()) <= float(src.max()) <= 1.0
         assert -1.0 <= float(target.min()) <= float(target.max()) <= 1.0
         assert -1.0 <= float(canonical.min()) <= float(canonical.max()) <= 1.0
@@ -96,19 +99,30 @@ def main() -> None:
             Image.new("RGB", (8, 8), color).save(folder / "color.png")
         config.update(brightness=0.0, contrast=0.0, saturation=0.0, flip_prob=0.0, rotation_range=(0.0, 0.0), scale_factor_range=(1.0, 1.0), tx_range=(0.0, 0.0), ty_range=(0.0, 0.0))
         rgb_loader = TrainingDataLoader(batch_size=1, device=torch.device("cpu"), img_resolution=8, src=[rgb_src], dst=[rgb_dst], **config)
-        src, target, canonical, theta = rgb_loader.next()
+        src, target, canonical, theta, same_mask = rgb_loader.next()
         for actual, color in ((src, (255, 128, 0)), (target, (0, 64, 255)), (canonical, (0, 64, 255))):
             expected = (torch.tensor(color, dtype=torch.float32) / 127.5 - 1.0).view(1, 3, 1, 1).expand(1, 3, 8, 8)
             torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0)
         torch.testing.assert_close(theta, torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]), atol=0, rtol=0)
+        assert not same_mask.item()
+
+        # same_prob=1 时 src 必须直接来自同一张 dst 原图，而不是继续从 src pool 独立采样。
+        config.update(same_prob=1.0)
+        same_loader = TrainingDataLoader(batch_size=1, device=torch.device("cpu"), img_resolution=8, src=[rgb_src], dst=[rgb_dst], **config)
+        same_src, same_target, same_canonical, _, same_mask = same_loader.next()
+        assert same_mask.item()
+        torch.testing.assert_close(same_src, same_canonical, atol=1e-6, rtol=0)
+        torch.testing.assert_close(same_target, same_canonical, atol=1e-6, rtol=0)
 
         # canonical 必须绕过 geometric affine；固定平移后 target 出现 padding，但 canonical 仍保持仿射前图像。
+        config.update(same_prob=0.0)
         config.update(tx_range=(0.25, 0.25))
         shifted_loader = TrainingDataLoader(batch_size=1, device=torch.device("cpu"), img_resolution=8, src=[rgb_src], dst=[rgb_dst], **config)
-        _, shifted_target, shifted_canonical, _ = shifted_loader.next()
+        _, shifted_target, shifted_canonical, _, shifted_same = shifted_loader.next()
         expected_canonical = (torch.tensor((0, 64, 255), dtype=torch.float32) / 127.5 - 1.0).view(1, 3, 1, 1).expand(1, 3, 8, 8)
         torch.testing.assert_close(shifted_canonical, expected_canonical, atol=1e-6, rtol=0)
         assert not torch.equal(shifted_target, shifted_canonical)
+        assert not shifted_same.item()
 
     # backend selector 必须真正区分同一个 CUDA device 上的 HIP 与 NVIDIA build。
     selected: list[str] = []

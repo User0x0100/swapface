@@ -14,14 +14,17 @@ from torch.utils.data import DataLoader, IterableDataset
 from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, validate_range
 
 
-class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor]]):
+class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool]]):
     """在 CPU worker 中随机采样、解码并 Lanczos resize 成固定尺寸。"""
 
-    def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource], img_resolution: int) -> None:
+    def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource], img_resolution: int, same_prob: float) -> None:
         super().__init__()
         if img_resolution <= 0:
             raise ValueError(f"img_resolution 必须为正数，实际为 {img_resolution}")
+        if not 0.0 <= same_prob <= 1.0:
+            raise ValueError(f"same_prob 必须位于 [0, 1]，实际为 {same_prob}")
         self.img_resolution = img_resolution
+        self.same_prob = same_prob
         self.src_pools, self.src_cdf, src_info = build_image_pools(src)
         self.dst_pools, self.dst_cdf, dst_info = build_image_pools(dst)
         print_image_pools("SRC Sources", src_info)
@@ -42,14 +45,19 @@ class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor]]):
             array = np.asarray(image, dtype=np.uint8).copy()
         return torch.from_numpy(array).permute(2, 0, 1)
 
-    def __iter__(self) -> Iterator[tuple[Tensor, Tensor]]:
+    def __iter__(self) -> Iterator[tuple[Tensor, Tensor, bool]]:
         # DataLoader 会为每个 worker 设置独立 torch seed；以它初始化 NumPy RNG，
         # 避免 spawn/fork worker 复制出相同采样序列。
         rng = np.random.default_rng(torch.initial_seed())
         while True:
-            src_path = self._sample_path(rng, self.src_pools, self.src_cdf)
             dst_path = self._sample_path(rng, self.dst_pools, self.dst_cdf)
-            yield self._decode_resize(src_path), self._decode_resize(dst_path)
+            same = bool(rng.random() < self.same_prob)
+            src_path = dst_path if same else self._sample_path(rng, self.src_pools, self.src_cdf)
+            if same:
+                image = self._decode_resize(dst_path)
+                yield image, image, True
+            else:
+                yield self._decode_resize(src_path), self._decode_resize(dst_path), False
 
 
 def _uniform(batch_size: int, value_range: FloatRange, device: torch.device) -> Tensor:
@@ -156,6 +164,7 @@ class _NativeTrainingDataLoader:
         contrast: float,
         saturation: float,
         flip_prob: float,
+        same_prob: float,
         rotation_range: FloatRange,
         scale_factor_range: FloatRange,
         tx_range: FloatRange,
@@ -172,6 +181,8 @@ class _NativeTrainingDataLoader:
             raise ValueError("brightness/contrast/saturation 不能为负数")
         if not 0.0 <= flip_prob <= 1.0:
             raise ValueError("flip_prob 必须位于 [0, 1]")
+        if not 0.0 <= same_prob <= 1.0:
+            raise ValueError("same_prob 必须位于 [0, 1]")
 
         self.device = device
         self.img_resolution = img_resolution
@@ -186,7 +197,7 @@ class _NativeTrainingDataLoader:
         if self.scale_factor_range[0] <= 0.0:
             raise ValueError("scale_factor_range 必须为正数范围")
 
-        dataset = _RandomImagePairDataset(src, dst, img_resolution)
+        dataset = _RandomImagePairDataset(src, dst, img_resolution, same_prob)
         loader_kwargs: dict[str, object] = {
             "batch_size": batch_size,
             "num_workers": py_num_workers,
@@ -204,10 +215,11 @@ class _NativeTrainingDataLoader:
         print(f"PyTorch 数据管线：CPU Pillow/Lanczos 解码缩放，workers={py_num_workers}, prefetch_factor={reader_prefetch_queue_depth}；批量增强在 {device} 执行")
 
     @torch.no_grad()
-    def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        src, dst = next(self.iterator)
+    def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        src, dst, same_mask = next(self.iterator)
         src = src.to(device=self.device, dtype=torch.float32, non_blocking=True)
         dst = dst.to(device=self.device, dtype=torch.float32, non_blocking=True)
+        same_mask = same_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
         batch_size = src.shape[0]
 
         if self.flip_prob > 0.0:
@@ -234,4 +246,4 @@ class _NativeTrainingDataLoader:
         src = src.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
         dst = dst.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
         dst_canonical = dst_canonical.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
-        return src, dst, dst_canonical, theta_restore
+        return src, dst, dst_canonical, theta_restore, same_mask

@@ -66,7 +66,7 @@ loss_weight = 10.0
 
 
 [loss]
-# 是否启用 fake 与增强后 dst 之间的 L1 reconstruction loss。
+# 是否启用 self-reconstruction L1 loss；仅 same 样本参与。
 enable_rec_loss = true
 
 # Reconstruction Loss 权重。
@@ -184,6 +184,11 @@ saturation = 0.2
 
 # src 与 dst 独立执行水平翻转的概率，范围 [0, 1]。
 flip_prob = 0.5
+
+# 每个样本令 src/dst 从同一张 dst 原图构造的概率。
+# same 样本用于 self-reconstruction；当前 L1 reconstruction loss 只作用于这些样本。
+# 0.0 表示关闭 same，此时 reconstruction loss 始终为 0。
+same_prob = 0.2
 
 # dst 随机旋转角范围，单位：度。
 rotation_range = [-3.0, 3.0]

@@ -1,7 +1,7 @@
 """高吞吐、可配置的 DALI 人脸交换训练数据管线。
 
 数据流:
-    1. ``src`` 与 ``dst`` 从两个独立图片池随机采样编码图像。
+    1. ``src`` 与 ``dst`` 默认独立采样；按 ``same_prob`` 可令二者来自同一张 dst 原图。
     2. DALI 解码后在 GPU 上执行 resize 与随机水平翻转。
     3. ``dst`` 额外执行亮度、对比度、饱和度增强，并保留几何增强前的 ``dst_canonical``。
     4. ``dst`` 再执行随机仿射增强。
@@ -26,6 +26,7 @@
     ``dst_canonical``: ``float32``，与 ``dst`` 相同的 flip/color，但未做几何仿射。
     ``theta_restore``: ``float32``，形状 ``(B, 2, 3)``，可直接传给
     ``torch.nn.functional.affine_grid(..., align_corners=False)``。
+    ``same_mask``: ``bool``，形状 ``(B,)``，标记 src/dst 是否来自同一张原图。
 """
 
 import os
@@ -44,7 +45,10 @@ from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, Loc
 class _RandomImagePairSource:
     """为 DALI parallel external_source 提供本地 source/target 编码图像。"""
 
-    def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource]) -> None:
+    def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource], same_prob: float) -> None:
+        if not 0.0 <= same_prob <= 1.0:
+            raise ValueError(f"same_prob 必须位于 [0, 1]，实际为 {same_prob}")
+        self.same_prob = same_prob
         self.src_pools, self.src_cdf, src_info = build_image_pools(src)
         self.dst_pools, self.dst_cdf, dst_info = build_image_pools(dst)
         self.rng = np.random.default_rng()
@@ -66,8 +70,11 @@ class _RandomImagePairSource:
         file_name = pool.file_names[int(self.rng.integers(len(pool.file_names)))]
         return np.fromfile(os.path.join(pool.root, file_name), dtype=np.uint8)
 
-    def __call__(self, _sample_info) -> tuple[ndarray, ndarray]:
-        return self._sample_encoded(self.src_pools, self.src_cdf), self._sample_encoded(self.dst_pools, self.dst_cdf)
+    def __call__(self, _sample_info) -> tuple[ndarray, ndarray, ndarray]:
+        dst = self._sample_encoded(self.dst_pools, self.dst_cdf)
+        same = self.rng.random() < self.same_prob
+        src = dst if same else self._sample_encoded(self.src_pools, self.src_cdf)
+        return src, dst, np.asarray(same, dtype=np.bool_)
 
 
 def _random_affine_matrices(img_resolution: int, rotation_range: FloatRange, scale_factor_range: FloatRange, tx_range: FloatRange, ty_range: FloatRange):
@@ -140,6 +147,7 @@ def create_dataloader_pipeline(
     contrast: float = 0.2,
     saturation: float = 0.2,
     flip_prob: float = 0.5,
+    same_prob: float = 0.0,
     rotation_range: FloatRange = (-10.0, 10.0),
     scale_factor_range: FloatRange = (1.0 / 1.3, 1.25),
     tx_range: FloatRange = (-0.15, 0.15),
@@ -161,6 +169,7 @@ def create_dataloader_pipeline(
         contrast: ``dst`` 对比度随机乘数的最大偏移。
         saturation: ``dst`` 饱和度随机乘数的最大偏移。
         flip_prob: ``src`` 和 ``dst`` 各自独立水平翻转的概率。
+        same_prob: 每个样本令 ``src`` 与 ``dst`` 来自同一张 dst 原图的概率。
         rotation_range: ``dst`` 随机旋转角范围，单位为度。
         scale_factor_range: ``dst`` **实际缩放倍数**范围，例如 ``(0.8, 1.2)``。
             不再使用旧式“缩放偏移”语义。
@@ -168,10 +177,10 @@ def create_dataloader_pipeline(
         ty_range: ``dst`` 垂直平移范围，相对于图像高度。
 
     返回:
-        四个 DALI DataNode：``src``、``dst``、``dst_canonical`` 和 ``theta_restore``。
+        五个 DALI DataNode：``src``、``dst``、``dst_canonical``、``theta_restore`` 和 ``same_mask``。
         图像输出均为 RGB/NCHW/float32/``[-1, 1]``；``dst_canonical`` 保留与 ``dst``
         相同的 flip/color，但未做几何仿射；``theta_restore`` 为 ``(2, 3)`` 每样本矩阵，
-        batch 经 DALIGenericIterator 后形状为 ``(B, 2, 3)``。
+        batch 经 DALIGenericIterator 后形状为 ``(B, 2, 3)``；``same_mask`` 为逐样本 bool。
 
     说明:
         ``@pipeline_def`` 还接受 ``batch_size``、``device_id``、``num_threads``、
@@ -182,22 +191,24 @@ def create_dataloader_pipeline(
         raise ValueError(f"img_resolution 必须为正数，实际为 {img_resolution}")
     if reader_prefetch_queue_depth <= 0:
         raise ValueError(f"reader_prefetch_queue_depth 必须为正数，实际为 {reader_prefetch_queue_depth}")
-    for name, value in (("brightness", brightness), ("contrast", contrast), ("saturation", saturation), ("flip_prob", flip_prob)):
+    for name, value in (("brightness", brightness), ("contrast", contrast), ("saturation", saturation), ("flip_prob", flip_prob), ("same_prob", same_prob)):
         if not np.isfinite(value):
             raise ValueError(f"{name} 必须为有限数值，实际为 {value}")
     if min(brightness, contrast, saturation) < 0.0:
         raise ValueError("brightness/contrast/saturation 不能为负数")
     if not 0.0 <= flip_prob <= 1.0:
         raise ValueError(f"flip_prob 必须位于 [0, 1]，实际为 {flip_prob}")
+    if not 0.0 <= same_prob <= 1.0:
+        raise ValueError(f"same_prob 必须位于 [0, 1]，实际为 {same_prob}")
 
-    src_raw, dst_raw = fn.external_source(
-        source=_RandomImagePairSource(src, dst),
-        num_outputs=2,
+    src_raw, dst_raw, same_mask = fn.external_source(
+        source=_RandomImagePairSource(src, dst, same_prob),
+        num_outputs=3,
         device="cpu",
         parallel=True,
         prefetch_queue_depth=reader_prefetch_queue_depth,
-        dtype=DALIDataType.UINT8,
-        ndim=1,
+        dtype=(DALIDataType.UINT8, DALIDataType.UINT8, DALIDataType.BOOL),
+        ndim=(1, 1, 0),
         batch=False,
     )
 
@@ -222,7 +233,7 @@ def create_dataloader_pipeline(
     affine_matrix, theta_restore = _random_affine_matrices(img_resolution, rotation_range, scale_factor_range, tx_range, ty_range)
     dst_image = fn.warp_affine(dst_image, affine_matrix, device="gpu", inverse_map=False, fill_value=-1.0)
 
-    return _normalize_chw(src_image), _normalize_chw(dst_image), dst_canonical, theta_restore
+    return _normalize_chw(src_image), _normalize_chw(dst_image), dst_canonical, theta_restore, fn.copy(same_mask, device="gpu")
 
 
 class _DALITrainingDataLoader:
@@ -250,7 +261,7 @@ class _DALITrainingDataLoader:
             dst=dst,
             **config,
         )
-        self._output_map = ["src", "dst", "dst_canonical", "theta_restore"]
+        self._output_map = ["src", "dst", "dst_canonical", "theta_restore", "same_mask"]
         self._iterator = DALIGenericIterator(
             pipelines=pipe,
             output_map=self._output_map,

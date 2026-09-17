@@ -21,14 +21,14 @@ from swapface.train import Trainer, _assert_branch_model_compatible, _compile_tr
 def _check_train_config(root: Path) -> None:
     source = root / "canonical.toml"
     source.write_text(
-        '[train]\nbatch_size = 8\ncompile_module = false\n'
-        '[generator]\naad_skip_layers = []\n'
+        "[train]\nbatch_size = 8\ncompile_module = false\n"
+        "[generator]\naad_skip_layers = []\n"
         '[identity]\ngenerator_provider = "MS1MV3_ARCFACE_R50_FP16"\nloss_provider = "BLENDFACE"\n'
-        '[dataloader]\nrotation_range = [-3, 3]\n'
-        '[loss.gaze]\nenable = true\nweight = 0.75\ndistribution_weight = 0.2\nconfidence_weighted = false\n'
-        '[loss.hrffa]\nenable = true\npose_weight = 0.5\neye_weight = 1.25\nmouth_weight = 1.5\ncontour_weight = 2.0\ncontour_shape_weight = 0.4\noccluded_geometry_weight = 0.1\n'
-        '[loss.facs]\nenable = true\nweight = 0.8\nbrow_weight = 1.1\neye_weight = 1.2\nnose_weight = 0.9\nmouth_weight = 1.3\nlower_face_weight = 0.7\nasymmetry_weight = 1.4\n'
-        '[loss.wfm.weights]\n2 = 0.25\n'
+        "[dataloader]\nrotation_range = [-3, 3]\nsame_prob = 0.25\n"
+        "[loss.gaze]\nenable = true\nweight = 0.75\ndistribution_weight = 0.2\nconfidence_weighted = false\n"
+        "[loss.hrffa]\nenable = true\npose_weight = 0.5\neye_weight = 1.25\nmouth_weight = 1.5\ncontour_weight = 2.0\ncontour_shape_weight = 0.4\noccluded_geometry_weight = 0.1\n"
+        "[loss.facs]\nenable = true\nweight = 0.8\nbrow_weight = 1.1\neye_weight = 1.2\nnose_weight = 0.9\nmouth_weight = 1.3\nlower_face_weight = 0.7\nasymmetry_weight = 1.4\n"
+        "[loss.wfm.weights]\n2 = 0.25\n"
         '[[src]]\npath = "source"\nadjustment = 1\n'
         '[[dst]]\npath = "target"\nadjustment = -1\n',
         encoding="utf-8",
@@ -39,13 +39,15 @@ def _check_train_config(root: Path) -> None:
         resolved = resolve_train_config(raw)
     assert raw == original
     assert resolve_train_config(resolved) == resolved
-    _, loaded = load_train_config(source)
+    runtime, loaded = load_train_config(source)
     assert loaded == resolved
+    assert runtime["rec_same_only"] is True
     assert resolved["train"]["batch_size"] == 8
     assert resolved["train"]["compile_module"] is False
     assert resolved["identity"]["generator_provider"] == raw["identity"]["generator_provider"]
     assert resolved["identity"]["loss_provider"] == raw["identity"]["loss_provider"]
     assert resolved["dataloader"]["rotation_range"] == [-3.0, 3.0]
+    assert abs(resolved["dataloader"]["same_prob"] - 0.25) < 1e-12
     assert resolved["loss"]["gaze"] == {"enable": True, "weight": 0.75, "distribution_weight": 0.2, "confidence_weighted": False}
     assert resolved["loss"]["hrffa"] == {
         "enable": True,
@@ -78,11 +80,14 @@ def _check_train_config(root: Path) -> None:
     legacy_resolved = copy.deepcopy(resolved)
     legacy_resolved["loss"].pop("hrffa")
     legacy_resolved["loss"].pop("facs")
+    legacy_resolved["dataloader"].pop("same_prob")
     legacy_paths = create_run(root / "legacy-runs", source, legacy_resolved, name="legacy")
     legacy_runtime, legacy_frozen = _load_run_config(legacy_paths)
     assert legacy_frozen == legacy_resolved
     assert legacy_runtime["enable_hrffa_loss"] is False
     assert legacy_runtime["enable_facs_loss"] is False
+    assert abs(legacy_runtime["dataloader_cfg"]["same_prob"]) < 1e-12
+    assert legacy_runtime["rec_same_only"] is False
     assert config_sha256(legacy_frozen) == json.loads(legacy_paths.metadata.read_text(encoding="utf-8"))["config_sha256"]
 
     invalid = copy.deepcopy(raw)
@@ -93,6 +98,15 @@ def _check_train_config(root: Path) -> None:
         assert "unknown_field" in str(error)
     else:
         raise AssertionError("配置错误接受了未知字段")
+
+    invalid = copy.deepcopy(raw)
+    invalid["dataloader"]["same_prob"] = 1.1
+    try:
+        resolve_train_config(invalid)
+    except ValueError as error:
+        assert "same_prob" in str(error)
+    else:
+        raise AssertionError("配置错误接受了 same_prob > 1")
 
     for key, value in (("pose_weight", float("nan")), ("eye_weight", float("inf")), ("occluded_geometry_weight", float("nan"))):
         invalid = copy.deepcopy(raw)

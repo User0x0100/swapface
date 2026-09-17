@@ -138,6 +138,11 @@ def _normalize_dataloader(values: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, (list, tuple)) or len(value) != 2:
             raise ValueError(f"dataloader.{key} 必须为包含两个数值的数组")
         config[key] = [float(value[0]), float(value[1])]
+
+    same_prob = float(config["same_prob"])
+    if not math.isfinite(same_prob) or not 0.0 <= same_prob <= 1.0:
+        raise ValueError(f"dataloader.same_prob 必须位于 [0, 1]，实际为 {same_prob}")
+    config["same_prob"] = same_prob
     return config
 
 
@@ -195,10 +200,7 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
     unknown_hrffa = set(hrffa) - set(DEFAULT_LOSS_CONFIG["hrffa"])
     if unknown_hrffa:
         raise ValueError(f"[loss.hrffa] 包含未知字段：{sorted(unknown_hrffa)}")
-    hrffa_config = {
-        key: bool(hrffa.get(key, default)) if key == "enable" else float(hrffa.get(key, default))
-        for key, default in DEFAULT_LOSS_CONFIG["hrffa"].items()
-    }
+    hrffa_config = {key: bool(hrffa.get(key, default)) if key == "enable" else float(hrffa.get(key, default)) for key, default in DEFAULT_LOSS_CONFIG["hrffa"].items()}
     hrffa_numeric = {key: value for key, value in hrffa_config.items() if key != "enable"}
     non_finite_hrffa = {key: value for key, value in hrffa_numeric.items() if not math.isfinite(value)}
     if non_finite_hrffa:
@@ -215,15 +217,8 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
     unknown_facs = set(facs) - set(DEFAULT_LOSS_CONFIG["facs"])
     if unknown_facs:
         raise ValueError(f"[loss.facs] 包含未知字段：{sorted(unknown_facs)}")
-    facs_config = {
-        key: bool(facs.get(key, default)) if key == "enable" else float(facs.get(key, default))
-        for key, default in DEFAULT_LOSS_CONFIG["facs"].items()
-    }
-    invalid_facs = {
-        key: value
-        for key, value in facs_config.items()
-        if key != "enable" and (not math.isfinite(value) or value < 0.0)
-    }
+    facs_config = {key: bool(facs.get(key, default)) if key == "enable" else float(facs.get(key, default)) for key, default in DEFAULT_LOSS_CONFIG["facs"].items()}
+    invalid_facs = {key: value for key, value in facs_config.items() if key != "enable" and (not math.isfinite(value) or value < 0.0)}
     if invalid_facs:
         raise ValueError(f"[loss.facs] 权重必须为有限非负数：{invalid_facs}")
 
@@ -295,6 +290,7 @@ def _runtime_train_config(resolved: dict[str, Any]) -> dict[str, Any]:
         "id_loss_weight": float(identity["loss_weight"]),
         "enable_rec_loss": bool(loss["enable_rec_loss"]),
         "rec_loss_weight": float(loss["rec_loss_weight"]),
+        "rec_same_only": True,
         "enable_gaze_loss": bool(loss["gaze"]["enable"]),
         "gaze_loss_weight": float(loss["gaze"]["weight"]),
         "gaze_distribution_weight": float(loss["gaze"]["distribution_weight"]),

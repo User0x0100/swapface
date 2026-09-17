@@ -32,7 +32,7 @@ class ImageDecoderBackend(Enum):
     CPU = "cpu"
 
 
-# 保持既有配置 schema 不变，避免已有 run 的 resolved config 因新增默认字段而失效。
+# 数据管线默认配置；旧 run 缺少后续新增字段时由 resume 兼容逻辑补默认值。
 DEFAULT_DATALOADER_CONFIG: dict[str, Any] = {
     "num_threads": 16,
     "prefetch_queue_depth": 4,
@@ -45,6 +45,7 @@ DEFAULT_DATALOADER_CONFIG: dict[str, Any] = {
     "contrast": 0.2,
     "saturation": 0.2,
     "flip_prob": 0.5,
+    "same_prob": 0.2,
     "rotation_range": (-10.0, 10.0),
     "scale_factor_range": (1.0 / 1.3, 1.25),
     "tx_range": (-0.15, 0.15),
