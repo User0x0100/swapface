@@ -158,7 +158,10 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise TypeError(f"[{section}] 必须为表/对象")
 
-    train = _with_defaults(dict(config.get("train", {})), DEFAULT_TRAIN_CONFIG, "[train]")
+    raw_train = dict(config.get("train", {}))
+    if "precision" not in raw_train:
+        raise ValueError("[train].precision 必须显式配置为 fp32、fp16 或 bf16")
+    train = _with_defaults(raw_train, DEFAULT_TRAIN_CONFIG, "[train]")
     precision = train["precision"]
     if not isinstance(precision, str):
         raise TypeError(f"train.precision 必须为字符串，实际为 {type(precision).__name__}")

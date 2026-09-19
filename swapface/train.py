@@ -1,6 +1,5 @@
 import argparse
 import copy
-import itertools
 import signal
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -63,6 +62,7 @@ EPS = 1e-8
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
+MAX_AMP_OVERFLOW_RETRIES = 8
 
 
 def _configure_training_runtime() -> None:
@@ -93,6 +93,36 @@ def _load_branch_optimizer_state(optimizer: optim.Optimizer, state: dict[str, An
         for group in optimizer.param_groups:
             group["lr"] = lr
             group["initial_lr"] = lr
+
+
+def _scaled_backward_step(loss: Tensor, optimizer: optim.Optimizer, scaler: GradScaler) -> bool:
+    """执行一次 AMP backward/optimizer step，并返回参数是否实际更新。"""
+    scale_before = scaler.get_scale()
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+    return not scaler.is_enabled() or scaler.get_scale() >= scale_before
+
+
+def _ensure_finite_loss(name: str, loss: Tensor) -> None:
+    """在进入 backward 前阻止非有限标量损失污染训练状态。"""
+    if not bool(torch.isfinite(loss.detach()).all().item()):
+        raise FloatingPointError(f"{name} 出现 NaN/Inf：{loss.detach().float().cpu().item()}")
+
+
+def _migrate_legacy_run_precision(config: dict[str, Any]) -> dict[str, Any]:
+    """仅为旧 run 的 frozen config 将 bf16 布尔协议迁移为 precision 字符串。"""
+    migrated = copy.deepcopy(config)
+    train = migrated.get("train")
+    if not isinstance(train, dict) or "bf16" not in train:
+        return migrated
+    if "precision" in train:
+        raise ValueError("旧 run 的 [train] 同时包含 bf16 与 precision，无法确定训练精度")
+    legacy_bf16 = train.pop("bf16")
+    if not isinstance(legacy_bf16, bool):
+        raise TypeError(f"旧 run 的 train.bf16 必须为 bool，实际为 {type(legacy_bf16).__name__}")
+    train["precision"] = "bf16" if legacy_bf16 else "fp32"
+    return migrated
 
 
 def print_mapping(title: str, mapping: Mapping[Any, Any], indent: int = 0) -> None:
@@ -663,156 +693,181 @@ class Trainer:
 
         net_g, net_d = self.train_g, self.train_d
         sample_batch = self.fetch_sample()
+        d_overflow_streak = 0
 
-        for _ in tqdm(itertools.count(start=self.completed_step), initial=self.completed_step, mininterval=1.0, bar_format="{n_fmt:7} | 速度 {rate_fmt:3} | 训练时间 {elapsed}"):
-            if self._stop_requested:
-                raise KeyboardInterrupt
+        with tqdm(total=None, initial=self.completed_step, mininterval=1.0, bar_format="{n_fmt:7} | 速度 {rate_fmt:3} | 训练时间 {elapsed}") as progress:
+            while True:
+                if self._stop_requested:
+                    raise KeyboardInterrupt
 
-            src, dst, dst_canonical, theta_restore, same_mask = self.fetch_sample()
-            self._step_in_progress = True
+                src, dst, dst_canonical, theta_restore, same_mask = self.fetch_sample()
+                self._step_in_progress = True
 
-            # ========================= 生成器前向 =========================
-            with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                with torch.no_grad():
-                    source_identity_faces = self.prepare_identity_encoder_faces(src)
-                    generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
-                    source_identity_embeddings = self.identity_embeddings_forward(source_identity_faces)
-                fake: Tensor = net_g(dst, generator_identity_embeddings)
-
-            # ========================= 训练判别器 =========================
-            self.net_d.requires_grad_(True)
-            self.optim_d.zero_grad(set_to_none=True)
-            is_r1_reg_step = self.completed_step % self.r1_reg_step == 0
-
-            if is_r1_reg_step:
-                with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=False):
-                    fake_img = fake.detach().float()
-                    real_img = dst.detach().float().requires_grad_(True)
-
-                    # R1：使用原始判别器并以 FP32 计算
-                    fake_score = self.net_d(fake_img)
-                    real_score = self.net_d(real_img)
-
-                    d_loss = self.d_loss(fake_score, real_score)
-                    self.log("d_loss", d_loss)
-
-                    r1_loss_raw = r1_reg_loss(real_score, real_img, gamma=self.r1_gamma)
-                    self.log("r1_loss_raw", r1_loss_raw, force=True)
-                    r1_loss = r1_loss_raw * self.r1_reg_step
-                    self.log("r1_loss", r1_loss, force=True)
-                    d_loss = d_loss + r1_loss
-            else:
+                # ========================= 生成器前向 =========================
                 with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                    fake_score = net_d(fake.detach())
-                    real_score = net_d(dst.detach())
-
-                    d_loss = self.d_loss(fake_score, real_score)
-                    self.log("d_loss", d_loss)
-
-            self.scaler_d.scale(d_loss).backward()
-            self.scaler_d.step(self.optim_d)
-            self.scaler_d.update()
-
-            if self.use_cosine_lr:
-                self.lr_scheduler_d.step()
-
-            # ========================= 训练生成器 =========================
-            self.net_d.requires_grad_(False)
-            self.optim_g.zero_grad(set_to_none=True)
-
-            with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                # gan_loss
-                if self.enable_wfm_loss:
-                    fake_score, fake_feats = net_d(fake, True)
-                else:
-                    fake_score = net_d(fake)
-
-                gan_loss = self.gan_loss(fake_score)
-                self.log("gan_loss", gan_loss)
-                g_loss = gan_loss
-
-                # wfm_loss
-                if self.enable_wfm_loss:
                     with torch.no_grad():
-                        real_feats = self.train_d_features(dst, self.wfm_max_layer)
-                    wfm_loss = self.wfm_loss(fake_feats, real_feats)
-                    self.log("wfm_loss", wfm_loss)
-                    g_loss = g_loss + wfm_loss
+                        source_identity_faces = self.prepare_identity_encoder_faces(src)
+                        generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
+                        source_identity_embeddings = self.identity_embeddings_forward(source_identity_faces)
+                    fake: Tensor = net_g(dst, generator_identity_embeddings)
 
-                # id_loss
-                generated_identity_embeddings = self.identity_embeddings_forward(self.prepare_identity_encoder_faces(fake, theta_restore))
-                id_loss = self.id_loss(generated_identity_embeddings, source_identity_embeddings)
-                self.log("id_loss", id_loss)
-                g_loss = g_loss + id_loss
+                # ========================= 训练判别器 =========================
+                self.net_d.requires_grad_(True)
+                self.optim_d.zero_grad(set_to_none=True)
+                is_r1_reg_step = self.completed_step % self.r1_reg_step == 0
 
-                # Gaze / HRFFA / FACS：只将 fake 恢复到 canonical 坐标系，reference 直接使用 dst_canonical。
-                if self.enable_gaze_loss or self.enable_hrffa_loss or self.enable_facs_loss:
+                if is_r1_reg_step:
                     with autocast(device_type="cuda", enabled=False):
-                        restore_grid = NF.affine_grid(theta_restore.float(), size=list(fake.shape), align_corners=False)
-                        fake_restored = NF.grid_sample(fake.float(), restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+                        fake_img = fake.detach().float()
+                        real_img = dst.detach().float().requires_grad_(True)
 
-                # gaze_loss：生成结果保持 canonical dst 的视线方向。
-                if self.enable_gaze_loss:
-                    gaze_loss = self.gaze_loss_forward(fake_restored, dst_canonical)
-                    self.log("gaze_loss", gaze_loss)
-                    g_loss = g_loss + gaze_loss
+                        # R1：使用原始判别器并以 FP32 计算。
+                        fake_score = self.net_d(fake_img)
+                        real_score = self.net_d(real_img)
 
-                # HRFFA：姿态、眼睑、嘴部开合和 target 外轮廓。
-                # compile_module 仅编译 HRFFA 神经网络主体；FP32 几何求解保持 eager。
-                if self.enable_hrffa_loss:
-                    hrffa_components = self.hrffa_loss.forward_components(fake_restored, dst_canonical)
-                    for name, component in hrffa_components.items():
-                        self.log(f"hrffa_{name}_loss", component)
-                    g_loss = g_loss + torch.stack(tuple(hrffa_components.values())).sum()
+                        d_loss = self.d_loss(fake_score, real_score)
+                        self.log("d_loss", d_loss)
 
-                # FACS：保持 canonical dst 的连续 Action Unit 激活状态与左右非对称表情。
-                if self.enable_facs_loss:
-                    facs_components = self.facs_loss.forward_components(fake_restored, dst_canonical)
-                    for name, component in facs_components.items():
-                        self.log(f"facs_{name}_loss", component)
-                    g_loss = g_loss + torch.stack(tuple(facs_components.values())).sum()
+                        r1_loss_raw = r1_reg_loss(real_score, real_img, gamma=self.r1_gamma)
+                        self.log("r1_loss_raw", r1_loss_raw, force=True)
+                        r1_loss = r1_loss_raw * self.r1_reg_step
+                        self.log("r1_loss", r1_loss, force=True)
+                        d_loss = d_loss + r1_loss
+                else:
+                    with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
+                        fake_score = net_d(fake.detach())
+                        real_score = net_d(dst.detach())
 
-                # perceptual_loss
-                if self.enable_perceptual_loss:
-                    perceptual_loss = self.perceptual_loss_forward(fake, dst)
-                    self.log("perceptual_loss", perceptual_loss)
-                    g_loss = g_loss + perceptual_loss
+                        d_loss = self.d_loss(fake_score, real_score)
+                        self.log("d_loss", d_loss)
 
-                # rec_loss：只约束 src/dst 来自同一张原图的 self-reconstruction 样本。
-                if self.enable_rec_loss:
-                    rec_per_sample = self.rec_loss(fake, dst).flatten(1).mean(dim=1)
-                    same_weight = same_mask.to(dtype=rec_per_sample.dtype)
-                    rec_loss = (rec_per_sample * same_weight).sum() / same_weight.sum().clamp_min(1.0)
-                    self.log("rec_loss", rec_loss)
-                    g_loss = g_loss + rec_loss
+                _ensure_finite_loss("d_loss", d_loss)
+                d_updated = _scaled_backward_step(d_loss, self.optim_d, self.scaler_d)
+                if not d_updated:
+                    d_overflow_streak += 1
+                    self.optim_d.zero_grad(set_to_none=True)
+                    self._log_buffer.clear()
+                    self._step_in_progress = False
+                    if d_overflow_streak >= MAX_AMP_OVERFLOW_RETRIES:
+                        raise FloatingPointError(f"Discriminator 连续 {MAX_AMP_OVERFLOW_RETRIES} 次 FP16 gradient overflow，停止训练")
+                    continue
+                d_overflow_streak = 0
 
-            self.scaler_g.scale(g_loss).backward()
-            self.scaler_g.step(self.optim_g)
-            self.scaler_g.update()
+                if self.use_cosine_lr:
+                    self.lr_scheduler_d.step()
 
-            if self.use_cosine_lr:
-                self.lr_scheduler_g.step()
+                # ========================= 训练生成器 =========================
+                self.net_d.requires_grad_(False)
+                g_overflow_retries = 0
 
-            self.update_ema()
-            self._completed_step += 1
-            self._step_in_progress = False
-            self.flush_logs()
+                while True:
+                    self.optim_g.zero_grad(set_to_none=True)
+                    if g_overflow_retries > 0:
+                        # D 已经成功更新，G overflow 时只重算 G，避免重复执行 D/R1。
+                        with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
+                            fake = net_g(dst, generator_identity_embeddings)
 
-            if self._stop_requested:
-                raise KeyboardInterrupt
+                    with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
+                        # gan_loss
+                        if self.enable_wfm_loss:
+                            fake_score, fake_feats = net_d(fake, True)
+                        else:
+                            fake_score = net_d(fake)
 
-            if self.completed_step % self.weight_save_every == 0:
-                self.save_ckpt()
+                        gan_loss = self.gan_loss(fake_score)
+                        self.log("gan_loss", gan_loss)
+                        g_loss = gan_loss
 
-            if self.completed_step % self.sample_save_every == 0:
-                self._save_sample(sample_batch, (src, dst, dst_canonical, theta_restore, same_mask))
+                        # wfm_loss
+                        if self.enable_wfm_loss:
+                            with torch.no_grad():
+                                real_feats = self.train_d_features(dst, self.wfm_max_layer)
+                            wfm_loss = self.wfm_loss(fake_feats, real_feats)
+                            self.log("wfm_loss", wfm_loss)
+                            g_loss = g_loss + wfm_loss
+
+                        # id_loss
+                        generated_identity_embeddings = self.identity_embeddings_forward(self.prepare_identity_encoder_faces(fake, theta_restore))
+                        id_loss = self.id_loss(generated_identity_embeddings, source_identity_embeddings)
+                        self.log("id_loss", id_loss)
+                        g_loss = g_loss + id_loss
+
+                        # Gaze / HRFFA / FACS：只将 fake 恢复到 canonical 坐标系，reference 直接使用 dst_canonical。
+                        if self.enable_gaze_loss or self.enable_hrffa_loss or self.enable_facs_loss:
+                            with autocast(device_type="cuda", enabled=False):
+                                restore_grid = NF.affine_grid(theta_restore.float(), size=list(fake.shape), align_corners=False)
+                                fake_restored = NF.grid_sample(fake.float(), restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+
+                        # gaze_loss：生成结果保持 canonical dst 的视线方向。
+                        if self.enable_gaze_loss:
+                            gaze_loss = self.gaze_loss_forward(fake_restored, dst_canonical)
+                            self.log("gaze_loss", gaze_loss)
+                            g_loss = g_loss + gaze_loss
+
+                        # HRFFA：姿态、眼睑、嘴部开合和 target 外轮廓。
+                        # compile_module 仅编译 HRFFA 神经网络主体；FP32 几何求解保持 eager。
+                        if self.enable_hrffa_loss:
+                            hrffa_components = self.hrffa_loss.forward_components(fake_restored, dst_canonical)
+                            for name, component in hrffa_components.items():
+                                self.log(f"hrffa_{name}_loss", component)
+                            g_loss = g_loss + torch.stack(tuple(hrffa_components.values())).sum()
+
+                        # FACS：保持 canonical dst 的连续 Action Unit 激活状态与左右非对称表情。
+                        if self.enable_facs_loss:
+                            facs_components = self.facs_loss.forward_components(fake_restored, dst_canonical)
+                            for name, component in facs_components.items():
+                                self.log(f"facs_{name}_loss", component)
+                            g_loss = g_loss + torch.stack(tuple(facs_components.values())).sum()
+
+                        # perceptual_loss
+                        if self.enable_perceptual_loss:
+                            perceptual_loss = self.perceptual_loss_forward(fake, dst)
+                            self.log("perceptual_loss", perceptual_loss)
+                            g_loss = g_loss + perceptual_loss
+
+                        # rec_loss：只约束 src/dst 来自同一张原图的 self-reconstruction 样本。
+                        if self.enable_rec_loss:
+                            rec_per_sample = self.rec_loss(fake, dst).flatten(1).mean(dim=1)
+                            same_weight = same_mask.to(dtype=rec_per_sample.dtype)
+                            rec_loss = (rec_per_sample * same_weight).sum() / same_weight.sum().clamp_min(1.0)
+                            self.log("rec_loss", rec_loss)
+                            g_loss = g_loss + rec_loss
+
+                    _ensure_finite_loss("g_loss", g_loss)
+                    if _scaled_backward_step(g_loss, self.optim_g, self.scaler_g):
+                        break
+
+                    g_overflow_retries += 1
+                    self.optim_g.zero_grad(set_to_none=True)
+                    if g_overflow_retries >= MAX_AMP_OVERFLOW_RETRIES:
+                        raise FloatingPointError(f"Generator 连续 {MAX_AMP_OVERFLOW_RETRIES} 次 FP16 gradient overflow，停止训练")
+
+                if self.use_cosine_lr:
+                    self.lr_scheduler_g.step()
+
+                self.update_ema()
+                self._completed_step += 1
+                self._step_in_progress = False
+                self.flush_logs()
+                progress.update(1)
+
+                if self._stop_requested:
+                    raise KeyboardInterrupt
+
+                if self.completed_step % self.weight_save_every == 0:
+                    self.save_ckpt()
+
+                if self.completed_step % self.sample_save_every == 0:
+                    self._save_sample(sample_batch, (src, dst, dst_canonical, theta_restore, same_mask))
 
 
 def _load_run_config(paths: RunPaths) -> tuple[dict[str, Any], dict[str, Any]]:
     resolved = load_resolved_config(paths)
-    canonical = resolve_train_config(resolved)
-    if canonical != resolved:
+    migrated = _migrate_legacy_run_precision(resolved)
+    canonical = resolve_train_config(migrated)
+    if canonical != migrated:
         raise ValueError(f"run 的 resolved config 不是当前格式的规范表示：{paths.resolved_config}")
+    # 返回原始 frozen config 以保持 metadata/checkpoint 中既有 config_sha256 不变。
     return _runtime_train_config(canonical), resolved
 
 

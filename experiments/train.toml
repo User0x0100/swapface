@@ -29,7 +29,7 @@ r1_reg_step = 16
 # R1 正则 gamma。实际 lazy R1 会再乘以 r1_reg_step 进行间隔补偿。
 r1_gamma = 10.0
 
-# 混合精度模式：fp32 / fp16 / bf16。
+# 必须显式设置混合精度模式：fp32 / fp16 / bf16。
 # Radeon gfx1100 上部分 BF16 卷积 backward 存在严重性能退化，因此当前实验使用 FP16。
 precision = "fp16"
 

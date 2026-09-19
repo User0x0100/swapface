@@ -15,7 +15,16 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from swapface.config import load_train_config, resolve_train_config
 from swapface.contracts import CHECKPOINT_VERSION
 from swapface.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
-from swapface.train import Trainer, _assert_branch_model_compatible, _compile_training_callable, _load_branch_checkpoint, _load_branch_optimizer_state, _load_run_config, _supports_compiled_bf16
+from swapface.train import (
+    Trainer,
+    _assert_branch_model_compatible,
+    _compile_training_callable,
+    _load_branch_checkpoint,
+    _load_branch_optimizer_state,
+    _load_run_config,
+    _scaled_backward_step,
+    _supports_compiled_bf16,
+)
 
 
 def _check_train_config(root: Path) -> None:
@@ -77,6 +86,15 @@ def _check_train_config(root: Path) -> None:
     assert metadata["config_sha256"] == config_sha256(resolved)
 
     # 旧 schema 不再兼容；缺少当前必需字段的 run 必须拒绝 resume。
+    legacy_precision_resolved = copy.deepcopy(resolved)
+    legacy_precision_resolved["train"].pop("precision")
+    legacy_precision_resolved["train"]["bf16"] = True
+    legacy_precision_paths = create_run(root / "legacy-precision-runs", source, legacy_precision_resolved, name="legacy-precision")
+    legacy_runtime, legacy_frozen = _load_run_config(legacy_precision_paths)
+    assert legacy_runtime["precision"] == "bf16"
+    assert legacy_frozen == legacy_precision_resolved
+    assert load_resolved_config(legacy_precision_paths) == legacy_precision_resolved
+
     legacy_resolved = copy.deepcopy(resolved)
     legacy_resolved["dataloader"].pop("same_prob")
     legacy_paths = create_run(root / "legacy-runs", source, legacy_resolved, name="legacy")
@@ -104,6 +122,15 @@ def _check_train_config(root: Path) -> None:
         assert "precision" in str(error)
     else:
         raise AssertionError("配置错误接受了未知训练精度")
+
+    invalid = copy.deepcopy(raw)
+    invalid["train"].pop("precision")
+    try:
+        resolve_train_config(invalid)
+    except ValueError as error:
+        assert "precision" in str(error)
+    else:
+        raise AssertionError("配置错误接受了未显式声明的训练精度")
 
     invalid = copy.deepcopy(raw)
     invalid["dataloader"]["same_prob"] = 1.1
@@ -147,8 +174,46 @@ def _check_step_boundary() -> None:
     print("PASS: fresh/completed/partial step checkpoint boundary")
 
 
+def _check_scaled_optimizer_step() -> None:
+    class FakeScaler:
+        def __init__(self, *, overflow: bool):
+            self.overflow = overflow
+            self.scale_value = 8.0
+
+        def get_scale(self) -> float:
+            return self.scale_value
+
+        def is_enabled(self) -> bool:
+            return True
+
+        def scale(self, loss: torch.Tensor) -> torch.Tensor:
+            return loss
+
+        def step(self, optimizer: torch.optim.Optimizer) -> None:
+            if not self.overflow:
+                optimizer.step()
+
+        def update(self) -> None:
+            if self.overflow:
+                self.scale_value *= 0.5
+
+    successful_parameter = torch.nn.Parameter(torch.tensor(1.0))
+    successful_optimizer = torch.optim.SGD([successful_parameter], lr=0.1)
+    successful_loss = successful_parameter.square()
+    assert _scaled_backward_step(successful_loss, successful_optimizer, FakeScaler(overflow=False))
+    assert not torch.equal(successful_parameter.detach(), torch.tensor(1.0))
+
+    skipped_parameter = torch.nn.Parameter(torch.tensor(1.0))
+    skipped_optimizer = torch.optim.SGD([skipped_parameter], lr=0.1)
+    skipped_loss = skipped_parameter.square()
+    assert not _scaled_backward_step(skipped_loss, skipped_optimizer, FakeScaler(overflow=True))
+    torch.testing.assert_close(skipped_parameter.detach(), torch.tensor(1.0))
+    print("PASS: AMP scaler distinguishes successful and skipped optimizer updates")
+
+
 def main() -> None:
     _check_step_boundary()
+    _check_scaled_optimizer_step()
     # ROCm 不使用 NVIDIA compute capability；CUDA 继续保持 SM80+ 的 compile-BF16 限制。
     with (
         patch("swapface.train.torch.version.hip", "7.0.0"),
