@@ -173,7 +173,7 @@ Branch 允许修改训练配置，例如：
 - loss 类型、开关和权重；
 - Generator Identity provider 与 Identity Loss provider；
 - 学习率与 scheduler；
-- batch size、R1、BF16/compile；
+- batch size、R1、precision/compile；
 - 数据源、数据增强与数据管线参数（NVIDIA 使用 DALI，ROCm 使用原生 PyTorch 管线）；
 - 日志、sample 和 checkpoint 间隔。
 
@@ -192,19 +192,19 @@ Branch 继承 Generator、Discriminator、EMA 和 Adam moments/step。optimizer 
 - **resume**：原 run、原冻结配置、latest checkpoint，严格线性继续；
 - **branch**：新 run、父 checkpoint 的已训练模型状态、新训练配置，但模型定义不可改变。
 
-### 可选严格校验 BF16
+### 可选严格校验训练精度
 
-BF16 是否实际生效不仅由 TOML 的 `bf16 = true` 决定，还取决于当前 GPU 与 `torch.compile` 能力。ROCm 使用 PyTorch 报告的 BF16 能力；NVIDIA 在启用 `torch.compile` 时继续要求 SM80+。默认 resume **不要求**当前实际 BF16/FP32 模式与 checkpoint 一致，因为设备和软件环境不属于严格训练配置约束。
+`[train].precision` 支持 `fp32`、`fp16`、`bf16`。FP16 使用独立的 Generator/Discriminator `GradScaler`；BF16 不使用 loss scaling。R1、仿射恢复与 HRFFA 的数值敏感几何求解继续固定为 FP32。
 
-如果某次恢复训练需要把数值精度模式也视为严格条件，可显式使用：
+默认 resume 不要求当前实际训练精度与 checkpoint 一致，因为设备和软件环境可能变化。需要严格复现时可显式使用：
 
 ```bash
 uv run python -m swapface.train \
-  --resume experiments/runs/20260910-162600_blendface-vgg \
-  --strict-bf16
+  --resume experiments/runs/<run_id> \
+  --strict-precision
 ```
 
-此时程序比较 checkpoint 中记录的实际 `training_config.bf16` 与当前进程实际生效的 BF16 状态；不一致时拒绝 resume。`--strict-bf16` 是本次 resume 的运行时策略，不写入 TOML，也不能用于 fresh training。
+此时程序比较 checkpoint 中记录的实际 `training_config.precision` 与当前进程实际生效的精度；不一致时拒绝 resume。对于旧 v3 checkpoint，`training_config.bf16` 仅用于映射旧的 BF16/FP32 运行状态。`--strict-precision` 是本次 resume 的运行时策略，不写入 TOML，也不能用于 fresh training。
 
 ## 配置冻结与哈希
 

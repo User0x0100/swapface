@@ -15,7 +15,7 @@ DEFAULT_TRAIN_CONFIG: dict[str, Any] = {
     "lr_scheduler_t_max": 0,
     "r1_reg_step": 16,
     "r1_gamma": 10.0,
-    "bf16": True,
+    "precision": "bf16",
     "device": "cuda",
     "compile_module": True,
     "log_interval": 10,
@@ -159,6 +159,13 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
             raise TypeError(f"[{section}] 必须为表/对象")
 
     train = _with_defaults(dict(config.get("train", {})), DEFAULT_TRAIN_CONFIG, "[train]")
+    precision = train["precision"]
+    if not isinstance(precision, str):
+        raise TypeError(f"train.precision 必须为字符串，实际为 {type(precision).__name__}")
+    precision = precision.lower()
+    if precision not in {"fp32", "fp16", "bf16"}:
+        raise ValueError(f"train.precision={precision!r} 无效，可选：fp32、fp16、bf16")
+    train["precision"] = precision
 
     identity = dict(config.get("identity", {}))
     unknown_identity = set(identity) - set(DEFAULT_IDENTITY_CONFIG)

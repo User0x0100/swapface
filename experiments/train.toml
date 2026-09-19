@@ -3,7 +3,7 @@
 #
 # 使用方式：
 #   新训练：uv run python -m swapface.train --config experiments/train.toml [--name NAME]
-#   恢复训练：uv run python -m swapface.train --resume experiments/runs/<run_id> [--strict-bf16]
+#   恢复训练：uv run python -m swapface.train --resume experiments/runs/<run_id> [--strict-precision]
 #
 # 说明：
 # - 本文件只描述训练实验本身，不保存 checkpoint/output 路径等运行时状态。
@@ -29,8 +29,9 @@ r1_reg_step = 16
 # R1 正则 gamma。实际 lazy R1 会再乘以 r1_reg_step 进行间隔补偿。
 r1_gamma = 10.0
 
-# 是否启用 BF16 autocast。若 GPU 不支持 BF16，会自动回退。
-bf16 = true
+# 混合精度模式：fp32 / fp16 / bf16。
+# Radeon gfx1100 上部分 BF16 卷积 backward 存在严重性能退化，因此当前实验使用 FP16。
+precision = "fp16"
 
 # Trainer 支持 PyTorch CUDA/HIP GPU。ROCm 也沿用 PyTorch 的 "cuda" 设备命名。
 # 可写 "cuda"、"cuda:0" 等，不使用 "rocm" 或 "hip" 设备名。

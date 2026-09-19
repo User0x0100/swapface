@@ -10,7 +10,7 @@ import cv2
 import torch
 import torch.nn.functional as NF
 from torch import Tensor, optim
-from torch.amp import autocast
+from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid
@@ -114,7 +114,7 @@ class Trainer:
         lr_scheduler_t_max: int = 0,
         r1_reg_step: int = 16,
         r1_gamma: float = 10.0,
-        bf16: bool = True,
+        precision: str = "bf16",
         device: str = "cuda",
         compile_module: bool = True,
         log_interval: int = 10,
@@ -164,7 +164,7 @@ class Trainer:
         resume_checkpoint: str | Path | None = None,
         run_id: str | None = None,
         resolved_config_sha256: str | None = None,
-        strict_bf16_resume: bool = False,
+        strict_precision_resume: bool = False,
         checkpoint_mode: Literal["resume", "branch"] = "resume",
         preloaded_checkpoint: dict[str, Any] | None = None,
     ):
@@ -225,21 +225,36 @@ class Trainer:
         self.enable_wfm_loss = enable_wfm_loss
 
         device_id = self.device.index if self.device.index is not None else torch.cuda.current_device()
-        bf16_runtime_supported = torch.cuda.is_bf16_supported()
-        bf16_compile_supported = _supports_compiled_bf16(device_id)
-        self.bf16 = bool(bf16 and bf16_runtime_supported and (not compile_module or bf16_compile_supported))
-        if bf16 and not self.bf16:
-            if compile_module and bf16_runtime_supported and not bf16_compile_supported:
-                major, minor = torch.cuda.get_device_capability(device_id)
-                print(f"警告：当前 GPU SM{major}{minor} 可运行 BF16，但 torch.compile 不支持该架构的 BF16，训练自动回退 FP32")
+        requested_precision = precision.lower()
+        if requested_precision == "bf16":
+            bf16_runtime_supported = torch.cuda.is_bf16_supported()
+            bf16_compile_supported = _supports_compiled_bf16(device_id)
+            if bf16_runtime_supported and (not compile_module or bf16_compile_supported):
+                self.precision = "bf16"
+                self.amp_dtype = torch.bfloat16
             else:
-                print("警告：当前显卡不支持 BF16，训练自动回退 FP32")
+                self.precision = "fp32"
+                self.amp_dtype = None
+                if compile_module and bf16_runtime_supported and not bf16_compile_supported:
+                    major, minor = torch.cuda.get_device_capability(device_id)
+                    print(f"警告：当前 GPU SM{major}{minor} 可运行 BF16，但 torch.compile 不支持该架构的 BF16，训练自动回退 FP32")
+                else:
+                    print("警告：当前显卡不支持 BF16，训练自动回退 FP32")
+        elif requested_precision == "fp16":
+            self.precision = "fp16"
+            self.amp_dtype = torch.float16
+        elif requested_precision == "fp32":
+            self.precision = "fp32"
+            self.amp_dtype = None
+        else:
+            raise ValueError(f"precision={precision!r} 无效，可选：fp32、fp16、bf16")
+        self.amp_enabled = self.amp_dtype is not None
 
         self.sample_save_every = sample_save_every
         self.weight_save_every = weight_save_every
         self.log_interval = log_interval
         self.use_cosine_lr = lr_scheduler_t_max > 0
-        self.training_config = {"bf16": self.bf16, "lr": lr, "lr_scheduler_t_max": lr_scheduler_t_max}
+        self.training_config = {"precision": self.precision, "lr": lr, "lr_scheduler_t_max": lr_scheduler_t_max}
 
         # ========================= 初始化模型 =========================
 
@@ -253,6 +268,7 @@ class Trainer:
         checkpoint: dict[str, Any] | None = preloaded_checkpoint
         training_state: dict[str, Any] | None = None
         saved_training_config: dict[str, Any] | None = None
+        saved_precision: str | None = None
         if resume_checkpoint is not None:
             checkpoint_path = Path(resume_checkpoint)
             if not checkpoint_path.exists():
@@ -281,8 +297,12 @@ class Trainer:
                     raise ValueError("checkpoint 不属于当前 run 或冻结配置已变化")
 
             saved_training_config = checkpoint["training_config"]
-            if strict_bf16_resume and checkpoint_mode == "resume" and saved_training_config["bf16"] != self.bf16:
-                raise ValueError(f"BF16 模式不一致：checkpoint={saved_training_config['bf16']}，current={self.bf16}")
+            saved_precision = saved_training_config.get("precision")
+            # 兼容旧 v3 checkpoint 的运行时精度元数据；旧 run 配置协议本身仍按当前 schema 校验。
+            if saved_precision is None and "bf16" in saved_training_config:
+                saved_precision = "bf16" if saved_training_config["bf16"] else "fp32"
+            if strict_precision_resume and checkpoint_mode == "resume" and saved_precision != self.precision:
+                raise ValueError(f"训练精度不一致：checkpoint={saved_precision}，current={self.precision}")
 
             saved_generator_provider = checkpoint["identity_encoders"]["generator"]
             if checkpoint_mode == "resume" and saved_generator_provider != self.generator_id_encoder_provider.name:
@@ -332,6 +352,11 @@ class Trainer:
         # ========================= 优化器 =========================
         self.optim_g = optim.Adam(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
         self.optim_d = optim.Adam(self.net_d.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
+        # FP16 的指数范围远小于 FP32/BF16，G/D 使用独立动态 loss scaler。
+        # BF16/FP32 下 GradScaler 禁用，保持原始 backward/step 语义。
+        scaler_enabled = self.precision == "fp16"
+        self.scaler_g = GradScaler("cuda", enabled=scaler_enabled)
+        self.scaler_d = GradScaler("cuda", enabled=scaler_enabled)
 
         if training_state is not None:
             assert saved_training_config is not None
@@ -344,6 +369,14 @@ class Trainer:
                 self.optim_d.load_state_dict(training_state["optim_d"])
         else:
             scheduler_config_unchanged = False
+
+        if training_state is not None and saved_precision == self.precision == "fp16":
+            scaler_g_state = training_state.get("scaler_g")
+            scaler_d_state = training_state.get("scaler_d")
+            if scaler_g_state is not None:
+                self.scaler_g.load_state_dict(scaler_g_state)
+            if scaler_d_state is not None:
+                self.scaler_d.load_state_dict(scaler_d_state)
 
         if self.use_cosine_lr:
             self.lr_scheduler_g = CosineAnnealingLR(self.optim_g, T_max=lr_scheduler_t_max, eta_min=lr * 0.1)
@@ -531,6 +564,8 @@ class Trainer:
             "net_g": self.net_g.state_dict(),
             "optim_g": self.optim_g.state_dict(),
             "optim_d": self.optim_d.state_dict(),
+            "scaler_g": self.scaler_g.state_dict() if self.precision == "fp16" else None,
+            "scaler_d": self.scaler_d.state_dict() if self.precision == "fp16" else None,
             "lr_scheduler_g": self.lr_scheduler_g.state_dict() if self.use_cosine_lr else None,
             "lr_scheduler_d": self.lr_scheduler_d.state_dict() if self.use_cosine_lr else None,
         }
@@ -578,7 +613,7 @@ class Trainer:
     def _save_sample(self, sample_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor], current_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor]) -> None:
         sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, _sample_same_mask = sample_batch
         src, dst, dst_canonical, theta_restore, _same_mask = current_batch
-        with torch.no_grad(), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
+        with torch.no_grad(), autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
             half = self.batch_size // 2
             src_vis = torch.cat((sample_src[:half], src[: self.batch_size - half]), dim=0)
             dst_vis = torch.cat((sample_dst[:half], dst[: self.batch_size - half]), dim=0)
@@ -637,7 +672,7 @@ class Trainer:
             self._step_in_progress = True
 
             # ========================= 生成器前向 =========================
-            with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
+            with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                 with torch.no_grad():
                     source_identity_faces = self.prepare_identity_encoder_faces(src)
                     generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
@@ -667,15 +702,16 @@ class Trainer:
                     self.log("r1_loss", r1_loss, force=True)
                     d_loss = d_loss + r1_loss
             else:
-                with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
+                with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                     fake_score = net_d(fake.detach())
                     real_score = net_d(dst.detach())
 
                     d_loss = self.d_loss(fake_score, real_score)
                     self.log("d_loss", d_loss)
 
-            d_loss.backward()
-            self.optim_d.step()
+            self.scaler_d.scale(d_loss).backward()
+            self.scaler_d.step(self.optim_d)
+            self.scaler_d.update()
 
             if self.use_cosine_lr:
                 self.lr_scheduler_d.step()
@@ -684,7 +720,7 @@ class Trainer:
             self.net_d.requires_grad_(False)
             self.optim_g.zero_grad(set_to_none=True)
 
-            with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.bf16):
+            with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                 # gan_loss
                 if self.enable_wfm_loss:
                     fake_score, fake_feats = net_d(fake, True)
@@ -750,8 +786,9 @@ class Trainer:
                     self.log("rec_loss", rec_loss)
                     g_loss = g_loss + rec_loss
 
-            g_loss.backward()
-            self.optim_g.step()
+            self.scaler_g.scale(g_loss).backward()
+            self.scaler_g.step(self.optim_g)
+            self.scaler_g.update()
 
             if self.use_cosine_lr:
                 self.lr_scheduler_g.step()
@@ -822,7 +859,7 @@ def main() -> None:
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument("--resume", type=Path, default=None, help="严格恢复原 run，只允许 latest checkpoint，并使用原 run 冻结配置")
     source_group.add_argument("--branch-from", type=Path, default=None, help="从标准 run 或独立 checkpoint 创建新 run；允许修改训练配置，但禁止修改模型架构")
-    parser.add_argument("--strict-bf16", action="store_true", help="仅用于 resume：要求当前实际 BF16/FP32 模式与 checkpoint 一致；默认允许变化")
+    parser.add_argument("--strict-precision", action="store_true", help="仅用于 resume：要求当前实际训练精度与 checkpoint 一致；默认允许变化")
     args = parser.parse_args()
 
     is_resume = args.resume is not None
@@ -836,8 +873,8 @@ def main() -> None:
         parser.error("--resume 与 --runs-root 不能同时使用；resume 继续写入原 run")
     if is_branch and args.config is None:
         parser.error("--branch-from 必须显式配合 --config，branch 会创建使用该配置的新 run")
-    if args.strict_bf16 and not is_resume:
-        parser.error("--strict-bf16 仅用于 --resume")
+    if args.strict_precision and not is_resume:
+        parser.error("--strict-precision 仅用于 --resume")
 
     checkpoint_mode: Literal["resume", "branch"] = "resume"
     preloaded_checkpoint: dict[str, Any] | None = None
@@ -880,7 +917,7 @@ def main() -> None:
                 resume_checkpoint=resume_checkpoint,
                 run_id=run_id,
                 resolved_config_sha256=digest,
-                strict_bf16_resume=args.strict_bf16,
+                strict_precision_resume=args.strict_precision,
                 checkpoint_mode=checkpoint_mode,
                 preloaded_checkpoint=preloaded_checkpoint,
             )

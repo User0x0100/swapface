@@ -21,7 +21,7 @@ from swapface.train import Trainer, _assert_branch_model_compatible, _compile_tr
 def _check_train_config(root: Path) -> None:
     source = root / "canonical.toml"
     source.write_text(
-        "[train]\nbatch_size = 8\ncompile_module = false\n"
+        "[train]\nbatch_size = 8\nprecision = \"fp16\"\ncompile_module = false\n"
         "[generator]\naad_skip_layers = []\n"
         '[identity]\ngenerator_provider = "MS1MV3_ARCFACE_R50_FP16"\nloss_provider = "BLENDFACE"\n'
         "[dataloader]\nrotation_range = [-3, 3]\nsame_prob = 0.25\n"
@@ -43,6 +43,7 @@ def _check_train_config(root: Path) -> None:
     assert loaded == resolved
     assert resolved["train"]["batch_size"] == 8
     assert resolved["train"]["compile_module"] is False
+    assert resolved["train"]["precision"] == "fp16"
     assert resolved["identity"]["generator_provider"] == raw["identity"]["generator_provider"]
     assert resolved["identity"]["loss_provider"] == raw["identity"]["loss_provider"]
     assert resolved["dataloader"]["rotation_range"] == [-3.0, 3.0]
@@ -94,6 +95,15 @@ def _check_train_config(root: Path) -> None:
         assert "unknown_field" in str(error)
     else:
         raise AssertionError("配置错误接受了未知字段")
+
+    invalid = copy.deepcopy(raw)
+    invalid["train"]["precision"] = "fp8"
+    try:
+        resolve_train_config(invalid)
+    except ValueError as error:
+        assert "precision" in str(error)
+    else:
+        raise AssertionError("配置错误接受了未知训练精度")
 
     invalid = copy.deepcopy(raw)
     invalid["dataloader"]["same_prob"] = 1.1
