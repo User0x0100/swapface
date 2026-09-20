@@ -1,7 +1,7 @@
 import argparse
 import copy
 import signal
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -95,13 +95,48 @@ def _load_branch_optimizer_state(optimizer: optim.Optimizer, state: dict[str, An
             group["initial_lr"] = lr
 
 
-def _scaled_backward_step(loss: Tensor, optimizer: optim.Optimizer, scaler: GradScaler) -> bool:
-    """执行一次 AMP backward/optimizer step，并返回参数是否实际更新。"""
+def _ensure_finite_gradients(name: str, named_parameters: Iterable[tuple[str, Tensor]]) -> None:
+    """在 optimizer.step 前阻止 BF16/FP32 非有限梯度污染参数与优化器状态。"""
+    gradients = [(parameter_name, parameter.grad) for parameter_name, parameter in named_parameters if parameter.grad is not None]
+    if not gradients:
+        return
+
+    # infinity norm 不会像 L2 norm 那样因平方/求和而把有限大值误判为 Inf；
+    # foreach 让常规路径按 tensor list 批量归约，最终只同步一次标量结果。
+    gradient_norms = torch._foreach_norm([gradient.detach() for _, gradient in gradients], ord=float("inf"))
+    if bool(torch.isfinite(torch.stack(gradient_norms)).all().item()):
+        return
+
+    for (parameter_name, gradient), gradient_norm in zip(gradients, gradient_norms, strict=True):
+        if bool(torch.isfinite(gradient_norm).item()):
+            continue
+        detached = gradient.detach()
+        finite_count = int(torch.isfinite(detached).sum().item())
+        total_count = detached.numel()
+        raise FloatingPointError(f"{name} gradient 出现 NaN/Inf：parameter={parameter_name}, shape={tuple(detached.shape)}, dtype={detached.dtype}, finite={finite_count}/{total_count}")
+    raise AssertionError("检测到非有限梯度，但未找到对应参数")
+
+
+def _scaled_backward_step(
+    loss: Tensor,
+    optimizer: optim.Optimizer,
+    scaler: GradScaler,
+    *,
+    name: str,
+    named_parameters: Iterable[tuple[str, Tensor]],
+) -> bool:
+    """执行 backward/optimizer step；FP16 overflow 由 GradScaler 恢复，其余精度先验证梯度。"""
     scale_before = scaler.get_scale()
     scaler.scale(loss).backward()
+
+    if not scaler.is_enabled():
+        _ensure_finite_gradients(name, named_parameters)
+        optimizer.step()
+        return True
+
     scaler.step(optimizer)
     scaler.update()
-    return not scaler.is_enabled() or scaler.get_scale() >= scale_before
+    return scaler.get_scale() >= scale_before
 
 
 def _ensure_finite_loss(name: str, loss: Tensor) -> None:
@@ -742,7 +777,13 @@ class Trainer:
                         self.log("d_loss", d_loss)
 
                 _ensure_finite_loss("d_loss", d_loss)
-                d_updated = _scaled_backward_step(d_loss, self.optim_d, self.scaler_d)
+                d_updated = _scaled_backward_step(
+                    d_loss,
+                    self.optim_d,
+                    self.scaler_d,
+                    name="Discriminator",
+                    named_parameters=self.net_d.named_parameters(),
+                )
                 if not d_updated:
                     d_overflow_streak += 1
                     self.optim_d.zero_grad(set_to_none=True)
@@ -834,7 +875,13 @@ class Trainer:
                             g_loss = g_loss + rec_loss
 
                     _ensure_finite_loss("g_loss", g_loss)
-                    if _scaled_backward_step(g_loss, self.optim_g, self.scaler_g):
+                    if _scaled_backward_step(
+                        g_loss,
+                        self.optim_g,
+                        self.scaler_g,
+                        name="Generator",
+                        named_parameters=self.net_g.named_parameters(),
+                    ):
                         break
 
                     g_overflow_retries += 1

@@ -196,7 +196,7 @@ Branch 继承 Generator、Discriminator、EMA 和 Adam moments/step。optimizer 
 
 `[train].precision` 必须显式配置，支持 `fp32`、`fp16`、`bf16`。FP16 使用独立的 Generator/Discriminator `GradScaler`；BF16 不使用 loss scaling。R1、仿射恢复与 HRFFA 的数值敏感几何求解继续固定为 FP32。
 
-FP16 中只有实际执行了 optimizer update 的阶段才推进对应 scheduler。D overflow 时当前 global step 不推进；D 已成功而 G overflow 时只重算并重试 G，直到 G 成功后才更新 EMA 和 `completed_step`。总 `d_loss` / `g_loss` 出现 NaN/Inf 时直接终止，避免把非有限值误当作可通过降低 loss scale 恢复的 overflow。
+FP16 中只有实际执行了 optimizer update 的阶段才推进对应 scheduler。D overflow 时当前 global step 不推进；D 已成功而 G overflow 时只重算并重试 G，直到 G 成功后才更新 EMA 和 `completed_step`。总 `d_loss` / `g_loss` 出现 NaN/Inf 时直接终止，避免把非有限值误当作可通过降低 loss scale 恢复的 overflow。BF16/FP32 在 backward 后、`optimizer.step()` 前额外检查参数梯度；若任一梯度出现 NaN/Inf，则报告首个异常参数并终止，避免污染模型参数和 optimizer state。FP16 的梯度 overflow 仍由 `GradScaler` 负责跳过 update 和动态调整 scale，不走该 fatal gradient guard。
 
 旧 v3 run 的 frozen config 若仍使用 `bf16 = true/false`，resume 时只在内存中映射为 `precision = "bf16"/"fp32"`，不会改写原 `config.resolved.json` 或其 SHA-256，因此旧 run 仍可线性 resume。
 

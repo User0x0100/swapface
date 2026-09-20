@@ -176,7 +176,8 @@ def _check_step_boundary() -> None:
 
 def _check_scaled_optimizer_step() -> None:
     class FakeScaler:
-        def __init__(self, *, overflow: bool):
+        def __init__(self, *, enabled: bool, overflow: bool = False):
+            self.enabled = enabled
             self.overflow = overflow
             self.scale_value = 8.0
 
@@ -184,7 +185,7 @@ def _check_scaled_optimizer_step() -> None:
             return self.scale_value
 
         def is_enabled(self) -> bool:
-            return True
+            return self.enabled
 
         def scale(self, loss: torch.Tensor) -> torch.Tensor:
             return loss
@@ -200,15 +201,69 @@ def _check_scaled_optimizer_step() -> None:
     successful_parameter = torch.nn.Parameter(torch.tensor(1.0))
     successful_optimizer = torch.optim.SGD([successful_parameter], lr=0.1)
     successful_loss = successful_parameter.square()
-    assert _scaled_backward_step(successful_loss, successful_optimizer, FakeScaler(overflow=False))
+    assert _scaled_backward_step(
+        successful_loss,
+        successful_optimizer,
+        FakeScaler(enabled=True),
+        name="FP16",
+        named_parameters=[("weight", successful_parameter)],
+    )
     assert not torch.equal(successful_parameter.detach(), torch.tensor(1.0))
 
     skipped_parameter = torch.nn.Parameter(torch.tensor(1.0))
     skipped_optimizer = torch.optim.SGD([skipped_parameter], lr=0.1)
     skipped_loss = skipped_parameter.square()
-    assert not _scaled_backward_step(skipped_loss, skipped_optimizer, FakeScaler(overflow=True))
+    assert not _scaled_backward_step(
+        skipped_loss,
+        skipped_optimizer,
+        FakeScaler(enabled=True, overflow=True),
+        name="FP16",
+        named_parameters=[("weight", skipped_parameter)],
+    )
     torch.testing.assert_close(skipped_parameter.detach(), torch.tensor(1.0))
-    print("PASS: AMP scaler distinguishes successful and skipped optimizer updates")
+
+    unscaled_parameter = torch.nn.Parameter(torch.tensor(1.0))
+    unscaled_optimizer = torch.optim.SGD([unscaled_parameter], lr=0.1)
+    unscaled_loss = unscaled_parameter.square()
+    assert _scaled_backward_step(
+        unscaled_loss,
+        unscaled_optimizer,
+        FakeScaler(enabled=False),
+        name="BF16",
+        named_parameters=[("weight", unscaled_parameter)],
+    )
+    assert not torch.equal(unscaled_parameter.detach(), torch.tensor(1.0))
+
+    class FiniteLossNaNGradient(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value: torch.Tensor) -> torch.Tensor:
+            ctx.shape = value.shape
+            return value.new_zeros(())
+
+        @staticmethod
+        def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
+            return (torch.full(ctx.shape, torch.nan, device=grad_output.device, dtype=grad_output.dtype),)
+
+    guarded_parameter = torch.nn.Parameter(torch.tensor(1.0))
+    guarded_optimizer = torch.optim.SGD([guarded_parameter], lr=0.1)
+    guarded_loss = FiniteLossNaNGradient.apply(guarded_parameter)
+    try:
+        _scaled_backward_step(
+            guarded_loss,
+            guarded_optimizer,
+            FakeScaler(enabled=False),
+            name="BF16",
+            named_parameters=[("weight", guarded_parameter)],
+        )
+    except FloatingPointError as error:
+        message = str(error)
+        assert "BF16 gradient 出现 NaN/Inf" in message
+        assert "parameter=weight" in message
+        assert "finite=0/1" in message
+    else:
+        raise AssertionError("BF16 非有限梯度必须在 optimizer.step 前终止")
+    torch.testing.assert_close(guarded_parameter.detach(), torch.tensor(1.0))
+    print("PASS: FP16 overflow remains recoverable; BF16/FP32 non-finite gradients are blocked before optimizer.step")
 
 
 def main() -> None:
