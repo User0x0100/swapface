@@ -30,7 +30,7 @@ from losses import (
 from misc.face_alignment import ffhq_to_arcface_112, make_ffhq_to_arcface_112_grid, transform_sampling_grid
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
 from models.discriminator import Discriminator
-from models.discriminator.upfirdn2d import initialize_upfirdn2d
+from models.discriminator.upfirdn2d import initialize_upfirdn2d, is_rocm_gfx1100
 from models.networks import Generator
 
 from .config import (
@@ -540,8 +540,7 @@ class Trainer:
             if self.enable_facs_loss:
                 # gfx1100/ROCm 上 compiled OpenGraphAU 在当前混合精度路径会产生错误输出；
                 # 仅此架构保持 FACS teacher eager，其余模块继续 compile。
-                gcn_arch = getattr(torch.cuda.get_device_properties(device_id), "gcnArchName", "")
-                if torch.version.hip is not None and gcn_arch.split(":", 1)[0] == "gfx1100":
+                if is_rocm_gfx1100(device_id):
                     print("警告：gfx1100 上 FACS/OpenGraphAU 保持 eager，避免 compiled 混合精度数值错误")
                 else:
                     self.facs_loss.au_model = _compile_training_callable(self.facs_loss.au_model)

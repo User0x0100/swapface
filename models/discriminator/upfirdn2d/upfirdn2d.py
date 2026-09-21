@@ -53,6 +53,19 @@ def _parse_padding(padding):
     return padx0, padx1, pady0, pady1
 
 
+def is_rocm_gfx1100(device: torch.device | int | None = None) -> bool:
+    """Return whether *device* is exactly a ROCm gfx1100 GPU.
+
+    ROCm may append feature flags to gcnArchName; only the base architecture
+    name is compared.
+    """
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return False
+
+    gcn_arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+    return gcn_arch.split(":", 1)[0] == "gfx1100"
+
+
 def _get_filter_size(f: Tensor):
 
     assert isinstance(f, torch.Tensor) and f.ndim in [1, 2]
@@ -334,7 +347,7 @@ class UpFIRDn2d(nn.Module):
         return upfirdn2d(x, self.get_buffer("f"), self.upx, self.upy, self.downx, self.downy, self.padx0, self.padx1, self.pady0, self.pady1, self.flip_filter, self.gain)
 
 
-def _downfirdn2d_rocm_separable(
+def _downfirdn2d_separable(
     x: Tensor,
     f: Tensor,
     downx: int,
@@ -346,7 +359,7 @@ def _downfirdn2d_rocm_separable(
     flip_filter: bool,
     gain: float,
 ) -> Tensor:
-    """ROCm fast path for the separable binomial FIR used by DownFIRDn2d."""
+    """Separable binomial FIR implementation used by the gfx1100 fast path."""
     x = F.pad(x, (max(padx0, 0), max(padx1, 0), max(pady0, 0), max(pady1, 0)))
     crop_x0, crop_x1 = max(-padx0, 0), max(-padx1, 0)
     crop_y0, crop_y1 = max(-pady0, 0), max(-pady1, 0)
@@ -447,8 +460,8 @@ class DownFIRDn2d(nn.Module):
         Returns:
             Tensor of the shape `[batch_size, num_channels, out_height, out_width]`.
         """
-        if x.device.type == "cuda" and torch.version.hip is not None:
-            return _downfirdn2d_rocm_separable(
+        if x.device.type == "cuda" and is_rocm_gfx1100(x.device):
+            return _downfirdn2d_separable(
                 x, self.get_buffer("f"), self.downx, self.downy,
                 self.padx0, self.padx1, self.pady0, self.pady1,
                 self.flip_filter, self.gain,
