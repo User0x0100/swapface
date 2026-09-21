@@ -1,6 +1,5 @@
 import argparse
 import copy
-import os
 import signal
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -67,12 +66,6 @@ MAX_AMP_OVERFLOW_RETRIES = 8
 
 
 def _configure_training_runtime() -> None:
-    if torch.version.hip is not None:
-        # 服务器 gfx1100：FAST 避免 MIOpen 首次遇到新卷积形状时进行代价极高的
-        # exhaustive solver search。外部显式设置仍拥有优先级。
-        os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
-        os.environ.setdefault("MIOPEN_COMPILE_PARALLEL_LEVEL", "128")
-
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = torch.version.hip is None
