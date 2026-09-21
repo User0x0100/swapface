@@ -334,6 +334,46 @@ class UpFIRDn2d(nn.Module):
         return upfirdn2d(x, self.get_buffer("f"), self.upx, self.upy, self.downx, self.downy, self.padx0, self.padx1, self.pady0, self.pady1, self.flip_filter, self.gain)
 
 
+def _downfirdn2d_rocm_separable(
+    x: Tensor,
+    f: Tensor,
+    downx: int,
+    downy: int,
+    padx0: int,
+    padx1: int,
+    pady0: int,
+    pady1: int,
+    flip_filter: bool,
+    gain: float,
+) -> Tensor:
+    """ROCm fast path for the separable binomial FIR used by DownFIRDn2d."""
+    x = F.pad(x, (max(padx0, 0), max(padx1, 0), max(pady0, 0), max(pady1, 0)))
+    crop_x0, crop_x1 = max(-padx0, 0), max(-padx1, 0)
+    crop_y0, crop_y1 = max(-pady0, 0), max(-pady1, 0)
+    if crop_x0 or crop_x1 or crop_y0 or crop_y1:
+        x = x[:, :, crop_y0 : x.shape[2] - crop_y1, crop_x0 : x.shape[3] - crop_x1]
+
+    kernel = f if flip_filter else f.flip((0, 1))
+    kernel = kernel.to(device=x.device, dtype=x.dtype).mul(gain)
+    kernel_y = kernel.sum(dim=1)
+    kernel_x = kernel.sum(dim=0) / kernel.sum()
+
+    out_w = (x.shape[3] - kernel_x.numel()) // downx + 1
+    horizontal = None
+    for index_x in range(kernel_x.numel()):
+        term = x[:, :, :, index_x : index_x + out_w * downx : downx] * kernel_x[index_x]
+        horizontal = term if horizontal is None else horizontal + term
+    assert horizontal is not None
+
+    out_h = (horizontal.shape[2] - kernel_y.numel()) // downy + 1
+    output = None
+    for index_y in range(kernel_y.numel()):
+        term = horizontal[:, :, index_y : index_y + out_h * downy : downy, :] * kernel_y[index_y]
+        output = term if output is None else output + term
+    assert output is not None
+    return output
+
+
 class DownFIRDn2d(nn.Module):
     def __init__(self, filt_size: int = 4, scale_factor: int = 2, padding: int = 0, flip_filter: bool = False, gain: int = 1) -> None:
         r"""Anti-aliased downsampling layer using FIR filtering.
@@ -407,6 +447,12 @@ class DownFIRDn2d(nn.Module):
         Returns:
             Tensor of the shape `[batch_size, num_channels, out_height, out_width]`.
         """
+        if x.device.type == "cuda" and torch.version.hip is not None:
+            return _downfirdn2d_rocm_separable(
+                x, self.get_buffer("f"), self.downx, self.downy,
+                self.padx0, self.padx1, self.pady0, self.pady1,
+                self.flip_filter, self.gain,
+            )
         return upfirdn2d(x, self.get_buffer("f"), self.upx, self.upy, self.downx, self.downy, self.padx0, self.padx1, self.pady0, self.pady1, self.flip_filter, self.gain)
 
 

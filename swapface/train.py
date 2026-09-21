@@ -1,5 +1,6 @@
 import argparse
 import copy
+import os
 import signal
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -66,6 +67,12 @@ MAX_AMP_OVERFLOW_RETRIES = 8
 
 
 def _configure_training_runtime() -> None:
+    if torch.version.hip is not None:
+        # 服务器 gfx1100：FAST 避免 MIOpen 首次遇到新卷积形状时进行代价极高的
+        # exhaustive solver search。外部显式设置仍拥有优先级。
+        os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+        os.environ.setdefault("MIOPEN_COMPILE_PARALLEL_LEVEL", "128")
+
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = torch.version.hip is None
@@ -538,8 +545,13 @@ class Trainer:
                 # 只编译 HRFFA 的神经网络主体；输入/visibility 与 FP32 几何求解保持 eager。
                 self.hrffa_loss.hrffa.network = _compile_training_callable(self.hrffa_loss.hrffa.network)
             if self.enable_facs_loss:
-                # 编译冻结的 OpenGraphAU teacher；FACS 分组与损失归约保持 eager。
-                self.facs_loss.au_model = _compile_training_callable(self.facs_loss.au_model)
+                # gfx1100/ROCm 上 compiled OpenGraphAU 在当前混合精度路径会产生错误输出；
+                # 仅此架构保持 FACS teacher eager，其余模块继续 compile。
+                gcn_arch = getattr(torch.cuda.get_device_properties(device_id), "gcnArchName", "")
+                if torch.version.hip is not None and gcn_arch.split(":", 1)[0] == "gfx1100":
+                    print("警告：gfx1100 上 FACS/OpenGraphAU 保持 eager，避免 compiled 混合精度数值错误")
+                else:
+                    self.facs_loss.au_model = _compile_training_callable(self.facs_loss.au_model)
             if self.enable_perceptual_loss:
                 self.perceptual_loss_forward = _compile_training_callable(self.perceptual_loss)
             if self.enable_wfm_loss:
