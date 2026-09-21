@@ -460,13 +460,29 @@ class DownFIRDn2d(nn.Module):
         Returns:
             Tensor of the shape `[batch_size, num_channels, out_height, out_width]`.
         """
-        if x.device.type == "cuda" and is_rocm_gfx1100(x.device):
-            return _downfirdn2d_separable(
-                x, self.get_buffer("f"), self.downx, self.downy,
-                self.padx0, self.padx1, self.pady0, self.pady1,
-                self.flip_filter, self.gain,
-            )
-        return upfirdn2d(x, self.get_buffer("f"), self.upx, self.upy, self.downx, self.downy, self.padx0, self.padx1, self.pady0, self.pady1, self.flip_filter, self.gain)
+        f = self.get_buffer("f")
+        match (x.device.type, torch.version.hip):
+            case ("cuda", None):
+                initialize_upfirdn2d()
+                return torch.ops.upfirdn2d.upfirdn2d(
+                    x, f,
+                    self.upx, self.upy, self.downx, self.downy,
+                    self.padx0, self.padx1, self.pady0, self.pady1,
+                    self.flip_filter, self.gain,
+                )
+            case ("cuda", _) if is_rocm_gfx1100(x.device):
+                return _downfirdn2d_separable(
+                    x, f, self.downx, self.downy,
+                    self.padx0, self.padx1, self.pady0, self.pady1,
+                    self.flip_filter, self.gain,
+                )
+            case _:
+                return _upfirdn2d_native(
+                    x, f,
+                    self.upx, self.upy, self.downx, self.downy,
+                    self.padx0, self.padx1, self.pady0, self.pady1,
+                    self.flip_filter, self.gain,
+                )
 
 
 def setup_context(

@@ -241,7 +241,8 @@ def _check_scaled_optimizer_step() -> None:
             return value.new_zeros(())
 
         @staticmethod
-        def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
+        def backward(ctx, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor]:
+            (grad_output,) = grad_outputs
             return (torch.full(ctx.shape, torch.nan, device=grad_output.device, dtype=grad_output.dtype),)
 
     guarded_parameter = torch.nn.Parameter(torch.tensor(1.0))
