@@ -64,6 +64,8 @@ class IDEncoderProvider(Enum):
         input_mean=(0.5312, 0.4265, 0.3753),
         input_std=(0.2873, 0.2555, 0.2496),
     )
+    GLINT360K_TOPOFR_R100 = IDEncoderProviderConfig(iresnet100, "glint360k_r100_topofr.pth")
+
 
 
 class IDEncoder(nn.Module):
