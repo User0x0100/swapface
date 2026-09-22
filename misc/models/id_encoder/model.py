@@ -11,6 +11,7 @@ from torch import Tensor, nn
 from ...models import MODEL_REPOSITORY_ID
 from .adaface import IR_101
 from .iresnet import iresnet50, iresnet100
+from .qcface_iresnet import qcface_iresnet100
 from .vit import vit_b, vit_l, vit_s
 
 ID_ENCODER_INPUT_SIZE = (112, 112)
@@ -44,6 +45,8 @@ def get_alignment_template(output_size: int = 112) -> np.ndarray:
 class IDEncoderProviderConfig:
     backbone: Callable[[], nn.Module]
     weight_filename: str
+    input_mean: tuple[float, float, float] | None = None
+    input_std: tuple[float, float, float] | None = None
 
 
 class IDEncoderProvider(Enum):
@@ -55,6 +58,12 @@ class IDEncoderProvider(Enum):
     MS1MV2_TRANSFACE_L = IDEncoderProviderConfig(vit_l, "ms1mv2_model_TransFace_L.pt")
     MS1MV2_ADAFACE_R100 = IDEncoderProviderConfig(IR_101, "adaface_ir101_ms1mv2.ckpt")
     MS1MV3_ADAFACE_R100 = IDEncoderProviderConfig(IR_101, "adaface_ir101_ms1mv3.ckpt")
+    QCFACE_ARC_IR100 = IDEncoderProviderConfig(
+        qcface_iresnet100,
+        "qcface_arc_ir100.pth",
+        input_mean=(0.5312, 0.4265, 0.3753),
+        input_std=(0.2873, 0.2555, 0.2496),
+    )
 
 
 class IDEncoder(nn.Module):
@@ -77,6 +86,13 @@ class IDEncoder(nn.Module):
         weight_path = hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename=provider.value.weight_filename)
         self.backbone = provider.value.backbone()
 
+        mean = provider.value.input_mean
+        std = provider.value.input_std
+        if (mean is None) != (std is None):
+            raise ValueError(f"{provider.name} must define both input_mean and input_std")
+        self.register_buffer("input_mean", None if mean is None else torch.tensor(mean).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer("input_std", None if std is None else torch.tensor(std).view(1, 3, 1, 1), persistent=False)
+
         state_dict = torch.load(weight_path, weights_only=True, map_location="cpu")
         self.backbone.load_state_dict(state_dict)
         self.backbone.eval().requires_grad_(False)
@@ -93,6 +109,9 @@ class IDEncoder(nn.Module):
 
         if x.shape[2:] != ID_ENCODER_INPUT_SIZE:
             x = F.interpolate(x, ID_ENCODER_INPUT_SIZE, mode="bilinear", align_corners=False)
+        if self.input_mean is not None and self.input_std is not None:
+            x = (x + 1.0) * 0.5
+            x = (x - self.input_mean.to(dtype=x.dtype)) / self.input_std.to(dtype=x.dtype)
         features = self.backbone(x)
         return F.normalize(features, p=2, dim=1)
 
