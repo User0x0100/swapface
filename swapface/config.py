@@ -56,6 +56,7 @@ DEFAULT_IDENTITY_CONFIG: dict[str, Any] = {
 DEFAULT_LOSS_CONFIG: dict[str, Any] = {
     "enable_rec_loss": True,
     "rec_loss_weight": 10.0,
+    "rec_loss_scope": "same",
     "gaze": {"enable": False, "weight": 1.0, "distribution_weight": 0.1, "confidence_weighted": True},
     "hrffa": {
         "enable": False,
@@ -190,6 +191,11 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
 
     enable_rec_loss = bool(loss.get("enable_rec_loss", DEFAULT_LOSS_CONFIG["enable_rec_loss"]))
     rec_loss_weight = float(loss.get("rec_loss_weight", DEFAULT_LOSS_CONFIG["rec_loss_weight"]))
+    rec_loss_scope = loss.get("rec_loss_scope", DEFAULT_LOSS_CONFIG["rec_loss_scope"])
+    if not isinstance(rec_loss_scope, str):
+        raise TypeError(f"loss.rec_loss_scope 必须为字符串，实际为 {type(rec_loss_scope).__name__}")
+    if rec_loss_scope not in {"same", "all"}:
+        raise ValueError(f"loss.rec_loss_scope={rec_loss_scope!r} 无效，可选：same、all")
 
     gaze = loss.get("gaze", {})
     if not isinstance(gaze, dict):
@@ -269,6 +275,7 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
         "loss": {
             "enable_rec_loss": enable_rec_loss,
             "rec_loss_weight": rec_loss_weight,
+            "rec_loss_scope": rec_loss_scope,
             "gaze": gaze_config,
             "hrffa": hrffa_config,
             "facs": facs_config,
@@ -300,6 +307,7 @@ def _runtime_train_config(resolved: dict[str, Any]) -> dict[str, Any]:
         "id_loss_weight": float(identity["loss_weight"]),
         "enable_rec_loss": bool(loss["enable_rec_loss"]),
         "rec_loss_weight": float(loss["rec_loss_weight"]),
+        "rec_loss_scope": str(loss["rec_loss_scope"]),
         "enable_gaze_loss": bool(loss["gaze"]["enable"]),
         "gaze_loss_weight": float(loss["gaze"]["weight"]),
         "gaze_distribution_weight": float(loss["gaze"]["distribution_weight"]),

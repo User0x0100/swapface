@@ -67,11 +67,15 @@ loss_weight = 10.0
 
 
 [loss]
-# 是否启用 self-reconstruction L1 loss；仅 same 样本参与。
+# 是否启用 reconstruction L1 loss。
 enable_rec_loss = true
 
 # Reconstruction Loss 权重。
 rec_loss_weight = 8.0
+
+# Reconstruction Loss 作用范围："same" 仅 same self-reconstruction 样本；
+# "all" 对 batch 内所有 src/dst pair 生效。
+rec_loss_scope = "same"
 
 
 [loss.gaze]

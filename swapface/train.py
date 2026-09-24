@@ -145,19 +145,39 @@ def _ensure_finite_loss(name: str, loss: Tensor) -> None:
         raise FloatingPointError(f"{name} 出现 NaN/Inf：{loss.detach().float().cpu().item()}")
 
 
-def _migrate_legacy_run_precision(config: dict[str, Any]) -> dict[str, Any]:
-    """仅为旧 run 的 frozen config 将 bf16 布尔协议迁移为 precision 字符串。"""
+def _migrate_legacy_run_config(config: dict[str, Any]) -> dict[str, Any]:
+    """将旧 run 的兼容字段迁移为当前规范表示。"""
     migrated = copy.deepcopy(config)
+
     train = migrated.get("train")
-    if not isinstance(train, dict) or "bf16" not in train:
-        return migrated
-    if "precision" in train:
-        raise ValueError("旧 run 的 [train] 同时包含 bf16 与 precision，无法确定训练精度")
-    legacy_bf16 = train.pop("bf16")
-    if not isinstance(legacy_bf16, bool):
-        raise TypeError(f"旧 run 的 train.bf16 必须为 bool，实际为 {type(legacy_bf16).__name__}")
-    train["precision"] = "bf16" if legacy_bf16 else "fp32"
+    if isinstance(train, dict) and "bf16" in train:
+        if "precision" in train:
+            raise ValueError("旧 run 的 [train] 同时包含 bf16 与 precision，无法确定训练精度")
+        legacy_bf16 = train.pop("bf16")
+        if not isinstance(legacy_bf16, bool):
+            raise TypeError(f"旧 run 的 train.bf16 必须为 bool，实际为 {type(legacy_bf16).__name__}")
+        train["precision"] = "bf16" if legacy_bf16 else "fp32"
+
+    loss = migrated.get("loss")
+    if isinstance(loss, dict) and "rec_loss_scope" not in loss:
+        # 旧实现只对 same 样本应用 reconstruction loss。
+        loss["rec_loss_scope"] = "same"
+
     return migrated
+
+
+def _reduce_reconstruction_loss(
+    rec_per_sample: Tensor,
+    same_mask: Tensor,
+    scope: Literal["same", "all"],
+) -> Tensor:
+    """按配置范围聚合逐样本 reconstruction loss。"""
+    if scope == "all":
+        return rec_per_sample.mean()
+    if scope == "same":
+        same_weight = same_mask.to(dtype=rec_per_sample.dtype)
+        return (rec_per_sample * same_weight).sum() / same_weight.sum().clamp_min(1.0)
+    raise ValueError(f"rec_loss_scope 无效：{scope!r}")
 
 
 def print_mapping(title: str, mapping: Mapping[Any, Any], indent: int = 0) -> None:
@@ -197,6 +217,7 @@ class Trainer:
         # 重建损失
         enable_rec_loss: bool = True,
         rec_loss_weight: float = 10.0,
+        rec_loss_scope: Literal["same", "all"] = "same",
         # L2CS-Net gaze consistency loss
         enable_gaze_loss: bool = False,
         gaze_loss_weight: float = 1.0,
@@ -258,6 +279,8 @@ class Trainer:
             raise ValueError(f"r1_gamma 不能为负数，实际为 {r1_gamma}")
         if log_interval <= 0 or sample_save_every <= 0 or weight_save_every <= 0:
             raise ValueError("log_interval、sample_save_every 和 weight_save_every 必须为正数")
+        if rec_loss_scope not in ("same", "all"):
+            raise ValueError(f"rec_loss_scope={rec_loss_scope!r} 无效，可选：same、all")
         if perceptual_loss_weight is None:
             perceptual_loss_weight = dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)
         if enable_perceptual_loss and not perceptual_loss_weight:
@@ -283,6 +306,7 @@ class Trainer:
         self.r1_reg_step = r1_reg_step
         self.r1_gamma = r1_gamma
         self.enable_rec_loss = enable_rec_loss
+        self.rec_loss_scope = rec_loss_scope
         self.enable_gaze_loss = enable_gaze_loss
         self.enable_hrffa_loss = enable_hrffa_loss
         self.enable_facs_loss = enable_facs_loss
@@ -870,11 +894,10 @@ class Trainer:
                             self.log("perceptual_loss", perceptual_loss)
                             g_loss = g_loss + perceptual_loss
 
-                        # rec_loss：只约束 src/dst 来自同一张原图的 self-reconstruction 样本。
+                        # rec_loss：可仅约束 same self-reconstruction 样本，或应用于整个 batch。
                         if self.enable_rec_loss:
                             rec_per_sample = self.rec_loss(fake, dst).flatten(1).mean(dim=1)
-                            same_weight = same_mask.to(dtype=rec_per_sample.dtype)
-                            rec_loss = (rec_per_sample * same_weight).sum() / same_weight.sum().clamp_min(1.0)
+                            rec_loss = _reduce_reconstruction_loss(rec_per_sample, same_mask, self.rec_loss_scope)
                             self.log("rec_loss", rec_loss)
                             g_loss = g_loss + rec_loss
 
@@ -914,7 +937,7 @@ class Trainer:
 
 def _load_run_config(paths: RunPaths) -> tuple[dict[str, Any], dict[str, Any]]:
     resolved = load_resolved_config(paths)
-    migrated = _migrate_legacy_run_precision(resolved)
+    migrated = _migrate_legacy_run_config(resolved)
     canonical = resolve_train_config(migrated)
     if canonical != migrated:
         raise ValueError(f"run 的 resolved config 不是当前格式的规范表示：{paths.resolved_config}")

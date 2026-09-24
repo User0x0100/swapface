@@ -22,6 +22,7 @@ from swapface.train import (
     _load_branch_checkpoint,
     _load_branch_optimizer_state,
     _load_run_config,
+    _reduce_reconstruction_loss,
     _scaled_backward_step,
     _supports_compiled_bf16,
 )
@@ -34,6 +35,7 @@ def _check_train_config(root: Path) -> None:
         "[generator]\naad_skip_layers = []\n"
         '[identity]\ngenerator_provider = "MS1MV3_ARCFACE_R50_FP16"\nloss_provider = "BLENDFACE"\n'
         "[dataloader]\nrotation_range = [-3, 3]\nsame_prob = 0.25\n"
+        "[loss]\nrec_loss_scope = \"all\"\n"
         "[loss.gaze]\nenable = true\nweight = 0.75\ndistribution_weight = 0.2\nconfidence_weighted = false\n"
         "[loss.hrffa]\nenable = true\npose_weight = 0.5\neye_weight = 1.25\nmouth_weight = 1.5\ncontour_weight = 2.0\ncontour_shape_weight = 0.4\noccluded_geometry_weight = 0.1\n"
         "[loss.facs]\nenable = true\nweight = 0.8\nbrow_weight = 1.1\neye_weight = 1.2\nnose_weight = 0.9\nmouth_weight = 1.3\nlower_face_weight = 0.7\nasymmetry_weight = 1.4\n"
@@ -48,7 +50,7 @@ def _check_train_config(root: Path) -> None:
         resolved = resolve_train_config(raw)
     assert raw == original
     assert resolve_train_config(resolved) == resolved
-    _, loaded = load_train_config(source)
+    runtime, loaded = load_train_config(source)
     assert loaded == resolved
     assert resolved["train"]["batch_size"] == 8
     assert resolved["train"]["compile_module"] is False
@@ -57,6 +59,8 @@ def _check_train_config(root: Path) -> None:
     assert resolved["identity"]["loss_provider"] == raw["identity"]["loss_provider"]
     assert resolved["dataloader"]["rotation_range"] == [-3.0, 3.0]
     assert abs(resolved["dataloader"]["same_prob"] - 0.25) < 1e-12
+    assert resolved["loss"]["rec_loss_scope"] == "all"
+    assert runtime["rec_loss_scope"] == "all"
     assert resolved["loss"]["gaze"] == {"enable": True, "weight": 0.75, "distribution_weight": 0.2, "confidence_weighted": False}
     assert resolved["loss"]["hrffa"] == {
         "enable": True,
@@ -94,6 +98,13 @@ def _check_train_config(root: Path) -> None:
     assert legacy_runtime["precision"] == "bf16"
     assert legacy_frozen == legacy_precision_resolved
     assert load_resolved_config(legacy_precision_paths) == legacy_precision_resolved
+
+    legacy_rec_scope_resolved = copy.deepcopy(resolved)
+    legacy_rec_scope_resolved["loss"].pop("rec_loss_scope")
+    legacy_rec_scope_paths = create_run(root / "legacy-rec-scope-runs", source, legacy_rec_scope_resolved, name="legacy-rec-scope")
+    legacy_runtime, legacy_frozen = _load_run_config(legacy_rec_scope_paths)
+    assert legacy_runtime["rec_loss_scope"] == "same"
+    assert "rec_loss_scope" not in legacy_frozen["loss"]
 
     legacy_resolved = copy.deepcopy(resolved)
     legacy_resolved["dataloader"].pop("same_prob")
@@ -133,6 +144,15 @@ def _check_train_config(root: Path) -> None:
         raise AssertionError("配置错误接受了未显式声明的训练精度")
 
     invalid = copy.deepcopy(raw)
+    invalid["loss"]["rec_loss_scope"] = "cross"
+    try:
+        resolve_train_config(invalid)
+    except ValueError as error:
+        assert "rec_loss_scope" in str(error)
+    else:
+        raise AssertionError("配置错误接受了未知 rec_loss_scope")
+
+    invalid = copy.deepcopy(raw)
     invalid["dataloader"]["same_prob"] = 1.1
     try:
         resolve_train_config(invalid)
@@ -151,6 +171,20 @@ def _check_train_config(root: Path) -> None:
         else:
             raise AssertionError(f"配置错误接受了 HRFFA 非有限数值：{key}={value}")
     print("PASS: TOML fields, canonical config persistence and unknown-field rejection")
+
+
+def _check_reconstruction_scope() -> None:
+    rec_per_sample = torch.tensor([1.0, 10.0, 5.0])
+    same_mask = torch.tensor([True, False, True])
+
+    same = _reduce_reconstruction_loss(rec_per_sample, same_mask, "same")
+    all_pairs = _reduce_reconstruction_loss(rec_per_sample, same_mask, "all")
+    no_same = _reduce_reconstruction_loss(rec_per_sample, torch.zeros(3, dtype=torch.bool), "same")
+
+    torch.testing.assert_close(same, torch.tensor(3.0))
+    torch.testing.assert_close(all_pairs, torch.tensor(16.0 / 3.0))
+    torch.testing.assert_close(no_same, torch.tensor(0.0))
+    print("PASS: reconstruction loss scope same/all")
 
 
 def _check_step_boundary() -> None:
@@ -268,6 +302,7 @@ def _check_scaled_optimizer_step() -> None:
 
 
 def main() -> None:
+    _check_reconstruction_scope()
     _check_step_boundary()
     _check_scaled_optimizer_step()
     # ROCm 不使用 NVIDIA compute capability；CUDA 继续保持 SM80+ 的 compile-BF16 限制。
