@@ -4,11 +4,12 @@ version = "0.1.0"
 description = "Experimental SwapFace training workspace"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "huggingface-hub",
+    "huggingface-hub>=1.32.0",
     "numpy",
     "onnx",
     "onnxscript",
     "opencv-python",
+    "pillow",
     "tensorboard",
     "tqdm",
     "fvcore",
