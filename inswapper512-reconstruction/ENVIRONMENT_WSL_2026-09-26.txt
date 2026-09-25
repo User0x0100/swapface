@@ -1,0 +1,8 @@
+snapshot_date=2026-09-26
+host=DESKTOP-PU0NUP8
+repo=/home/User0/swap
+repo_head=41933ec621991b50a76c76f3ac89d9e20eb9496a
+repo_branch=main
+python=Python 3.12.14
+torch=2.14.0+cu126
+cuda_available=True

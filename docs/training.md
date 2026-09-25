@@ -162,7 +162,7 @@ uv run python -m swapface.train \
 
 ## Branch：从已有 checkpoint 派生新实验
 
-Branch 从已有完整训练状态创建一个新的 run。它不会修改父 run，可以从标准 run 的 latest、其中任意历史 checkpoint，或单独保存的当前 v3 + 当前训练语义 checkpoint 文件分叉：
+Branch 从已有完整训练状态创建一个新的 run。它不会修改父 run，可以从标准 run 的 latest、其中任意历史 checkpoint，或单独保存的当前 v4 + 当前训练语义 checkpoint 文件分叉：
 
 ```bash
 uv run python -m swapface.train \
@@ -171,7 +171,7 @@ uv run python -m swapface.train \
   --name lower-id-loss
 ```
 
-独立 checkpoint 不需要保留原 run 目录；只要文件名保持 `step_<step>.pth`，其内部 v3 元数据、当前 `training_config.semantics_version`、step 与 Generator/Discriminator 架构有效即可：
+独立 checkpoint 不需要保留原 run 目录；只要文件名保持 `step_<step>.pth`，其内部 v4 元数据、当前 `training_config.semantics_version`、step 与 Generator/Discriminator 架构有效即可：
 
 ```bash
 uv run --no-sync python -m swapface.train \
@@ -180,7 +180,7 @@ uv run --no-sync python -m swapface.train \
   --name lower-id-loss
 ```
 
-`--branch-from` 必须显式提供 `--config`。Branch 以 checkpoint 自身保存的 v3 元数据和 Generator/Discriminator `network_cfg` 为准，在创建新 run 前与新配置比较模型定义；通过后立即创建新 run，并在 `metadata.json.parent` 中记录父 `run_id`、checkpoint、step 和配置摘要。checkpoint 权重、optimizer 和 scheduler 是否真的可恢复，直接交给 PyTorch 的 `load_state_dict()`；失败时使用原始错误并将新 run 标记为 `failed`。
+`--branch-from` 必须显式提供 `--config`。Branch 以 checkpoint 自身保存的 v4 元数据和 Generator/Discriminator `network_cfg` 为准，在创建新 run 前与新配置比较模型定义；通过后立即创建新 run，并在 `metadata.json.parent` 中记录父 `run_id`、checkpoint、step 和配置摘要。checkpoint 权重、optimizer 和 scheduler 是否真的可恢复，直接交给 PyTorch 的 `load_state_dict()`；失败时使用原始错误并将新 run 标记为 `failed`。
 
 Branch 允许修改训练配置，例如：
 

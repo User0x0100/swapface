@@ -27,17 +27,24 @@ DEFAULT_SCHEDULER_CONFIG: dict[str, Any] = {
     "min_lr_ratio": 0.1,
 }
 DEFAULT_GENERATOR_CONFIG: dict[str, Any] = {
-    "img_resolution": 256,
+    "img_resolution": 512,
     "img_channels": 3,
-    "num_depth": 3,
-    "num_latent": 6,
-    "base_ch": 256,
-    "max_ch": 1024,
     "id_dim": 512,
-    "aad_skip_layers": (),
+    "coarse_resolution": 128,
+    "coarse_bottleneck_resolution": 32,
+    "coarse_base_ch": 32,
+    "coarse_max_ch": 256,
+    "num_style_blocks": 6,
+    "hq_bottleneck_resolution": 16,
+    "hq_base_ch": 8,
+    "hq_max_ch": 128,
+    "hq_channel_hold_level": 2,
+    "norm_eps": 1e-8,
+    "leaky_relu_slope": 0.2,
 }
+
 DEFAULT_DISCRIMINATOR_CONFIG: dict[str, Any] = {
-    "img_resolution": 256,
+    "img_resolution": 512,
     "img_channels": 3,
     "base_ch": 64,
     "max_ch": 512,
@@ -325,16 +332,60 @@ def _normalize_loss(config: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
     result = _with_defaults(_table(config, "generator", "[generator]"), DEFAULT_GENERATOR_CONFIG, "[generator]")
-    for key in ("img_resolution", "img_channels", "num_depth", "num_latent", "base_ch", "max_ch", "id_dim"):
-        result[key] = _int(result[key], f"generator.{key}")
 
-    skip_layers = result["aad_skip_layers"]
-    if not isinstance(skip_layers, (list, tuple)):
-        raise TypeError(f"generator.aad_skip_layers 必须为整数数组，实际为 {type(skip_layers).__name__}")
-    normalized_skip_layers: list[int] = []
-    for index, layer in enumerate(skip_layers):
-        normalized_skip_layers.append(_int(layer, f"generator.aad_skip_layers[{index}]"))
-    result["aad_skip_layers"] = normalized_skip_layers
+    integer_keys = (
+        "img_resolution",
+        "img_channels",
+        "id_dim",
+        "coarse_resolution",
+        "coarse_bottleneck_resolution",
+        "coarse_base_ch",
+        "coarse_max_ch",
+        "num_style_blocks",
+        "hq_bottleneck_resolution",
+        "hq_base_ch",
+        "hq_max_ch",
+        "hq_channel_hold_level",
+    )
+    for key in integer_keys:
+        result[key] = _int(result[key], f"generator.{key}", minimum=1)
+
+    result["norm_eps"] = _float(result["norm_eps"], "generator.norm_eps", minimum=1e-30)
+    result["leaky_relu_slope"] = _float(
+        result["leaky_relu_slope"],
+        "generator.leaky_relu_slope",
+        minimum=0.0,
+    )
+
+    if result["coarse_resolution"] > result["img_resolution"]:
+        raise ValueError("generator.coarse_resolution 不能大于 generator.img_resolution")
+    if result["coarse_max_ch"] < result["coarse_base_ch"]:
+        raise ValueError("generator.coarse_max_ch 必须 >= generator.coarse_base_ch")
+    if result["hq_max_ch"] < result["hq_base_ch"]:
+        raise ValueError("generator.hq_max_ch 必须 >= generator.hq_base_ch")
+
+    for resolution_key, bottleneck_key in (
+        ("coarse_resolution", "coarse_bottleneck_resolution"),
+        ("img_resolution", "hq_bottleneck_resolution"),
+    ):
+        resolution = result[resolution_key]
+        bottleneck = result[bottleneck_key]
+        if resolution < bottleneck or resolution % bottleneck != 0:
+            raise ValueError(
+                f"generator.{resolution_key} 必须是 generator.{bottleneck_key} 的整数倍"
+            )
+        ratio = resolution // bottleneck
+        if ratio & (ratio - 1):
+            raise ValueError(
+                f"generator.{resolution_key}/generator.{bottleneck_key} 必须为 2 的整数次幂"
+            )
+
+    hq_num_levels = (result["img_resolution"] // result["hq_bottleneck_resolution"]).bit_length()
+    if result["hq_channel_hold_level"] >= hq_num_levels:
+        raise ValueError(
+            f"generator.hq_channel_hold_level 必须小于 HQ level 数 {hq_num_levels}"
+        )
+
     return result
 
 

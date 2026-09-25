@@ -74,7 +74,18 @@ def main() -> None:
     torch.set_num_threads(2)
     device = torch.device("cpu")
     provider = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16  # 非默认编码器，防止静默回退 BlendFace。
-    model = Generator(img_resolution=16, num_depth=1, num_latent=1, base_ch=4, max_ch=8, aad_skip_layers=[0]).eval()
+    model = Generator(
+        img_resolution=16,
+        coarse_resolution=8,
+        coarse_bottleneck_resolution=4,
+        coarse_base_ch=2,
+        coarse_max_ch=8,
+        num_style_blocks=1,
+        hq_bottleneck_resolution=4,
+        hq_base_ch=2,
+        hq_max_ch=8,
+        hq_channel_hold_level=1,
+    ).eval()
     faces = torch.rand(3, 3, 16, 16) * 2 - 1
     identity = torch.nn.functional.normalize(torch.randn(1, 512), dim=1)
     with tempfile.TemporaryDirectory(prefix="swapface-check-") as temporary:

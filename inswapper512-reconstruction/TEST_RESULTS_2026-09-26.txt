@@ -1,0 +1,18 @@
+test_coarse_activation_slope (test_model.ModelTest.test_coarse_activation_slope) ... ok
+test_conv_inventory (test_model.ModelTest.test_conv_inventory) ... ok
+test_final_head_is_recovered_1x1 (test_model.ModelTest.test_final_head_is_recovered_1x1) ... ok
+test_hq_pool_is_maxpool (test_model.ModelTest.test_hq_pool_is_maxpool) ... ok
+test_hq_upsample_aligns_corners (test_model.ModelTest.test_hq_upsample_aligns_corners) ... ok
+test_live_parameter_count (test_model.ModelTest.test_live_parameter_count) ... ok
+test_live_shapes_meta (test_model.ModelTest.test_live_shapes_meta) ... ok
+test_style_norm_epsilon (test_model.ModelTest.test_style_norm_epsilon) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 3.004s
+
+OK
+
+--- smoke ---
+params=8,466,154
+coarse (1, 3, 128, 128) 0.3867979645729065 0.6373929381370544
+output (1, 3, 512, 512) 126.40266418457031 141.5801544189453

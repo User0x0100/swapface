@@ -162,19 +162,26 @@ same_prob = 0.2
 
 
 [generator]
-# Generator / Discriminator 保持单一架构协议，不引入 architecture 选择层。
-img_resolution = 256
+# 唯一 Generator：128 coarse identity-transfer core + 512 HQ refiner。
+# 深度、通道表、decoder 与 style-bank 宽度均由这些边界参数自动推导。
+img_resolution = 512
 img_channels = 3
-num_depth = 4
-num_latent = 8
-base_ch = 64
-max_ch = 512
 id_dim = 512
-aad_skip_layers = []
+coarse_resolution = 128
+coarse_bottleneck_resolution = 32
+coarse_base_ch = 32
+coarse_max_ch = 256
+num_style_blocks = 6
+hq_bottleneck_resolution = 16
+hq_base_ch = 8
+hq_max_ch = 128
+hq_channel_hold_level = 2
+norm_eps = 1e-8
+leaky_relu_slope = 0.2
 
 
 [discriminator]
-img_resolution = 256
+img_resolution = 512
 img_channels = 3
 base_ch = 64
 max_ch = 512

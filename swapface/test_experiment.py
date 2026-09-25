@@ -36,7 +36,7 @@ def _check_train_config(root: Path) -> None:
         '[train]\nbatch_size = 8\nprecision = "fp16"\ncompile_module = false\n'
         "[optimizer]\nlr = 5e-5\n"
         '[scheduler]\ntype = "cosine"\nt_max = 1234\nmin_lr_ratio = 0.2\n'
-        "[generator]\naad_skip_layers = []\n"
+        "[generator]\nhq_channel_hold_level = 2\n"
         '[identity]\nprovider = "MS1MV3_ARCFACE_R50_FP16"\n'
         '[loss.reconstruction]\nscope = "all"\n'
         "[loss.gan]\nweight = 0.8\n"
@@ -98,9 +98,9 @@ def _check_train_config(root: Path) -> None:
     assert resolved["data"]["src"][0]["adjustment"] == 1 and resolved["data"]["dst"][0]["adjustment"] == -1
 
     default_generator = copy.deepcopy(raw)
-    default_generator["generator"].pop("aad_skip_layers")
+    default_generator["generator"].pop("hq_channel_hold_level")
     default_generator_resolved = resolve_train_config(default_generator)
-    assert default_generator_resolved["generator"]["aad_skip_layers"] == []
+    assert default_generator_resolved["generator"]["hq_channel_hold_level"] == 2
     _assert_branch_model_compatible(json.loads(json.dumps(default_generator_resolved)), default_generator_resolved)
 
     paths = create_run(root / "config-runs", source, resolved, name="canonical")
@@ -213,15 +213,28 @@ def _check_train_config(root: Path) -> None:
         else:
             raise AssertionError(f"配置错误接受了非整数类型：{section}.{key}={value!r}")
 
-    for invalid_layers in (["1"], [1.9], True):
+    for key, value in (
+        ("coarse_resolution", 96),
+        ("coarse_bottleneck_resolution", 48),
+        ("hq_bottleneck_resolution", 24),
+    ):
         invalid = copy.deepcopy(raw)
-        invalid["generator"]["aad_skip_layers"] = invalid_layers
+        invalid["generator"][key] = value
         try:
             resolve_train_config(invalid)
-        except TypeError:
+        except ValueError:
             pass
         else:
-            raise AssertionError(f"配置错误接受了非法 aad_skip_layers：{invalid_layers!r}")
+            raise AssertionError(f"配置错误接受了非法生成器尺度：{key}={value!r}")
+
+    legacy = copy.deepcopy(raw)
+    legacy["generator"]["aad_skip_layers"] = []
+    try:
+        resolve_train_config(legacy)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("配置错误接受了已移除的 generator.aad_skip_layers")
 
     invalid = copy.deepcopy(raw)
     invalid.setdefault("discriminator", {})["group_size"] = 0
@@ -412,7 +425,7 @@ def main() -> None:
         assert _compile_training_callable(object()) is compile_target
         assert compile_mock.call_args.kwargs["mode"] == "max-autotune-no-cudagraphs"
 
-    resolved = {"train": {"batch_size": 8}, "generator": {"depth": 5}, "discriminator": {"base_ch": 64}, "identity": {"provider": "BLENDFACE"}}
+    resolved = {"train": {"batch_size": 8}, "generator": {"coarse_resolution": 128}, "discriminator": {"base_ch": 64}, "identity": {"provider": "BLENDFACE"}}
 
     with tempfile.TemporaryDirectory(prefix="swapface-run-check-") as temporary:
         root = Path(temporary)
@@ -500,7 +513,7 @@ def main() -> None:
         assert json.loads(branch.metadata.read_text(encoding="utf-8"))["parent"] == parent
 
         _assert_branch_model_compatible(resolved, dict(resolved))
-        for section, key, value in (("generator", "depth", 6), ("discriminator", "base_ch", 128)):
+        for section, key, value in (("generator", "coarse_resolution", 256), ("discriminator", "base_ch", 128)):
             changed = copy.deepcopy(resolved)
             changed[section][key] = value
             try:
