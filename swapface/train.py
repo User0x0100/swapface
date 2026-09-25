@@ -1,7 +1,7 @@
 import argparse
 import copy
 import signal
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -33,17 +33,9 @@ from models.discriminator import Discriminator
 from models.discriminator.upfirdn2d import initialize_upfirdn2d, is_rocm_gfx1100
 from models.networks import Generator
 
-from .config import (
-    DEFAULT_GENERATOR_ID_ENCODER_PROVIDER,
-    DEFAULT_IDENTITY_LOSS_PROVIDER,
-    DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT,
-    DEFAULT_WFM_LOSS_WEIGHT,
-    _runtime_train_config,
-    load_train_config,
-    resolve_train_config,
-)
+from .config import load_train_config, resolve_train_config
 from .contracts import CHECKPOINT_VERSION
-from .dataloader import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, ImageSource, TrainingDataLoader
+from .dataloader import ImageDecoderBackend, TrainingDataLoader
 from .experiment import (
     RunLock,
     RunPaths,
@@ -63,6 +55,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 8
+TRAINING_SEMANTICS_VERSION = 2
 
 
 def _configure_training_runtime() -> None:
@@ -145,25 +138,40 @@ def _ensure_finite_loss(name: str, loss: Tensor) -> None:
         raise FloatingPointError(f"{name} 出现 NaN/Inf：{loss.detach().float().cpu().item()}")
 
 
-def _migrate_legacy_run_config(config: dict[str, Any]) -> dict[str, Any]:
-    """将旧 run 的兼容字段迁移为当前规范表示。"""
-    migrated = copy.deepcopy(config)
+def _require_current_training_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
+    """严格读取当前训练 checkpoint 协议，不迁移或补全旧字段。"""
+    training_config = checkpoint.get("training_config")
+    if training_config is None:
+        raise ValueError("checkpoint.training_config 缺失")
+    if not isinstance(training_config, dict):
+        raise TypeError(f"checkpoint.training_config 必须为 dict，实际为 {type(training_config).__name__}")
 
-    train = migrated.get("train")
-    if isinstance(train, dict) and "bf16" in train:
-        if "precision" in train:
-            raise ValueError("旧 run 的 [train] 同时包含 bf16 与 precision，无法确定训练精度")
-        legacy_bf16 = train.pop("bf16")
-        if not isinstance(legacy_bf16, bool):
-            raise TypeError(f"旧 run 的 train.bf16 必须为 bool，实际为 {type(legacy_bf16).__name__}")
-        train["precision"] = "bf16" if legacy_bf16 else "fp32"
+    expected_keys = {"semantics_version", "precision", "optimizer", "scheduler"}
+    actual_keys = set(training_config)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unknown = sorted(actual_keys - expected_keys)
+        raise ValueError(f"checkpoint.training_config 不是当前协议：missing={missing}, unknown={unknown}")
 
-    loss = migrated.get("loss")
-    if isinstance(loss, dict) and "rec_loss_scope" not in loss:
-        # 旧实现只对 same 样本应用 reconstruction loss。
-        loss["rec_loss_scope"] = "same"
+    semantics_version = training_config["semantics_version"]
+    if not isinstance(semantics_version, int) or isinstance(semantics_version, bool):
+        raise TypeError(f"checkpoint.training_config.semantics_version 必须为 int，实际为 {type(semantics_version).__name__}")
+    if semantics_version != TRAINING_SEMANTICS_VERSION:
+        raise ValueError(f"训练语义版本不匹配：checkpoint={semantics_version}, current={TRAINING_SEMANTICS_VERSION}")
 
-    return migrated
+    precision = training_config["precision"]
+    if not isinstance(precision, str):
+        raise TypeError(f"checkpoint.training_config.precision 必须为 str，实际为 {type(precision).__name__}")
+    if precision not in {"fp32", "fp16", "bf16"}:
+        raise ValueError(f"checkpoint.training_config.precision 无效：{precision!r}")
+
+    optimizer = training_config["optimizer"]
+    scheduler = training_config["scheduler"]
+    if not isinstance(optimizer, dict) or set(optimizer) != {"lr"}:
+        raise ValueError("checkpoint.training_config.optimizer 不是当前协议")
+    if not isinstance(scheduler, dict) or set(scheduler) != {"type", "t_max", "min_lr_ratio"}:
+        raise ValueError("checkpoint.training_config.scheduler 不是当前协议")
+    return training_config
 
 
 def _reduce_reconstruction_loss(
@@ -177,7 +185,7 @@ def _reduce_reconstruction_loss(
     if scope == "same":
         same_weight = same_mask.to(dtype=rec_per_sample.dtype)
         return (rec_per_sample * same_weight).sum() / same_weight.sum().clamp_min(1.0)
-    raise ValueError(f"rec_loss_scope 无效：{scope!r}")
+    raise ValueError(f"reconstruction_scope 无效：{scope!r}")
 
 
 def print_mapping(title: str, mapping: Mapping[Any, Any], indent: int = 0) -> None:
@@ -192,129 +200,72 @@ def print_mapping(title: str, mapping: Mapping[Any, Any], indent: int = 0) -> No
 class Trainer:
     def __init__(
         self,
-        src: Sequence[ImageSource],
-        dst: Sequence[ImageSource],
-        batch_size: int = 16,
-        lr: float = 1e-4,
-        lr_scheduler_t_max: int = 0,
-        r1_reg_step: int = 16,
-        r1_gamma: float = 10.0,
-        precision: str = "bf16",
-        device: str = "cuda",
-        compile_module: bool = True,
-        log_interval: int = 10,
-        sample_save_every: int = 1000,
-        weight_save_every: int = 10000,
-        # 模型与数据管线配置。dataloader_cfg 覆盖 DEFAULT_DATALOADER_CONFIG，
-        # batch_size/device_id/img_resolution/src/dst 由 Trainer 管理，禁止在其中重复指定。
-        net_g_cfg: dict[str, Any] | None = None,
-        net_d_cfg: dict[str, Any] | None = None,
-        dataloader_cfg: dict[str, Any] | None = None,
-        # 身份编码与身份损失
-        generator_id_encoder_provider: IDEncoderProvider = DEFAULT_GENERATOR_ID_ENCODER_PROVIDER,
-        identity_loss_provider: IDEncoderProvider = DEFAULT_IDENTITY_LOSS_PROVIDER,
-        id_loss_weight: float = 10.0,
-        # 重建损失
-        enable_rec_loss: bool = True,
-        rec_loss_weight: float = 10.0,
-        rec_loss_scope: Literal["same", "all"] = "same",
-        # L2CS-Net gaze consistency loss
-        enable_gaze_loss: bool = False,
-        gaze_loss_weight: float = 1.0,
-        gaze_distribution_weight: float = 0.1,
-        gaze_confidence_weighted: bool = True,
-        # HRFFA 面部几何损失
-        enable_hrffa_loss: bool = False,
-        hrffa_pose_weight: float = 1.0,
-        hrffa_eye_weight: float = 1.0,
-        hrffa_mouth_weight: float = 1.0,
-        hrffa_contour_weight: float = 1.0,
-        hrffa_contour_shape_weight: float = 0.5,
-        hrffa_occluded_geometry_weight: float = 0.25,
-        # OpenGraphAU / FACS 表情动作一致性损失
-        enable_facs_loss: bool = False,
-        facs_loss_weight: float = 1.0,
-        facs_brow_weight: float = 1.0,
-        facs_eye_weight: float = 1.0,
-        facs_nose_weight: float = 1.0,
-        facs_mouth_weight: float = 1.0,
-        facs_lower_face_weight: float = 1.0,
-        facs_asymmetry_weight: float = 1.0,
-        # VGG19 感知特征损失
-        enable_perceptual_loss: bool = True,
-        perceptual_loss_weight: dict[str, float] | None = None,
-        # 判别器浅层/中层特征的弱特征匹配
-        enable_wfm_loss: bool = True,
-        wfm_loss_weight: dict[int, float] | None = None,
-        run_dir: str | Path = "train_log/exper_0",
+        config: Mapping[str, Any],
+        *,
+        run_dir: str | Path,
         resume_checkpoint: str | Path | None = None,
         run_id: str | None = None,
         resolved_config_sha256: str | None = None,
         strict_precision_resume: bool = False,
         checkpoint_mode: Literal["resume", "branch"] = "resume",
         preloaded_checkpoint: dict[str, Any] | None = None,
-    ):
-        if dataloader_cfg is None:
-            dataloader_cfg = dict(DEFAULT_DATALOADER_CONFIG)
-        else:
-            reserved_keys = DATALOADER_RESERVED_KEYS.intersection(dataloader_cfg)
-            if reserved_keys:
-                names = ", ".join(sorted(reserved_keys))
-                raise ValueError(f"dataloader_cfg 不能覆盖保留字段：{names}")
-            dataloader_cfg = DEFAULT_DATALOADER_CONFIG | dataloader_cfg
+    ) -> None:
+        # config 必须是 resolve_train_config() 产生的 canonical schema。Trainer 不再维护第二套默认值/配置协议。
+        train_config = config["train"]
+        optimizer_config = config["optimizer"]
+        scheduler_config = config["scheduler"]
+        identity_config = config["identity"]
+        loss_config = config["loss"]
+        data_config = config["data"]
+        net_g_cfg = dict(config["generator"])
+        net_d_cfg = dict(config["discriminator"])
 
-        if not isinstance(generator_id_encoder_provider, IDEncoderProvider):
-            raise TypeError(f"generator_id_encoder_provider 必须为 IDEncoderProvider，实际为 {type(generator_id_encoder_provider).__name__}")
-        if not isinstance(identity_loss_provider, IDEncoderProvider):
-            raise TypeError(f"identity_loss_provider 必须为 IDEncoderProvider，实际为 {type(identity_loss_provider).__name__}")
-        if batch_size <= 0:
-            raise ValueError(f"batch_size 必须为正数，实际为 {batch_size}")
-        if lr <= 0.0:
-            raise ValueError(f"lr 必须为正数，实际为 {lr}")
-        if lr_scheduler_t_max < 0:
-            raise ValueError(f"lr_scheduler_t_max 不能为负数，实际为 {lr_scheduler_t_max}")
-        if r1_reg_step <= 0:
-            raise ValueError(f"r1_reg_step 必须为正数，实际为 {r1_reg_step}")
-        if r1_gamma < 0.0:
-            raise ValueError(f"r1_gamma 不能为负数，实际为 {r1_gamma}")
-        if log_interval <= 0 or sample_save_every <= 0 or weight_save_every <= 0:
-            raise ValueError("log_interval、sample_save_every 和 weight_save_every 必须为正数")
-        if rec_loss_scope not in ("same", "all"):
-            raise ValueError(f"rec_loss_scope={rec_loss_scope!r} 无效，可选：same、all")
-        if perceptual_loss_weight is None:
-            perceptual_loss_weight = dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)
-        if enable_perceptual_loss and not perceptual_loss_weight:
-            raise ValueError("enable_perceptual_loss=True 时 perceptual_loss_weight 不能为空")
-        if wfm_loss_weight is None:
-            wfm_loss_weight = dict(DEFAULT_WFM_LOSS_WEIGHT)
-        if enable_wfm_loss and not wfm_loss_weight:
-            raise ValueError("enable_wfm_loss=True 时 wfm_loss_weight 不能为空")
+        batch_size = int(train_config["batch_size"])
+        lr = float(optimizer_config["lr"])
+        compile_module = bool(train_config["compile_module"])
+        checkpoint_save_every = int(train_config["checkpoint_save_every"])
+        self.log_interval = int(train_config["log_interval"])
+        self.sample_save_every = int(train_config["sample_save_every"])
+        self.checkpoint_save_every = checkpoint_save_every
+        self.batch_size = batch_size
 
-        args = locals().copy()
-        for k in ["src", "dst", "self", "preloaded_checkpoint"]:
-            args.pop(k)
+        reconstruction_scope = str(loss_config["reconstruction"]["scope"])
+        gan_config = loss_config["gan"]
+        identity_loss_config = loss_config["identity"]
+        l1_config = loss_config["l1"]
+        r1_config = loss_config["r1"]
+        gaze_config = loss_config["gaze"]
+        hrffa_config = loss_config["hrffa"]
+        facs_config = loss_config["facs"]
+        vgg_config = loss_config["vgg"]
+        wfm_config = loss_config["wfm"]
 
-        print_mapping("训练信息", args)
+        self.generator_id_encoder_provider = IDEncoderProvider[str(identity_config["provider"])]
+        self.identity_loss_provider = IDEncoderProvider[str(identity_loss_config["provider"])]
+        self.reconstruction_scope = reconstruction_scope
+        self.enable_r1_loss = bool(r1_config["enable"])
+        self.r1_reg_step = int(r1_config["interval"])
+        self.r1_gamma = float(r1_config["gamma"])
+        self.enable_l1_loss = bool(l1_config["enable"])
+        self.enable_gaze_loss = bool(gaze_config["enable"])
+        self.enable_hrffa_loss = bool(hrffa_config["enable"])
+        self.enable_facs_loss = bool(facs_config["enable"])
+        self.enable_vgg_loss = bool(vgg_config["enable"])
+        self.enable_wfm_loss = bool(wfm_config["enable"])
 
-        self.device = torch.device(device)
+        dataloader_cfg = {**data_config["loader"], **data_config["augmentation"], **data_config["sampling"]}
+        dataloader_cfg["decoder_backend"] = ImageDecoderBackend(dataloader_cfg["decoder_backend"])
+        src = [(str(entry["path"]), float(entry["adjustment"])) for entry in data_config["src"]]
+        dst = [(str(entry["path"]), float(entry["adjustment"])) for entry in data_config["dst"]]
+
+        print_mapping("训练配置", config)
+
+        self.device = torch.device(str(train_config["device"]))
         if self.device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("Trainer 仅支持 PyTorch CUDA/HIP GPU 设备")
 
-        self.batch_size = batch_size
-        self.generator_id_encoder_provider = generator_id_encoder_provider
-        self.identity_loss_provider = identity_loss_provider
-        self.r1_reg_step = r1_reg_step
-        self.r1_gamma = r1_gamma
-        self.enable_rec_loss = enable_rec_loss
-        self.rec_loss_scope = rec_loss_scope
-        self.enable_gaze_loss = enable_gaze_loss
-        self.enable_hrffa_loss = enable_hrffa_loss
-        self.enable_facs_loss = enable_facs_loss
-        self.enable_perceptual_loss = enable_perceptual_loss
-        self.enable_wfm_loss = enable_wfm_loss
-
         device_id = self.device.index if self.device.index is not None else torch.cuda.current_device()
-        requested_precision = precision.lower()
+        requested_precision = str(train_config["precision"])
         if requested_precision == "bf16":
             bf16_runtime_supported = torch.cuda.is_bf16_supported()
             bf16_compile_supported = _supports_compiled_bf16(device_id)
@@ -332,20 +283,21 @@ class Trainer:
         elif requested_precision == "fp16":
             self.precision = "fp16"
             self.amp_dtype = torch.float16
-        elif requested_precision == "fp32":
+        else:
             self.precision = "fp32"
             self.amp_dtype = None
-        else:
-            raise ValueError(f"precision={precision!r} 无效，可选：fp32、fp16、bf16")
         self.amp_enabled = self.amp_dtype is not None
 
-        self.sample_save_every = sample_save_every
-        self.weight_save_every = weight_save_every
-        self.log_interval = log_interval
-        self.use_cosine_lr = lr_scheduler_t_max > 0
-        self.training_config = {"precision": self.precision, "lr": lr, "lr_scheduler_t_max": lr_scheduler_t_max}
-
-        # ========================= 初始化模型 =========================
+        scheduler_type = str(scheduler_config["type"])
+        self.use_cosine_lr = scheduler_type == "cosine"
+        scheduler_t_max = int(scheduler_config["t_max"])
+        scheduler_min_lr_ratio = float(scheduler_config["min_lr_ratio"])
+        self.training_config = {
+            "semantics_version": TRAINING_SEMANTICS_VERSION,
+            "precision": self.precision,
+            "optimizer": dict(optimizer_config),
+            "scheduler": dict(scheduler_config),
+        }
 
         if checkpoint_mode not in ("resume", "branch"):
             raise ValueError(f"checkpoint_mode 无效：{checkpoint_mode!r}")
@@ -385,11 +337,8 @@ class Trainer:
                 if checkpoint_run["id"] != run_id or checkpoint_run["config_sha256"] != resolved_config_sha256:
                     raise ValueError("checkpoint 不属于当前 run 或冻结配置已变化")
 
-            saved_training_config = checkpoint["training_config"]
-            saved_precision = saved_training_config.get("precision")
-            # 兼容旧 v3 checkpoint 的运行时精度元数据；旧 run 配置协议本身仍按当前 schema 校验。
-            if saved_precision is None and "bf16" in saved_training_config:
-                saved_precision = "bf16" if saved_training_config["bf16"] else "fp32"
+            saved_training_config = _require_current_training_config(checkpoint)
+            saved_precision = str(saved_training_config["precision"])
             if strict_precision_resume and checkpoint_mode == "resume" and saved_precision != self.precision:
                 raise ValueError(f"训练精度不一致：checkpoint={saved_precision}，current={self.precision}")
 
@@ -399,8 +348,6 @@ class Trainer:
 
             saved_net_g_cfg = dict(checkpoint["net_g"]["network_cfg"])
             saved_net_d_cfg = dict(checkpoint["net_d"]["network_cfg"])
-            if net_g_cfg is None or net_d_cfg is None:
-                raise ValueError("恢复 checkpoint 时必须提供 Generator / Discriminator 配置")
             if saved_net_g_cfg != net_g_cfg or saved_net_d_cfg != net_d_cfg:
                 raise ValueError("checkpoint 模型架构与当前配置不一致")
 
@@ -414,9 +361,7 @@ class Trainer:
         else:
             if checkpoint_mode == "branch":
                 raise ValueError("branch 必须提供父 checkpoint")
-            if net_g_cfg is None or net_d_cfg is None:
-                raise ValueError("net_g_cfg 和 net_d_cfg 在未提供 ckpt 时不能为空")
-            self.img_resolution = net_g_cfg["img_resolution"]
+            self.img_resolution = int(net_g_cfg["img_resolution"])
             net_g = Generator(**net_g_cfg)
             net_d = Discriminator(**net_d_cfg)
 
@@ -438,26 +383,24 @@ class Trainer:
         self._ema_params = tuple(self.net_g_ema.parameters())
         self._train_g_params = tuple(self.net_g.parameters())
 
-        # ========================= 优化器 =========================
+        # ========================= 优化器 / 调度器 =========================
         self.optim_g = optim.Adam(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
         self.optim_d = optim.Adam(self.net_d.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
-        # FP16 的指数范围远小于 FP32/BF16，G/D 使用独立动态 loss scaler。
-        # BF16/FP32 下 GradScaler 禁用，保持原始 backward/step 语义。
         scaler_enabled = self.precision == "fp16"
         self.scaler_g = GradScaler("cuda", enabled=scaler_enabled)
         self.scaler_d = GradScaler("cuda", enabled=scaler_enabled)
 
         if training_state is not None:
             assert saved_training_config is not None
-            scheduler_config_unchanged = saved_training_config["lr"] == lr and saved_training_config["lr_scheduler_t_max"] == lr_scheduler_t_max
+            optimizer_scheduler_unchanged = saved_training_config["optimizer"] == optimizer_config and saved_training_config["scheduler"] == scheduler_config
             if checkpoint_mode == "branch":
-                _load_branch_optimizer_state(self.optim_g, training_state["optim_g"], lr=lr, reset_lr=not scheduler_config_unchanged)
-                _load_branch_optimizer_state(self.optim_d, training_state["optim_d"], lr=lr, reset_lr=not scheduler_config_unchanged)
+                _load_branch_optimizer_state(self.optim_g, training_state["optim_g"], lr=lr, reset_lr=not optimizer_scheduler_unchanged)
+                _load_branch_optimizer_state(self.optim_d, training_state["optim_d"], lr=lr, reset_lr=not optimizer_scheduler_unchanged)
             else:
                 self.optim_g.load_state_dict(training_state["optim_g"])
                 self.optim_d.load_state_dict(training_state["optim_d"])
         else:
-            scheduler_config_unchanged = False
+            optimizer_scheduler_unchanged = False
 
         if training_state is not None and saved_precision == self.precision == "fp16":
             scaler_g_state = training_state.get("scaler_g")
@@ -468,64 +411,62 @@ class Trainer:
                 self.scaler_d.load_state_dict(scaler_d_state)
 
         if self.use_cosine_lr:
-            self.lr_scheduler_g = CosineAnnealingLR(self.optim_g, T_max=lr_scheduler_t_max, eta_min=lr * 0.1)
-            self.lr_scheduler_d = CosineAnnealingLR(self.optim_d, T_max=lr_scheduler_t_max, eta_min=lr * 0.1)
-            if training_state is not None and (checkpoint_mode == "resume" or scheduler_config_unchanged):
+            self.lr_scheduler_g = CosineAnnealingLR(self.optim_g, T_max=scheduler_t_max, eta_min=lr * scheduler_min_lr_ratio)
+            self.lr_scheduler_d = CosineAnnealingLR(self.optim_d, T_max=scheduler_t_max, eta_min=lr * scheduler_min_lr_ratio)
+            if training_state is not None and (checkpoint_mode == "resume" or optimizer_scheduler_unchanged):
                 self.lr_scheduler_g.load_state_dict(training_state["lr_scheduler_g"])
                 self.lr_scheduler_d.load_state_dict(training_state["lr_scheduler_d"])
 
         # ========================= 损失 =========================
-
         self.d_loss = DiscriminatorAdversarialLoss(weight=1.0, reduction="mean").to(self.device)
-        self.gan_loss = GeneratorAdversarialLoss(weight=1.0, reduction="mean").to(self.device)
+        self.gan_loss = GeneratorAdversarialLoss(weight=float(gan_config["weight"]), reduction="mean").to(self.device)
 
         self.generator_id_encoder = IDEncoder(self.generator_id_encoder_provider).to(self.device).eval().requires_grad_(False)
-        self.id_loss = IdentityLoss(weight=id_loss_weight, provider=self.identity_loss_provider).to(self.device)
-        # 训练数据默认使用 FFHQ canonical alignment。Generator 身份编码器与 Identity Loss
-        # 共用同一套 FFHQ -> ArcFace 112 canonical 映射；sampling grid 仅初始化一次。
+        self.id_loss = IdentityLoss(weight=float(identity_loss_config["weight"]), provider=self.identity_loss_provider).to(self.device)
         self.identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.img_resolution, self.batch_size, self.device)
 
-        if self.enable_rec_loss:
-            self.rec_loss = make_l1_loss(weight=rec_loss_weight, reduction="none")
+        if self.enable_l1_loss:
+            self.l1_loss = make_l1_loss(weight=float(l1_config["weight"]), reduction="none")
 
         if self.enable_gaze_loss:
             self.gaze_loss = GazeLoss(
-                weight=gaze_loss_weight,
-                distribution_weight=gaze_distribution_weight,
-                confidence_weighted=gaze_confidence_weighted,
+                weight=float(gaze_config["weight"]),
+                distribution_weight=float(gaze_config["distribution_weight"]),
+                confidence_weighted=bool(gaze_config["confidence_weighted"]),
             ).to(self.device)
 
         if self.enable_hrffa_loss:
             self.hrffa_loss = HRFFAFacialGeometryLoss(
-                pose_weight=hrffa_pose_weight,
-                eye_weight=hrffa_eye_weight,
-                mouth_weight=hrffa_mouth_weight,
-                contour_weight=hrffa_contour_weight,
-                contour_shape_weight=hrffa_contour_shape_weight,
-                occluded_geometry_weight=hrffa_occluded_geometry_weight,
+                pose_weight=float(hrffa_config["pose_weight"]),
+                eye_weight=float(hrffa_config["eye_weight"]),
+                mouth_weight=float(hrffa_config["mouth_weight"]),
+                contour_weight=float(hrffa_config["contour_weight"]),
+                contour_shape_weight=float(hrffa_config["contour_shape_weight"]),
+                occluded_geometry_weight=float(hrffa_config["occluded_geometry_weight"]),
             ).to(self.device)
 
         if self.enable_facs_loss:
             self.facs_loss = FACSConsistencyLoss(
-                weight=facs_loss_weight,
-                brow_weight=facs_brow_weight,
-                eye_weight=facs_eye_weight,
-                nose_weight=facs_nose_weight,
-                mouth_weight=facs_mouth_weight,
-                lower_face_weight=facs_lower_face_weight,
-                asymmetry_weight=facs_asymmetry_weight,
+                weight=float(facs_config["weight"]),
+                brow_weight=float(facs_config["brow_weight"]),
+                eye_weight=float(facs_config["eye_weight"]),
+                nose_weight=float(facs_config["nose_weight"]),
+                mouth_weight=float(facs_config["mouth_weight"]),
+                lower_face_weight=float(facs_config["lower_face_weight"]),
+                asymmetry_weight=float(facs_config["asymmetry_weight"]),
             ).to(self.device)
 
-        if self.enable_perceptual_loss:
-            self.perceptual_loss = VGGPerceptualLoss(layer_weights=perceptual_loss_weight, reduction="mean").to(self.device)
+        if self.enable_vgg_loss:
+            self.vgg_loss = VGGPerceptualLoss(layer_weights=vgg_config["weights"], reduction="none").to(self.device)
 
         if self.enable_wfm_loss:
+            wfm_weights = {int(index): float(weight) for index, weight in wfm_config["weights"].items()}
             feature_count = len(self.net_d.down_blocks)
-            invalid_layers = sorted(index for index in wfm_loss_weight if index >= feature_count)
+            invalid_layers = sorted(index for index in wfm_weights if index >= feature_count)
             if invalid_layers:
-                raise ValueError(f"wfm_loss_weight 层索引超出判别器特征范围 0~{feature_count - 1}：{invalid_layers}")
-            self.wfm_loss = WeightedFeatureMatchingLoss(layer_weights=wfm_loss_weight, criterion="l1").to(self.device)
-            self.wfm_max_layer = max(wfm_loss_weight)
+                raise ValueError(f"loss.wfm.weights 层索引超出判别器特征范围 0~{feature_count - 1}：{invalid_layers}")
+            self.wfm_loss = WeightedFeatureMatchingLoss(layer_weights=wfm_weights, criterion="l1").to(self.device)
+            self.wfm_max_layer = max(wfm_weights)
 
         # ========================= Run 输出 =========================
         self.run_paths = RunPaths.from_root(run_dir)
@@ -539,7 +480,6 @@ class Trainer:
             path.mkdir(exist_ok=True, parents=True)
 
         # ========================= 数据采样 =========================
-
         self.dataset = TrainingDataLoader(
             batch_size=self.batch_size,
             device=self.device,
@@ -559,17 +499,14 @@ class Trainer:
             if self.enable_gaze_loss:
                 self.gaze_loss_forward = _compile_training_callable(self.gaze_loss)
             if self.enable_hrffa_loss:
-                # 只编译 HRFFA 的神经网络主体；输入/visibility 与 FP32 几何求解保持 eager。
                 self.hrffa_loss.hrffa.network = _compile_training_callable(self.hrffa_loss.hrffa.network)
             if self.enable_facs_loss:
-                # gfx1100/ROCm 上 compiled OpenGraphAU 在当前混合精度路径会产生错误输出；
-                # 仅此架构保持 FACS teacher eager，其余模块继续 compile。
                 if is_rocm_gfx1100(device_id):
                     print("警告：gfx1100 上 FACS/OpenGraphAU 保持 eager，避免 compiled 混合精度数值错误")
                 else:
                     self.facs_loss.au_model = _compile_training_callable(self.facs_loss.au_model)
-            if self.enable_perceptual_loss:
-                self.perceptual_loss_forward = _compile_training_callable(self.perceptual_loss)
+            if self.enable_vgg_loss:
+                self.vgg_loss_forward = _compile_training_callable(self.vgg_loss)
             if self.enable_wfm_loss:
                 self.train_d_features = _compile_training_callable(self.net_d.get_feats)
         else:
@@ -579,12 +516,11 @@ class Trainer:
             self.identity_embeddings_forward = self.id_loss.extract_identity_embeddings
             if self.enable_gaze_loss:
                 self.gaze_loss_forward = self.gaze_loss
-            if self.enable_perceptual_loss:
-                self.perceptual_loss_forward = self.perceptual_loss
+            if self.enable_vgg_loss:
+                self.vgg_loss_forward = self.vgg_loss
             if self.enable_wfm_loss:
                 self.train_d_features = self.net_d.get_feats
 
-        # TensorBoard writer 最后创建，避免初始化模型/数据管线失败时遗留后台资源。
         tensorboard_purge_step = None
         if checkpoint is not None and checkpoint_mode == "resume":
             tensorboard_purge_step = self.completed_step + 1
@@ -777,7 +713,7 @@ class Trainer:
                 # ========================= 训练判别器 =========================
                 self.net_d.requires_grad_(True)
                 self.optim_d.zero_grad(set_to_none=True)
-                is_r1_reg_step = self.completed_step % self.r1_reg_step == 0
+                is_r1_reg_step = self.enable_r1_loss and self.completed_step % self.r1_reg_step == 0
 
                 if is_r1_reg_step:
                     with autocast(device_type="cuda", enabled=False):
@@ -888,18 +824,18 @@ class Trainer:
                                 self.log(f"facs_{name}_loss", component)
                             g_loss = g_loss + torch.stack(tuple(facs_components.values())).sum()
 
-                        # perceptual_loss
-                        if self.enable_perceptual_loss:
-                            perceptual_loss = self.perceptual_loss_forward(fake, dst)
-                            self.log("perceptual_loss", perceptual_loss)
-                            g_loss = g_loss + perceptual_loss
+                        # VGG/L1 reconstruction 共用 loss.reconstruction.scope。
+                        if self.enable_vgg_loss:
+                            vgg_per_sample = self.vgg_loss_forward(fake, dst)
+                            vgg_loss = _reduce_reconstruction_loss(vgg_per_sample, same_mask, self.reconstruction_scope)
+                            self.log("vgg_loss", vgg_loss)
+                            g_loss = g_loss + vgg_loss
 
-                        # rec_loss：可仅约束 same self-reconstruction 样本，或应用于整个 batch。
-                        if self.enable_rec_loss:
-                            rec_per_sample = self.rec_loss(fake, dst).flatten(1).mean(dim=1)
-                            rec_loss = _reduce_reconstruction_loss(rec_per_sample, same_mask, self.rec_loss_scope)
-                            self.log("rec_loss", rec_loss)
-                            g_loss = g_loss + rec_loss
+                        if self.enable_l1_loss:
+                            l1_per_sample = self.l1_loss(fake, dst).flatten(1).mean(dim=1)
+                            l1_loss = _reduce_reconstruction_loss(l1_per_sample, same_mask, self.reconstruction_scope)
+                            self.log("l1_loss", l1_loss)
+                            g_loss = g_loss + l1_loss
 
                     _ensure_finite_loss("g_loss", g_loss)
                     if _scaled_backward_step(
@@ -928,21 +864,19 @@ class Trainer:
                 if self._stop_requested:
                     raise KeyboardInterrupt
 
-                if self.completed_step % self.weight_save_every == 0:
+                if self.completed_step % self.checkpoint_save_every == 0:
                     self.save_ckpt()
 
                 if self.completed_step % self.sample_save_every == 0:
                     self._save_sample(sample_batch, (src, dst, dst_canonical, theta_restore, same_mask))
 
 
-def _load_run_config(paths: RunPaths) -> tuple[dict[str, Any], dict[str, Any]]:
+def _load_run_config(paths: RunPaths) -> dict[str, Any]:
     resolved = load_resolved_config(paths)
-    migrated = _migrate_legacy_run_config(resolved)
-    canonical = resolve_train_config(migrated)
-    if canonical != migrated:
+    canonical = resolve_train_config(resolved)
+    if canonical != resolved:
         raise ValueError(f"run 的 resolved config 不是当前格式的规范表示：{paths.resolved_config}")
-    # 返回原始 frozen config 以保持 metadata/checkpoint 中既有 config_sha256 不变。
-    return _runtime_train_config(canonical), resolved
+    return resolved
 
 
 def _assert_branch_model_compatible(parent: dict[str, Any], branch: dict[str, Any]) -> None:
@@ -956,6 +890,8 @@ def _load_branch_checkpoint(checkpoint_path: Path, resolved: dict[str, Any]) -> 
     checkpoint_version = checkpoint["version"]
     if checkpoint_version != CHECKPOINT_VERSION:
         raise ValueError(f"不支持的 checkpoint version：{checkpoint_version}，当前仅支持 v{CHECKPOINT_VERSION}")
+
+    _require_current_training_config(checkpoint)
 
     checkpoint_step = int(checkpoint["step"])
     filename_step = checkpoint_step_from_name(checkpoint_path.name)
@@ -1011,11 +947,11 @@ def main() -> None:
     if is_resume:
         assert args.resume is not None
         run_paths, resume_checkpoint = resolve_resume_target(args.resume)
-        trainer_config, resolved = _load_run_config(run_paths)
+        resolved = _load_run_config(run_paths)
     elif is_branch:
         assert args.branch_from is not None and args.config is not None
         resume_checkpoint = resolve_branch_target(args.branch_from)
-        trainer_config, resolved = load_train_config(args.config)
+        resolved = load_train_config(args.config)
 
         preloaded_checkpoint, parent = _load_branch_checkpoint(resume_checkpoint, resolved)
 
@@ -1023,7 +959,7 @@ def main() -> None:
         checkpoint_mode = "branch"
     else:
         config_path = args.config or DEFAULT_TRAIN_CONFIG_PATH
-        trainer_config, resolved = load_train_config(config_path)
+        resolved = load_train_config(config_path)
         run_paths = create_run(args.runs_root or DEFAULT_RUNS_ROOT, config_path, resolved, name=args.name)
         resume_checkpoint = None
 
@@ -1041,7 +977,7 @@ def main() -> None:
         trainer: Trainer | None = None
         try:
             trainer = Trainer(
-                **trainer_config,
+                resolved,
                 run_dir=run_paths.root,
                 resume_checkpoint=resume_checkpoint,
                 run_id=run_id,

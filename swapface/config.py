@@ -1,4 +1,4 @@
-"""训练实验配置协议：显式默认值、TOML 解析与 runtime 参数转换。"""
+"""训练实验配置协议：默认值、严格校验与 canonical config 生成。"""
 
 import math
 import tomllib
@@ -7,20 +7,24 @@ from typing import Any
 
 from misc.models.id_encoder import IDEncoderProvider
 
-from .dataloader_common import DEFAULT_DATALOADER_CONFIG, ImageDecoderBackend, ImageSource
+from .dataloader_common import ImageDecoderBackend
 
 DEFAULT_TRAIN_CONFIG: dict[str, Any] = {
     "batch_size": 16,
-    "lr": 1e-4,
-    "lr_scheduler_t_max": 0,
-    "r1_reg_step": 16,
-    "r1_gamma": 10.0,
     "precision": "bf16",
     "device": "cuda",
     "compile_module": True,
     "log_interval": 10,
     "sample_save_every": 1000,
-    "weight_save_every": 10000,
+    "checkpoint_save_every": 10000,
+}
+DEFAULT_OPTIMIZER_CONFIG: dict[str, Any] = {
+    "lr": 1e-4,
+}
+DEFAULT_SCHEDULER_CONFIG: dict[str, Any] = {
+    "type": "none",
+    "t_max": 20000,
+    "min_lr_ratio": 0.1,
 }
 DEFAULT_GENERATOR_CONFIG: dict[str, Any] = {
     "img_resolution": 256,
@@ -41,6 +45,9 @@ DEFAULT_DISCRIMINATOR_CONFIG: dict[str, Any] = {
 }
 DEFAULT_GENERATOR_ID_ENCODER_PROVIDER = IDEncoderProvider.BLENDFACE
 DEFAULT_IDENTITY_LOSS_PROVIDER = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16
+DEFAULT_IDENTITY_CONFIG: dict[str, Any] = {
+    "provider": DEFAULT_GENERATOR_ID_ENCODER_PROVIDER.name,
+}
 DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
     "conv1_2": 2.5,
     "conv2_2": 2.5,
@@ -48,15 +55,12 @@ DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
     "conv4_3": 2.5,
 }
 DEFAULT_WFM_LOSS_WEIGHT: dict[int, float] = {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.1}
-DEFAULT_IDENTITY_CONFIG: dict[str, Any] = {
-    "generator_provider": DEFAULT_GENERATOR_ID_ENCODER_PROVIDER.name,
-    "loss_provider": DEFAULT_IDENTITY_LOSS_PROVIDER.name,
-    "loss_weight": 10.0,
-}
 DEFAULT_LOSS_CONFIG: dict[str, Any] = {
-    "enable_rec_loss": True,
-    "rec_loss_weight": 10.0,
-    "rec_loss_scope": "same",
+    "reconstruction": {"scope": "same"},
+    "gan": {"weight": 1.0},
+    "identity": {"provider": DEFAULT_IDENTITY_LOSS_PROVIDER.name, "weight": 10.0},
+    "l1": {"enable": True, "weight": 10.0},
+    "r1": {"enable": True, "interval": 16, "gamma": 10.0},
     "gaze": {"enable": False, "weight": 1.0, "distribution_weight": 0.1, "confidence_weighted": True},
     "hrffa": {
         "enable": False,
@@ -80,6 +84,31 @@ DEFAULT_LOSS_CONFIG: dict[str, Any] = {
     "vgg": {"enable": True, "weights": DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT},
     "wfm": {"enable": True, "weights": DEFAULT_WFM_LOSS_WEIGHT},
 }
+
+DEFAULT_DATA_CONFIG: dict[str, Any] = {
+    "loader": {
+        "num_threads": 16,
+        "prefetch_queue_depth": 4,
+        "py_num_workers": 8,
+        "py_start_method": "spawn",
+        "reader_prefetch_queue_depth": 2,
+        "decoder_backend": ImageDecoderBackend.MIXED.value,
+        "decoder_hw_load": 0.75,
+    },
+    "augmentation": {
+        "brightness": 0.2,
+        "contrast": 0.2,
+        "saturation": 0.2,
+        "flip_prob": 0.5,
+        "rotation_range": (-10.0, 10.0),
+        "scale_factor_range": (1.0 / 1.3, 1.25),
+        "tx_range": (-0.15, 0.15),
+        "ty_range": (-0.15, 0.15),
+    },
+    "sampling": {
+        "same_prob": 0.2,
+    },
+}
 DATALOADER_RANGE_KEYS = ("rotation_range", "scale_factor_range", "tx_range", "ty_range")
 
 
@@ -88,6 +117,62 @@ def _with_defaults(values: dict[str, Any], defaults: dict[str, Any], section: st
     if unknown:
         raise ValueError(f"{section} 包含未知字段：{sorted(unknown)}")
     return defaults | values
+
+
+def _table(parent: dict[str, Any], key: str, section: str) -> dict[str, Any]:
+    value = parent.get(key, {})
+    if not isinstance(value, dict):
+        raise TypeError(f"{section} 必须为表/对象")
+    return dict(value)
+
+
+def _bool(value: object, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} 必须为 bool，实际为 {type(value).__name__}")
+    return value
+
+
+def _int(value: object, name: str, *, minimum: int | None = None) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} 必须为 int，实际为 {type(value).__name__}")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} 必须 >= {minimum}，实际为 {value}")
+    return value
+
+
+def _float(value: object, name: str, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} 必须为数值，实际为 {type(value).__name__}")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} 必须为有限值，实际为 {result}")
+    if minimum is not None and result < minimum:
+        raise ValueError(f"{name} 必须 >= {minimum}，实际为 {result}")
+    if maximum is not None and result > maximum:
+        raise ValueError(f"{name} 必须 <= {maximum}，实际为 {result}")
+    return result
+
+
+def _range(value: object, name: str, *, positive: bool = False) -> list[float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{name} 必须为包含两个数值的数组")
+    low = _float(value[0], f"{name}[0]")
+    high = _float(value[1], f"{name}[1]")
+    if low > high:
+        raise ValueError(f"{name} 必须按从小到大排列，实际为 [{low}, {high}]")
+    if positive and low <= 0.0:
+        raise ValueError(f"{name} 必须为正数范围，实际为 [{low}, {high}]")
+    return [low, high]
+
+
+def _provider(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} 必须为字符串，实际为 {type(value).__name__}")
+    try:
+        return IDEncoderProvider[value].name
+    except KeyError as exc:
+        supported = ", ".join(provider.name for provider in IDEncoderProvider)
+        raise ValueError(f"{name}={value!r} 无效，可选：{supported}") from exc
 
 
 def _normalize_image_sources(entries: object, section: str) -> list[dict[str, Any]]:
@@ -103,244 +188,225 @@ def _normalize_image_sources(entries: object, section: str) -> list[dict[str, An
         unknown = set(entry) - allowed_fields
         if unknown:
             raise ValueError(f"[[{section}]] 第 {index} 项包含未知字段：{sorted(unknown)}；训练数据源仅支持本地 path/adjustment")
-
         path = entry.get("path")
         if not isinstance(path, str) or not path:
             raise ValueError(f"[[{section}]] 第 {index} 项 path 必须为非空字符串")
-        try:
-            adjustment = float(entry.get("adjustment", 0.0))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"[[{section}]] 第 {index} 项 adjustment 必须为数值") from exc
-        normalized.append({"path": path, "adjustment": adjustment})
+        normalized.append({"path": path, "adjustment": _float(entry.get("adjustment", 0.0), f"{section}[{index}].adjustment")})
     return normalized
 
 
-def _load_image_sources(entries: list[dict[str, Any]]) -> list[ImageSource]:
-    return [(str(entry["path"]), float(entry["adjustment"])) for entry in entries]
+def _normalize_train(config: dict[str, Any]) -> dict[str, Any]:
+    raw = _table(config, "train", "[train]")
+    if "precision" not in raw:
+        raise ValueError("[train].precision 必须显式配置为 fp32、fp16 或 bf16")
+    result = _with_defaults(raw, DEFAULT_TRAIN_CONFIG, "[train]")
+    result["batch_size"] = _int(result["batch_size"], "train.batch_size", minimum=1)
+    if not isinstance(result["precision"], str):
+        raise TypeError(f"train.precision 必须为字符串，实际为 {type(result['precision']).__name__}")
+    result["precision"] = result["precision"].lower()
+    if result["precision"] not in {"fp32", "fp16", "bf16"}:
+        raise ValueError(f"train.precision={result['precision']!r} 无效，可选：fp32、fp16、bf16")
+    if not isinstance(result["device"], str) or not result["device"]:
+        raise TypeError("train.device 必须为非空字符串")
+    result["compile_module"] = _bool(result["compile_module"], "train.compile_module")
+    for key in ("log_interval", "sample_save_every", "checkpoint_save_every"):
+        result[key] = _int(result[key], f"train.{key}", minimum=1)
+    return result
 
 
-def _normalize_dataloader(values: dict[str, Any]) -> dict[str, Any]:
-    unknown = set(values) - set(DEFAULT_DATALOADER_CONFIG)
+def _normalize_optimizer(config: dict[str, Any]) -> dict[str, Any]:
+    result = _with_defaults(_table(config, "optimizer", "[optimizer]"), DEFAULT_OPTIMIZER_CONFIG, "[optimizer]")
+    result["lr"] = _float(result["lr"], "optimizer.lr", minimum=1e-30)
+    return result
+
+
+def _normalize_scheduler(config: dict[str, Any]) -> dict[str, Any]:
+    result = _with_defaults(_table(config, "scheduler", "[scheduler]"), DEFAULT_SCHEDULER_CONFIG, "[scheduler]")
+    scheduler_type = result["type"]
+    if not isinstance(scheduler_type, str):
+        raise TypeError(f"scheduler.type 必须为字符串，实际为 {type(scheduler_type).__name__}")
+    scheduler_type = scheduler_type.lower()
+    if scheduler_type not in {"none", "cosine"}:
+        raise ValueError(f"scheduler.type={scheduler_type!r} 无效，可选：none、cosine")
+    result["type"] = scheduler_type
+    result["t_max"] = _int(result["t_max"], "scheduler.t_max", minimum=1)
+    result["min_lr_ratio"] = _float(result["min_lr_ratio"], "scheduler.min_lr_ratio", minimum=0.0, maximum=1.0)
+    return result
+
+
+def _normalize_identity(config: dict[str, Any]) -> dict[str, Any]:
+    result = _with_defaults(_table(config, "identity", "[identity]"), DEFAULT_IDENTITY_CONFIG, "[identity]")
+    result["provider"] = _provider(result["provider"], "identity.provider")
+    return result
+
+
+def _normalize_loss(config: dict[str, Any]) -> dict[str, Any]:
+    loss = _table(config, "loss", "[loss]")
+    unknown = set(loss) - set(DEFAULT_LOSS_CONFIG)
     if unknown:
-        raise ValueError(f"[dataloader] 包含未知字段：{sorted(unknown)}")
-    config = dict(DEFAULT_DATALOADER_CONFIG) | values
+        raise ValueError(f"[loss] 包含未知字段：{sorted(unknown)}")
 
+    reconstruction = _with_defaults(_table(loss, "reconstruction", "[loss.reconstruction]"), DEFAULT_LOSS_CONFIG["reconstruction"], "[loss.reconstruction]")
+    scope = reconstruction["scope"]
+    if not isinstance(scope, str):
+        raise TypeError(f"loss.reconstruction.scope 必须为字符串，实际为 {type(scope).__name__}")
+    if scope not in {"same", "all"}:
+        raise ValueError(f"loss.reconstruction.scope={scope!r} 无效，可选：same、all")
+
+    gan = _with_defaults(_table(loss, "gan", "[loss.gan]"), DEFAULT_LOSS_CONFIG["gan"], "[loss.gan]")
+    gan["weight"] = _float(gan["weight"], "loss.gan.weight", minimum=0.0)
+
+    identity = _with_defaults(_table(loss, "identity", "[loss.identity]"), DEFAULT_LOSS_CONFIG["identity"], "[loss.identity]")
+    identity["provider"] = _provider(identity["provider"], "loss.identity.provider")
+    identity["weight"] = _float(identity["weight"], "loss.identity.weight", minimum=0.0)
+
+    l1 = _with_defaults(_table(loss, "l1", "[loss.l1]"), DEFAULT_LOSS_CONFIG["l1"], "[loss.l1]")
+    l1["enable"] = _bool(l1["enable"], "loss.l1.enable")
+    l1["weight"] = _float(l1["weight"], "loss.l1.weight", minimum=0.0)
+
+    r1 = _with_defaults(_table(loss, "r1", "[loss.r1]"), DEFAULT_LOSS_CONFIG["r1"], "[loss.r1]")
+    r1["enable"] = _bool(r1["enable"], "loss.r1.enable")
+    r1["interval"] = _int(r1["interval"], "loss.r1.interval", minimum=1)
+    r1["gamma"] = _float(r1["gamma"], "loss.r1.gamma", minimum=0.0)
+
+    gaze = _with_defaults(_table(loss, "gaze", "[loss.gaze]"), DEFAULT_LOSS_CONFIG["gaze"], "[loss.gaze]")
+    gaze["enable"] = _bool(gaze["enable"], "loss.gaze.enable")
+    gaze["weight"] = _float(gaze["weight"], "loss.gaze.weight", minimum=0.0)
+    gaze["distribution_weight"] = _float(gaze["distribution_weight"], "loss.gaze.distribution_weight", minimum=0.0)
+    gaze["confidence_weighted"] = _bool(gaze["confidence_weighted"], "loss.gaze.confidence_weighted")
+
+    hrffa = _with_defaults(_table(loss, "hrffa", "[loss.hrffa]"), DEFAULT_LOSS_CONFIG["hrffa"], "[loss.hrffa]")
+    hrffa["enable"] = _bool(hrffa["enable"], "loss.hrffa.enable")
+    for key in ("pose_weight", "eye_weight", "mouth_weight", "contour_weight", "contour_shape_weight"):
+        hrffa[key] = _float(hrffa[key], f"loss.hrffa.{key}", minimum=0.0)
+    hrffa["occluded_geometry_weight"] = _float(hrffa["occluded_geometry_weight"], "loss.hrffa.occluded_geometry_weight", minimum=0.0, maximum=1.0)
+
+    facs = _with_defaults(_table(loss, "facs", "[loss.facs]"), DEFAULT_LOSS_CONFIG["facs"], "[loss.facs]")
+    facs["enable"] = _bool(facs["enable"], "loss.facs.enable")
+    for key in ("weight", "brow_weight", "eye_weight", "nose_weight", "mouth_weight", "lower_face_weight", "asymmetry_weight"):
+        facs[key] = _float(facs[key], f"loss.facs.{key}", minimum=0.0)
+
+    vgg = _with_defaults(_table(loss, "vgg", "[loss.vgg]"), DEFAULT_LOSS_CONFIG["vgg"], "[loss.vgg]")
+    vgg["enable"] = _bool(vgg["enable"], "loss.vgg.enable")
+    raw_vgg_weights = vgg["weights"]
+    if not isinstance(raw_vgg_weights, dict) or (vgg["enable"] and not raw_vgg_weights):
+        raise ValueError("[loss.vgg.weights] 必须为非空表/对象")
+    vgg["weights"] = {str(layer): _float(weight, f"loss.vgg.weights.{layer}", minimum=0.0) for layer, weight in raw_vgg_weights.items()}
+
+    wfm = _with_defaults(_table(loss, "wfm", "[loss.wfm]"), DEFAULT_LOSS_CONFIG["wfm"], "[loss.wfm]")
+    wfm["enable"] = _bool(wfm["enable"], "loss.wfm.enable")
+    raw_wfm_weights = wfm["weights"]
+    if not isinstance(raw_wfm_weights, dict) or (wfm["enable"] and not raw_wfm_weights):
+        raise ValueError("[loss.wfm.weights] 必须为非空表/对象")
+    normalized_wfm_weights: dict[str, float] = {}
+    for index, weight in raw_wfm_weights.items():
+        try:
+            layer_index = int(index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("[loss.wfm.weights] 的键必须是非负整数层索引") from exc
+        if layer_index < 0 or str(layer_index) != str(index):
+            raise ValueError(f"loss.wfm.weights 层索引无效：{index!r}")
+        normalized_wfm_weights[str(layer_index)] = _float(weight, f"loss.wfm.weights.{layer_index}", minimum=0.0)
+    wfm["weights"] = normalized_wfm_weights
+
+    return {
+        "reconstruction": reconstruction,
+        "gan": gan,
+        "identity": identity,
+        "l1": l1,
+        "r1": r1,
+        "gaze": gaze,
+        "hrffa": hrffa,
+        "facs": facs,
+        "vgg": vgg,
+        "wfm": wfm,
+    }
+
+
+def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
+    result = _with_defaults(_table(config, "generator", "[generator]"), DEFAULT_GENERATOR_CONFIG, "[generator]")
+    for key in ("img_resolution", "img_channels", "num_depth", "num_latent", "base_ch", "max_ch", "id_dim"):
+        result[key] = _int(result[key], f"generator.{key}")
+
+    skip_layers = result["aad_skip_layers"]
+    if not isinstance(skip_layers, (list, tuple)):
+        raise TypeError(f"generator.aad_skip_layers 必须为整数数组，实际为 {type(skip_layers).__name__}")
+    normalized_skip_layers: list[int] = []
+    for index, layer in enumerate(skip_layers):
+        normalized_skip_layers.append(_int(layer, f"generator.aad_skip_layers[{index}]"))
+    result["aad_skip_layers"] = normalized_skip_layers
+    return result
+
+
+def _normalize_discriminator(config: dict[str, Any]) -> dict[str, Any]:
+    result = _with_defaults(_table(config, "discriminator", "[discriminator]"), DEFAULT_DISCRIMINATOR_CONFIG, "[discriminator]")
+    for key in ("img_resolution", "img_channels", "base_ch", "max_ch"):
+        result[key] = _int(result[key], f"discriminator.{key}")
+    result["group_size"] = _int(result["group_size"], "discriminator.group_size", minimum=1)
+    return result
+
+
+def _normalize_data(config: dict[str, Any]) -> dict[str, Any]:
+    data = _table(config, "data", "[data]")
+    allowed = {"loader", "augmentation", "sampling", "src", "dst"}
+    unknown = set(data) - allowed
+    if unknown:
+        raise ValueError(f"[data] 包含未知字段：{sorted(unknown)}")
+
+    loader = _with_defaults(_table(data, "loader", "[data.loader]"), DEFAULT_DATA_CONFIG["loader"], "[data.loader]")
+    for key in ("num_threads", "prefetch_queue_depth", "reader_prefetch_queue_depth"):
+        loader[key] = _int(loader[key], f"data.loader.{key}", minimum=1)
+    loader["py_num_workers"] = _int(loader["py_num_workers"], "data.loader.py_num_workers", minimum=0)
+    if not isinstance(loader["py_start_method"], str) or loader["py_start_method"] not in {"spawn", "fork", "forkserver"}:
+        raise ValueError(f"data.loader.py_start_method={loader['py_start_method']!r} 无效，可选：spawn、fork、forkserver")
     try:
-        decoder_backend = config["decoder_backend"]
-        if not isinstance(decoder_backend, ImageDecoderBackend):
-            decoder_backend = ImageDecoderBackend(decoder_backend)
+        loader["decoder_backend"] = ImageDecoderBackend(loader["decoder_backend"]).value
     except ValueError as exc:
         supported = ", ".join(backend.value for backend in ImageDecoderBackend)
-        raise ValueError(f"dataloader.decoder_backend={config['decoder_backend']!r} 无效，可选：{supported}") from exc
-    config["decoder_backend"] = decoder_backend.value
+        raise ValueError(f"data.loader.decoder_backend={loader['decoder_backend']!r} 无效，可选：{supported}") from exc
+    loader["decoder_hw_load"] = _float(loader["decoder_hw_load"], "data.loader.decoder_hw_load", minimum=0.0, maximum=1.0)
 
+    augmentation = _with_defaults(_table(data, "augmentation", "[data.augmentation]"), DEFAULT_DATA_CONFIG["augmentation"], "[data.augmentation]")
+    for key in ("brightness", "contrast", "saturation"):
+        augmentation[key] = _float(augmentation[key], f"data.augmentation.{key}", minimum=0.0)
+    augmentation["flip_prob"] = _float(augmentation["flip_prob"], "data.augmentation.flip_prob", minimum=0.0, maximum=1.0)
     for key in DATALOADER_RANGE_KEYS:
-        value = config[key]
-        if not isinstance(value, (list, tuple)) or len(value) != 2:
-            raise ValueError(f"dataloader.{key} 必须为包含两个数值的数组")
-        config[key] = [float(value[0]), float(value[1])]
+        augmentation[key] = _range(augmentation[key], f"data.augmentation.{key}", positive=key == "scale_factor_range")
 
-    same_prob = float(config["same_prob"])
-    if not math.isfinite(same_prob) or not 0.0 <= same_prob <= 1.0:
-        raise ValueError(f"dataloader.same_prob 必须位于 [0, 1]，实际为 {same_prob}")
-    config["same_prob"] = same_prob
-    return config
+    sampling = _with_defaults(_table(data, "sampling", "[data.sampling]"), DEFAULT_DATA_CONFIG["sampling"], "[data.sampling]")
+    sampling["same_prob"] = _float(sampling["same_prob"], "data.sampling.same_prob", minimum=0.0, maximum=1.0)
+
+    return {
+        "loader": loader,
+        "augmentation": augmentation,
+        "sampling": sampling,
+        "src": _normalize_image_sources(data.get("src"), "data.src"),
+        "dst": _normalize_image_sources(data.get("dst"), "data.dst"),
+    }
 
 
 def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
-    """校验配置并展开显式协议默认值，得到可哈希、可持久化的规范配置。"""
-    allowed_sections = {"train", "identity", "loss", "dataloader", "generator", "discriminator", "src", "dst"}
+    """严格校验配置并展开默认值，得到唯一 canonical config。"""
+    allowed_sections = {"train", "optimizer", "scheduler", "identity", "loss", "data", "generator", "discriminator"}
     unknown_sections = set(config) - allowed_sections
     if unknown_sections:
         raise ValueError(f"配置包含未知顶层字段：{sorted(unknown_sections)}")
 
-    for section in ("train", "identity", "loss", "dataloader", "generator", "discriminator"):
-        value = config.get(section, {})
-        if not isinstance(value, dict):
-            raise TypeError(f"[{section}] 必须为表/对象")
-
-    raw_train = dict(config.get("train", {}))
-    if "precision" not in raw_train:
-        raise ValueError("[train].precision 必须显式配置为 fp32、fp16 或 bf16")
-    train = _with_defaults(raw_train, DEFAULT_TRAIN_CONFIG, "[train]")
-    precision = train["precision"]
-    if not isinstance(precision, str):
-        raise TypeError(f"train.precision 必须为字符串，实际为 {type(precision).__name__}")
-    precision = precision.lower()
-    if precision not in {"fp32", "fp16", "bf16"}:
-        raise ValueError(f"train.precision={precision!r} 无效，可选：fp32、fp16、bf16")
-    train["precision"] = precision
-
-    identity = dict(config.get("identity", {}))
-    unknown_identity = set(identity) - set(DEFAULT_IDENTITY_CONFIG)
-    if unknown_identity:
-        raise ValueError(f"[identity] 包含未知字段：{sorted(unknown_identity)}")
-    generator_provider = str(identity.get("generator_provider", DEFAULT_IDENTITY_CONFIG["generator_provider"]))
-    loss_provider = str(identity.get("loss_provider", DEFAULT_IDENTITY_CONFIG["loss_provider"]))
-    try:
-        IDEncoderProvider[generator_provider]
-        IDEncoderProvider[loss_provider]
-    except KeyError as exc:
-        supported = ", ".join(provider.name for provider in IDEncoderProvider)
-        raise ValueError(f"身份编码器类型无效，可选：{supported}") from exc
-
-    loss = dict(config.get("loss", {}))
-    unknown_loss = set(loss) - set(DEFAULT_LOSS_CONFIG)
-    if unknown_loss:
-        raise ValueError(f"[loss] 包含未知字段：{sorted(unknown_loss)}")
-
-    enable_rec_loss = bool(loss.get("enable_rec_loss", DEFAULT_LOSS_CONFIG["enable_rec_loss"]))
-    rec_loss_weight = float(loss.get("rec_loss_weight", DEFAULT_LOSS_CONFIG["rec_loss_weight"]))
-    rec_loss_scope = loss.get("rec_loss_scope", DEFAULT_LOSS_CONFIG["rec_loss_scope"])
-    if not isinstance(rec_loss_scope, str):
-        raise TypeError(f"loss.rec_loss_scope 必须为字符串，实际为 {type(rec_loss_scope).__name__}")
-    if rec_loss_scope not in {"same", "all"}:
-        raise ValueError(f"loss.rec_loss_scope={rec_loss_scope!r} 无效，可选：same、all")
-
-    gaze = loss.get("gaze", {})
-    if not isinstance(gaze, dict):
-        raise TypeError("[loss.gaze] 必须为表/对象")
-    unknown_gaze = set(gaze) - set(DEFAULT_LOSS_CONFIG["gaze"])
-    if unknown_gaze:
-        raise ValueError(f"[loss.gaze] 包含未知字段：{sorted(unknown_gaze)}")
-    gaze_config = {
-        "enable": bool(gaze.get("enable", DEFAULT_LOSS_CONFIG["gaze"]["enable"])),
-        "weight": float(gaze.get("weight", DEFAULT_LOSS_CONFIG["gaze"]["weight"])),
-        "distribution_weight": float(gaze.get("distribution_weight", DEFAULT_LOSS_CONFIG["gaze"]["distribution_weight"])),
-        "confidence_weighted": bool(gaze.get("confidence_weighted", DEFAULT_LOSS_CONFIG["gaze"]["confidence_weighted"])),
-    }
-
-    hrffa = loss.get("hrffa", {})
-    if not isinstance(hrffa, dict):
-        raise TypeError("[loss.hrffa] 必须为表/对象")
-    unknown_hrffa = set(hrffa) - set(DEFAULT_LOSS_CONFIG["hrffa"])
-    if unknown_hrffa:
-        raise ValueError(f"[loss.hrffa] 包含未知字段：{sorted(unknown_hrffa)}")
-    hrffa_config = {key: bool(hrffa.get(key, default)) if key == "enable" else float(hrffa.get(key, default)) for key, default in DEFAULT_LOSS_CONFIG["hrffa"].items()}
-    hrffa_numeric = {key: value for key, value in hrffa_config.items() if key != "enable"}
-    non_finite_hrffa = {key: value for key, value in hrffa_numeric.items() if not math.isfinite(value)}
-    if non_finite_hrffa:
-        raise ValueError(f"[loss.hrffa] 数值必须为有限值：{non_finite_hrffa}")
-    negative_hrffa = {key: value for key, value in hrffa_numeric.items() if value < 0.0}
-    if negative_hrffa:
-        raise ValueError(f"[loss.hrffa] 权重必须非负：{negative_hrffa}")
-    if hrffa_config["occluded_geometry_weight"] > 1.0:
-        raise ValueError(f"loss.hrffa.occluded_geometry_weight 必须位于 [0, 1]，实际为 {hrffa_config['occluded_geometry_weight']}")
-
-    facs = loss.get("facs", {})
-    if not isinstance(facs, dict):
-        raise TypeError("[loss.facs] 必须为表/对象")
-    unknown_facs = set(facs) - set(DEFAULT_LOSS_CONFIG["facs"])
-    if unknown_facs:
-        raise ValueError(f"[loss.facs] 包含未知字段：{sorted(unknown_facs)}")
-    facs_config = {key: bool(facs.get(key, default)) if key == "enable" else float(facs.get(key, default)) for key, default in DEFAULT_LOSS_CONFIG["facs"].items()}
-    invalid_facs = {key: value for key, value in facs_config.items() if key != "enable" and (not math.isfinite(value) or value < 0.0)}
-    if invalid_facs:
-        raise ValueError(f"[loss.facs] 权重必须为有限非负数：{invalid_facs}")
-
-    vgg = loss.get("vgg", {})
-    if not isinstance(vgg, dict):
-        raise TypeError("[loss.vgg] 必须为表/对象")
-    unknown_vgg = set(vgg) - set(DEFAULT_LOSS_CONFIG["vgg"])
-    if unknown_vgg:
-        raise ValueError(f"[loss.vgg] 包含未知字段：{sorted(unknown_vgg)}")
-    enable_vgg = bool(vgg.get("enable", DEFAULT_LOSS_CONFIG["vgg"]["enable"]))
-    raw_vgg_weights = vgg.get("weights", DEFAULT_LOSS_CONFIG["vgg"]["weights"])
-    if not isinstance(raw_vgg_weights, dict) or (enable_vgg and not raw_vgg_weights):
-        raise ValueError("[loss.vgg.weights] 必须为非空表/对象")
-    vgg_weights = {str(layer): float(weight) for layer, weight in raw_vgg_weights.items()}
-
-    wfm = loss.get("wfm", {})
-    if not isinstance(wfm, dict):
-        raise TypeError("[loss.wfm] 必须为表/对象")
-    unknown_wfm = set(wfm) - set(DEFAULT_LOSS_CONFIG["wfm"])
-    if unknown_wfm:
-        raise ValueError(f"[loss.wfm] 包含未知字段：{sorted(unknown_wfm)}")
-    enable_wfm = bool(wfm.get("enable", DEFAULT_LOSS_CONFIG["wfm"]["enable"]))
-    raw_wfm_weights = wfm.get("weights", DEFAULT_LOSS_CONFIG["wfm"]["weights"])
-    if not isinstance(raw_wfm_weights, dict) or (enable_wfm and not raw_wfm_weights):
-        raise ValueError("[loss.wfm.weights] 必须为非空表/对象")
-    try:
-        wfm_weights = {str(int(index)): float(weight) for index, weight in raw_wfm_weights.items()}
-    except (TypeError, ValueError) as exc:
-        raise ValueError("[loss.wfm.weights] 的键必须是整数层索引，值必须是数值") from exc
-
     return {
-        "train": train,
-        "identity": {
-            "generator_provider": generator_provider,
-            "loss_provider": loss_provider,
-            "loss_weight": float(identity.get("loss_weight", DEFAULT_IDENTITY_CONFIG["loss_weight"])),
-        },
-        "loss": {
-            "enable_rec_loss": enable_rec_loss,
-            "rec_loss_weight": rec_loss_weight,
-            "rec_loss_scope": rec_loss_scope,
-            "gaze": gaze_config,
-            "hrffa": hrffa_config,
-            "facs": facs_config,
-            "vgg": {"enable": enable_vgg, "weights": vgg_weights},
-            "wfm": {"enable": enable_wfm, "weights": wfm_weights},
-        },
-        "dataloader": _normalize_dataloader(dict(config.get("dataloader", {}))),
-        "generator": _with_defaults(dict(config.get("generator", {})), DEFAULT_GENERATOR_CONFIG, "[generator]"),
-        "discriminator": _with_defaults(dict(config.get("discriminator", {})), DEFAULT_DISCRIMINATOR_CONFIG, "[discriminator]"),
-        "src": _normalize_image_sources(config.get("src"), "src"),
-        "dst": _normalize_image_sources(config.get("dst"), "dst"),
+        "train": _normalize_train(config),
+        "optimizer": _normalize_optimizer(config),
+        "scheduler": _normalize_scheduler(config),
+        "identity": _normalize_identity(config),
+        "loss": _normalize_loss(config),
+        "data": _normalize_data(config),
+        "generator": _normalize_generator(config),
+        "discriminator": _normalize_discriminator(config),
     }
 
 
-def _runtime_train_config(resolved: dict[str, Any]) -> dict[str, Any]:
-    dataloader = dict(resolved["dataloader"])
-    dataloader["decoder_backend"] = ImageDecoderBackend(dataloader["decoder_backend"])
-    for key in DATALOADER_RANGE_KEYS:
-        dataloader[key] = tuple(float(value) for value in dataloader[key])
-
-    identity = resolved["identity"]
-    loss = resolved["loss"]
-    return {
-        **resolved["train"],
-        "src": _load_image_sources(resolved["src"]),
-        "dst": _load_image_sources(resolved["dst"]),
-        "generator_id_encoder_provider": IDEncoderProvider[identity["generator_provider"]],
-        "identity_loss_provider": IDEncoderProvider[identity["loss_provider"]],
-        "id_loss_weight": float(identity["loss_weight"]),
-        "enable_rec_loss": bool(loss["enable_rec_loss"]),
-        "rec_loss_weight": float(loss["rec_loss_weight"]),
-        "rec_loss_scope": str(loss["rec_loss_scope"]),
-        "enable_gaze_loss": bool(loss["gaze"]["enable"]),
-        "gaze_loss_weight": float(loss["gaze"]["weight"]),
-        "gaze_distribution_weight": float(loss["gaze"]["distribution_weight"]),
-        "gaze_confidence_weighted": bool(loss["gaze"]["confidence_weighted"]),
-        "enable_hrffa_loss": bool(loss["hrffa"]["enable"]),
-        "hrffa_pose_weight": float(loss["hrffa"]["pose_weight"]),
-        "hrffa_eye_weight": float(loss["hrffa"]["eye_weight"]),
-        "hrffa_mouth_weight": float(loss["hrffa"]["mouth_weight"]),
-        "hrffa_contour_weight": float(loss["hrffa"]["contour_weight"]),
-        "hrffa_contour_shape_weight": float(loss["hrffa"]["contour_shape_weight"]),
-        "hrffa_occluded_geometry_weight": float(loss["hrffa"]["occluded_geometry_weight"]),
-        "enable_facs_loss": bool(loss["facs"]["enable"]),
-        "facs_loss_weight": float(loss["facs"]["weight"]),
-        "facs_brow_weight": float(loss["facs"]["brow_weight"]),
-        "facs_eye_weight": float(loss["facs"]["eye_weight"]),
-        "facs_nose_weight": float(loss["facs"]["nose_weight"]),
-        "facs_mouth_weight": float(loss["facs"]["mouth_weight"]),
-        "facs_lower_face_weight": float(loss["facs"]["lower_face_weight"]),
-        "facs_asymmetry_weight": float(loss["facs"]["asymmetry_weight"]),
-        "enable_perceptual_loss": bool(loss["vgg"]["enable"]),
-        "perceptual_loss_weight": {str(layer): float(weight) for layer, weight in loss["vgg"]["weights"].items()},
-        "enable_wfm_loss": bool(loss["wfm"]["enable"]),
-        "wfm_loss_weight": {int(index): float(weight) for index, weight in loss["wfm"]["weights"].items()},
-        "dataloader_cfg": dataloader,
-        "net_g_cfg": dict(resolved["generator"]),
-        "net_d_cfg": dict(resolved["discriminator"]),
-    }
-
-
-def load_train_config(path: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    """读取用户 TOML，返回 Trainer 参数与完整 resolved config。"""
+def load_train_config(path: str | Path) -> dict[str, Any]:
+    """读取用户 TOML 并返回唯一 canonical config。"""
     config_path = Path(path)
     with config_path.open("rb") as file:
         raw_config = tomllib.load(file)
-    resolved = resolve_train_config(raw_config)
-    return _runtime_train_config(resolved), resolved
+    return resolve_train_config(raw_config)

@@ -9,7 +9,7 @@ from collections.abc import Sequence
 import torch
 from torch import Tensor
 
-from .dataloader_common import DATALOADER_RESERVED_KEYS, DEFAULT_DATALOADER_CONFIG, ImageDecoderBackend, ImageSource
+from .dataloader_common import ImageDecoderBackend, ImageSource
 
 
 class TrainingDataLoader:
@@ -49,8 +49,6 @@ class TrainingDataLoader:
 
 
 __all__ = [
-    "DATALOADER_RESERVED_KEYS",
-    "DEFAULT_DATALOADER_CONFIG",
     "ImageDecoderBackend",
     "ImageSource",
     "TrainingDataLoader",

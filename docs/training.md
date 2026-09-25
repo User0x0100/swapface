@@ -55,18 +55,32 @@ uv run python -m swapface.train \
 
 `--name` 只参与 run ID，不改变实验配置。默认结果根目录为 `experiments/runs`；如确有需要，可用 `--runs-root PATH` 覆盖。
 
-`compile_module` 控制训练路径的 `torch.compile`：启用时，由 Trainer 统一编译 Generator、Discriminator、Generator 身份编码与 Identity Loss embedding 提取，以及启用的 VGG/WFM 热路径；设为 `false` 时，训练路径全部保持 eager。
+`[train].compile_module` 控制训练路径的 `torch.compile`：启用时，由 Trainer 统一编译 Generator、Discriminator、Generator 身份编码与 Identity Loss embedding 提取，以及启用的 VGG/WFM 热路径；设为 `false` 时，训练路径全部保持 eager。
+
+## 配置职责
+
+训练配置只存在一套 canonical schema；`swapface/config.py` 负责默认值、严格校验和 canonical 化，`Trainer` 直接消费该结构，不再维护第二套扁平配置参数。顶层职责为：
+
+- `[train]`：batch、precision、device、compile 与输出周期；
+- `[optimizer]` / `[scheduler]`：优化器学习率与调度策略；
+- `[identity]`：Generator 的 source identity 条件编码器；
+- `[loss.*]`：每一种训练损失及其共享 reconstruction 策略；
+- `[data.loader]` / `[data.augmentation]` / `[data.sampling]`：数据执行、增强和配对采样；
+- `[[data.src]]` / `[[data.dst]]`：训练数据源；
+- `[generator]` / `[discriminator]`：模型定义。
+
+Identity Loss teacher 明确位于 `[loss.identity]`，不与 Generator 条件编码器混在 `[identity]`。L1 和 VGG 共享 `[loss.reconstruction].scope`。R1 位于 `[loss.r1]`，不再混入 `[train]`。 `[loss.gan].weight` 只缩放 Generator adversarial loss；Discriminator adversarial loss 固定权重 1.0，避免改变其与 R1 的相对尺度。
 
 ## 训练数据源
 
-训练数据只支持本地图片目录，不再由训练进程访问 Hugging Face、ModelScope 或其他在线数据集。`[[src]]` / `[[dst]]` 的 schema 只包含：
+训练数据只支持本地图片目录，不再由训练进程访问 Hugging Face、ModelScope 或其他在线数据集。`[[data.src]]` / `[[data.dst]]` 的 schema 只包含：
 
 ```toml
-[[src]]
+[[data.src]]
 path = "/path/to/source_faces"
 adjustment = 0.0
 
-[[dst]]
+[[data.dst]]
 path = "/path/to/target_faces"
 adjustment = 0.0
 ```
@@ -120,7 +134,7 @@ step_000010000.pth
 step_000010000.png
 ```
 
-例如 `step_000010000.pth` 表示已经完成 10,000 次训练更新。`weight_save_every = 10000` 会在 completed step 10,000、20,000、30,000... 保存。
+例如 `step_000010000.pth` 表示已经完成 10,000 次训练更新。`train.checkpoint_save_every = 10000` 会在 completed step 10,000、20,000、30,000... 保存。
 
 checkpoint 仍通过临时文件写入后原子 `replace`；只有 checkpoint 成功落盘后才原子更新 `latest.json`。
 
@@ -148,7 +162,7 @@ uv run python -m swapface.train \
 
 ## Branch：从已有 checkpoint 派生新实验
 
-Branch 从已有完整训练状态创建一个新的 run。它不会修改父 run，可以从标准 run 的 latest、其中任意历史 checkpoint，或单独保存的 v3 checkpoint 文件分叉：
+Branch 从已有完整训练状态创建一个新的 run。它不会修改父 run，可以从标准 run 的 latest、其中任意历史 checkpoint，或单独保存的当前 v3 + 当前训练语义 checkpoint 文件分叉：
 
 ```bash
 uv run python -m swapface.train \
@@ -157,7 +171,7 @@ uv run python -m swapface.train \
   --name lower-id-loss
 ```
 
-独立 checkpoint 不需要保留原 run 目录；只要文件名保持 `step_<step>.pth`，其内部 v3 元数据、step 与 Generator/Discriminator 架构有效即可：
+独立 checkpoint 不需要保留原 run 目录；只要文件名保持 `step_<step>.pth`，其内部 v3 元数据、当前 `training_config.semantics_version`、step 与 Generator/Discriminator 架构有效即可：
 
 ```bash
 uv run --no-sync python -m swapface.train \
@@ -171,10 +185,10 @@ uv run --no-sync python -m swapface.train \
 Branch 允许修改训练配置，例如：
 
 - loss 类型、开关和权重；
-- Generator Identity provider 与 Identity Loss provider；
+- `[identity].provider` 与 `[loss.identity].provider`；
 - 学习率与 scheduler；
-- batch size、R1、precision/compile；
-- 数据源、数据增强与数据管线参数（NVIDIA 使用 DALI，ROCm 使用原生 PyTorch 管线）；
+- batch size、`[loss.r1]`、precision/compile；
+- `[data.src]/[data.dst]`、`[data.augmentation]`、`[data.sampling]` 与 `[data.loader]`；
 - 日志、sample 和 checkpoint 间隔。
 
 但 Branch 的目的仍是**继续训练同一个模型定义**，因此以下配置必须与父 run 完全一致，否则在创建新 run 前直接拒绝：
@@ -184,7 +198,7 @@ Branch 允许修改训练配置，例如：
 
 若要修改这些模型定义，应创建 fresh run，而不是 branch。Branch 不做 partial load。
 
-Branch 继承 Generator、Discriminator、EMA 和 Adam moments/step。optimizer 的学习率等运行超参数以新配置为准；当 `lr` 与 `lr_scheduler_t_max` 都与父 checkpoint 一致时继承 scheduler 进度，否则 scheduler 按新配置重新初始化。
+Branch 继承 Generator、Discriminator、EMA 和 Adam moments/step。`[optimizer]` 与 `[scheduler]` 以新配置为准；两节与父 checkpoint 完全一致时继承 scheduler 进度，否则 optimizer LR 按新配置覆盖且 scheduler 重新初始化。
 
 因此三种入口具有明确语义：
 
@@ -198,8 +212,6 @@ Branch 继承 Generator、Discriminator、EMA 和 Adam moments/step。optimizer 
 
 FP16 中只有实际执行了 optimizer update 的阶段才推进对应 scheduler。D overflow 时当前 global step 不推进；D 已成功而 G overflow 时只重算并重试 G，直到 G 成功后才更新 EMA 和 `completed_step`。总 `d_loss` / `g_loss` 出现 NaN/Inf 时直接终止，避免把非有限值误当作可通过降低 loss scale 恢复的 overflow。BF16/FP32 在 backward 后、`optimizer.step()` 前额外检查参数梯度；若任一梯度出现 NaN/Inf，则报告首个异常参数并终止，避免污染模型参数和 optimizer state。FP16 的梯度 overflow 仍由 `GradScaler` 负责跳过 update 和动态调整 scale，不走该 fatal gradient guard。
 
-旧 v3 run 的 frozen config 若仍使用 `bf16 = true/false`，resume 时只在内存中映射为 `precision = "bf16"/"fp32"`，不会改写原 `config.resolved.json` 或其 SHA-256，因此旧 run 仍可线性 resume。
-
 默认 resume 不要求当前实际训练精度与 checkpoint 一致，因为设备和软件环境可能变化。需要严格复现时可显式使用：
 
 ```bash
@@ -208,7 +220,9 @@ uv run python -m swapface.train \
   --strict-precision
 ```
 
-此时程序比较 checkpoint 中记录的实际 `training_config.precision` 与当前进程实际生效的精度；不一致时拒绝 resume。对于旧 v3 checkpoint，`training_config.bf16` 仅用于映射旧的 BF16/FP32 运行状态。`--strict-precision` 是本次 resume 的运行时策略，不写入 TOML，也不能用于 fresh training。
+此时程序比较 checkpoint 中记录的实际 `training_config.precision` 与当前进程实际生效的精度；不一致时拒绝 resume。`--strict-precision` 是本次 resume 的运行时策略，不写入 TOML，也不能用于 fresh training。
+
+训练 checkpoint 还记录严格的 `training_config.semantics_version`。resume/branch 只接受与当前代码完全一致的训练语义版本；不迁移旧训练状态。纯推理/导出仍只依赖模型 checkpoint 格式，不受训练语义版本约束。
 
 ## 配置冻结与哈希
 

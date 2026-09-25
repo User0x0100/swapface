@@ -11,7 +11,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from swapface.dataloader import DEFAULT_DATALOADER_CONFIG, TrainingDataLoader
+from swapface.config import DEFAULT_DATA_CONFIG
+from swapface.dataloader import TrainingDataLoader
 from swapface.dataloader_common import build_image_pools
 from swapface.dataloader_native import make_affine_thetas
 
@@ -59,7 +60,7 @@ def main() -> None:
         expected_ratio = (9**0.5 * 2.0) / (4**0.5)
         assert abs(weights[1] / weights[0] - expected_ratio) < 1e-12
 
-        config = dict(DEFAULT_DATALOADER_CONFIG)
+        config = {**DEFAULT_DATA_CONFIG["loader"], **DEFAULT_DATA_CONFIG["augmentation"], **DEFAULT_DATA_CONFIG["sampling"]}
         config.update(
             py_num_workers=0,
             brightness=0.2,
@@ -171,7 +172,6 @@ def main() -> None:
 
     assert "nvidia.dali.plugin.pytorch" not in sys.modules
     assert "torchcodec" not in sys.modules
-    assert set(train.DEFAULT_DATALOADER_CONFIG) == set(DEFAULT_DATALOADER_CONFIG)
     train_source = Path(train.__file__).read_text(encoding="utf-8")
     assert "DALIGenericIterator" not in train_source
     assert "data_backend" not in train_source

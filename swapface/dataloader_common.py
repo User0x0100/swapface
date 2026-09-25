@@ -5,7 +5,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 from numpy import ndarray
@@ -22,7 +21,6 @@ class LocalImagePool:
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp")
-DATALOADER_RESERVED_KEYS = frozenset({"batch_size", "device", "device_id", "img_resolution", "src", "dst"})
 
 
 class ImageDecoderBackend(Enum):
@@ -30,27 +28,6 @@ class ImageDecoderBackend(Enum):
 
     MIXED = "mixed"
     CPU = "cpu"
-
-
-# 数据管线默认配置。
-DEFAULT_DATALOADER_CONFIG: dict[str, Any] = {
-    "num_threads": 16,
-    "prefetch_queue_depth": 4,
-    "py_num_workers": 8,
-    "py_start_method": "spawn",
-    "reader_prefetch_queue_depth": 2,
-    "decoder_backend": ImageDecoderBackend.MIXED,
-    "decoder_hw_load": 0.75,
-    "brightness": 0.2,
-    "contrast": 0.2,
-    "saturation": 0.2,
-    "flip_prob": 0.5,
-    "same_prob": 0.2,
-    "rotation_range": (-10.0, 10.0),
-    "scale_factor_range": (1.0 / 1.3, 1.25),
-    "tx_range": (-0.15, 0.15),
-    "ty_range": (-0.15, 0.15),
-}
 
 
 def validate_range(name: str, value: FloatRange) -> FloatRange:

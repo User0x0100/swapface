@@ -5,124 +5,103 @@
 #   新训练：uv run python -m swapface.train --config experiments/train.toml [--name NAME]
 #   恢复训练：uv run python -m swapface.train --resume experiments/runs/<run_id> [--strict-precision]
 #
-# 说明：
-# - 本文件只描述训练实验本身，不保存 checkpoint/output 路径等运行时状态。
-# - 每次新训练会自动创建唯一 run 目录，并冻结原始配置、resolved config 与运行元数据。
-# - 未显式配置的参数由 swapface/config.py 按显式训练配置协议补齐，并写入 run/config.resolved.json。
-# - 训练输入图像默认要求使用 FFHQ canonical alignment；Identity Loss 前固定映射到 112x112 canonical 坐标系。
-# - checkpoint 仅支持当前 v3 格式；恢复时使用原 run 的冻结配置，不重新读取本文件。
+# 本文件只描述训练实验本身。所有默认值、校验和 canonical schema 由 swapface/config.py 唯一维护。
+# checkpoint 只接受当前训练语义；旧配置/旧训练状态不做迁移或 alias。
 
 [train]
 # 每个训练 batch 的样本数。当前判别器的 minibatch group_size 必须能整除该值。
 batch_size = 12
 
-# Generator / Discriminator 的 Adam 初始学习率。
-lr = 1.0e-4
-
-# CosineAnnealingLR 的 T_max（单位：训练迭代数）。
-# 设为 0 表示禁用余弦学习率调度器。
-lr_scheduler_t_max = 0
-
-# Lazy R1：每隔多少个训练 step 执行一次 R1 正则；首个 step 即执行。
-r1_reg_step = 16
-
-# R1 正则 gamma。实际 lazy R1 会再乘以 r1_reg_step 进行间隔补偿。
-r1_gamma = 10.0
-
-# 必须显式设置混合精度模式：fp32 / fp16 / bf16。
-# Radeon gfx1100 上部分 BF16 卷积 backward 存在严重性能退化，因此当前实验使用 FP16。
+# 必须显式设置：fp32 / fp16 / bf16。
 precision = "fp16"
 
-# Trainer 支持 PyTorch CUDA/HIP GPU。ROCm 也沿用 PyTorch 的 "cuda" 设备命名。
-# 可写 "cuda"、"cuda:0" 等，不使用 "rocm" 或 "hip" 设备名。
+# Trainer 支持 PyTorch CUDA/HIP GPU；ROCm 也沿用 PyTorch 的 "cuda" 设备名。
 device = "cuda"
 
-# 是否启用训练路径的 torch.compile。
-# Trainer 统一编译 Generator、Discriminator、Generator 身份编码与 Identity Loss embedding 提取，
-# 以及启用的 Gaze/VGG/WFM 热路径；关闭后训练路径保持 eager。
+# 是否编译 Generator、Discriminator、身份编码器及启用的 loss 热路径。
 compile_module = true
 
-# TensorBoard loss 写入间隔，单位为 completed step。
+# 日志、样本和完整 checkpoint 的保存周期，单位均为 completed step。
 log_interval = 10
-
-# 保存可视化 sample 的间隔，单位为 completed step。
 sample_save_every = 1000
+checkpoint_save_every = 10000
 
-# 保存完整训练 checkpoint 的间隔，单位为 completed step。
-weight_save_every = 10000
+
+[optimizer]
+# Generator / Discriminator 共用的 Adam 初始学习率。
+# Adam betas=(0.0, 0.99) 与 fused 实现当前固定在训练代码中，不作为实验自由度暴露。
+lr = 1.0e-4
+
+
+[scheduler]
+# "none" 或 "cosine"。
+type = "none"
+
+# cosine 时使用；type="none" 时保留在 canonical config 中但不生效。
+t_max = 20000
+min_lr_ratio = 0.1
 
 
 [identity]
-# Generator 条件身份编码器。
-# 当前推荐/默认：BLENDFACE。
-# checkpoint 会记录并在恢复时严格校验该类型。
-generator_provider = "BLENDFACE"
-
-# Identity Loss 使用的身份编码器。
-# 当前使用 MS1MV3 ArcFace R50 FP16；Generator 条件编码器仍独立使用 BLENDFACE。
-loss_provider = "MS1MV3_ARCFACE_R50_FP16"
-
-# Identity Loss 的总权重。
-loss_weight = 10.0
+# Generator 的 source identity 条件编码器。它属于模型条件输入，不属于 Identity Loss teacher。
+provider = "BLENDFACE"
 
 
-[loss]
-# 是否启用 reconstruction L1 loss。
-enable_rec_loss = true
+[loss.reconstruction]
+# L1/VGG reconstruction 的共享作用范围：
+# "same" 仅 same self-reconstruction；"all" 对 batch 内所有 src/dst pair 生效。
+scope = "same"
 
-# Reconstruction Loss 权重。
-rec_loss_weight = 8.0
 
-# Reconstruction Loss 作用范围："same" 仅 same self-reconstruction 样本；
-# "all" 对 batch 内所有 src/dst pair 生效。
-rec_loss_scope = "same"
+[loss.gan]
+# Generator adversarial loss 权重；Discriminator adversarial loss 固定为 1.0。
+weight = 1.0
+
+
+[loss.identity]
+# Identity Loss teacher 与权重。
+provider = "MS1MV3_ARCFACE_R50_FP16"
+weight = 10.0
+
+
+[loss.l1]
+enable = true
+weight = 8.0
+
+
+[loss.r1]
+enable = true
+
+# Lazy R1：每隔多少个 completed step 执行一次；首个 step 即执行。
+interval = 16
+
+# R1 gamma。实际 lazy R1 会再乘以 interval 做间隔补偿。
+gamma = 10.0
 
 
 [loss.gaze]
-# L2CS-Net gaze consistency loss：restore fake 后，与数据管线直接提供的 dst_canonical 比较视线方向。
+# L2CS-Net gaze consistency：restore fake 后与 dst_canonical 比较视线方向。
 enable = true
-
-# Gaze Loss 总权重。
 weight = 1.0
-
-# L2CS 两个角度 logits 分布 KL 项相对于 3D gaze direction cosine loss 的权重。
 distribution_weight = 0.1
-
-# 使用参考视线预测熵降低低置信样本的权重。
 confidence_weighted = true
 
 
 [loss.hrffa]
 # HRFFA vitt-256 面部几何一致性损失。
-# restore fake 后，与 dst_canonical 比较头部朝向、左右眼睑开合、嘴部开合和面部外轮廓。
-# 当前处于实验阶段，默认关闭；启用前应先在实际训练数据上检查 HRFFA landmarks/visibility。
 enable = false
-
-# 以下权重分别作用于已经归一化的几何子损失；建议实验时逐项开启做 ablation。
 pose_weight = 1.0
 eye_weight = 1.0
 mouth_weight = 1.0
 contour_weight = 1.0
-
-# 相邻 contour segment 方向/长度约束相对于 contour 点坐标项的权重。
 contour_shape_weight = 0.5
-
-# pose / contour 使用 reference 的连续 visibility 概率：P(VISIBLE) + 此权重 * P(OCCLUDED)。
-# eye / mouth 仅使用 P(VISIBLE)，避免把不可见五官的推断坐标当作动作真值。
 occluded_geometry_weight = 0.25
 
 
 [loss.facs]
-# OpenGraphAU / MEFARG Stage-2 的连续 FACS Action Unit 一致性损失。
-# reference 直接使用数据管线提供的 dst_canonical；模型参数冻结，仅 fake 分支保留到 Generator 的梯度。
-# 当前处于实验阶段，默认关闭。
+# OpenGraphAU / MEFARG Stage-2 连续 FACS Action Unit 一致性损失。
 enable = false
-
-# 总权重。区域权重全部为 1 时，总损失是 27 个主 AU + 7 个左右差异，共 34 个语义信号的 mean L1。
 weight = 1.0
-
-# 分区域权重。lower_face 包含 chin raiser / tongue show / jaw drop；
-# asymmetry 使用 14 个左右侧 AU 组成的 7 个 (L-R) 差异，不重复匹配左右绝对激活。
 brow_weight = 1.0
 eye_weight = 1.0
 nose_weight = 1.0
@@ -132,8 +111,7 @@ asymmetry_weight = 1.0
 
 
 [loss.vgg]
-# VGG19 感知特征损失。默认开启；配置与 2026-06-29 训练版本一致。
-# 比较 fake 与增强后的 dst，使用 L1 匹配以下冻结 VGG19 中间特征。
+# VGG19 perceptual reconstruction。与 L1 共用 loss.reconstruction.scope。
 enable = true
 
 [loss.vgg.weights]
@@ -144,14 +122,9 @@ conv4_3 = 2.5
 
 
 [loss.wfm]
-# 是否启用判别器中间特征的 Weighted Feature Matching Loss。
-# fake 分支保留梯度，real 分支在 no_grad 下作为目标特征。
+# 判别器中间特征 Weighted Feature Matching。
 enable = false
 
-# WFM 使用的判别器特征层索引及对应权重。
-# 键是 Discriminator down_blocks 的 0-based 索引。
-# 索引必须小于当前判别器实际 down_blocks 数量。
-# 注意：越浅的层特征图越大，显存/带宽开销也越高。
 [loss.wfm.weights]
 0 = 0.1
 1 = 0.1
@@ -159,119 +132,77 @@ enable = false
 3 = 0.1
 
 
-[dataloader]
-# NVIDIA DALI pipeline CPU thread 数；ROCm 原生 PyTorch 管线不使用该项。
+[data.loader]
+# 数据执行/解码后端参数。
 num_threads = 16
-
-# NVIDIA DALI 整体 pipeline 预取深度；ROCm 原生 PyTorch 管线不使用该项。
 prefetch_queue_depth = 4
-
-# Python 图像读取 worker 数。NVIDIA 下用于 DALI external_source，ROCm 下用于 torch DataLoader。
 py_num_workers = 8
-
-# Python worker multiprocessing 启动方式，两种数据管线共用。
 py_start_method = "spawn"
-
-# 每个 Python worker 的读取预取深度；ROCm 下映射为 DataLoader prefetch_factor。
 reader_prefetch_queue_depth = 2
-
-# NVIDIA DALI 图像解码后端："mixed" 或 "cpu"。ROCm 固定使用 CPU Pillow 解码。
 decoder_backend = "mixed"
-
-# NVIDIA DALI mixed decoder 的硬件 JPEG decoder 负载比例；ROCm 不使用。
 decoder_hw_load = 0.75
 
-# 以下三项只应用于 dst。
-# 例如 brightness=0.2 表示随机乘数约为 [0.8, 1.2]。
+
+[data.augmentation]
+# src/dst 独立水平翻转；其余颜色和几何增强主要用于 dst。
 brightness = 0.2
 contrast = 0.2
 saturation = 0.2
-
-# src 与 dst 独立执行水平翻转的概率，范围 [0, 1]。
 flip_prob = 0.5
-
-# 每个样本令 src/dst 从同一张 dst 原图构造的概率。
-# same 样本用于 self-reconstruction；当前 L1 reconstruction loss 只作用于这些样本。
-# 0.0 表示关闭 same，此时 reconstruction loss 始终为 0。
-same_prob = 0.2
-
-# dst 随机旋转角范围，单位：度。
 rotation_range = [-3.0, 3.0]
-
-# dst 实际缩放倍数范围，必须为正数。
 scale_factor_range = [0.95, 1.05]
-
-# dst 水平/垂直平移范围，单位为图像宽高的比例。
-# 例如 0.15 表示最多平移 15%。
 tx_range = [-0.05, 0.05]
 ty_range = [-0.05, 0.05]
 
 
+[data.sampling]
+# 每个样本令 src/dst 从同一张 dst 原图构造的概率。
+# scope="same" 时，L1/VGG 只作用于这些样本。
+same_prob = 0.2
+
+
 [generator]
-# Generator 输入/输出正方形分辨率。
+# Generator / Discriminator 保持单一架构协议，不引入 architecture 选择层。
 img_resolution = 256
-
-# RGB 图像为 3 通道。
 img_channels = 3
-
-# Encoder/Decoder 下采样深度。
 num_depth = 4
-
-# 身份 latent 数量。
 num_latent = 8
-
-# Generator 基础通道数。
 base_ch = 64
-
-# Generator 最大通道数。
 max_ch = 512
-
-# Generator 身份条件向量维度。BlendFace 输出为 512。
 id_dim = 512
-
-# 通过 AAD 连接的 U-Net decoder 层索引。
-# 0 表示最深的第一个 decoder 层，num_depth-1 表示最终全分辨率 decoder 层。
-# 配置某层即启用对应 encoder -> decoder 的 AAD skip；不配置则不连接。
-# num_depth = 5 时 [0, 1, 2, 3, 4] 表示完整 U-Net。
 aad_skip_layers = []
 
 
 [discriminator]
-# 必须与 Generator img_resolution 一致。
 img_resolution = 256
 img_channels = 3
-
-# 判别器基础/最大通道数。
 base_ch = 64
 max_ch = 512
 
-# MinibatchStd group size。
-# 实际 effective group 为 min(group_size, batch_size)，且 batch_size 必须可被其整除。
+# MinibatchStd group size；batch_size 必须能被 effective group 整除。
 group_size = 4
 
 
-# 身份来源数据池。训练数据仅支持本地图片目录。
-# 每项可以单独设置 adjustment；实际数据源采样权重为：
-#   sqrt(file_count) * 2**adjustment
-[[src]]
+# 身份来源数据池。采样权重为 sqrt(file_count) * 2**adjustment。
+[[data.src]]
 path = "/path/to/source_faces_a"
 adjustment = 0.0
 
-[[src]]
+[[data.src]]
 path = "/path/to/source_faces_b"
 adjustment = 0.0
 
 
-# 目标/姿态/表情数据池，语义与 [[src]] 相同。
-[[dst]]
+# 目标/姿态/表情数据池，语义与 data.src 相同。
+[[data.dst]]
 path = "/path/to/target_faces_a"
 adjustment = 0.0
 
-[[dst]]
+[[data.dst]]
 path = "/path/to/target_faces_b"
 adjustment = 0.0
 
-# adjustment=1.0 表示相对基础权重乘 2，可用于提高特定困难数据的采样概率。
-[[dst]]
+# adjustment=1.0 表示相对基础权重乘 2，可提高困难数据采样概率。
+[[data.dst]]
 path = "/path/to/occlusion_faces"
 adjustment = 1.0
