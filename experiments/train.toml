@@ -54,7 +54,7 @@ scope = "same"
 
 
 [loss.gan]
-# Generator adversarial loss 权重；Discriminator adversarial loss 固定为 1.0。
+# Final/Coarse Generator adversarial loss 共用此权重；两个 Discriminator adversarial loss 固定为 1.0。
 weight = 1.0
 
 
@@ -181,6 +181,7 @@ leaky_relu_slope = 0.2
 
 
 [discriminator]
+# Final D 使用这里的 img_resolution；Coarse D 复用其余参数，并自动改为 generator.coarse_resolution。
 img_resolution = 512
 img_channels = 3
 base_ch = 64

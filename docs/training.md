@@ -55,7 +55,7 @@ uv run python -m swapface.train \
 
 `--name` 只参与 run ID，不改变实验配置。默认结果根目录为 `experiments/runs`；如确有需要，可用 `--runs-root PATH` 覆盖。
 
-`[train].compile_module` 控制训练路径的 `torch.compile`：启用时，由 Trainer 统一编译 Generator、Discriminator、Generator 身份编码与 Identity Loss embedding 提取，以及启用的 VGG/WFM 热路径；设为 `false` 时，训练路径全部保持 eager。
+`[train].compile_module` 控制训练路径的 `torch.compile`：启用时，由 Trainer 分别编译 CoarseSwapCore、HQRefiner、Discriminator、Generator 身份编码与 Identity Loss embedding 提取，以及启用的 VGG/WFM 热路径；设为 `false` 时，训练路径全部保持 eager。
 
 ## 配置职责
 
@@ -70,6 +70,16 @@ uv run python -m swapface.train \
 - `[generator]` / `[discriminator]`：模型定义。
 
 Identity Loss teacher 明确位于 `[loss.identity]`，不与 Generator 条件编码器混在 `[identity]`。L1 和 VGG 共享 `[loss.reconstruction].scope`。R1 位于 `[loss.r1]`，不再混入 `[train]`。 `[loss.gan].weight` 只缩放 Generator adversarial loss；Discriminator adversarial loss 固定权重 1.0，避免改变其与 R1 的相对尺度。
+
+## Generator 梯度职责
+
+CoarseSwapCore 与 HQRefiner 在同一个 iteration、同一个 Generator optimizer 中同时训练，但 HQ 输入使用 `coarse.detach()`。因此 Final/HQ losses 不会反向修改 Coarse；Coarse 只由自己的 coarse losses 更新。
+
+- Coarse：source identity、独立 coarse GAN，以及启用的 gaze / HRFFA / FACS target 属性监督；
+- HQ：final identity、final GAN/WFM、启用的 gaze / HRFFA / FACS，以及按 reconstruction scope 聚合的 L1/VGG；
+- Discriminator：Final 与 Coarse 各有一个判别器；两者共用同一个 D optimizer、scheduler、GradScaler 与 R1 周期。
+
+Coarse GAN 的 real 是将真实 `dst` 双线性缩放到 `coarse_resolution`，fake 是 Coarse 原始输出；它只负责约束真实人脸分布，不引入 Coarse L1/VGG target reconstruction。Coarse 的 target 属性监督则先将低分辨率输出双线性上采样到训练分辨率，再使用与 Final 相同的 `theta_restore` 恢复到 canonical 坐标系，与 `dst_canonical` 比较。
 
 ## 训练数据源
 
@@ -171,7 +181,7 @@ uv run python -m swapface.train \
   --name new-experiment
 ```
 
-`--branch-from` 必须显式提供 `--config`。新 run 的 `metadata.json.parent` 会记录父 `run_id`、checkpoint、父 step、配置摘要，以及 Discriminator 是 `inherit` 还是 `reset`。
+`--branch-from` 必须显式提供 `--config`。新 run 的 `metadata.json.parent` 会记录父 `run_id`、checkpoint、父 step、配置摘要，以及两个 Discriminator 是 `inherit` 还是 `reset`。
 
 默认继承父 checkpoint 的 step。如果希望从其他 step 开始，单独指定 `--step`：
 
@@ -184,7 +194,7 @@ uv run python -m swapface.train \
 
 `--step 0` 可以让新分支从 0 重新计数。这个值就是新 run 的实际 `completed_step` 起点，因此也会同时影响 R1 周期、EMA decay、sample/checkpoint 保存周期和文件名；它不是单独的 TensorBoard 显示偏移。
 
-Branch 始终要求 `[generator]` 与父 checkpoint 完全一致。默认还要求 `[discriminator]` 一致，并加载父 D 权重。若需要重新初始化 D（例如修改 D 架构或主动打破旧 GAN 平衡），使用：
+Branch 始终要求 `[generator]` 与父 checkpoint 完全一致。默认还要求 `[discriminator]` 一致，并同时加载父 Final/Coarse D 权重。若需要重新初始化 D（例如修改 D 架构或主动打破旧 GAN 平衡），使用：
 
 ```bash
 uv run python -m swapface.train \
@@ -193,7 +203,7 @@ uv run python -m swapface.train \
   --reset-discriminator
 ```
 
-设置 `--reset-discriminator` 后不会加载父 D 权重，并允许新配置修改 `[discriminator]`。无论是否恢复 D，Branch 都不会继承 G/D optimizer、scheduler 或 GradScaler；step 默认继承父 checkpoint，也可以由 `--step` 指定。
+设置 `--reset-discriminator` 后两个 D 都重新初始化，并允许新配置修改 `[discriminator]`。无论是否恢复 D，Branch 都不会继承 G/D optimizer、scheduler 或 GradScaler；step 默认继承父 checkpoint，也可以由 `--step` 指定。
 
 因此三种入口的语义为：
 

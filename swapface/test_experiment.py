@@ -470,6 +470,7 @@ def main() -> None:
         ema_g_state = {"marker": torch.tensor(1)}
         train_g_state = {"marker": torch.tensor(2)}
         d_state = {"marker": torch.tensor(3)}
+        coarse_d_state = {"marker": torch.tensor(4)}
         torch.save(
             {
                 "version": CHECKPOINT_VERSION,
@@ -483,6 +484,10 @@ def main() -> None:
                 },
                 "net_g": {"network_cfg": resolved["generator"], "state_dict": ema_g_state},
                 "net_d": {"network_cfg": resolved["discriminator"], "state_dict": d_state},
+                "net_d_coarse": {
+                    "network_cfg": {**resolved["discriminator"], "img_resolution": resolved["generator"]["coarse_resolution"]},
+                    "state_dict": coarse_d_state,
+                },
                 "training_state": {"net_g": train_g_state},
             },
             standalone,
@@ -501,11 +506,12 @@ def main() -> None:
             "config_sha256": metadata["config_sha256"],
             "discriminator": "inherit",
         }
-        branch_g_state, branch_d_state = _branch_model_states(loaded, reset_discriminator=False)
+        branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(loaded, reset_discriminator=False)
         assert branch_g_state["marker"].item() == 2  # training G, not EMA G
         assert branch_d_state is not None and branch_d_state["marker"].item() == 3
-        branch_g_state, branch_d_state = _branch_model_states(loaded, reset_discriminator=True)
-        assert branch_g_state["marker"].item() == 2 and branch_d_state is None
+        assert branch_d_coarse_state is not None and branch_d_coarse_state["marker"].item() == 4
+        branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(loaded, reset_discriminator=True)
+        assert branch_g_state["marker"].item() == 2 and branch_d_state is None and branch_d_coarse_state is None
 
         invalid_training_config = dict(loaded)
         invalid_training_config["training_config"] = {

@@ -2,6 +2,7 @@ import argparse
 import copy
 import signal
 from collections.abc import Iterable, Mapping
+from itertools import chain
 from pathlib import Path
 from typing import Any, Literal
 
@@ -55,7 +56,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 8
-TRAINING_SEMANTICS_VERSION = 2
+TRAINING_SEMANTICS_VERSION = 3
 
 
 def _configure_training_runtime() -> None:
@@ -195,6 +196,8 @@ class Trainer:
         data_config = config["data"]
         net_g_cfg = dict(config["generator"])
         net_d_cfg = dict(config["discriminator"])
+        coarse_resolution = int(net_g_cfg["coarse_resolution"])
+        net_d_coarse_cfg = {**net_d_cfg, "img_resolution": coarse_resolution}
 
         batch_size = int(train_config["batch_size"])
         lr = float(optimizer_config["lr"])
@@ -311,6 +314,7 @@ class Trainer:
             self.img_resolution = int(net_g_cfg["img_resolution"])
             net_g = Generator(**net_g_cfg)
             net_d = Discriminator(**net_d_cfg)
+            net_d_coarse = Discriminator(**net_d_coarse_cfg)
 
             if checkpoint_mode == "resume":
                 self._completed_step = checkpoint_step
@@ -330,27 +334,40 @@ class Trainer:
                 saved_net_d_cfg = dict(checkpoint["net_d"]["network_cfg"])
                 if saved_net_d_cfg != net_d_cfg:
                     raise ValueError("checkpoint Discriminator 架构与当前配置不一致")
+                saved_net_d_coarse_cfg = dict(checkpoint["net_d_coarse"]["network_cfg"])
+                if saved_net_d_coarse_cfg != net_d_coarse_cfg:
+                    raise ValueError("checkpoint Coarse Discriminator 架构与当前配置不一致")
 
                 training_state = checkpoint["training_state"]
                 net_g.load_state_dict(training_state["net_g"])
                 net_d.load_state_dict(checkpoint["net_d"]["state_dict"])
+                net_d_coarse.load_state_dict(checkpoint["net_d_coarse"]["state_dict"])
             else:
                 # Branch 继承父模型，但 optimizer/scheduler/scaler 重新初始化。
                 self._completed_step = checkpoint_step if start_step is None else start_step
-                branch_g_state, branch_d_state = _branch_model_states(checkpoint, reset_discriminator=reset_discriminator)
+                branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(
+                    checkpoint, reset_discriminator=reset_discriminator
+                )
                 net_g.load_state_dict(branch_g_state)
                 if branch_d_state is not None:
                     net_d.load_state_dict(branch_d_state)
+                if branch_d_coarse_state is not None:
+                    net_d_coarse.load_state_dict(branch_d_coarse_state)
         else:
             if checkpoint_mode == "branch":
                 raise ValueError("branch 必须提供父 checkpoint")
             self.img_resolution = int(net_g_cfg["img_resolution"])
             net_g = Generator(**net_g_cfg)
             net_d = Discriminator(**net_d_cfg)
+            net_d_coarse = Discriminator(**net_d_coarse_cfg)
 
         d_resolution = int(net_d.network_cfg["img_resolution"])
         if d_resolution != self.img_resolution:
             raise ValueError(f"生成器与判别器分辨率不一致：{self.img_resolution} != {d_resolution}")
+
+        coarse_d_resolution = int(net_d_coarse.network_cfg["img_resolution"])
+        if coarse_d_resolution != coarse_resolution:
+            raise ValueError(f"Coarse 与 Coarse Discriminator 分辨率不一致：{coarse_resolution} != {coarse_d_resolution}")
 
         group_size = min(int(net_d.network_cfg["group_size"]), self.batch_size)
         if self.batch_size % group_size != 0:
@@ -358,6 +375,7 @@ class Trainer:
 
         self.net_g = net_g.to(self.device).train()
         self.net_d = net_d.to(self.device).train()
+        self.net_d_coarse = net_d_coarse.to(self.device).train()
 
         self.net_g_ema = copy.deepcopy(self.net_g)
         if checkpoint is not None and checkpoint_mode == "resume":
@@ -368,7 +386,13 @@ class Trainer:
 
         # ========================= 优化器 / 调度器 =========================
         self.optim_g = optim.Adam(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
-        self.optim_d = optim.Adam(self.net_d.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
+        self.optim_d = optim.Adam(
+            chain(self.net_d.parameters(), self.net_d_coarse.parameters()), lr=lr, betas=(0.0, 0.99), fused=True
+        )
+        self._d_named_parameters = tuple(
+            [(f"final.{name}", parameter) for name, parameter in self.net_d.named_parameters()]
+            + [(f"coarse.{name}", parameter) for name, parameter in self.net_d_coarse.named_parameters()]
+        )
         scaler_enabled = self.precision == "fp16"
         self.scaler_g = GradScaler("cuda", enabled=scaler_enabled)
         self.scaler_d = GradScaler("cuda", enabled=scaler_enabled)
@@ -467,10 +491,13 @@ class Trainer:
         )
 
         # ========================= 编译模型 =========================
+        # Coarse/HQ 分开前向：HQ 只读取 detached Coarse，避免 final losses 反向改写 Coarse。
         if compile_module:
             initialize_upfirdn2d()
-            self.train_g = _compile_training_callable(self.net_g)
+            self.train_coarse = _compile_training_callable(self.net_g.coarse)
+            self.train_hq = _compile_training_callable(self.net_g.hq)
             self.train_d = _compile_training_callable(self.net_d)
+            self.train_d_coarse = _compile_training_callable(self.net_d_coarse)
             self.generator_id_encoder_forward = _compile_training_callable(self.generator_id_encoder)
             self.identity_embeddings_forward = _compile_training_callable(self.id_loss.extract_identity_embeddings)
             if self.enable_gaze_loss:
@@ -487,8 +514,10 @@ class Trainer:
             if self.enable_wfm_loss:
                 self.train_d_features = _compile_training_callable(self.net_d.get_feats)
         else:
-            self.train_g = self.net_g
+            self.train_coarse = self.net_g.coarse
+            self.train_hq = self.net_g.hq
             self.train_d = self.net_d
+            self.train_d_coarse = self.net_d_coarse
             self.generator_id_encoder_forward = self.generator_id_encoder
             self.identity_embeddings_forward = self.id_loss.extract_identity_embeddings
             if self.enable_gaze_loss:
@@ -573,6 +602,10 @@ class Trainer:
             "network_cfg": self.net_d.network_cfg,
             "state_dict": self.net_d.state_dict(),
         }
+        net_d_coarse = {
+            "network_cfg": self.net_d_coarse.network_cfg,
+            "state_dict": self.net_d_coarse.state_dict(),
+        }
         training_state = {
             "net_g": self.net_g.state_dict(),
             "optim_g": self.optim_g.state_dict(),
@@ -597,6 +630,7 @@ class Trainer:
             "training_config": self.training_config,
             "net_g": net_g,
             "net_d": net_d,
+            "net_d_coarse": net_d_coarse,
             "training_state": training_state,
         }
 
@@ -675,7 +709,8 @@ class Trainer:
 
     def train(self) -> None:
 
-        net_g, net_d = self.train_g, self.train_d
+        net_coarse, net_hq = self.train_coarse, self.train_hq
+        net_d, net_d_coarse = self.train_d, self.train_d_coarse
         sample_batch = self.fetch_sample()
         d_overflow_streak = 0
 
@@ -693,10 +728,12 @@ class Trainer:
                         source_identity_faces = self.prepare_identity_encoder_faces(src)
                         generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
                         source_identity_embeddings = self.identity_embeddings_forward(source_identity_faces)
-                    fake, coarse = net_g(dst, generator_identity_embeddings, return_coarse=True)
+                    coarse = net_coarse(dst, generator_identity_embeddings)
+                    fake = net_hq(dst, coarse.detach())
 
                 # ========================= 训练判别器 =========================
                 self.net_d.requires_grad_(True)
+                self.net_d_coarse.requires_grad_(True)
                 self.optim_d.zero_grad(set_to_none=True)
                 is_r1_reg_step = self.enable_r1_loss and self.completed_step % self.r1_reg_step == 0
 
@@ -704,26 +741,47 @@ class Trainer:
                     with autocast(device_type="cuda", enabled=False):
                         fake_img = fake.detach().float()
                         real_img = dst.detach().float().requires_grad_(True)
+                        fake_coarse_img = coarse.detach().float()
+                        real_coarse_img = NF.interpolate(
+                            dst.detach().float(), size=(self.coarse_resolution, self.coarse_resolution), mode="bilinear", align_corners=False
+                        ).requires_grad_(True)
 
-                        # R1：使用原始判别器并以 FP32 计算。
+                        # Final/Coarse R1 都使用原始判别器并以 FP32 计算。
                         fake_score = self.net_d(fake_img)
                         real_score = self.net_d(real_img)
+                        fake_coarse_score = self.net_d_coarse(fake_coarse_img)
+                        real_coarse_score = self.net_d_coarse(real_coarse_img)
 
-                        d_loss = self.d_loss(fake_score, real_score)
-                        self.log("d_loss", d_loss)
+                        final_d_loss = self.d_loss(fake_score, real_score)
+                        coarse_d_loss = self.d_loss(fake_coarse_score, real_coarse_score)
+                        self.log("d_loss", final_d_loss)
+                        self.log("coarse_d_loss", coarse_d_loss)
+                        d_loss = final_d_loss + coarse_d_loss
 
                         r1_loss_raw = r1_reg_loss(real_score, real_img, gamma=self.r1_gamma)
+                        coarse_r1_loss_raw = r1_reg_loss(real_coarse_score, real_coarse_img, gamma=self.r1_gamma)
                         self.log("r1_loss_raw", r1_loss_raw, force=True)
+                        self.log("coarse_r1_loss_raw", coarse_r1_loss_raw, force=True)
                         r1_loss = r1_loss_raw * self.r1_reg_step
+                        coarse_r1_loss = coarse_r1_loss_raw * self.r1_reg_step
                         self.log("r1_loss", r1_loss, force=True)
-                        d_loss = d_loss + r1_loss
+                        self.log("coarse_r1_loss", coarse_r1_loss, force=True)
+                        d_loss = d_loss + r1_loss + coarse_r1_loss
                 else:
                     with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                         fake_score = net_d(fake.detach())
                         real_score = net_d(dst.detach())
+                        real_coarse = NF.interpolate(
+                            dst.detach(), size=(self.coarse_resolution, self.coarse_resolution), mode="bilinear", align_corners=False
+                        )
+                        fake_coarse_score = net_d_coarse(coarse.detach())
+                        real_coarse_score = net_d_coarse(real_coarse)
 
-                        d_loss = self.d_loss(fake_score, real_score)
-                        self.log("d_loss", d_loss)
+                        final_d_loss = self.d_loss(fake_score, real_score)
+                        coarse_d_loss = self.d_loss(fake_coarse_score, real_coarse_score)
+                        self.log("d_loss", final_d_loss)
+                        self.log("coarse_d_loss", coarse_d_loss)
+                        d_loss = final_d_loss + coarse_d_loss
 
                 _ensure_finite_loss("d_loss", d_loss)
                 d_updated = _scaled_backward_step(
@@ -731,7 +789,7 @@ class Trainer:
                     self.optim_d,
                     self.scaler_d,
                     name="Discriminator",
-                    named_parameters=self.net_d.named_parameters(),
+                    named_parameters=self._d_named_parameters,
                 )
                 if not d_updated:
                     d_overflow_streak += 1
@@ -748,6 +806,7 @@ class Trainer:
 
                 # ========================= 训练生成器 =========================
                 self.net_d.requires_grad_(False)
+                self.net_d_coarse.requires_grad_(False)
                 g_overflow_retries = 0
 
                 while True:
@@ -755,7 +814,8 @@ class Trainer:
                     if g_overflow_retries > 0:
                         # D 已经成功更新，G overflow 时只重算 G，避免重复执行 D/R1。
                         with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                            fake, coarse = net_g(dst, generator_identity_embeddings, return_coarse=True)
+                            coarse = net_coarse(dst, generator_identity_embeddings)
+                            fake = net_hq(dst, coarse.detach())
 
                     with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                         # gan_loss
@@ -765,8 +825,10 @@ class Trainer:
                             fake_score = net_d(fake)
 
                         gan_loss = self.gan_loss(fake_score)
+                        coarse_gan_loss = self.gan_loss(net_d_coarse(coarse))
                         self.log("gan_loss", gan_loss)
-                        g_loss = gan_loss
+                        self.log("coarse_gan_loss", coarse_gan_loss)
+                        g_loss = gan_loss + coarse_gan_loss
 
                         # wfm_loss
                         if self.enable_wfm_loss:
@@ -782,38 +844,51 @@ class Trainer:
                         self.log("id_loss", id_loss)
                         g_loss = g_loss + id_loss
 
-                        # Coarse 直接增加身份监督；其余损失仍只作用于最终输出，保持端到端联合训练。
+                        # Coarse 负责身份迁移本身。Final/HQ losses 通过 coarse.detach() 与 Coarse 参数隔离。
                         coarse_identity_embeddings = self.identity_embeddings_forward(self.prepare_identity_encoder_faces(coarse, theta_restore))
                         coarse_id_loss = self.id_loss(coarse_identity_embeddings, source_identity_embeddings)
                         self.log("coarse_id_loss", coarse_id_loss)
                         g_loss = g_loss + coarse_id_loss
 
-                        # Gaze / HRFFA / FACS：只将 fake 恢复到 canonical 坐标系，reference 直接使用 dst_canonical。
+                        # Gaze / HRFFA / FACS：Final 和 Coarse 都保持 target 的 canonical 属性。
+                        # Coarse 先上采样到训练分辨率，再与 Final 共用同一个 restore grid。
                         if self.enable_gaze_loss or self.enable_hrffa_loss or self.enable_facs_loss:
                             with autocast(device_type="cuda", enabled=False):
                                 restore_grid = NF.affine_grid(theta_restore.float(), size=list(fake.shape), align_corners=False)
                                 fake_restored = NF.grid_sample(fake.float(), restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+                                coarse_full = NF.interpolate(coarse.float(), size=fake.shape[-2:], mode="bilinear", align_corners=False)
+                                coarse_restored = NF.grid_sample(coarse_full, restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
 
-                        # gaze_loss：生成结果保持 canonical dst 的视线方向。
+                        # gaze_loss：Final/Coarse 都保持 canonical dst 的视线方向。
                         if self.enable_gaze_loss:
                             gaze_loss = self.gaze_loss_forward(fake_restored, dst_canonical)
+                            coarse_gaze_loss = self.gaze_loss_forward(coarse_restored, dst_canonical)
                             self.log("gaze_loss", gaze_loss)
-                            g_loss = g_loss + gaze_loss
+                            self.log("coarse_gaze_loss", coarse_gaze_loss)
+                            g_loss = g_loss + gaze_loss + coarse_gaze_loss
 
                         # HRFFA：姿态、眼睑、嘴部开合和 target 外轮廓。
                         # compile_module 仅编译 HRFFA 神经网络主体；FP32 几何求解保持 eager。
                         if self.enable_hrffa_loss:
                             hrffa_components = self.hrffa_loss.forward_components(fake_restored, dst_canonical)
+                            coarse_hrffa_components = self.hrffa_loss.forward_components(coarse_restored, dst_canonical)
                             for name, component in hrffa_components.items():
                                 self.log(f"hrffa_{name}_loss", component)
+                            for name, component in coarse_hrffa_components.items():
+                                self.log(f"coarse_hrffa_{name}_loss", component)
                             g_loss = g_loss + torch.stack(tuple(hrffa_components.values())).sum()
+                            g_loss = g_loss + torch.stack(tuple(coarse_hrffa_components.values())).sum()
 
-                        # FACS：保持 canonical dst 的连续 Action Unit 激活状态与左右非对称表情。
+                        # FACS：Final/Coarse 都保持 canonical dst 的连续 Action Unit 与左右非对称表情。
                         if self.enable_facs_loss:
                             facs_components = self.facs_loss.forward_components(fake_restored, dst_canonical)
+                            coarse_facs_components = self.facs_loss.forward_components(coarse_restored, dst_canonical)
                             for name, component in facs_components.items():
                                 self.log(f"facs_{name}_loss", component)
+                            for name, component in coarse_facs_components.items():
+                                self.log(f"coarse_facs_{name}_loss", component)
                             g_loss = g_loss + torch.stack(tuple(facs_components.values())).sum()
+                            g_loss = g_loss + torch.stack(tuple(coarse_facs_components.values())).sum()
 
                         # VGG/L1 reconstruction 共用 loss.reconstruction.scope。
                         if self.enable_vgg_loss:
@@ -876,11 +951,14 @@ def _assert_branch_generator_compatible(parent: dict[str, Any], branch: dict[str
 
 
 
-def _branch_model_states(checkpoint: Mapping[str, Any], *, reset_discriminator: bool) -> tuple[Mapping[str, Tensor], Mapping[str, Tensor] | None]:
-    """Branch 继承训练态 G；D 默认继承，显式 reset 时重新初始化。"""
+def _branch_model_states(
+    checkpoint: Mapping[str, Any], *, reset_discriminator: bool
+) -> tuple[Mapping[str, Tensor], Mapping[str, Tensor] | None, Mapping[str, Tensor] | None]:
+    """Branch 继承训练态 G；两个 D 要么同时继承，要么同时重建。"""
     g_state = checkpoint["training_state"]["net_g"]
-    d_state = None if reset_discriminator else checkpoint["net_d"]["state_dict"]
-    return g_state, d_state
+    if reset_discriminator:
+        return g_state, None, None
+    return g_state, checkpoint["net_d"]["state_dict"], checkpoint["net_d_coarse"]["state_dict"]
 
 def _load_branch_checkpoint(
     checkpoint_path: Path,
@@ -902,8 +980,14 @@ def _load_branch_checkpoint(
         {"generator": dict(checkpoint["net_g"]["network_cfg"])},
         resolved,
     )
-    if not reset_discriminator and dict(checkpoint["net_d"]["network_cfg"]) != resolved["discriminator"]:
-        raise ValueError("branch 默认恢复 Discriminator，因此架构必须一致；如需新建请使用 --reset-discriminator")
+    # 当前训练 checkpoint 必须同时包含 Final/Coarse 两个判别器。
+    checkpoint["net_d_coarse"]
+    if not reset_discriminator:
+        if dict(checkpoint["net_d"]["network_cfg"]) != resolved["discriminator"]:
+            raise ValueError("branch 默认恢复 Discriminator，因此架构必须一致；如需新建请使用 --reset-discriminator")
+        expected_coarse_d_cfg = {**resolved["discriminator"], "img_resolution": int(resolved["generator"]["coarse_resolution"])}
+        if dict(checkpoint["net_d_coarse"]["network_cfg"]) != expected_coarse_d_cfg:
+            raise ValueError("branch 恢复 Coarse Discriminator 时要求架构一致；如需新建请使用 --reset-discriminator")
     _branch_model_states(checkpoint, reset_discriminator=reset_discriminator)
     checkpoint_run = checkpoint["run"]
     parent = {
