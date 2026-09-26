@@ -31,16 +31,13 @@ DEFAULT_GENERATOR_CONFIG: dict[str, Any] = {
     "img_channels": 3,
     "id_dim": 512,
     "coarse_resolution": 128,
-    "coarse_bottleneck_resolution": 32,
-    "coarse_base_ch": 32,
-    "coarse_max_ch": 256,
-    "num_style_blocks": 6,
+    "coarse_latent_resolution": 32,
+    "coarse_num_latent": 8,
+    "coarse_base_ch": 64,
+    "coarse_max_ch": 512,
     "hq_bottleneck_resolution": 16,
     "hq_base_ch": 8,
     "hq_max_ch": 128,
-    "hq_channel_hold_level": 2,
-    "norm_eps": 1e-8,
-    "leaky_relu_slope": 0.2,
 }
 
 DEFAULT_DISCRIMINATOR_CONFIG: dict[str, Any] = {
@@ -338,24 +335,16 @@ def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
         "img_channels",
         "id_dim",
         "coarse_resolution",
-        "coarse_bottleneck_resolution",
+        "coarse_latent_resolution",
+        "coarse_num_latent",
         "coarse_base_ch",
         "coarse_max_ch",
-        "num_style_blocks",
         "hq_bottleneck_resolution",
         "hq_base_ch",
         "hq_max_ch",
-        "hq_channel_hold_level",
     )
     for key in integer_keys:
         result[key] = _int(result[key], f"generator.{key}", minimum=1)
-
-    result["norm_eps"] = _float(result["norm_eps"], "generator.norm_eps", minimum=1e-30)
-    result["leaky_relu_slope"] = _float(
-        result["leaky_relu_slope"],
-        "generator.leaky_relu_slope",
-        minimum=0.0,
-    )
 
     if result["coarse_resolution"] > result["img_resolution"]:
         raise ValueError("generator.coarse_resolution 不能大于 generator.img_resolution")
@@ -364,27 +353,21 @@ def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
     if result["hq_max_ch"] < result["hq_base_ch"]:
         raise ValueError("generator.hq_max_ch 必须 >= generator.hq_base_ch")
 
-    for resolution_key, bottleneck_key in (
-        ("coarse_resolution", "coarse_bottleneck_resolution"),
+    for resolution_key, latent_key in (
+        ("coarse_resolution", "coarse_latent_resolution"),
         ("img_resolution", "hq_bottleneck_resolution"),
     ):
         resolution = result[resolution_key]
-        bottleneck = result[bottleneck_key]
-        if resolution < bottleneck or resolution % bottleneck != 0:
-            raise ValueError(
-                f"generator.{resolution_key} 必须是 generator.{bottleneck_key} 的整数倍"
-            )
-        ratio = resolution // bottleneck
+        latent = result[latent_key]
+        if resolution < latent or resolution % latent != 0:
+            raise ValueError(f"generator.{resolution_key} 必须是 generator.{latent_key} 的整数倍")
+        ratio = resolution // latent
         if ratio & (ratio - 1):
-            raise ValueError(
-                f"generator.{resolution_key}/generator.{bottleneck_key} 必须为 2 的整数次幂"
-            )
+            raise ValueError(f"generator.{resolution_key}/generator.{latent_key} 必须为 2 的整数次幂")
 
-    hq_num_levels = (result["img_resolution"] // result["hq_bottleneck_resolution"]).bit_length()
-    if result["hq_channel_hold_level"] >= hq_num_levels:
-        raise ValueError(
-            f"generator.hq_channel_hold_level 必须小于 HQ level 数 {hq_num_levels}"
-        )
+    # HQRefiner 至少需要一级下采样；其 bottleneck 不能等于最终输出分辨率。
+    if result["hq_bottleneck_resolution"] == result["img_resolution"]:
+        raise ValueError("generator.hq_bottleneck_resolution 必须小于 generator.img_resolution")
 
     return result
 

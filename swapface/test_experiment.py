@@ -34,7 +34,7 @@ def _check_train_config(root: Path) -> None:
         '[train]\nbatch_size = 8\nprecision = "fp16"\ncompile_module = false\n'
         "[optimizer]\nlr = 5e-5\n"
         '[scheduler]\ntype = "cosine"\nt_max = 1234\nmin_lr_ratio = 0.2\n'
-        "[generator]\nhq_channel_hold_level = 2\n"
+        "[generator]\ncoarse_num_latent = 7\n"
         '[identity]\nprovider = "MS1MV3_ARCFACE_R50_FP16"\n'
         '[loss.reconstruction]\nscope = "all"\n'
         "[loss.gan]\nweight = 0.8\n"
@@ -95,10 +95,11 @@ def _check_train_config(root: Path) -> None:
     assert resolved["loss"]["wfm"]["weights"] == {"2": 0.25}
     assert resolved["data"]["src"][0]["adjustment"] == 1 and resolved["data"]["dst"][0]["adjustment"] == -1
 
+    assert resolved["generator"]["coarse_num_latent"] == 7
     default_generator = copy.deepcopy(raw)
-    default_generator["generator"].pop("hq_channel_hold_level")
+    default_generator["generator"].pop("coarse_num_latent")
     default_generator_resolved = resolve_train_config(default_generator)
-    assert default_generator_resolved["generator"]["hq_channel_hold_level"] == 2
+    assert default_generator_resolved["generator"]["coarse_num_latent"] == 8
     _assert_branch_generator_compatible(json.loads(json.dumps(default_generator_resolved)), default_generator_resolved)
 
     paths = create_run(root / "config-runs", source, resolved, name="canonical")
@@ -213,7 +214,7 @@ def _check_train_config(root: Path) -> None:
 
     for key, value in (
         ("coarse_resolution", 96),
-        ("coarse_bottleneck_resolution", 48),
+        ("coarse_latent_resolution", 48),
         ("hq_bottleneck_resolution", 24),
     ):
         invalid = copy.deepcopy(raw)
@@ -225,14 +226,22 @@ def _check_train_config(root: Path) -> None:
         else:
             raise AssertionError(f"配置错误接受了非法生成器尺度：{key}={value!r}")
 
-    legacy = copy.deepcopy(raw)
-    legacy["generator"]["aad_skip_layers"] = []
-    try:
-        resolve_train_config(legacy)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("配置错误接受了已移除的 generator.aad_skip_layers")
+    for removed_key, removed_value in (
+        ("aad_skip_layers", []),
+        ("coarse_bottleneck_resolution", 32),
+        ("num_style_blocks", 6),
+        ("hq_channel_hold_level", 2),
+        ("norm_eps", 1e-8),
+        ("leaky_relu_slope", 0.2),
+    ):
+        legacy = copy.deepcopy(raw)
+        legacy["generator"][removed_key] = removed_value
+        try:
+            resolve_train_config(legacy)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"配置错误接受了已移除的 generator.{removed_key}")
 
     invalid = copy.deepcopy(raw)
     invalid.setdefault("discriminator", {})["group_size"] = 0

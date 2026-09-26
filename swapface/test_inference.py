@@ -77,14 +77,13 @@ def main() -> None:
     model = Generator(
         img_resolution=16,
         coarse_resolution=8,
-        coarse_bottleneck_resolution=4,
+        coarse_latent_resolution=4,
         coarse_base_ch=2,
         coarse_max_ch=8,
-        num_style_blocks=1,
+        coarse_num_latent=1,
         hq_bottleneck_resolution=4,
         hq_base_ch=2,
         hq_max_ch=8,
-        hq_channel_hold_level=1,
     ).eval()
     faces = torch.rand(3, 3, 16, 16) * 2 - 1
     identity = torch.nn.functional.normalize(torch.randn(1, 512), dim=1)

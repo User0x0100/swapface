@@ -162,22 +162,19 @@ same_prob = 0.2
 
 
 [generator]
-# 唯一 Generator：128 coarse identity-transfer core + 512 HQ refiner。
-# 深度、通道表、decoder 与 style-bank 宽度均由这些边界参数自动推导。
+# 唯一 Generator：旧式强 ID 注入 Coarse + HQ Refiner。
+# Coarse/HQ 深度由分辨率边界自动推导，通道逐级翻倍并由 max_ch 截断。
 img_resolution = 512
 img_channels = 3
 id_dim = 512
 coarse_resolution = 128
-coarse_bottleneck_resolution = 32
-coarse_base_ch = 32
-coarse_max_ch = 256
-num_style_blocks = 6
+coarse_latent_resolution = 32
+coarse_num_latent = 8
+coarse_base_ch = 64
+coarse_max_ch = 512
 hq_bottleneck_resolution = 16
 hq_base_ch = 8
 hq_max_ch = 128
-hq_channel_hold_level = 2
-norm_eps = 1e-8
-leaky_relu_slope = 0.2
 
 
 [discriminator]
