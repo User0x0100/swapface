@@ -423,7 +423,9 @@ class Trainer:
 
         self.generator_id_encoder = IDEncoder(self.generator_id_encoder_provider).to(self.device).eval().requires_grad_(False)
         self.id_loss = IdentityLoss(weight=float(identity_loss_config["weight"]), provider=self.identity_loss_provider).to(self.device)
+        self.coarse_resolution = int(self.net_g.network_cfg["coarse_resolution"])
         self.identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.img_resolution, self.batch_size, self.device)
+        self.coarse_identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.coarse_resolution, self.batch_size, self.device)
 
         if self.enable_l1_loss:
             self.l1_loss = make_l1_loss(weight=float(l1_config["weight"]), reduction="none")
@@ -562,11 +564,18 @@ class Trainer:
         return self.dataset.next()
 
     def prepare_identity_encoder_faces(self, faces: Tensor, theta_restore: Tensor | None = None) -> Tensor:
-        """将 FFHQ canonical 训练人脸映射为身份编码器使用的 ArcFace 112 canonical 输入。"""
-        if theta_restore is None:
-            return ffhq_to_arcface_112(faces, self.identity_encoder_grid)
-        grid = transform_sampling_grid(self.identity_encoder_grid, theta_restore)
-        return ffhq_to_arcface_112(faces, grid, padding_mode="reflection")
+        """将 full/coarse FFHQ aligned 人脸映射为身份编码器使用的 ArcFace 112 输入。"""
+        spatial = tuple(faces.shape[-2:])
+        if spatial == (self.img_resolution, self.img_resolution):
+            grid = self.identity_encoder_grid
+        elif spatial == (self.coarse_resolution, self.coarse_resolution):
+            grid = self.coarse_identity_encoder_grid
+        else:
+            raise ValueError(f"身份编码器输入分辨率无效：{spatial}")
+        if theta_restore is not None:
+            grid = transform_sampling_grid(grid, theta_restore)
+            return ffhq_to_arcface_112(faces, grid, padding_mode="reflection")
+        return ffhq_to_arcface_112(faces, grid)
 
     @torch.no_grad()
     def update_ema(self, decay: float = 0.999) -> None:
@@ -653,14 +662,15 @@ class Trainer:
             source_identity_faces_vis = self.prepare_identity_encoder_faces(src_vis)
             generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
             source_identity_embeddings_vis = self.identity_embeddings_forward(source_identity_faces_vis)
-            fake_vis: Tensor = self.net_g_ema(dst_vis, generator_identity_embeddings_vis)
+            fake_vis, coarse_vis = self.net_g_ema(dst_vis, generator_identity_embeddings_vis, return_coarse=True)
+            coarse_display_vis = NF.interpolate(coarse_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
 
             # Identity Loss 编码器真正接收的图像；直接组合 restore + FFHQ->112，
             # 避免先恢复到全分辨率再二次重采样。仅为 sample grid 显示再放大回训练分辨率。
             identity_encoder_input_vis = self.prepare_identity_encoder_faces(fake_vis, theta_restore_vis)
             identity_encoder_input_display_vis = NF.interpolate(identity_encoder_input_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
 
-            grid = [src_vis, dst_vis, fake_vis, dst_canonical_vis, identity_encoder_input_display_vis]
+            grid = [src_vis, dst_vis, coarse_display_vis, fake_vis, dst_canonical_vis, identity_encoder_input_display_vis]
 
             # ========================= GAN 损失梯度图 =========================
             fake_for_gan_grad = fake_vis.detach().requires_grad_(True)
@@ -708,7 +718,7 @@ class Trainer:
                         source_identity_faces = self.prepare_identity_encoder_faces(src)
                         generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
                         source_identity_embeddings = self.identity_embeddings_forward(source_identity_faces)
-                    fake: Tensor = net_g(dst, generator_identity_embeddings)
+                    fake, coarse = net_g(dst, generator_identity_embeddings, return_coarse=True)
 
                 # ========================= 训练判别器 =========================
                 self.net_d.requires_grad_(True)
@@ -770,7 +780,7 @@ class Trainer:
                     if g_overflow_retries > 0:
                         # D 已经成功更新，G overflow 时只重算 G，避免重复执行 D/R1。
                         with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                            fake = net_g(dst, generator_identity_embeddings)
+                            fake, coarse = net_g(dst, generator_identity_embeddings, return_coarse=True)
 
                     with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                         # gan_loss
@@ -796,6 +806,12 @@ class Trainer:
                         id_loss = self.id_loss(generated_identity_embeddings, source_identity_embeddings)
                         self.log("id_loss", id_loss)
                         g_loss = g_loss + id_loss
+
+                        # Coarse 直接增加身份监督；其余损失仍只作用于最终输出，保持端到端联合训练。
+                        coarse_identity_embeddings = self.identity_embeddings_forward(self.prepare_identity_encoder_faces(coarse, theta_restore))
+                        coarse_id_loss = self.id_loss(coarse_identity_embeddings, source_identity_embeddings)
+                        self.log("coarse_id_loss", coarse_id_loss)
+                        g_loss = g_loss + coarse_id_loss
 
                         # Gaze / HRFFA / FACS：只将 fake 恢复到 canonical 坐标系，reference 直接使用 dst_canonical。
                         if self.enable_gaze_loss or self.enable_hrffa_loss or self.enable_facs_loss:

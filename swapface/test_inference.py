@@ -106,7 +106,7 @@ def main() -> None:
 
         # 五点目标经训练端 affine 映射后必须回到原 ArcFace 112 坐标。
         affine = torch.tensor(FFHQ_TO_ARCFACE_112_AFFINE_512)
-        for resolution in (256, 512, 1024):
+        for resolution in (128, 256, 512, 1024):
             template = get_ffhq_alignment_template(resolution, device)
             mapped = (template * (512.0 / resolution)) @ affine[:, :2].T + affine[:, 2]
             torch.testing.assert_close(mapped, torch.tensor(get_alignment_template(112)), atol=2e-5, rtol=0)
@@ -116,6 +116,9 @@ def main() -> None:
             assert native.id_encoder.provider is provider
             with torch.inference_mode():
                 expected = model(faces, identity.expand(3, -1))
+                expected_with_coarse, coarse = model(faces, identity.expand(3, -1), return_coarse=True)
+            torch.testing.assert_close(expected_with_coarse, expected)
+            assert coarse.shape == (3, 3, model.network_cfg["coarse_resolution"], model.network_cfg["coarse_resolution"])
             torch.testing.assert_close(native.swap_faces(faces, identity), expected)
             assert native.swap_faces(faces[:0], identity).shape == (0, 3, 16, 16)
 

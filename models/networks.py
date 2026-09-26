@@ -330,9 +330,12 @@ class Generator(nn.Module):
             channel_hold_level=hq_channel_hold_level,
         )
 
-    def forward(self, target: Tensor, input_2: Tensor) -> Tensor:
+    def forward(self, target: Tensor, input_2: Tensor, return_coarse: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         coarse = self.coarse(target, input_2)
-        return self.hq(target, coarse)
+        output = self.hq(target, coarse)
+        if return_coarse:
+            return output, coarse
+        return output
 
 
 if __name__ == "__main__":
