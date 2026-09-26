@@ -87,14 +87,7 @@ class StyleResidualBlock(nn.Module):
     def modulate(x: Tensor, gamma: Tensor, beta: Tensor) -> Tensor:
         return x * gamma[:, :, None, None] + beta[:, :, None, None]
 
-    def forward(
-        self,
-        x: Tensor,
-        gamma0: Tensor,
-        beta0: Tensor,
-        gamma1: Tensor,
-        beta1: Tensor,
-    ) -> Tensor:
+    def forward(self, x: Tensor, gamma0: Tensor, beta0: Tensor, gamma1: Tensor, beta1: Tensor) -> Tensor:
         residual = x
         x = self.conv0(self.pad(x))
         x = self.act(self.modulate(self.norm0(x), gamma0, beta0))
@@ -237,18 +230,9 @@ class HQRefiner(nn.Module):
         if self.num_down < 1:
             raise ValueError("HQ refiner requires at least one downsampling stage")
 
-        self.feature_channels = _hq_channels(
-            base_ch,
-            max_ch,
-            self.num_down + 1,
-            channel_hold_level,
-        )
+        self.feature_channels = _hq_channels(base_ch, max_ch, self.num_down + 1, channel_hold_level)
 
-        self.coarse_resize = nn.Upsample(
-            size=(img_resolution, img_resolution),
-            mode="bilinear",
-            align_corners=False,
-        )
+        self.coarse_resize = nn.Upsample(size=(img_resolution, img_resolution), mode="bilinear", align_corners=False)
         self.pool = nn.MaxPool2d(2, 2)
 
         encoder: list[nn.Module] = []
@@ -258,11 +242,7 @@ class HQRefiner(nn.Module):
             in_ch = out_ch
         self.encoder = nn.ModuleList(encoder)
 
-        self.bottleneck = DoubleConv(
-            self.feature_channels[-2],
-            self.feature_channels[-1],
-            self.feature_channels[-1],
-        )
+        self.bottleneck = DoubleConv(self.feature_channels[-2], self.feature_channels[-1], self.feature_channels[-1])
 
         self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
         decoder: list[nn.Module] = []
