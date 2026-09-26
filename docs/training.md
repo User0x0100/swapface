@@ -162,49 +162,46 @@ uv run python -m swapface.train \
 
 ## Branch：从已有 checkpoint 派生新实验
 
-Branch 从已有完整训练状态创建一个新的 run。它不会修改父 run，可以从标准 run 的 latest、其中任意历史 checkpoint，或单独保存的当前 v4 + 当前训练语义 checkpoint 文件分叉：
+Branch 是一条新的训练时间线，不是 resume。它从父 checkpoint 的**训练态 Generator**继续，默认同时继承父 Discriminator 权重；optimizer、scheduler 和 GradScaler 重新初始化。`completed_step` 默认继承父 checkpoint，便于直接比较分支前后的 TensorBoard loss 趋势：
 
 ```bash
 uv run python -m swapface.train \
   --branch-from experiments/runs/20260910-162600-blendface-vgg/checkpoints/step_000050000.pth \
   --config experiments/train.toml \
-  --name lower-id-loss
+  --name new-experiment
 ```
 
-独立 checkpoint 不需要保留原 run 目录；只要文件名保持 `step_<step>.pth`，其内部 v4 元数据、当前 `training_config.semantics_version`、step 与 Generator/Discriminator 架构有效即可：
+`--branch-from` 必须显式提供 `--config`。新 run 的 `metadata.json.parent` 会记录父 `run_id`、checkpoint、父 step、配置摘要，以及 Discriminator 是 `inherit` 还是 `reset`。
+
+默认继承父 checkpoint 的 step。如果希望从其他 step 开始，单独指定 `--step`：
 
 ```bash
-uv run --no-sync python -m swapface.train \
-  --branch-from /mnt/workspace/step_000208939.pth \
-  --config /mnt/workspace/train.toml \
-  --name lower-id-loss
+uv run python -m swapface.train \
+  --branch-from experiments/runs/<run_id>/checkpoints/step_000050000.pth \
+  --config experiments/train.toml \
+  --step 30000
 ```
 
-`--branch-from` 必须显式提供 `--config`。Branch 以 checkpoint 自身保存的 v4 元数据和 Generator/Discriminator `network_cfg` 为准，在创建新 run 前与新配置比较模型定义；通过后立即创建新 run，并在 `metadata.json.parent` 中记录父 `run_id`、checkpoint、step 和配置摘要。checkpoint 权重、optimizer 和 scheduler 是否真的可恢复，直接交给 PyTorch 的 `load_state_dict()`；失败时使用原始错误并将新 run 标记为 `failed`。
+`--step 0` 可以让新分支从 0 重新计数。这个值就是新 run 的实际 `completed_step` 起点，因此也会同时影响 R1 周期、EMA decay、sample/checkpoint 保存周期和文件名；它不是单独的 TensorBoard 显示偏移。
 
-Branch 允许修改训练配置，例如：
+Branch 始终要求 `[generator]` 与父 checkpoint 完全一致。默认还要求 `[discriminator]` 一致，并加载父 D 权重。若需要重新初始化 D（例如修改 D 架构或主动打破旧 GAN 平衡），使用：
 
-- loss 类型、开关和权重；
-- `[identity].provider` 与 `[loss.identity].provider`；
-- 学习率与 scheduler；
-- batch size、`[loss.r1]`、precision/compile；
-- `[data.src]/[data.dst]`、`[data.augmentation]`、`[data.sampling]` 与 `[data.loader]`；
-- 日志、sample 和 checkpoint 间隔。
+```bash
+uv run python -m swapface.train \
+  --branch-from experiments/runs/<run_id>/checkpoints/step_000050000.pth \
+  --config experiments/train.toml \
+  --reset-discriminator
+```
 
-但 Branch 的目的仍是**继续训练同一个模型定义**，因此以下配置必须与父 run 完全一致，否则在创建新 run 前直接拒绝：
+设置 `--reset-discriminator` 后不会加载父 D 权重，并允许新配置修改 `[discriminator]`。无论是否恢复 D，Branch 都不会继承 G/D optimizer、scheduler 或 GradScaler；step 默认继承父 checkpoint，也可以由 `--step` 指定。
 
-- 整个 `[generator]`；
-- 整个 `[discriminator]`。
+因此三种入口的语义为：
 
-若要修改这些模型定义，应创建 fresh run，而不是 branch。Branch 不做 partial load。
+- **fresh**：新 Generator、新 Discriminator、新训练状态；
+- **resume**：原 run、原冻结配置、latest checkpoint，完整恢复训练态 Generator、EMA、Discriminator、optimizer、scheduler、GradScaler 与 step；
+- **branch**：新 run，继承父训练态 Generator，默认也继承 Discriminator 权重；optimizer/scheduler/GradScaler 重新初始化，step 默认继承父 checkpoint。
 
-Branch 继承 Generator、Discriminator、EMA 和 Adam moments/step。`[optimizer]` 与 `[scheduler]` 以新配置为准；两节与父 checkpoint 完全一致时继承 scheduler 进度，否则 optimizer LR 按新配置覆盖且 scheduler 重新初始化。
-
-因此三种入口具有明确语义：
-
-- **fresh**：新模型、新配置、新 run；
-- **resume**：原 run、原冻结配置、latest checkpoint，严格线性继续；
-- **branch**：新 run、父 checkpoint 的已训练模型状态、新训练配置，但模型定义不可改变。
+Branch 不检查 `training_config.semantics_version`，因为它不恢复父训练状态；resume 仍严格检查该版本。
 
 ### 可选严格校验训练精度
 
@@ -222,7 +219,7 @@ uv run python -m swapface.train \
 
 此时程序比较 checkpoint 中记录的实际 `training_config.precision` 与当前进程实际生效的精度；不一致时拒绝 resume。`--strict-precision` 是本次 resume 的运行时策略，不写入 TOML，也不能用于 fresh training。
 
-训练 checkpoint 还记录严格的 `training_config.semantics_version`。resume/branch 只接受与当前代码完全一致的训练语义版本；不迁移旧训练状态。纯推理/导出仍只依赖模型 checkpoint 格式，不受训练语义版本约束。
+训练 checkpoint 还记录 `training_config.semantics_version`。它只约束 resume，用于阻止训练代码语义已经改变时继续恢复旧 optimizer/scheduler/scaler 状态；Branch 不恢复这些状态，因此不检查该版本。纯推理/导出仍只依赖模型 checkpoint 格式。
 
 ## 配置冻结与哈希
 

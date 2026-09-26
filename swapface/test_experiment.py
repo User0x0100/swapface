@@ -9,8 +9,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
-from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from swapface.config import load_train_config, resolve_train_config
 from swapface.contracts import CHECKPOINT_VERSION
@@ -18,13 +16,13 @@ from swapface.experiment import RunLock, RunPaths, config_sha256, create_run, lo
 from swapface.train import (
     TRAINING_SEMANTICS_VERSION,
     Trainer,
-    _assert_branch_model_compatible,
+    _assert_branch_generator_compatible,
     _compile_training_callable,
     _load_branch_checkpoint,
-    _load_branch_optimizer_state,
+    _branch_model_states,
     _load_run_config,
     _reduce_reconstruction_loss,
-    _require_current_training_config,
+    _require_resume_training_config,
     _scaled_backward_step,
     _supports_compiled_bf16,
 )
@@ -101,7 +99,7 @@ def _check_train_config(root: Path) -> None:
     default_generator["generator"].pop("hq_channel_hold_level")
     default_generator_resolved = resolve_train_config(default_generator)
     assert default_generator_resolved["generator"]["hq_channel_hold_level"] == 2
-    _assert_branch_model_compatible(json.loads(json.dumps(default_generator_resolved)), default_generator_resolved)
+    _assert_branch_generator_compatible(json.loads(json.dumps(default_generator_resolved)), default_generator_resolved)
 
     paths = create_run(root / "config-runs", source, resolved, name="canonical")
     assert load_resolved_config(paths) == resolved
@@ -469,6 +467,9 @@ def main() -> None:
         assert resolve_branch_target(historical) == historical
 
         standalone = root / "step_000007500.pth"
+        ema_g_state = {"marker": torch.tensor(1)}
+        train_g_state = {"marker": torch.tensor(2)}
+        d_state = {"marker": torch.tensor(3)}
         torch.save(
             {
                 "version": CHECKPOINT_VERSION,
@@ -480,20 +481,31 @@ def main() -> None:
                     "optimizer": {"lr": 1e-4},
                     "scheduler": {"type": "none", "t_max": 20000, "min_lr_ratio": 0.1},
                 },
-                "net_g": {"network_cfg": resolved["generator"]},
-                "net_d": {"network_cfg": resolved["discriminator"]},
+                "net_g": {"network_cfg": resolved["generator"], "state_dict": ema_g_state},
+                "net_d": {"network_cfg": resolved["discriminator"], "state_dict": d_state},
+                "training_state": {"net_g": train_g_state},
             },
             standalone,
         )
         assert resolve_branch_target(standalone) == standalone
-        loaded, standalone_parent = _load_branch_checkpoint(standalone, resolved)
+        loaded, standalone_parent = _load_branch_checkpoint(standalone, resolved, reset_discriminator=False)
         assert loaded["step"] == 7500
+        assert _require_resume_training_config(loaded) == {
+            "semantics_version": TRAINING_SEMANTICS_VERSION,
+            "precision": "fp16",
+        }
         assert standalone_parent == {
             "run_id": metadata["run_id"],
             "checkpoint": standalone.name,
             "step": 7500,
             "config_sha256": metadata["config_sha256"],
+            "discriminator": "inherit",
         }
+        branch_g_state, branch_d_state = _branch_model_states(loaded, reset_discriminator=False)
+        assert branch_g_state["marker"].item() == 2  # training G, not EMA G
+        assert branch_d_state is not None and branch_d_state["marker"].item() == 3
+        branch_g_state, branch_d_state = _branch_model_states(loaded, reset_discriminator=True)
+        assert branch_g_state["marker"].item() == 2 and branch_d_state is None
 
         invalid_training_config = dict(loaded)
         invalid_training_config["training_config"] = {
@@ -502,58 +514,42 @@ def main() -> None:
             "scheduler": {"type": "none", "t_max": 20000, "min_lr_ratio": 0.1},
         }
         try:
-            _require_current_training_config(invalid_training_config)
+            _require_resume_training_config(invalid_training_config)
         except ValueError:
             pass
         else:
             raise AssertionError("缺少 semantics_version 的旧训练 checkpoint 被错误接受")
 
-        parent = {"run_id": metadata["run_id"], "checkpoint": historical.name, "step": 5000, "config_sha256": metadata["config_sha256"]}
+        parent = dict(standalone_parent)
         branch = create_run(runs_root, source_config, resolved, name="branch", parent=parent)
         assert json.loads(branch.metadata.read_text(encoding="utf-8"))["parent"] == parent
 
-        _assert_branch_model_compatible(resolved, dict(resolved))
-        for section, key, value in (("generator", "coarse_resolution", 256), ("discriminator", "base_ch", 128)):
-            changed = copy.deepcopy(resolved)
-            changed[section][key] = value
-            try:
-                _assert_branch_model_compatible(resolved, changed)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError(f"branch 错误接受了 {section} 架构变更")
+        _assert_branch_generator_compatible(resolved, dict(resolved))
 
-        changed_provider = json.loads(json.dumps(resolved))
+        changed_generator = copy.deepcopy(resolved)
+        changed_generator["generator"]["coarse_resolution"] = 256
+        try:
+            _assert_branch_generator_compatible(resolved, changed_generator)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("branch 错误接受了 Generator 架构变更")
+
+        changed_discriminator = copy.deepcopy(resolved)
+        changed_discriminator["discriminator"]["base_ch"] = 128
+        try:
+            _load_branch_checkpoint(standalone, changed_discriminator, reset_discriminator=False)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("branch 默认错误接受了 Discriminator 架构变更")
+        _, reset_parent = _load_branch_checkpoint(standalone, changed_discriminator, reset_discriminator=True)
+        assert reset_parent["discriminator"] == "reset"
+
+
+        changed_provider = copy.deepcopy(resolved)
         changed_provider["identity"]["provider"] = "MS1MV3_ARCFACE_R50_FP16"
-        _assert_branch_model_compatible(resolved, changed_provider)
-
-        # scheduler 配置不变时，branch 必须从 checkpoint 的当前 LR 连续运行。
-        parent_param = torch.nn.Parameter(torch.tensor(1.0))
-        parent_optim = Adam([parent_param], lr=1e-4)
-        parent_scheduler = CosineAnnealingLR(parent_optim, T_max=100, eta_min=1e-5)
-        for _ in range(20):
-            parent_optim.step()
-            parent_scheduler.step()
-
-        inherited_param = torch.nn.Parameter(torch.tensor(1.0))
-        inherited_optim = Adam([inherited_param], lr=1e-4)
-        _load_branch_optimizer_state(inherited_optim, parent_optim.state_dict(), lr=1e-4, reset_lr=False)
-        inherited_scheduler = CosineAnnealingLR(inherited_optim, T_max=100, eta_min=1e-5)
-        inherited_scheduler.load_state_dict(parent_scheduler.state_dict())
-        inherited_optim.step()
-        inherited_scheduler.step()
-
-        reference_param = torch.nn.Parameter(torch.tensor(1.0))
-        reference_optim = Adam([reference_param], lr=1e-4)
-        reference_scheduler = CosineAnnealingLR(reference_optim, T_max=100, eta_min=1e-5)
-        for _ in range(21):
-            reference_optim.step()
-            reference_scheduler.step()
-        assert abs(inherited_optim.param_groups[0]["lr"] - reference_optim.param_groups[0]["lr"]) < 1e-15
-
-        changed_optim = Adam([torch.nn.Parameter(torch.tensor(1.0))], lr=5e-5)
-        _load_branch_optimizer_state(changed_optim, parent_optim.state_dict(), lr=5e-5, reset_lr=True)
-        assert abs(changed_optim.param_groups[0]["lr"] - 5e-5) < 1e-15
+        _assert_branch_generator_compatible(resolved, changed_provider)
 
         document = json.loads(first.resolved_config.read_text(encoding="utf-8"))
         document["config"]["train"]["batch_size"] = 16
@@ -565,7 +561,7 @@ def main() -> None:
         else:
             raise AssertionError("被修改的 resolved config 未被拒绝")
 
-    print("PASS: run layout, latest/resume, branch guard, scheduler continuity and config digest")
+    print("PASS: run layout, latest/resume, simple branch semantics and config digest")
 
 
 if __name__ == "__main__":

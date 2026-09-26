@@ -79,15 +79,6 @@ def _compile_training_callable(fn: Any) -> Any:
     return torch.compile(fn, fullgraph=True, dynamic=False, mode=mode)
 
 
-def _load_branch_optimizer_state(optimizer: optim.Optimizer, state: dict[str, Any], *, lr: float, reset_lr: bool) -> None:
-    """恢复 Adam 状态；仅在 branch 启动新 LR/scheduler 时覆盖 param-group LR。"""
-    optimizer.load_state_dict(state)
-    if reset_lr:
-        for group in optimizer.param_groups:
-            group["lr"] = lr
-            group["initial_lr"] = lr
-
-
 def _ensure_finite_gradients(name: str, named_parameters: Iterable[tuple[str, Tensor]]) -> None:
     """在 optimizer.step 前阻止 BF16/FP32 非有限梯度污染参数与优化器状态。"""
     gradients = [(parameter_name, parameter.grad) for parameter_name, parameter in named_parameters if parameter.grad is not None]
@@ -138,40 +129,23 @@ def _ensure_finite_loss(name: str, loss: Tensor) -> None:
         raise FloatingPointError(f"{name} 出现 NaN/Inf：{loss.detach().float().cpu().item()}")
 
 
-def _require_current_training_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
-    """严格读取当前训练 checkpoint 协议，不迁移或补全旧字段。"""
+def _require_resume_training_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
+    """读取 resume 真正依赖的运行时状态；旧 checkpoint 的额外字段允许保留。"""
     training_config = checkpoint.get("training_config")
-    if training_config is None:
-        raise ValueError("checkpoint.training_config 缺失")
     if not isinstance(training_config, dict):
-        raise TypeError(f"checkpoint.training_config 必须为 dict，实际为 {type(training_config).__name__}")
+        raise ValueError("checkpoint.training_config 缺失或无效")
 
-    expected_keys = {"semantics_version", "precision", "optimizer", "scheduler"}
-    actual_keys = set(training_config)
-    if actual_keys != expected_keys:
-        missing = sorted(expected_keys - actual_keys)
-        unknown = sorted(actual_keys - expected_keys)
-        raise ValueError(f"checkpoint.training_config 不是当前协议：missing={missing}, unknown={unknown}")
-
-    semantics_version = training_config["semantics_version"]
+    semantics_version = training_config.get("semantics_version")
     if not isinstance(semantics_version, int) or isinstance(semantics_version, bool):
-        raise TypeError(f"checkpoint.training_config.semantics_version 必须为 int，实际为 {type(semantics_version).__name__}")
+        raise ValueError("checkpoint.training_config.semantics_version 缺失或无效")
     if semantics_version != TRAINING_SEMANTICS_VERSION:
         raise ValueError(f"训练语义版本不匹配：checkpoint={semantics_version}, current={TRAINING_SEMANTICS_VERSION}")
 
-    precision = training_config["precision"]
-    if not isinstance(precision, str):
-        raise TypeError(f"checkpoint.training_config.precision 必须为 str，实际为 {type(precision).__name__}")
+    precision = training_config.get("precision")
     if precision not in {"fp32", "fp16", "bf16"}:
         raise ValueError(f"checkpoint.training_config.precision 无效：{precision!r}")
 
-    optimizer = training_config["optimizer"]
-    scheduler = training_config["scheduler"]
-    if not isinstance(optimizer, dict) or set(optimizer) != {"lr"}:
-        raise ValueError("checkpoint.training_config.optimizer 不是当前协议")
-    if not isinstance(scheduler, dict) or set(scheduler) != {"type", "t_max", "min_lr_ratio"}:
-        raise ValueError("checkpoint.training_config.scheduler 不是当前协议")
-    return training_config
+    return {"semantics_version": semantics_version, "precision": precision}
 
 
 def _reduce_reconstruction_loss(
@@ -203,12 +177,14 @@ class Trainer:
         config: Mapping[str, Any],
         *,
         run_dir: str | Path,
-        resume_checkpoint: str | Path | None = None,
+        checkpoint_path: str | Path | None = None,
         run_id: str | None = None,
         resolved_config_sha256: str | None = None,
         strict_precision_resume: bool = False,
         checkpoint_mode: Literal["resume", "branch"] = "resume",
         preloaded_checkpoint: dict[str, Any] | None = None,
+        reset_discriminator: bool = False,
+        start_step: int | None = None,
     ) -> None:
         # config 必须是 resolve_train_config() 产生的 canonical schema。Trainer 不再维护第二套默认值/配置协议。
         train_config = config["train"]
@@ -295,8 +271,6 @@ class Trainer:
         self.training_config = {
             "semantics_version": TRAINING_SEMANTICS_VERSION,
             "precision": self.precision,
-            "optimizer": dict(optimizer_config),
-            "scheduler": dict(scheduler_config),
         }
 
         if checkpoint_mode not in ("resume", "branch"):
@@ -308,56 +282,65 @@ class Trainer:
 
         checkpoint: dict[str, Any] | None = preloaded_checkpoint
         training_state: dict[str, Any] | None = None
-        saved_training_config: dict[str, Any] | None = None
         saved_precision: str | None = None
-        if resume_checkpoint is not None:
-            checkpoint_path = Path(resume_checkpoint)
+        if checkpoint_path is not None:
+            checkpoint_path = Path(checkpoint_path)
             if not checkpoint_path.exists():
-                raise FileNotFoundError(f"找不到检查点文件：{resume_checkpoint}")
+                raise FileNotFoundError(f"找不到检查点文件：{checkpoint_path}")
 
-            print(f"正在加载检查点：{resume_checkpoint}")
+            print(f"正在加载检查点：{checkpoint_path}")
             if checkpoint is None:
                 checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             checkpoint_version = checkpoint["version"]
             if checkpoint_version != CHECKPOINT_VERSION:
                 raise ValueError(f"不支持的 checkpoint version：{checkpoint_version}，当前仅支持 v{CHECKPOINT_VERSION}")
 
-            completed_step = int(checkpoint["step"])
+            checkpoint_step = int(checkpoint["step"])
             filename_step = checkpoint_step_from_name(checkpoint_path.name)
-            if filename_step != completed_step:
-                raise ValueError(f"checkpoint 文件名 step 与内部状态不一致：filename={filename_step}, checkpoint={completed_step}")
-            self._completed_step = completed_step
+            if filename_step != checkpoint_step:
+                raise ValueError(f"checkpoint 文件名 step 与内部状态不一致：filename={filename_step}, checkpoint={checkpoint_step}")
 
-            print(f"检查点信息：\n  {'版本':25}: {checkpoint_version}\n  {'已完成 step':25}: {completed_step}")
+            print(f"检查点信息：\n  {'版本':25}: {checkpoint_version}\n  {'已完成 step':25}: {checkpoint_step}")
             print_mapping("net_g", checkpoint["net_g"]["network_cfg"])
             print_mapping("net_d", checkpoint["net_d"]["network_cfg"])
 
+            saved_net_g_cfg = dict(checkpoint["net_g"]["network_cfg"])
+            if saved_net_g_cfg != net_g_cfg:
+                raise ValueError("checkpoint Generator 架构与当前配置不一致")
+
+            self.img_resolution = int(net_g_cfg["img_resolution"])
+            net_g = Generator(**net_g_cfg)
+            net_d = Discriminator(**net_d_cfg)
+
             if checkpoint_mode == "resume":
+                self._completed_step = checkpoint_step
                 checkpoint_run = checkpoint["run"]
                 if checkpoint_run["id"] != run_id or checkpoint_run["config_sha256"] != resolved_config_sha256:
                     raise ValueError("checkpoint 不属于当前 run 或冻结配置已变化")
 
-            saved_training_config = _require_current_training_config(checkpoint)
-            saved_precision = str(saved_training_config["precision"])
-            if strict_precision_resume and checkpoint_mode == "resume" and saved_precision != self.precision:
-                raise ValueError(f"训练精度不一致：checkpoint={saved_precision}，current={self.precision}")
+                saved_training_config = _require_resume_training_config(checkpoint)
+                saved_precision = str(saved_training_config["precision"])
+                if strict_precision_resume and saved_precision != self.precision:
+                    raise ValueError(f"训练精度不一致：checkpoint={saved_precision}，current={self.precision}")
 
-            saved_generator_provider = checkpoint["identity_encoders"]["generator"]
-            if checkpoint_mode == "resume" and saved_generator_provider != self.generator_id_encoder_provider.name:
-                raise ValueError(f"Generator 身份编码器不匹配：{saved_generator_provider} != {self.generator_id_encoder_provider.name}")
+                saved_generator_provider = checkpoint["identity_encoders"]["generator"]
+                if saved_generator_provider != self.generator_id_encoder_provider.name:
+                    raise ValueError(f"Generator 身份编码器不匹配：{saved_generator_provider} != {self.generator_id_encoder_provider.name}")
 
-            saved_net_g_cfg = dict(checkpoint["net_g"]["network_cfg"])
-            saved_net_d_cfg = dict(checkpoint["net_d"]["network_cfg"])
-            if saved_net_g_cfg != net_g_cfg or saved_net_d_cfg != net_d_cfg:
-                raise ValueError("checkpoint 模型架构与当前配置不一致")
+                saved_net_d_cfg = dict(checkpoint["net_d"]["network_cfg"])
+                if saved_net_d_cfg != net_d_cfg:
+                    raise ValueError("checkpoint Discriminator 架构与当前配置不一致")
 
-            self.img_resolution = int(saved_net_g_cfg["img_resolution"])
-            net_g = Generator(**saved_net_g_cfg)
-            net_d = Discriminator(**saved_net_d_cfg)
-            net_d.load_state_dict(checkpoint["net_d"]["state_dict"])
-
-            training_state = checkpoint["training_state"]
-            net_g.load_state_dict(training_state["net_g"])
+                training_state = checkpoint["training_state"]
+                net_g.load_state_dict(training_state["net_g"])
+                net_d.load_state_dict(checkpoint["net_d"]["state_dict"])
+            else:
+                # Branch 继承父模型，但 optimizer/scheduler/scaler 重新初始化。
+                self._completed_step = checkpoint_step if start_step is None else start_step
+                branch_g_state, branch_d_state = _branch_model_states(checkpoint, reset_discriminator=reset_discriminator)
+                net_g.load_state_dict(branch_g_state)
+                if branch_d_state is not None:
+                    net_d.load_state_dict(branch_d_state)
         else:
             if checkpoint_mode == "branch":
                 raise ValueError("branch 必须提供父 checkpoint")
@@ -377,7 +360,7 @@ class Trainer:
         self.net_d = net_d.to(self.device).train()
 
         self.net_g_ema = copy.deepcopy(self.net_g)
-        if checkpoint is not None:
+        if checkpoint is not None and checkpoint_mode == "resume":
             self.net_g_ema.load_state_dict(checkpoint["net_g"]["state_dict"])
         self.net_g_ema.eval().requires_grad_(False)
         self._ema_params = tuple(self.net_g_ema.parameters())
@@ -391,16 +374,8 @@ class Trainer:
         self.scaler_d = GradScaler("cuda", enabled=scaler_enabled)
 
         if training_state is not None:
-            assert saved_training_config is not None
-            optimizer_scheduler_unchanged = saved_training_config["optimizer"] == optimizer_config and saved_training_config["scheduler"] == scheduler_config
-            if checkpoint_mode == "branch":
-                _load_branch_optimizer_state(self.optim_g, training_state["optim_g"], lr=lr, reset_lr=not optimizer_scheduler_unchanged)
-                _load_branch_optimizer_state(self.optim_d, training_state["optim_d"], lr=lr, reset_lr=not optimizer_scheduler_unchanged)
-            else:
-                self.optim_g.load_state_dict(training_state["optim_g"])
-                self.optim_d.load_state_dict(training_state["optim_d"])
-        else:
-            optimizer_scheduler_unchanged = False
+            self.optim_g.load_state_dict(training_state["optim_g"])
+            self.optim_d.load_state_dict(training_state["optim_d"])
 
         if training_state is not None and saved_precision == self.precision == "fp16":
             scaler_g_state = training_state.get("scaler_g")
@@ -413,7 +388,7 @@ class Trainer:
         if self.use_cosine_lr:
             self.lr_scheduler_g = CosineAnnealingLR(self.optim_g, T_max=scheduler_t_max, eta_min=lr * scheduler_min_lr_ratio)
             self.lr_scheduler_d = CosineAnnealingLR(self.optim_d, T_max=scheduler_t_max, eta_min=lr * scheduler_min_lr_ratio)
-            if training_state is not None and (checkpoint_mode == "resume" or optimizer_scheduler_unchanged):
+            if training_state is not None:
                 self.lr_scheduler_g.load_state_dict(training_state["lr_scheduler_g"])
                 self.lr_scheduler_d.load_state_dict(training_state["lr_scheduler_d"])
 
@@ -895,38 +870,48 @@ def _load_run_config(paths: RunPaths) -> dict[str, Any]:
     return resolved
 
 
-def _assert_branch_model_compatible(parent: dict[str, Any], branch: dict[str, Any]) -> None:
-    """Branch 允许改变训练配置，但 Generator/Discriminator 参数拓扑必须保持不变。"""
-    if parent["generator"] != branch["generator"] or parent["discriminator"] != branch["discriminator"]:
-        raise ValueError("branch 不能修改 Generator/Discriminator 架构")
+def _assert_branch_generator_compatible(parent: dict[str, Any], branch: dict[str, Any]) -> None:
+    if parent["generator"] != branch["generator"]:
+        raise ValueError("branch 不能修改 Generator 架构")
 
 
-def _load_branch_checkpoint(checkpoint_path: Path, resolved: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+
+def _branch_model_states(checkpoint: Mapping[str, Any], *, reset_discriminator: bool) -> tuple[Mapping[str, Tensor], Mapping[str, Tensor] | None]:
+    """Branch 继承训练态 G；D 默认继承，显式 reset 时重新初始化。"""
+    g_state = checkpoint["training_state"]["net_g"]
+    d_state = None if reset_discriminator else checkpoint["net_d"]["state_dict"]
+    return g_state, d_state
+
+def _load_branch_checkpoint(
+    checkpoint_path: Path,
+    resolved: dict[str, Any],
+    *,
+    reset_discriminator: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     checkpoint_version = checkpoint["version"]
     if checkpoint_version != CHECKPOINT_VERSION:
         raise ValueError(f"不支持的 checkpoint version：{checkpoint_version}，当前仅支持 v{CHECKPOINT_VERSION}")
-
-    _require_current_training_config(checkpoint)
 
     checkpoint_step = int(checkpoint["step"])
     filename_step = checkpoint_step_from_name(checkpoint_path.name)
     if filename_step != checkpoint_step:
         raise ValueError(f"checkpoint 文件名 step 与内部状态不一致：filename={filename_step}, checkpoint={checkpoint_step}")
 
-    _assert_branch_model_compatible(
-        {
-            "generator": dict(checkpoint["net_g"]["network_cfg"]),
-            "discriminator": dict(checkpoint["net_d"]["network_cfg"]),
-        },
+    _assert_branch_generator_compatible(
+        {"generator": dict(checkpoint["net_g"]["network_cfg"])},
         resolved,
     )
+    if not reset_discriminator and dict(checkpoint["net_d"]["network_cfg"]) != resolved["discriminator"]:
+        raise ValueError("branch 默认恢复 Discriminator，因此架构必须一致；如需新建请使用 --reset-discriminator")
+    _branch_model_states(checkpoint, reset_discriminator=reset_discriminator)
     checkpoint_run = checkpoint["run"]
     parent = {
         "run_id": checkpoint_run["id"],
         "checkpoint": checkpoint_path.name,
         "step": checkpoint_step,
         "config_sha256": checkpoint_run["config_sha256"],
+        "discriminator": "reset" if reset_discriminator else "inherit",
     }
     return checkpoint, parent
 
@@ -939,7 +924,9 @@ def main() -> None:
     parser.add_argument("--runs-root", type=Path, default=None, help=f"新 run 根目录，默认：{DEFAULT_RUNS_ROOT}")
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument("--resume", type=Path, default=None, help="严格恢复原 run，只允许 latest checkpoint，并使用原 run 冻结配置")
-    source_group.add_argument("--branch-from", type=Path, default=None, help="从标准 run 或独立 checkpoint 创建新 run；允许修改训练配置，但禁止修改模型架构")
+    source_group.add_argument("--branch-from", type=Path, default=None, help="从 checkpoint 创建新 run；继承训练态 Generator，默认也继承 Discriminator 权重")
+    parser.add_argument("--reset-discriminator", action="store_true", help="仅用于 branch：不恢复父 Discriminator，按新配置重新初始化")
+    parser.add_argument("--step", type=int, default=None, help="仅用于 branch：新 run 的起始 step；默认继承父 checkpoint step")
     parser.add_argument("--strict-precision", action="store_true", help="仅用于 resume：要求当前实际训练精度与 checkpoint 一致；默认允许变化")
     args = parser.parse_args()
 
@@ -954,22 +941,34 @@ def main() -> None:
         parser.error("--resume 与 --runs-root 不能同时使用；resume 继续写入原 run")
     if is_branch and args.config is None:
         parser.error("--branch-from 必须显式配合 --config，branch 会创建使用该配置的新 run")
+    if args.reset_discriminator and not is_branch:
+        parser.error("--reset-discriminator 仅用于 --branch-from")
+    if args.step is not None and not is_branch:
+        parser.error("--step 仅用于 --branch-from")
+    if args.step is not None and args.step < 0:
+        parser.error("--step 必须 >= 0")
     if args.strict_precision and not is_resume:
         parser.error("--strict-precision 仅用于 --resume")
 
     checkpoint_mode: Literal["resume", "branch"] = "resume"
     preloaded_checkpoint: dict[str, Any] | None = None
+    start_step: int | None = None
 
     if is_resume:
         assert args.resume is not None
-        run_paths, resume_checkpoint = resolve_resume_target(args.resume)
+        run_paths, checkpoint_path = resolve_resume_target(args.resume)
         resolved = _load_run_config(run_paths)
     elif is_branch:
         assert args.branch_from is not None and args.config is not None
-        resume_checkpoint = resolve_branch_target(args.branch_from)
+        checkpoint_path = resolve_branch_target(args.branch_from)
         resolved = load_train_config(args.config)
 
-        preloaded_checkpoint, parent = _load_branch_checkpoint(resume_checkpoint, resolved)
+        preloaded_checkpoint, parent = _load_branch_checkpoint(
+            checkpoint_path,
+            resolved,
+            reset_discriminator=args.reset_discriminator,
+        )
+        start_step = int(preloaded_checkpoint["step"]) if args.step is None else args.step
 
         run_paths = create_run(args.runs_root or DEFAULT_RUNS_ROOT, args.config, resolved, name=args.name, parent=parent)
         checkpoint_mode = "branch"
@@ -977,7 +976,7 @@ def main() -> None:
         config_path = args.config or DEFAULT_TRAIN_CONFIG_PATH
         resolved = load_train_config(config_path)
         run_paths = create_run(args.runs_root or DEFAULT_RUNS_ROOT, config_path, resolved, name=args.name)
-        resume_checkpoint = None
+        checkpoint_path = None
 
     run_metadata = load_metadata(run_paths)
     run_id = run_metadata["run_id"]
@@ -986,7 +985,7 @@ def main() -> None:
     with RunLock(run_paths):
         if is_resume:
             # latest 只能在线性历史上继续；拿到锁后重新解析，避免锁前竞态。
-            _, resume_checkpoint = resolve_resume_target(run_paths.root)
+            _, checkpoint_path = resolve_resume_target(run_paths.root)
 
         update_metadata(run_paths, status="running", error=None)
 
@@ -995,16 +994,18 @@ def main() -> None:
             trainer = Trainer(
                 resolved,
                 run_dir=run_paths.root,
-                resume_checkpoint=resume_checkpoint,
+                checkpoint_path=checkpoint_path,
                 run_id=run_id,
                 resolved_config_sha256=digest,
                 strict_precision_resume=args.strict_precision,
                 checkpoint_mode=checkpoint_mode,
                 preloaded_checkpoint=preloaded_checkpoint,
+                reset_discriminator=args.reset_discriminator,
+                start_step=start_step,
             )
             preloaded_checkpoint = None
             if is_branch:
-                print(f"Branch 来源：{resume_checkpoint}")
+                print(f"Branch 来源：{checkpoint_path}")
             print(f"Run 目录：{run_paths.root}")
 
             previous_sigint_handler = signal.getsignal(signal.SIGINT)
