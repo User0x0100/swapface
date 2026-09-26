@@ -55,7 +55,7 @@ EPS = 1e-8
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
-MAX_AMP_OVERFLOW_RETRIES = 8
+MAX_AMP_OVERFLOW_RETRIES = 16
 TRAINING_SEMANTICS_VERSION = 3
 
 
