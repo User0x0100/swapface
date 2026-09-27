@@ -76,14 +76,14 @@ Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失�
 `[train].stage` 决定 active training stage：
 
 - `joint`：Coarse 与 HQRefiner 在同一个 iteration 中同时训练；
-- `coarse`：只训练 Coarse 与 Coarse Discriminator，不执行 HQ forward、HQ D 或 HQ losses；
+- `coarse`：只训练 Coarse 与 Coarse Discriminator；训练 step 不执行 HQ forward、HQ D 或 HQ losses；
 - `hq`：Coarse 作为冻结的 conditioner 在 `no_grad` 下前向，只训练 HQRefiner 与 HQ Discriminator。
 
-三个模式继续共用现有 Generator/Discriminator optimizer、scheduler 与 GradScaler；inactive stage 参数没有 gradient，因此不会被 optimizer 更新。EMA 也只更新 active Generator stage。`hq` 模式下 HQ 输入仍使用冻结 Coarse 的输出；`joint` 模式下 HQ 输入使用 `coarse.detach()`，因此 Final/HQ losses 不会反向修改 Coarse。
+Generator 继续使用单独的 G optimizer/scheduler/GradScaler；HQ Discriminator 与 Coarse Discriminator 各自拥有独立的 optimizer、scheduler 与 GradScaler。inactive stage 参数没有 gradient，因此不会被 optimizer 更新。EMA 也只更新 active Generator stage。`hq` 模式下 HQ 输入仍使用冻结 Coarse 的输出；`joint` 模式下 HQ 输入使用 `coarse.detach()`，因此 Final/HQ losses 不会反向修改 Coarse。
 
 - Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、R1，以及 gaze / HRFFA / FACS target 属性监督；
 - HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/R1/WFM、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
-- Discriminator：HQ 与 Coarse 各有一个判别器；两者共用同一个 D optimizer、scheduler、GradScaler，但 R1 enable/interval/gamma 分别由各自 stage 配置控制。
+- Discriminator：HQ 与 Coarse 各有一个判别器，并分别维护自己的 D optimizer、scheduler、GradScaler 与 R1 enable/interval/gamma。joint 模式下两个 D 各自完成一次更新；某个 D 的 FP16 overflow 只重试该 D。
 
 Coarse GAN 的 real 是将真实 `dst` 双线性缩放到 `coarse_resolution`，fake 是 Coarse 原始输出；它只负责约束真实人脸分布，不引入 Coarse L1/VGG target reconstruction。Coarse 的 target 属性监督则先将低分辨率输出双线性上采样到训练分辨率，再使用与 Final 相同的 `theta_restore` 恢复到 canonical 坐标系，与 `dst_canonical` 比较。
 
@@ -221,9 +221,9 @@ Branch 不检查 `training_config.semantics_version`，因为它不恢复父训�
 
 ### 可选严格校验训练精度
 
-`[train].precision` 必须显式配置，支持 `fp32`、`fp16`、`bf16`。FP16 使用独立的 Generator/Discriminator `GradScaler`；BF16 不使用 loss scaling。R1、仿射恢复与 HRFFA 的数值敏感几何求解继续固定为 FP32。
+`[train].precision` 必须显式配置，支持 `fp32`、`fp16`、`bf16`。FP16 使用 Generator、HQ Discriminator、Coarse Discriminator 三个独立 `GradScaler`；BF16 不使用 loss scaling。R1、仿射恢复与 HRFFA 的数值敏感几何求解继续固定为 FP32。
 
-FP16 中只有实际执行了 optimizer update 的阶段才推进对应 scheduler。D overflow 时当前 global step 不推进；D 已成功而 G overflow 时只重算并重试 G，直到 G 成功后才更新 EMA 和 `completed_step`。总 `d_loss` / `g_loss` 出现 NaN/Inf 时直接终止，避免把非有限值误当作可通过降低 loss scale 恢复的 overflow。BF16/FP32 在 backward 后、`optimizer.step()` 前额外检查参数梯度；若任一梯度出现 NaN/Inf，则报告首个异常参数并终止，避免污染模型参数和 optimizer state。FP16 的梯度 overflow 仍由 `GradScaler` 负责跳过 update 和动态调整 scale，不走该 fatal gradient guard。
+FP16 中只有实际执行了 optimizer update 的阶段才推进对应 scheduler。D overflow 时当前 global step 不推进；D 已成功而 G overflow 时只重算并重试 G，直到 G 成功后才更新 EMA 和 `completed_step`。任一 active D stage 的 loss 或 `g_loss` 出现 NaN/Inf 时直接终止，避免把非有限值误当作可通过降低 loss scale 恢复的 overflow。BF16/FP32 在 backward 后、`optimizer.step()` 前额外检查参数梯度；若任一梯度出现 NaN/Inf，则报告首个异常参数并终止，避免污染模型参数和 optimizer state。FP16 的梯度 overflow 仍由 `GradScaler` 负责跳过 update 和动态调整 scale，不走该 fatal gradient guard。
 
 默认 resume 不要求当前实际训练精度与 checkpoint 一致，因为设备和软件环境可能变化。需要严格复现时可显式使用：
 

@@ -520,11 +520,17 @@ def _check_generator_responsibility_boundary() -> None:
         and isinstance(node.func, ast.Attribute)
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "self"
-        and node.func.attr == "_discriminator_stage_loss"
+        and node.func.attr == "_update_discriminator_stage"
     ]
     assert len(discriminator_stage_calls) == 2
     calls_by_stage = {call.args[0].value: call for call in discriminator_stage_calls if isinstance(call.args[0], ast.Constant)}
     assert set(calls_by_stage) == {"hq", "coarse"}
+
+    def positional_attribute(call: ast.Call, index: int) -> str:
+        value = call.args[index]
+        assert isinstance(value, ast.Attribute)
+        assert isinstance(value.value, ast.Name) and value.value.id == "self"
+        return value.attr
 
     def keyword_attribute(call: ast.Call, keyword_name: str) -> str:
         keyword = next(item for item in call.keywords if item.arg == keyword_name)
@@ -532,12 +538,29 @@ def _check_generator_responsibility_boundary() -> None:
         assert isinstance(keyword.value.value, ast.Name) and keyword.value.value.id == "self"
         return keyword.value.attr
 
+    assert positional_attribute(calls_by_stage["hq"], 5) == "optim_d_hq"
+    assert positional_attribute(calls_by_stage["hq"], 6) == "scaler_d_hq"
+    assert positional_attribute(calls_by_stage["hq"], 7) == "_hq_d_named_parameters"
+    assert positional_attribute(calls_by_stage["coarse"], 5) == "optim_d_coarse"
+    assert positional_attribute(calls_by_stage["coarse"], 6) == "scaler_d_coarse"
+    assert positional_attribute(calls_by_stage["coarse"], 7) == "_coarse_d_named_parameters"
     assert keyword_attribute(calls_by_stage["hq"], "r1_enabled") == "enable_hq_r1_loss"
     assert keyword_attribute(calls_by_stage["hq"], "r1_interval") == "hq_r1_reg_step"
     assert keyword_attribute(calls_by_stage["hq"], "r1_gamma") == "hq_r1_gamma"
     assert keyword_attribute(calls_by_stage["coarse"], "r1_enabled") == "enable_coarse_r1_loss"
     assert keyword_attribute(calls_by_stage["coarse"], "r1_interval") == "coarse_r1_reg_step"
     assert keyword_attribute(calls_by_stage["coarse"], "r1_gamma") == "coarse_r1_gamma"
+
+    discriminator_update_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer._update_discriminator_stage)))
+    update_self_calls = {
+        node.func.attr
+        for node in ast.walk(discriminator_update_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+    }
+    assert "_discriminator_stage_loss" in update_self_calls
 
     discriminator_stage_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer._discriminator_stage_loss)))
     r1_branches = [node for node in ast.walk(discriminator_stage_tree) if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "r1_step"]
@@ -574,8 +597,8 @@ def _check_generator_responsibility_boundary() -> None:
                         calls.add(child.func.attr)
         return calls
 
-    assert {"train_hq", "_hq_generator_stage_loss"}.issubset(guarded_calls("hq_stage_active"))
-    assert "_coarse_generator_stage_loss" in guarded_calls("coarse_stage_active")
+    assert {"train_hq", "_hq_generator_stage_loss", "_update_discriminator_stage"}.issubset(guarded_calls("hq_stage_active"))
+    assert {"_coarse_generator_stage_loss", "_update_discriminator_stage"}.issubset(guarded_calls("coarse_stage_active"))
 
     def self_calls(method: object) -> set[str]:
         tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
@@ -633,7 +656,35 @@ def _check_generator_responsibility_boundary() -> None:
     ]
     assert {call.func.attr for call in train_source_teacher_calls} == {"hq_identity_embeddings_forward", "coarse_identity_embeddings_forward"}
     assert all(isinstance(call.args[0], ast.Name) and call.args[0].id == "source_identity_faces" for call in train_source_teacher_calls)
-    print("PASS: HQ/Coarse gradients, losses, teachers and R1 execution paths remain independent")
+    print("PASS: HQ/Coarse gradients, D optimizers, losses, teachers and R1 execution paths remain independent")
+
+
+def _check_discriminator_training_state_split() -> None:
+    save_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer.save_ckpt)))
+    training_state_keys: set[str] | None = None
+    for node in ast.walk(save_tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or target.id != "training_state" or not isinstance(node.value, ast.Dict):
+            continue
+        training_state_keys = {
+            key.value
+            for key in node.value.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+        break
+    assert training_state_keys is not None
+    assert {
+        "optim_d_hq",
+        "optim_d_coarse",
+        "scaler_d_hq",
+        "scaler_d_coarse",
+        "lr_scheduler_d_hq",
+        "lr_scheduler_d_coarse",
+    }.issubset(training_state_keys)
+    assert not {"optim_d", "scaler_d", "lr_scheduler_d"} & training_state_keys
+    print("PASS: HQ/Coarse discriminator optimizer, scaler and scheduler checkpoint states are split")
 
 
 def _check_sample_gradient_maps() -> None:
@@ -656,6 +707,7 @@ def _check_sample_gradient_maps() -> None:
 def main() -> None:
     _check_reconstruction_scope()
     _check_generator_responsibility_boundary()
+    _check_discriminator_training_state_split()
     _check_sample_gradient_maps()
     _check_step_boundary()
     _check_scaled_optimizer_step()

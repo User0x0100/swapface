@@ -31,7 +31,7 @@ checkpoint_save_every = 10000
 
 
 [optimizer]
-# Generator / Discriminator 共用的 Adam 初始学习率。
+# Generator、HQ Discriminator、Coarse Discriminator 三个 Adam optimizer 共用的初始学习率。
 # Adam betas=(0.0, 0.99) 与 fused 实现当前固定在训练代码中，不作为实验自由度暴露。
 lr = 1.0e-4
 

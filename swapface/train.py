@@ -2,7 +2,6 @@ import argparse
 import copy
 import signal
 from collections.abc import Iterable, Mapping
-from itertools import chain
 from pathlib import Path
 from typing import Any, Literal
 
@@ -56,7 +55,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 7
+TRAINING_SEMANTICS_VERSION = 8
 
 
 def _configure_training_runtime() -> None:
@@ -431,33 +430,39 @@ class Trainer:
 
         # ========================= 优化器 / 调度器 =========================
         self.optim_g = optim.Adam(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
-        self.optim_d = optim.Adam(chain(self.net_d.parameters(), self.net_d_coarse.parameters()), lr=lr, betas=(0.0, 0.99), fused=True)
-        self._d_named_parameters = tuple(
-            ([(f"final.{name}", parameter) for name, parameter in self.net_d.named_parameters()] if self.hq_stage_active else [])
-            + ([(f"coarse.{name}", parameter) for name, parameter in self.net_d_coarse.named_parameters()] if self.coarse_stage_active else [])
-        )
+        self.optim_d_hq = optim.Adam(self.net_d.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
+        self.optim_d_coarse = optim.Adam(self.net_d_coarse.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
+        self._hq_d_named_parameters = tuple((f"hq.{name}", parameter) for name, parameter in self.net_d.named_parameters())
+        self._coarse_d_named_parameters = tuple((f"coarse.{name}", parameter) for name, parameter in self.net_d_coarse.named_parameters())
         scaler_enabled = self.precision == "fp16"
         self.scaler_g = GradScaler("cuda", enabled=scaler_enabled)
-        self.scaler_d = GradScaler("cuda", enabled=scaler_enabled)
+        self.scaler_d_hq = GradScaler("cuda", enabled=scaler_enabled)
+        self.scaler_d_coarse = GradScaler("cuda", enabled=scaler_enabled)
 
         if training_state is not None:
             self.optim_g.load_state_dict(training_state["optim_g"])
-            self.optim_d.load_state_dict(training_state["optim_d"])
+            self.optim_d_hq.load_state_dict(training_state["optim_d_hq"])
+            self.optim_d_coarse.load_state_dict(training_state["optim_d_coarse"])
 
         if training_state is not None and saved_precision == self.precision == "fp16":
             scaler_g_state = training_state.get("scaler_g")
-            scaler_d_state = training_state.get("scaler_d")
+            scaler_d_hq_state = training_state.get("scaler_d_hq")
+            scaler_d_coarse_state = training_state.get("scaler_d_coarse")
             if scaler_g_state is not None:
                 self.scaler_g.load_state_dict(scaler_g_state)
-            if scaler_d_state is not None:
-                self.scaler_d.load_state_dict(scaler_d_state)
+            if scaler_d_hq_state is not None:
+                self.scaler_d_hq.load_state_dict(scaler_d_hq_state)
+            if scaler_d_coarse_state is not None:
+                self.scaler_d_coarse.load_state_dict(scaler_d_coarse_state)
 
         if self.use_cosine_lr:
             self.lr_scheduler_g = CosineAnnealingLR(self.optim_g, T_max=scheduler_t_max, eta_min=lr * scheduler_min_lr_ratio)
-            self.lr_scheduler_d = CosineAnnealingLR(self.optim_d, T_max=scheduler_t_max, eta_min=lr * scheduler_min_lr_ratio)
+            self.lr_scheduler_d_hq = CosineAnnealingLR(self.optim_d_hq, T_max=scheduler_t_max, eta_min=lr * scheduler_min_lr_ratio)
+            self.lr_scheduler_d_coarse = CosineAnnealingLR(self.optim_d_coarse, T_max=scheduler_t_max, eta_min=lr * scheduler_min_lr_ratio)
             if training_state is not None:
                 self.lr_scheduler_g.load_state_dict(training_state["lr_scheduler_g"])
-                self.lr_scheduler_d.load_state_dict(training_state["lr_scheduler_d"])
+                self.lr_scheduler_d_hq.load_state_dict(training_state["lr_scheduler_d_hq"])
+                self.lr_scheduler_d_coarse.load_state_dict(training_state["lr_scheduler_d_coarse"])
 
         # ========================= 损失 =========================
         self.d_loss = DiscriminatorAdversarialLoss(weight=1.0, reduction="mean").to(self.device)
@@ -727,6 +732,50 @@ class Trainer:
         self.log(f"{stage}_d_loss", adversarial_loss)
         return total
 
+    def _update_discriminator_stage(
+        self,
+        stage: Literal["hq", "coarse"],
+        fake: Tensor,
+        real: Tensor,
+        net: Discriminator,
+        train_net: Any,
+        optimizer: optim.Optimizer,
+        scaler: GradScaler,
+        named_parameters: Iterable[tuple[str, Tensor]],
+        *,
+        r1_enabled: bool,
+        r1_interval: int,
+        r1_gamma: float,
+    ) -> None:
+        """独立完成一个判别器 stage 的 backward/step；FP16 overflow 只重试当前 stage。"""
+        overflow_retries = 0
+        while True:
+            optimizer.zero_grad(set_to_none=True)
+            loss = self._discriminator_stage_loss(
+                stage,
+                fake,
+                real,
+                net,
+                train_net,
+                r1_enabled=r1_enabled,
+                r1_interval=r1_interval,
+                r1_gamma=r1_gamma,
+            )
+            _ensure_finite_loss(f"{stage}_d_loss", loss)
+            if _scaled_backward_step(
+                loss,
+                optimizer,
+                scaler,
+                name=f"{stage} Discriminator",
+                named_parameters=named_parameters,
+            ):
+                return
+
+            overflow_retries += 1
+            optimizer.zero_grad(set_to_none=True)
+            if overflow_retries >= MAX_AMP_OVERFLOW_RETRIES:
+                raise FloatingPointError(f"{stage} Discriminator 连续 {MAX_AMP_OVERFLOW_RETRIES} 次 FP16 gradient overflow，停止训练")
+
     def _coarse_generator_stage_loss(
         self,
         coarse: Tensor,
@@ -869,11 +918,14 @@ class Trainer:
         training_state = {
             "net_g": self.net_g.state_dict(),
             "optim_g": self.optim_g.state_dict(),
-            "optim_d": self.optim_d.state_dict(),
+            "optim_d_hq": self.optim_d_hq.state_dict(),
+            "optim_d_coarse": self.optim_d_coarse.state_dict(),
             "scaler_g": self.scaler_g.state_dict() if self.precision == "fp16" else None,
-            "scaler_d": self.scaler_d.state_dict() if self.precision == "fp16" else None,
+            "scaler_d_hq": self.scaler_d_hq.state_dict() if self.precision == "fp16" else None,
+            "scaler_d_coarse": self.scaler_d_coarse.state_dict() if self.precision == "fp16" else None,
             "lr_scheduler_g": self.lr_scheduler_g.state_dict() if self.use_cosine_lr else None,
-            "lr_scheduler_d": self.lr_scheduler_d.state_dict() if self.use_cosine_lr else None,
+            "lr_scheduler_d_hq": self.lr_scheduler_d_hq.state_dict() if self.use_cosine_lr else None,
+            "lr_scheduler_d_coarse": self.lr_scheduler_d_coarse.state_dict() if self.use_cosine_lr else None,
         }
         completed_step = self.completed_step
         state_dict = {
@@ -997,8 +1049,6 @@ class Trainer:
         sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, _ = self.dataset.next()
         half = self.batch_size // 2
         sample_reference = tuple(tensor[:half].detach().cpu() for tensor in (sample_src, sample_dst, sample_dst_canonical, sample_theta_restore))
-        d_overflow_streak = 0
-
         with tqdm(total=None, initial=self.completed_step, mininterval=1.0, bar_format="{n_fmt:7} | 速度 {rate_fmt:3} | 训练时间 {elapsed}") as progress:
             while True:
                 if self._stop_requested:
@@ -1025,59 +1075,41 @@ class Trainer:
                 # ========================= 训练判别器 =========================
                 self.net_d.requires_grad_(self.hq_stage_active)
                 self.net_d_coarse.requires_grad_(self.coarse_stage_active)
-                self.optim_d.zero_grad(set_to_none=True)
 
                 if self.hq_stage_active:
-                    hq_d_total = self._discriminator_stage_loss(
+                    self._update_discriminator_stage(
                         "hq",
                         fake,
                         dst,
                         self.net_d,
                         self.train_d,
+                        self.optim_d_hq,
+                        self.scaler_d_hq,
+                        self._hq_d_named_parameters,
                         r1_enabled=self.enable_hq_r1_loss,
                         r1_interval=self.hq_r1_reg_step,
                         r1_gamma=self.hq_r1_gamma,
                     )
+                    if self.use_cosine_lr:
+                        self.lr_scheduler_d_hq.step()
+
                 if self.coarse_stage_active:
                     real_coarse = NF.interpolate(dst, size=(self.coarse_resolution, self.coarse_resolution), mode="bilinear", align_corners=False)
-                    coarse_d_total = self._discriminator_stage_loss(
+                    self._update_discriminator_stage(
                         "coarse",
                         coarse,
                         real_coarse,
                         self.net_d_coarse,
                         self.train_d_coarse,
+                        self.optim_d_coarse,
+                        self.scaler_d_coarse,
+                        self._coarse_d_named_parameters,
                         r1_enabled=self.enable_coarse_r1_loss,
                         r1_interval=self.coarse_r1_reg_step,
                         r1_gamma=self.coarse_r1_gamma,
                     )
-
-                if self.train_stage == "joint":
-                    d_loss = hq_d_total + coarse_d_total
-                elif self.hq_stage_active:
-                    d_loss = hq_d_total
-                else:
-                    d_loss = coarse_d_total
-
-                _ensure_finite_loss("d_loss", d_loss)
-                d_updated = _scaled_backward_step(
-                    d_loss,
-                    self.optim_d,
-                    self.scaler_d,
-                    name="Discriminator",
-                    named_parameters=self._d_named_parameters,
-                )
-                if not d_updated:
-                    d_overflow_streak += 1
-                    self.optim_d.zero_grad(set_to_none=True)
-                    self._log_buffer.clear()
-                    self._step_in_progress = False
-                    if d_overflow_streak >= MAX_AMP_OVERFLOW_RETRIES:
-                        raise FloatingPointError(f"Discriminator 连续 {MAX_AMP_OVERFLOW_RETRIES} 次 FP16 gradient overflow，停止训练")
-                    continue
-                d_overflow_streak = 0
-
-                if self.use_cosine_lr:
-                    self.lr_scheduler_d.step()
+                    if self.use_cosine_lr:
+                        self.lr_scheduler_d_coarse.step()
 
                 # source identity teacher 只为 active stage 计算，并跨 G overflow retry 复用。
                 with torch.no_grad():
