@@ -19,13 +19,23 @@ DEFAULT_TRAIN_CONFIG: dict[str, Any] = {
     "sample_save_every": 1000,
     "checkpoint_save_every": 10000,
 }
-DEFAULT_OPTIMIZER_CONFIG: dict[str, Any] = {
+DEFAULT_OPTIMIZER_STAGE_CONFIG: dict[str, Any] = {
     "lr": 1e-4,
 }
-DEFAULT_SCHEDULER_CONFIG: dict[str, Any] = {
+DEFAULT_OPTIMIZER_CONFIG: dict[str, Any] = {
+    "generator": dict(DEFAULT_OPTIMIZER_STAGE_CONFIG),
+    "hq_discriminator": dict(DEFAULT_OPTIMIZER_STAGE_CONFIG),
+    "coarse_discriminator": dict(DEFAULT_OPTIMIZER_STAGE_CONFIG),
+}
+DEFAULT_SCHEDULER_STAGE_CONFIG: dict[str, Any] = {
     "type": "none",
     "t_max": 20000,
     "min_lr_ratio": 0.1,
+}
+DEFAULT_SCHEDULER_CONFIG: dict[str, Any] = {
+    "generator": dict(DEFAULT_SCHEDULER_STAGE_CONFIG),
+    "hq_discriminator": dict(DEFAULT_SCHEDULER_STAGE_CONFIG),
+    "coarse_discriminator": dict(DEFAULT_SCHEDULER_STAGE_CONFIG),
 }
 DEFAULT_GENERATOR_CONFIG: dict[str, Any] = {
     "img_resolution": 512,
@@ -243,22 +253,46 @@ def _normalize_train(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_optimizer(config: dict[str, Any]) -> dict[str, Any]:
-    result = _with_defaults(_table(config, "optimizer", "[optimizer]"), DEFAULT_OPTIMIZER_CONFIG, "[optimizer]")
-    result["lr"] = _float(result["lr"], "optimizer.lr", minimum=1e-30)
+    optimizer = _table(config, "optimizer", "[optimizer]")
+    unknown = set(optimizer) - set(DEFAULT_OPTIMIZER_CONFIG)
+    if unknown:
+        raise ValueError(f"[optimizer] 包含未知字段：{sorted(unknown)}")
+
+    result: dict[str, Any] = {}
+    for stage, defaults in DEFAULT_OPTIMIZER_CONFIG.items():
+        stage_config = _with_defaults(
+            _table(optimizer, stage, f"[optimizer.{stage}]"),
+            defaults,
+            f"[optimizer.{stage}]",
+        )
+        stage_config["lr"] = _float(stage_config["lr"], f"optimizer.{stage}.lr", minimum=1e-30)
+        result[stage] = stage_config
     return result
 
 
 def _normalize_scheduler(config: dict[str, Any]) -> dict[str, Any]:
-    result = _with_defaults(_table(config, "scheduler", "[scheduler]"), DEFAULT_SCHEDULER_CONFIG, "[scheduler]")
-    scheduler_type = result["type"]
-    if not isinstance(scheduler_type, str):
-        raise TypeError(f"scheduler.type 必须为字符串，实际为 {type(scheduler_type).__name__}")
-    scheduler_type = scheduler_type.lower()
-    if scheduler_type not in {"none", "cosine"}:
-        raise ValueError(f"scheduler.type={scheduler_type!r} 无效，可选：none、cosine")
-    result["type"] = scheduler_type
-    result["t_max"] = _int(result["t_max"], "scheduler.t_max", minimum=1)
-    result["min_lr_ratio"] = _float(result["min_lr_ratio"], "scheduler.min_lr_ratio", minimum=0.0, maximum=1.0)
+    scheduler = _table(config, "scheduler", "[scheduler]")
+    unknown = set(scheduler) - set(DEFAULT_SCHEDULER_CONFIG)
+    if unknown:
+        raise ValueError(f"[scheduler] 包含未知字段：{sorted(unknown)}")
+
+    result: dict[str, Any] = {}
+    for stage, defaults in DEFAULT_SCHEDULER_CONFIG.items():
+        stage_config = _with_defaults(
+            _table(scheduler, stage, f"[scheduler.{stage}]"),
+            defaults,
+            f"[scheduler.{stage}]",
+        )
+        scheduler_type = stage_config["type"]
+        if not isinstance(scheduler_type, str):
+            raise TypeError(f"scheduler.{stage}.type 必须为字符串，实际为 {type(scheduler_type).__name__}")
+        scheduler_type = scheduler_type.lower()
+        if scheduler_type not in {"none", "cosine"}:
+            raise ValueError(f"scheduler.{stage}.type={scheduler_type!r} 无效，可选：none、cosine")
+        stage_config["type"] = scheduler_type
+        stage_config["t_max"] = _int(stage_config["t_max"], f"scheduler.{stage}.t_max", minimum=1)
+        stage_config["min_lr_ratio"] = _float(stage_config["min_lr_ratio"], f"scheduler.{stage}.min_lr_ratio", minimum=0.0, maximum=1.0)
+        result[stage] = stage_config
     return result
 
 

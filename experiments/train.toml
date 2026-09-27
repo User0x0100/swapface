@@ -30,17 +30,32 @@ sample_save_every = 1000
 checkpoint_save_every = 10000
 
 
-[optimizer]
-# Generator、HQ Discriminator、Coarse Discriminator 三个 Adam optimizer 共用的初始学习率。
-# Adam betas=(0.0, 0.99) 与 fused 实现当前固定在训练代码中，不作为实验自由度暴露。
+[optimizer.generator]
+# Generator Adam。betas=(0.0, 0.99) 与 fused 实现固定在训练代码中。
+lr = 1.0e-4
+
+[optimizer.hq_discriminator]
+# HQ Discriminator Adam。
+lr = 1.0e-4
+
+[optimizer.coarse_discriminator]
+# Coarse Discriminator Adam。
 lr = 1.0e-4
 
 
-[scheduler]
+[scheduler.generator]
 # "none" 或 "cosine"。
 type = "none"
+t_max = 20000
+min_lr_ratio = 0.1
 
-# cosine 时使用；type="none" 时保留在 canonical config 中但不生效。
+[scheduler.hq_discriminator]
+type = "none"
+t_max = 20000
+min_lr_ratio = 0.1
+
+[scheduler.coarse_discriminator]
+type = "none"
 t_max = 20000
 min_lr_ratio = 0.1
 

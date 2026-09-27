@@ -55,7 +55,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 8
+TRAINING_SEMANTICS_VERSION = 9
 
 
 def _configure_training_runtime() -> None:
@@ -192,7 +192,8 @@ class Trainer:
         strict_precision_resume: bool = False,
         checkpoint_mode: Literal["resume", "branch"] = "resume",
         preloaded_checkpoint: dict[str, Any] | None = None,
-        reset_discriminator: bool = False,
+        reset_hq_discriminator: bool = False,
+        reset_coarse_discriminator: bool = False,
         start_step: int | None = None,
     ) -> None:
         # config 必须是 resolve_train_config() 产生的 canonical schema。Trainer 不再维护第二套默认值/配置协议。
@@ -207,7 +208,15 @@ class Trainer:
         coarse_resolution = int(net_g_cfg["coarse_resolution"])
         net_d_coarse_cfg = {**net_d_cfg, "img_resolution": coarse_resolution}
 
-        lr = float(optimizer_config["lr"])
+        generator_optimizer_config = optimizer_config["generator"]
+        hq_d_optimizer_config = optimizer_config["hq_discriminator"]
+        coarse_d_optimizer_config = optimizer_config["coarse_discriminator"]
+        generator_scheduler_config = scheduler_config["generator"]
+        hq_d_scheduler_config = scheduler_config["hq_discriminator"]
+        coarse_d_scheduler_config = scheduler_config["coarse_discriminator"]
+        generator_lr = float(generator_optimizer_config["lr"])
+        hq_d_lr = float(hq_d_optimizer_config["lr"])
+        coarse_d_lr = float(coarse_d_optimizer_config["lr"])
         compile_module = bool(train_config["compile_module"])
         self.train_stage = str(train_config["stage"])
         self.coarse_stage_active = self.train_stage in {"joint", "coarse"}
@@ -291,10 +300,9 @@ class Trainer:
             self.amp_dtype = None
         self.amp_enabled = self.amp_dtype is not None
 
-        scheduler_type = str(scheduler_config["type"])
-        self.use_cosine_lr = scheduler_type == "cosine"
-        scheduler_t_max = int(scheduler_config["t_max"])
-        scheduler_min_lr_ratio = float(scheduler_config["min_lr_ratio"])
+        self.use_cosine_lr_g = str(generator_scheduler_config["type"]) == "cosine"
+        self.use_cosine_lr_d_hq = self.hq_stage_active and str(hq_d_scheduler_config["type"]) == "cosine"
+        self.use_cosine_lr_d_coarse = self.coarse_stage_active and str(coarse_d_scheduler_config["type"]) == "cosine"
         self.training_config = {
             "semantics_version": TRAINING_SEMANTICS_VERSION,
             "precision": self.precision,
@@ -377,7 +385,11 @@ class Trainer:
             else:
                 # Branch 继承父模型，但 optimizer/scheduler/scaler 重新初始化。
                 self._completed_step = checkpoint_step if start_step is None else start_step
-                branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(checkpoint, reset_discriminator=reset_discriminator)
+                branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(
+                    checkpoint,
+                    reset_hq_discriminator=reset_hq_discriminator,
+                    reset_coarse_discriminator=reset_coarse_discriminator,
+                )
                 net_g.load_state_dict(branch_g_state)
                 if branch_d_state is not None:
                     net_d.load_state_dict(branch_d_state)
@@ -411,8 +423,12 @@ class Trainer:
         if not self.hq_stage_active:
             self.net_g.hq.eval()
 
-        self.net_d = net_d.to(self.device).train(self.hq_stage_active).requires_grad_(self.hq_stage_active)
-        self.net_d_coarse = net_d_coarse.to(self.device).train(self.coarse_stage_active).requires_grad_(self.coarse_stage_active)
+        self.net_d = net_d.train(self.hq_stage_active).requires_grad_(self.hq_stage_active)
+        self.net_d_coarse = net_d_coarse.train(self.coarse_stage_active).requires_grad_(self.coarse_stage_active)
+        if self.hq_stage_active:
+            self.net_d.to(self.device)
+        if self.coarse_stage_active:
+            self.net_d_coarse.to(self.device)
 
         self.net_g_ema = copy.deepcopy(self.net_g)
         if checkpoint is not None and checkpoint_mode == "resume":
@@ -429,39 +445,65 @@ class Trainer:
             self._train_g_params = tuple(self.net_g.hq.parameters())
 
         # ========================= 优化器 / 调度器 =========================
-        self.optim_g = optim.Adam(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
-        self.optim_d_hq = optim.Adam(self.net_d.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
-        self.optim_d_coarse = optim.Adam(self.net_d_coarse.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
-        self._hq_d_named_parameters = tuple((f"hq.{name}", parameter) for name, parameter in self.net_d.named_parameters())
-        self._coarse_d_named_parameters = tuple((f"coarse.{name}", parameter) for name, parameter in self.net_d_coarse.named_parameters())
+        self.optim_g = optim.Adam(self.net_g.parameters(), lr=generator_lr, betas=(0.0, 0.99), fused=True)
+        self.optim_d_hq = optim.Adam(self.net_d.parameters(), lr=hq_d_lr, betas=(0.0, 0.99), fused=True) if self.hq_stage_active else None
+        self.optim_d_coarse = optim.Adam(self.net_d_coarse.parameters(), lr=coarse_d_lr, betas=(0.0, 0.99), fused=True) if self.coarse_stage_active else None
+        self._hq_d_named_parameters = tuple((f"hq.{name}", parameter) for name, parameter in self.net_d.named_parameters()) if self.hq_stage_active else ()
+        self._coarse_d_named_parameters = tuple((f"coarse.{name}", parameter) for name, parameter in self.net_d_coarse.named_parameters()) if self.coarse_stage_active else ()
         scaler_enabled = self.precision == "fp16"
         self.scaler_g = GradScaler("cuda", enabled=scaler_enabled)
-        self.scaler_d_hq = GradScaler("cuda", enabled=scaler_enabled)
-        self.scaler_d_coarse = GradScaler("cuda", enabled=scaler_enabled)
+        self.scaler_d_hq = GradScaler("cuda", enabled=scaler_enabled) if self.hq_stage_active else None
+        self.scaler_d_coarse = GradScaler("cuda", enabled=scaler_enabled) if self.coarse_stage_active else None
 
         if training_state is not None:
             self.optim_g.load_state_dict(training_state["optim_g"])
-            self.optim_d_hq.load_state_dict(training_state["optim_d_hq"])
-            self.optim_d_coarse.load_state_dict(training_state["optim_d_coarse"])
+            if self.hq_stage_active:
+                assert self.optim_d_hq is not None
+                self.optim_d_hq.load_state_dict(training_state["optim_d_hq"])
+            if self.coarse_stage_active:
+                assert self.optim_d_coarse is not None
+                self.optim_d_coarse.load_state_dict(training_state["optim_d_coarse"])
 
         if training_state is not None and saved_precision == self.precision == "fp16":
             scaler_g_state = training_state.get("scaler_g")
-            scaler_d_hq_state = training_state.get("scaler_d_hq")
-            scaler_d_coarse_state = training_state.get("scaler_d_coarse")
             if scaler_g_state is not None:
                 self.scaler_g.load_state_dict(scaler_g_state)
-            if scaler_d_hq_state is not None:
-                self.scaler_d_hq.load_state_dict(scaler_d_hq_state)
-            if scaler_d_coarse_state is not None:
-                self.scaler_d_coarse.load_state_dict(scaler_d_coarse_state)
+            if self.hq_stage_active:
+                assert self.scaler_d_hq is not None
+                scaler_d_hq_state = training_state.get("scaler_d_hq")
+                if scaler_d_hq_state is not None:
+                    self.scaler_d_hq.load_state_dict(scaler_d_hq_state)
+            if self.coarse_stage_active:
+                assert self.scaler_d_coarse is not None
+                scaler_d_coarse_state = training_state.get("scaler_d_coarse")
+                if scaler_d_coarse_state is not None:
+                    self.scaler_d_coarse.load_state_dict(scaler_d_coarse_state)
 
-        if self.use_cosine_lr:
-            self.lr_scheduler_g = CosineAnnealingLR(self.optim_g, T_max=scheduler_t_max, eta_min=lr * scheduler_min_lr_ratio)
-            self.lr_scheduler_d_hq = CosineAnnealingLR(self.optim_d_hq, T_max=scheduler_t_max, eta_min=lr * scheduler_min_lr_ratio)
-            self.lr_scheduler_d_coarse = CosineAnnealingLR(self.optim_d_coarse, T_max=scheduler_t_max, eta_min=lr * scheduler_min_lr_ratio)
+        if self.use_cosine_lr_g:
+            self.lr_scheduler_g = CosineAnnealingLR(
+                self.optim_g,
+                T_max=int(generator_scheduler_config["t_max"]),
+                eta_min=generator_lr * float(generator_scheduler_config["min_lr_ratio"]),
+            )
             if training_state is not None:
                 self.lr_scheduler_g.load_state_dict(training_state["lr_scheduler_g"])
+        if self.use_cosine_lr_d_hq:
+            assert self.optim_d_hq is not None
+            self.lr_scheduler_d_hq = CosineAnnealingLR(
+                self.optim_d_hq,
+                T_max=int(hq_d_scheduler_config["t_max"]),
+                eta_min=hq_d_lr * float(hq_d_scheduler_config["min_lr_ratio"]),
+            )
+            if training_state is not None:
                 self.lr_scheduler_d_hq.load_state_dict(training_state["lr_scheduler_d_hq"])
+        if self.use_cosine_lr_d_coarse:
+            assert self.optim_d_coarse is not None
+            self.lr_scheduler_d_coarse = CosineAnnealingLR(
+                self.optim_d_coarse,
+                T_max=int(coarse_d_scheduler_config["t_max"]),
+                eta_min=coarse_d_lr * float(coarse_d_scheduler_config["min_lr_ratio"]),
+            )
+            if training_state is not None:
                 self.lr_scheduler_d_coarse.load_state_dict(training_state["lr_scheduler_d_coarse"])
 
         # ========================= 损失 =========================
@@ -918,14 +960,14 @@ class Trainer:
         training_state = {
             "net_g": self.net_g.state_dict(),
             "optim_g": self.optim_g.state_dict(),
-            "optim_d_hq": self.optim_d_hq.state_dict(),
-            "optim_d_coarse": self.optim_d_coarse.state_dict(),
+            "optim_d_hq": self.optim_d_hq.state_dict() if self.optim_d_hq is not None else None,
+            "optim_d_coarse": self.optim_d_coarse.state_dict() if self.optim_d_coarse is not None else None,
             "scaler_g": self.scaler_g.state_dict() if self.precision == "fp16" else None,
-            "scaler_d_hq": self.scaler_d_hq.state_dict() if self.precision == "fp16" else None,
-            "scaler_d_coarse": self.scaler_d_coarse.state_dict() if self.precision == "fp16" else None,
-            "lr_scheduler_g": self.lr_scheduler_g.state_dict() if self.use_cosine_lr else None,
-            "lr_scheduler_d_hq": self.lr_scheduler_d_hq.state_dict() if self.use_cosine_lr else None,
-            "lr_scheduler_d_coarse": self.lr_scheduler_d_coarse.state_dict() if self.use_cosine_lr else None,
+            "scaler_d_hq": self.scaler_d_hq.state_dict() if self.precision == "fp16" and self.scaler_d_hq is not None else None,
+            "scaler_d_coarse": self.scaler_d_coarse.state_dict() if self.precision == "fp16" and self.scaler_d_coarse is not None else None,
+            "lr_scheduler_g": self.lr_scheduler_g.state_dict() if self.use_cosine_lr_g else None,
+            "lr_scheduler_d_hq": self.lr_scheduler_d_hq.state_dict() if self.use_cosine_lr_d_hq else None,
+            "lr_scheduler_d_coarse": self.lr_scheduler_d_coarse.state_dict() if self.use_cosine_lr_d_coarse else None,
         }
         completed_step = self.completed_step
         state_dict = {
@@ -1077,6 +1119,7 @@ class Trainer:
                 self.net_d_coarse.requires_grad_(self.coarse_stage_active)
 
                 if self.hq_stage_active:
+                    assert self.optim_d_hq is not None and self.scaler_d_hq is not None
                     self._update_discriminator_stage(
                         "hq",
                         fake,
@@ -1090,11 +1133,12 @@ class Trainer:
                         r1_interval=self.hq_r1_reg_step,
                         r1_gamma=self.hq_r1_gamma,
                     )
-                    if self.use_cosine_lr:
+                    if self.use_cosine_lr_d_hq:
                         self.lr_scheduler_d_hq.step()
 
                 if self.coarse_stage_active:
                     real_coarse = NF.interpolate(dst, size=(self.coarse_resolution, self.coarse_resolution), mode="bilinear", align_corners=False)
+                    assert self.optim_d_coarse is not None and self.scaler_d_coarse is not None
                     self._update_discriminator_stage(
                         "coarse",
                         coarse,
@@ -1108,7 +1152,7 @@ class Trainer:
                         r1_interval=self.coarse_r1_reg_step,
                         r1_gamma=self.coarse_r1_gamma,
                     )
-                    if self.use_cosine_lr:
+                    if self.use_cosine_lr_d_coarse:
                         self.lr_scheduler_d_coarse.step()
 
                 # source identity teacher 只为 active stage 计算，并跨 G overflow retry 复用。
@@ -1190,7 +1234,7 @@ class Trainer:
                     if g_overflow_retries >= MAX_AMP_OVERFLOW_RETRIES:
                         raise FloatingPointError(f"Generator 连续 {MAX_AMP_OVERFLOW_RETRIES} 次 FP16 gradient overflow，停止训练")
 
-                if self.use_cosine_lr:
+                if self.use_cosine_lr_g:
                     self.lr_scheduler_g.step()
 
                 self.update_ema()
@@ -1217,15 +1261,26 @@ def _load_run_config(paths: RunPaths) -> dict[str, Any]:
     return resolved
 
 
-def _branch_model_states(checkpoint: Mapping[str, Any], *, reset_discriminator: bool) -> tuple[Mapping[str, Tensor], Mapping[str, Tensor] | None, Mapping[str, Tensor] | None]:
-    """Branch 继承训练态 G；两个 D 要么同时继承，要么同时重建。"""
+def _branch_model_states(
+    checkpoint: Mapping[str, Any],
+    *,
+    reset_hq_discriminator: bool,
+    reset_coarse_discriminator: bool,
+) -> tuple[Mapping[str, Tensor], Mapping[str, Tensor] | None, Mapping[str, Tensor] | None]:
+    """Branch 继承训练态 G；HQ/Coarse D 可分别继承或重建。"""
     g_state = checkpoint["training_state"]["net_g"]
-    if reset_discriminator:
-        return g_state, None, None
-    return g_state, checkpoint["net_d"]["state_dict"], checkpoint["net_d_coarse"]["state_dict"]
+    hq_d_state = None if reset_hq_discriminator else checkpoint["net_d"]["state_dict"]
+    coarse_d_state = None if reset_coarse_discriminator else checkpoint["net_d_coarse"]["state_dict"]
+    return g_state, hq_d_state, coarse_d_state
 
 
-def _load_branch_checkpoint(checkpoint_path: Path, resolved: dict[str, Any], *, reset_discriminator: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+def _load_branch_checkpoint(
+    checkpoint_path: Path,
+    resolved: dict[str, Any],
+    *,
+    reset_hq_discriminator: bool,
+    reset_coarse_discriminator: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     checkpoint_version = checkpoint["version"]
     if checkpoint_version != CHECKPOINT_VERSION:
@@ -1238,22 +1293,30 @@ def _load_branch_checkpoint(checkpoint_path: Path, resolved: dict[str, Any], *, 
 
     if dict(checkpoint["net_g"]["network_cfg"]) != resolved["generator"]:
         raise ValueError("branch 不能修改 Generator 架构")
-    # 当前训练 checkpoint 必须同时包含 HQ/Coarse 两个判别器。
+
     checkpoint["net_d_coarse"]
-    if not reset_discriminator:
-        if dict(checkpoint["net_d"]["network_cfg"]) != resolved["discriminator"]:
-            raise ValueError("branch 默认恢复 Discriminator，因此架构必须一致；如需新建请使用 --reset-discriminator")
-        expected_coarse_d_cfg = {**resolved["discriminator"], "img_resolution": int(resolved["generator"]["coarse_resolution"])}
-        if dict(checkpoint["net_d_coarse"]["network_cfg"]) != expected_coarse_d_cfg:
-            raise ValueError("branch 恢复 Coarse Discriminator 时要求架构一致；如需新建请使用 --reset-discriminator")
-    _branch_model_states(checkpoint, reset_discriminator=reset_discriminator)
+    if not reset_hq_discriminator and dict(checkpoint["net_d"]["network_cfg"]) != resolved["discriminator"]:
+        raise ValueError("branch 继承 HQ Discriminator 时要求架构一致；如需新建请使用 --reset-hq-discriminator")
+
+    expected_coarse_d_cfg = {**resolved["discriminator"], "img_resolution": int(resolved["generator"]["coarse_resolution"])}
+    if not reset_coarse_discriminator and dict(checkpoint["net_d_coarse"]["network_cfg"]) != expected_coarse_d_cfg:
+        raise ValueError("branch 继承 Coarse Discriminator 时要求架构一致；如需新建请使用 --reset-coarse-discriminator")
+
+    _branch_model_states(
+        checkpoint,
+        reset_hq_discriminator=reset_hq_discriminator,
+        reset_coarse_discriminator=reset_coarse_discriminator,
+    )
     checkpoint_run = checkpoint["run"]
     parent = {
         "run_id": checkpoint_run["id"],
         "checkpoint": checkpoint_path.name,
         "step": checkpoint_step,
         "config_sha256": checkpoint_run["config_sha256"],
-        "discriminator": "reset" if reset_discriminator else "inherit",
+        "discriminator": {
+            "hq": "reset" if reset_hq_discriminator else "inherit",
+            "coarse": "reset" if reset_coarse_discriminator else "inherit",
+        },
     }
     return checkpoint, parent
 
@@ -1267,7 +1330,8 @@ def main() -> None:
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument("--resume", type=Path, default=None, help="严格恢复原 run，只允许 latest checkpoint，并使用原 run 冻结配置")
     source_group.add_argument("--branch-from", type=Path, default=None, help="从 checkpoint 创建新 run；继承训练态 Generator，默认也继承 Discriminator 权重")
-    parser.add_argument("--reset-discriminator", action="store_true", help="仅用于 branch：不恢复父 Discriminator，按新配置重新初始化")
+    parser.add_argument("--reset-hq-discriminator", action="store_true", help="仅用于 branch：重新初始化 HQ Discriminator")
+    parser.add_argument("--reset-coarse-discriminator", action="store_true", help="仅用于 branch：重新初始化 Coarse Discriminator")
     parser.add_argument("--step", type=int, default=None, help="仅用于 branch：新 run 的起始 step；默认继承父 checkpoint step")
     parser.add_argument("--strict-precision", action="store_true", help="仅用于 resume：要求当前实际训练精度与 checkpoint 一致；默认允许变化")
     args = parser.parse_args()
@@ -1283,8 +1347,10 @@ def main() -> None:
         parser.error("--resume 与 --runs-root 不能同时使用；resume 继续写入原 run")
     if is_branch and args.config is None:
         parser.error("--branch-from 必须显式配合 --config，branch 会创建使用该配置的新 run")
-    if args.reset_discriminator and not is_branch:
-        parser.error("--reset-discriminator 仅用于 --branch-from")
+    if args.reset_hq_discriminator and not is_branch:
+        parser.error("--reset-hq-discriminator 仅用于 --branch-from")
+    if args.reset_coarse_discriminator and not is_branch:
+        parser.error("--reset-coarse-discriminator 仅用于 --branch-from")
     if args.step is not None and not is_branch:
         parser.error("--step 仅用于 --branch-from")
     if args.step is not None and args.step < 0:
@@ -1305,7 +1371,12 @@ def main() -> None:
         checkpoint_path = resolve_branch_target(args.branch_from)
         resolved = load_train_config(args.config)
 
-        preloaded_checkpoint, parent = _load_branch_checkpoint(checkpoint_path, resolved, reset_discriminator=args.reset_discriminator)
+        preloaded_checkpoint, parent = _load_branch_checkpoint(
+            checkpoint_path,
+            resolved,
+            reset_hq_discriminator=args.reset_hq_discriminator,
+            reset_coarse_discriminator=args.reset_coarse_discriminator,
+        )
         start_step = int(preloaded_checkpoint["step"]) if args.step is None else args.step
 
         run_paths = create_run(args.runs_root or DEFAULT_RUNS_ROOT, args.config, resolved, name=args.name, parent=parent)
@@ -1338,7 +1409,8 @@ def main() -> None:
                 strict_precision_resume=args.strict_precision,
                 checkpoint_mode=checkpoint_mode,
                 preloaded_checkpoint=preloaded_checkpoint,
-                reset_discriminator=args.reset_discriminator,
+                reset_hq_discriminator=args.reset_hq_discriminator,
+                reset_coarse_discriminator=args.reset_coarse_discriminator,
                 start_step=start_step,
             )
             preloaded_checkpoint = None

@@ -34,8 +34,12 @@ def _check_train_config(root: Path) -> None:
     source = root / "canonical.toml"
     source.write_text(
         '[train]\nbatch_size = 8\nprecision = "fp16"\ncompile_module = false\n'
-        "[optimizer]\nlr = 5e-5\n"
-        '[scheduler]\ntype = "cosine"\nt_max = 1234\nmin_lr_ratio = 0.2\n'
+        "[optimizer.generator]\nlr = 5e-5\n"
+        "[optimizer.hq_discriminator]\nlr = 6e-5\n"
+        "[optimizer.coarse_discriminator]\nlr = 7e-5\n"
+        '[scheduler.generator]\ntype = "cosine"\nt_max = 1234\nmin_lr_ratio = 0.2\n'
+        '[scheduler.hq_discriminator]\ntype = "cosine"\nt_max = 2345\nmin_lr_ratio = 0.3\n'
+        '[scheduler.coarse_discriminator]\ntype = "none"\nt_max = 3456\nmin_lr_ratio = 0.4\n'
         "[generator]\ncoarse_num_latent = 7\n"
         '[identity]\nprovider = "MS1MV3_ARCFACE_R50_FP16"\n'
         "[loss.coarse.gan]\nweight = 0.6\n"
@@ -74,8 +78,16 @@ def _check_train_config(root: Path) -> None:
     assert resolved["train"]["stage"] == "joint"
     assert resolved["train"]["compile_module"] is False
     assert resolved["train"]["precision"] == "fp16"
-    assert resolved["optimizer"] == {"lr": 5e-5}
-    assert resolved["scheduler"] == {"type": "cosine", "t_max": 1234, "min_lr_ratio": 0.2}
+    assert resolved["optimizer"] == {
+        "generator": {"lr": 5e-5},
+        "hq_discriminator": {"lr": 6e-5},
+        "coarse_discriminator": {"lr": 7e-5},
+    }
+    assert resolved["scheduler"] == {
+        "generator": {"type": "cosine", "t_max": 1234, "min_lr_ratio": 0.2},
+        "hq_discriminator": {"type": "cosine", "t_max": 2345, "min_lr_ratio": 0.3},
+        "coarse_discriminator": {"type": "none", "t_max": 3456, "min_lr_ratio": 0.4},
+    }
     assert resolved["identity"]["provider"] == raw["identity"]["provider"]
     assert resolved["loss"]["coarse"]["gan"] == {"weight": 0.6}
     assert resolved["loss"]["coarse"]["identity"] == {"provider": "BLENDFACE", "weight": 7.0}
@@ -179,6 +191,24 @@ def _check_train_config(root: Path) -> None:
     else:
         raise AssertionError("配置错误接受了未知 train.stage")
 
+    legacy_optimizer = copy.deepcopy(raw)
+    legacy_optimizer["optimizer"] = {"lr": 1e-4}
+    try:
+        resolve_train_config(legacy_optimizer)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("配置错误接受了旧扁平 optimizer schema")
+
+    legacy_scheduler = copy.deepcopy(raw)
+    legacy_scheduler["scheduler"] = {"type": "none", "t_max": 100, "min_lr_ratio": 0.1}
+    try:
+        resolve_train_config(legacy_scheduler)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("配置错误接受了旧扁平 scheduler schema")
+
     invalid = copy.deepcopy(raw)
     invalid["train"]["precision"] = "fp8"
     try:
@@ -233,7 +263,7 @@ def _check_train_config(root: Path) -> None:
     else:
         raise AssertionError("配置错误接受了 same_prob > 1")
 
-    for section, key, value in (("optimizer", "lr", True), ("loss.coarse.gan", "weight", True), ("loss.hq.gan", "weight", "0.5")):
+    for section, key, value in (("optimizer.generator", "lr", True), ("loss.coarse.gan", "weight", True), ("loss.hq.gan", "weight", "0.5")):
         invalid = copy.deepcopy(raw)
         target = invalid
         for part in section.split("."):
@@ -454,6 +484,62 @@ def _check_scaled_optimizer_step() -> None:
         raise AssertionError("BF16 非有限梯度必须在 optimizer.step 前终止")
     torch.testing.assert_close(guarded_parameter.detach(), torch.tensor(1.0))
     print("PASS: FP16 overflow remains recoverable; BF16/FP32 non-finite gradients are blocked before optimizer.step")
+
+
+def _check_discriminator_overflow_isolation() -> None:
+    class OverflowOnceScaler:
+        def __init__(self) -> None:
+            self.scale_value = 8.0
+            self.attempts = 0
+
+        def get_scale(self) -> float:
+            return self.scale_value
+
+        def is_enabled(self) -> bool:
+            return True
+
+        def scale(self, loss: torch.Tensor) -> torch.Tensor:
+            return loss
+
+        def step(self, optimizer: torch.optim.Optimizer) -> None:
+            self.attempts += 1
+            if self.attempts > 1:
+                optimizer.step()
+
+        def update(self) -> None:
+            if self.attempts == 1:
+                self.scale_value *= 0.5
+
+    trainer = Trainer.__new__(Trainer)
+    hq_parameter = torch.nn.Parameter(torch.tensor(1.0))
+    coarse_parameter = torch.nn.Parameter(torch.tensor(2.0))
+    hq_optimizer = torch.optim.SGD([hq_parameter], lr=0.1)
+    coarse_optimizer = torch.optim.SGD([coarse_parameter], lr=0.1)
+    hq_scaler = OverflowOnceScaler()
+    coarse_scaler = OverflowOnceScaler()
+
+    trainer._discriminator_stage_loss = lambda *_args, **_kwargs: hq_parameter.square()
+    trainer._update_discriminator_stage(
+        "hq",
+        torch.empty(0),
+        torch.empty(0),
+        torch.nn.Identity(),
+        torch.nn.Identity(),
+        hq_optimizer,
+        hq_scaler,
+        [("hq.weight", hq_parameter)],
+        r1_enabled=False,
+        r1_interval=16,
+        r1_gamma=10.0,
+    )
+
+    assert hq_scaler.attempts == 2
+    assert abs(hq_scaler.get_scale() - 4.0) < 1e-12
+    torch.testing.assert_close(hq_parameter.detach(), torch.tensor(0.8))
+    torch.testing.assert_close(coarse_parameter.detach(), torch.tensor(2.0))
+    assert coarse_scaler.attempts == 0 and abs(coarse_scaler.get_scale() - 8.0) < 1e-12
+    assert not coarse_optimizer.state
+    print("PASS: HQ discriminator FP16 overflow retry does not touch Coarse discriminator state")
 
 
 def _check_generator_responsibility_boundary() -> None:
@@ -711,6 +797,7 @@ def main() -> None:
     _check_sample_gradient_maps()
     _check_step_boundary()
     _check_scaled_optimizer_step()
+    _check_discriminator_overflow_isolation()
     # ROCm 不使用 NVIDIA compute capability；CUDA 继续保持 SM80+ 的 compile-BF16 限制。
     with (
         patch("swapface.train.torch.version.hip", "7.0.0"),
@@ -795,7 +882,12 @@ def main() -> None:
             standalone,
         )
         assert resolve_branch_target(standalone) == standalone
-        loaded, standalone_parent = _load_branch_checkpoint(standalone, resolved, reset_discriminator=False)
+        loaded, standalone_parent = _load_branch_checkpoint(
+            standalone,
+            resolved,
+            reset_hq_discriminator=False,
+            reset_coarse_discriminator=False,
+        )
         assert loaded["step"] == 7500
         assert _require_resume_training_config(loaded) == {
             "semantics_version": TRAINING_SEMANTICS_VERSION,
@@ -807,14 +899,35 @@ def main() -> None:
             "checkpoint": standalone.name,
             "step": 7500,
             "config_sha256": metadata["config_sha256"],
-            "discriminator": "inherit",
+            "discriminator": {"hq": "inherit", "coarse": "inherit"},
         }
-        branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(loaded, reset_discriminator=False)
+        branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(
+            loaded,
+            reset_hq_discriminator=False,
+            reset_coarse_discriminator=False,
+        )
         assert branch_g_state["marker"].item() == 2  # training G, not EMA G
         assert branch_d_state is not None and branch_d_state["marker"].item() == 3
         assert branch_d_coarse_state is not None and branch_d_coarse_state["marker"].item() == 4
-        branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(loaded, reset_discriminator=True)
-        assert branch_g_state["marker"].item() == 2 and branch_d_state is None and branch_d_coarse_state is None
+
+        _, branch_d_state, branch_d_coarse_state = _branch_model_states(
+            loaded,
+            reset_hq_discriminator=True,
+            reset_coarse_discriminator=False,
+        )
+        assert branch_d_state is None and branch_d_coarse_state is not None
+        _, branch_d_state, branch_d_coarse_state = _branch_model_states(
+            loaded,
+            reset_hq_discriminator=False,
+            reset_coarse_discriminator=True,
+        )
+        assert branch_d_state is not None and branch_d_coarse_state is None
+        _, branch_d_state, branch_d_coarse_state = _branch_model_states(
+            loaded,
+            reset_hq_discriminator=True,
+            reset_coarse_discriminator=True,
+        )
+        assert branch_d_state is None and branch_d_coarse_state is None
 
         invalid_training_config = dict(loaded)
         invalid_training_config["training_config"] = {"precision": "fp16"}
@@ -869,7 +982,12 @@ def main() -> None:
         changed_generator = copy.deepcopy(resolved)
         changed_generator["generator"]["coarse_resolution"] = 256
         try:
-            _load_branch_checkpoint(standalone, changed_generator, reset_discriminator=False)
+            _load_branch_checkpoint(
+                standalone,
+                changed_generator,
+                reset_hq_discriminator=False,
+                reset_coarse_discriminator=False,
+            )
         except ValueError:
             pass
         else:
@@ -878,17 +996,62 @@ def main() -> None:
         changed_discriminator = copy.deepcopy(resolved)
         changed_discriminator["discriminator"]["base_ch"] = 128
         try:
-            _load_branch_checkpoint(standalone, changed_discriminator, reset_discriminator=False)
+            _load_branch_checkpoint(
+                standalone,
+                changed_discriminator,
+                reset_hq_discriminator=False,
+                reset_coarse_discriminator=False,
+            )
         except ValueError:
             pass
         else:
             raise AssertionError("branch 默认错误接受了 Discriminator 架构变更")
-        _, reset_parent = _load_branch_checkpoint(standalone, changed_discriminator, reset_discriminator=True)
-        assert reset_parent["discriminator"] == "reset"
+
+        # discriminator schema 目前由 HQ/Coarse 共用；只 reset 一边时，另一边仍要求架构一致。
+        for reset_hq, reset_coarse in ((True, False), (False, True)):
+            try:
+                _load_branch_checkpoint(
+                    standalone,
+                    changed_discriminator,
+                    reset_hq_discriminator=reset_hq,
+                    reset_coarse_discriminator=reset_coarse,
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("只 reset 一个 D 时错误接受了共享 Discriminator 架构变更")
+
+        _, reset_parent = _load_branch_checkpoint(
+            standalone,
+            changed_discriminator,
+            reset_hq_discriminator=True,
+            reset_coarse_discriminator=True,
+        )
+        assert reset_parent["discriminator"] == {"hq": "reset", "coarse": "reset"}
+
+        _, hq_reset_parent = _load_branch_checkpoint(
+            standalone,
+            resolved,
+            reset_hq_discriminator=True,
+            reset_coarse_discriminator=False,
+        )
+        assert hq_reset_parent["discriminator"] == {"hq": "reset", "coarse": "inherit"}
+        _, coarse_reset_parent = _load_branch_checkpoint(
+            standalone,
+            resolved,
+            reset_hq_discriminator=False,
+            reset_coarse_discriminator=True,
+        )
+        assert coarse_reset_parent["discriminator"] == {"hq": "inherit", "coarse": "reset"}
 
         changed_provider = copy.deepcopy(resolved)
         changed_provider["identity"]["provider"] = "MS1MV3_ARCFACE_R50_FP16"
-        _load_branch_checkpoint(standalone, changed_provider, reset_discriminator=False)
+        _load_branch_checkpoint(
+            standalone,
+            changed_provider,
+            reset_hq_discriminator=False,
+            reset_coarse_discriminator=False,
+        )
 
         document = json.loads(first.resolved_config.read_text(encoding="utf-8"))
         document["config"]["train"]["batch_size"] = 16

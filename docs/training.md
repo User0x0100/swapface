@@ -62,7 +62,7 @@ uv run python -m swapface.train \
 训练配置只存在一套 canonical schema；`swapface/config.py` 负责默认值、严格校验和 canonical 化，`Trainer` 直接消费该结构，不再维护第二套扁平配置参数。顶层职责为：
 
 - `[train]`：训练 stage、batch、precision、device、compile 与输出周期；
-- `[optimizer]` / `[scheduler]`：优化器学习率与调度策略；
+- `[optimizer.*]` / `[scheduler.*]`：Generator、HQ D、Coarse D 各自的学习率与调度策略；
 - `[identity]`：Generator 的 source identity 条件编码器；
 - `[loss.*]`：每一种训练损失及其共享 reconstruction 策略；
 - `[data.loader]` / `[data.augmentation]` / `[data.sampling]`：数据执行、增强和配对采样；
@@ -70,6 +70,8 @@ uv run python -m swapface.train \
 - `[generator]` / `[discriminator]`：模型定义。
 
 Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、R1、gaze、HRFFA、FACS 均独立配置。L1/VGG/WFM 与 reconstruction scope 只属于 HQ。`gan.weight` 只缩放对应阶段的 Generator adversarial loss；两个 Discriminator adversarial loss 固定权重 1.0。
+
+优化策略按训练实体分开配置：`[optimizer.generator]`、`[optimizer.hq_discriminator]`、`[optimizer.coarse_discriminator]` 分别设置 LR；对应的 `[scheduler.generator]`、`[scheduler.hq_discriminator]`、`[scheduler.coarse_discriminator]` 分别设置 `type / t_max / min_lr_ratio`。Adam 的 `betas=(0.0, 0.99)` 与 fused 实现仍固定在训练代码中。
 
 ## Generator 梯度职责
 
@@ -79,7 +81,7 @@ Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失�
 - `coarse`：只训练 Coarse 与 Coarse Discriminator；训练 step 不执行 HQ forward、HQ D 或 HQ losses；
 - `hq`：Coarse 作为冻结的 conditioner 在 `no_grad` 下前向，只训练 HQRefiner 与 HQ Discriminator。
 
-Generator 继续使用单独的 G optimizer/scheduler/GradScaler；HQ Discriminator 与 Coarse Discriminator 各自拥有独立的 optimizer、scheduler 与 GradScaler。inactive stage 参数没有 gradient，因此不会被 optimizer 更新。EMA 也只更新 active Generator stage。`hq` 模式下 HQ 输入仍使用冻结 Coarse 的输出；`joint` 模式下 HQ 输入使用 `coarse.detach()`，因此 Final/HQ losses 不会反向修改 Coarse。
+Generator、HQ Discriminator、Coarse Discriminator 分别拥有独立的 optimizer/scheduler/GradScaler。inactive Discriminator 保持在 CPU，不创建 optimizer/scaler/scheduler，也不占用训练 GPU 显存；inactive Generator stage 参数没有 gradient。EMA 只更新 active Generator stage。`hq` 模式下 HQ 输入仍使用冻结 Coarse 的输出；`joint` 模式下 HQ 输入使用 `coarse.detach()`，因此 Final/HQ losses 不会反向修改 Coarse。
 
 - Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、R1，以及 gaze / HRFFA / FACS target 属性监督；
 - HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/R1/WFM、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
@@ -200,16 +202,23 @@ uv run python -m swapface.train \
 
 `--step 0` 可以让新分支从 0 重新计数。这个值就是新 run 的实际 `completed_step` 起点，因此也会同时影响 R1 周期、EMA decay、sample/checkpoint 保存周期和文件名；它不是单独的 TensorBoard 显示偏移。
 
-Branch 始终要求 `[generator]` 与父 checkpoint 完全一致。默认还要求 `[discriminator]` 一致，并同时加载父 HQ/Coarse D 权重。若需要重新初始化 D（例如修改 D 架构或主动打破旧 GAN 平衡），使用：
+Branch 始终要求 `[generator]` 与父 checkpoint 完全一致。默认还要求被继承的 Discriminator 架构一致。HQ D 与 Coarse D 可以分别重建：
 
 ```bash
+# 只重建 HQ D
 uv run python -m swapface.train \
   --branch-from experiments/runs/<run_id>/checkpoints/step_000050000.pth \
   --config experiments/train.toml \
-  --reset-discriminator
+  --reset-hq-discriminator
+
+# 只重建 Coarse D
+uv run python -m swapface.train \
+  --branch-from experiments/runs/<run_id>/checkpoints/step_000050000.pth \
+  --config experiments/train.toml \
+  --reset-coarse-discriminator
 ```
 
-设置 `--reset-discriminator` 后两个 D 都重新初始化，并允许新配置修改 `[discriminator]`。无论是否恢复 D，Branch 都不会继承 G/D optimizer、scheduler 或 GradScaler；step 默认继承父 checkpoint，也可以由 `--step` 指定。
+需要两个 D 都重建时同时传入两个开关。Branch metadata 会分别记录 HQ/Coarse D 的 `inherit` / `reset`。由于当前 HQ/Coarse D 共用同一 `[discriminator]` 架构参数表，如果修改该架构，则所有仍选择 inherit 的 D 都必须与父 checkpoint 保持兼容。无论是否恢复 D，Branch 都不会继承 G/D optimizer、scheduler 或 GradScaler；step 默认继承父 checkpoint，也可以由 `--step` 指定。
 
 因此三种入口的语义为：
 
