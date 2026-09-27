@@ -502,9 +502,27 @@ def _check_generator_responsibility_boundary() -> None:
     print("PASS: HQ/Coarse gradients and R1 execution paths remain independent")
 
 
+def _check_sample_gradient_maps() -> None:
+    sample_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer._save_sample)))
+    self_calls = {node.func.attr for node in ast.walk(sample_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"}
+    assert {
+        "train_d_coarse",
+        "coarse_gan_loss",
+        "coarse_identity_embeddings_forward",
+        "coarse_id_loss",
+        "train_d",
+        "hq_gan_loss",
+        "hq_identity_embeddings_forward",
+        "hq_id_loss",
+        "loss_grad_map",
+    }.issubset(self_calls)
+    print("PASS: sample visualization keeps Coarse/HQ discriminator and identity gradient maps")
+
+
 def main() -> None:
     _check_reconstruction_scope()
     _check_generator_responsibility_boundary()
+    _check_sample_gradient_maps()
     _check_step_boundary()
     _check_scaled_optimizer_step()
     # ROCm 不使用 NVIDIA compute capability；CUDA 继续保持 SM80+ 的 compile-BF16 限制。

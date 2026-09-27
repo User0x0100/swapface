@@ -127,7 +127,7 @@ experiments/
 - `metadata.json`：只记录 run ID、状态、配置摘要和可选的 branch 父来源。
 - `latest.json`：很小的最新 checkpoint 指针，不复制大模型文件，适合本地文件系统和对象存储。
 - `checkpoints/`：完整训练状态。
-- `samples/`：与 completed step 对齐的训练可视化。
+- `samples/`：与 completed step 对齐的训练可视化；依次包含 src、dst、Coarse、HQ、canonical dst、HQ Identity 输入，以及 Coarse/HQ 各自的判别器梯度图和 Identity 梯度图。
 - `tensorboard/`：TensorBoard event 文件；一次 resume 可能新增 event 文件，这是正常现象。
 
 `experiments/*.toml` 可以进入 Git；`experiments/*/` 属于运行生成物，默认忽略。

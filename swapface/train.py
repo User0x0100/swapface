@@ -752,7 +752,11 @@ class Trainer:
 
             source_identity_faces_vis = self.prepare_identity_encoder_faces(src_vis)
             generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
-            source_identity_embeddings_vis = self.hq_identity_embeddings_forward(source_identity_faces_vis)
+            hq_source_identity_embeddings_vis = self.hq_identity_embeddings_forward(source_identity_faces_vis)
+            if self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
+                coarse_source_identity_embeddings_vis = hq_source_identity_embeddings_vis
+            else:
+                coarse_source_identity_embeddings_vis = self.coarse_identity_embeddings_forward(source_identity_faces_vis)
             fake_vis, coarse_vis = self.net_g_ema(dst_vis, generator_identity_embeddings_vis, return_coarse=True)
             coarse_display_vis = NF.interpolate(coarse_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
 
@@ -763,7 +767,23 @@ class Trainer:
 
             grid = [src_vis, dst_vis, coarse_display_vis, fake_vis, dst_canonical_vis, identity_encoder_input_display_vis]
 
-            # ========================= GAN 损失梯度图 =========================
+            # ========================= Coarse 判别器梯度图 =========================
+            coarse_for_gan_grad = coarse_vis.detach().requires_grad_(True)
+            with torch.enable_grad():
+                coarse_score_vis = self.train_d_coarse(coarse_for_gan_grad)
+                coarse_gan_loss_vis = self.coarse_gan_loss(coarse_score_vis)
+                coarse_gan_grad_map = self.loss_grad_map(coarse_gan_loss_vis, coarse_for_gan_grad)
+            grid.append(NF.interpolate(coarse_gan_grad_map, size=fake_vis.shape[2:], mode="bilinear", align_corners=False))
+
+            # ========================= Coarse 身份损失梯度图 =========================
+            with torch.enable_grad():
+                coarse_for_id_grad = coarse_vis.detach().requires_grad_(True)
+                coarse_identity_embeddings_vis = self.coarse_identity_embeddings_forward(self.prepare_identity_encoder_faces(coarse_for_id_grad, theta_restore_vis))
+                coarse_id_loss_vis = self.coarse_id_loss(coarse_identity_embeddings_vis, coarse_source_identity_embeddings_vis.detach())
+                coarse_id_grad_map = self.loss_grad_map(coarse_id_loss_vis, coarse_for_id_grad)
+            grid.append(NF.interpolate(coarse_id_grad_map, size=fake_vis.shape[2:], mode="bilinear", align_corners=False))
+
+            # ========================= HQ 判别器梯度图 =========================
             fake_for_gan_grad = fake_vis.detach().requires_grad_(True)
             with torch.enable_grad():
                 fake_score_vis = self.train_d(fake_for_gan_grad)
@@ -771,13 +791,12 @@ class Trainer:
                 gan_grad_map = self.loss_grad_map(gan_loss_vis, fake_for_gan_grad)
             grid.append(gan_grad_map)
 
-            # ========================= 身份损失梯度图 =========================
+            # ========================= HQ 身份损失梯度图 =========================
             with torch.enable_grad():
                 fake_for_id_grad = fake_vis.detach().requires_grad_(True)
                 generated_identity_embeddings_vis = self.hq_identity_embeddings_forward(self.prepare_identity_encoder_faces(fake_for_id_grad, theta_restore_vis))
-                id_loss_vis = self.hq_id_loss(generated_identity_embeddings_vis, source_identity_embeddings_vis.detach())
+                id_loss_vis = self.hq_id_loss(generated_identity_embeddings_vis, hq_source_identity_embeddings_vis.detach())
                 id_grad_map = self.loss_grad_map(id_loss_vis, fake_for_id_grad)
-
             grid.append(id_grad_map)
 
             grid = torch.cat(grid, dim=0)
