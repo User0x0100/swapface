@@ -490,15 +490,35 @@ def _check_generator_responsibility_boundary() -> None:
             detach_boundaries += 1
     assert detach_boundaries == 2
 
-    r1_branch_names = []
-    for node in ast.walk(train_tree):
-        if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id in {"hq_r1_step", "coarse_r1_step"}:
-            r1_branch_names.append(node.test.id)
-        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
-            names = {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
-            assert not {"hq_r1_step", "coarse_r1_step"}.issubset(names)
-    assert r1_branch_names.count("hq_r1_step") == 1
-    assert r1_branch_names.count("coarse_r1_step") == 1
+    discriminator_stage_calls = [
+        node
+        for node in ast.walk(train_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and node.func.attr == "_discriminator_stage_loss"
+    ]
+    assert len(discriminator_stage_calls) == 2
+    calls_by_stage = {call.args[0].value: call for call in discriminator_stage_calls if isinstance(call.args[0], ast.Constant)}
+    assert set(calls_by_stage) == {"hq", "coarse"}
+
+    def keyword_attribute(call: ast.Call, keyword_name: str) -> str:
+        keyword = next(item for item in call.keywords if item.arg == keyword_name)
+        assert isinstance(keyword.value, ast.Attribute)
+        assert isinstance(keyword.value.value, ast.Name) and keyword.value.value.id == "self"
+        return keyword.value.attr
+
+    assert keyword_attribute(calls_by_stage["hq"], "r1_enabled") == "enable_hq_r1_loss"
+    assert keyword_attribute(calls_by_stage["hq"], "r1_interval") == "hq_r1_reg_step"
+    assert keyword_attribute(calls_by_stage["hq"], "r1_gamma") == "hq_r1_gamma"
+    assert keyword_attribute(calls_by_stage["coarse"], "r1_enabled") == "enable_coarse_r1_loss"
+    assert keyword_attribute(calls_by_stage["coarse"], "r1_interval") == "coarse_r1_reg_step"
+    assert keyword_attribute(calls_by_stage["coarse"], "r1_gamma") == "coarse_r1_gamma"
+
+    discriminator_stage_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer._discriminator_stage_loss)))
+    r1_branches = [node for node in ast.walk(discriminator_stage_tree) if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "r1_step"]
+    assert len(r1_branches) == 1
     print("PASS: HQ/Coarse gradients and R1 execution paths remain independent")
 
 

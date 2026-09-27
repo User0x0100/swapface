@@ -204,14 +204,12 @@ class Trainer:
         coarse_resolution = int(net_g_cfg["coarse_resolution"])
         net_d_coarse_cfg = {**net_d_cfg, "img_resolution": coarse_resolution}
 
-        batch_size = int(train_config["batch_size"])
         lr = float(optimizer_config["lr"])
         compile_module = bool(train_config["compile_module"])
-        checkpoint_save_every = int(train_config["checkpoint_save_every"])
+        self.batch_size = int(train_config["batch_size"])
         self.log_interval = int(train_config["log_interval"])
         self.sample_save_every = int(train_config["sample_save_every"])
-        self.checkpoint_save_every = checkpoint_save_every
-        self.batch_size = batch_size
+        self.checkpoint_save_every = int(train_config["checkpoint_save_every"])
 
         coarse_loss_config = loss_config["coarse"]
         hq_loss_config = loss_config["hq"]
@@ -539,11 +537,7 @@ class Trainer:
         self.run_paths = RunPaths.from_root(run_dir)
         self.run_id = run_id
         self.resolved_config_sha256 = resolved_config_sha256
-        self.ckpt_dir = self.run_paths.checkpoints
-        self.sample_dir = self.run_paths.samples
-        self.tensorboard_dir = self.run_paths.tensorboard
-
-        for path in (self.ckpt_dir, self.sample_dir, self.tensorboard_dir):
+        for path in (self.run_paths.checkpoints, self.run_paths.samples, self.run_paths.tensorboard):
             path.mkdir(exist_ok=True, parents=True)
 
         # ========================= 数据采样 =========================
@@ -611,7 +605,7 @@ class Trainer:
         tensorboard_purge_step = None
         if checkpoint is not None and checkpoint_mode == "resume":
             tensorboard_purge_step = self.completed_step + 1
-        self.log_writer = SummaryWriter(self.tensorboard_dir, purge_step=tensorboard_purge_step)
+        self.log_writer = SummaryWriter(self.run_paths.tensorboard, purge_step=tensorboard_purge_step)
         self._log_buffer: dict[str, Tensor] = {}
 
     @property
@@ -644,10 +638,6 @@ class Trainer:
         for key, value in zip(keys, values):
             self.log_writer.add_scalar(f"Loss/{key}", value, self.completed_step)
 
-    @torch.no_grad()
-    def fetch_sample(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        return self.dataset.next()
-
     def prepare_identity_encoder_faces(self, faces: Tensor, theta_restore: Tensor | None = None) -> Tensor:
         """将 full/coarse FFHQ aligned 人脸映射为身份编码器使用的 ArcFace 112 输入。"""
         spatial = tuple(faces.shape[-2:])
@@ -661,6 +651,42 @@ class Trainer:
             grid = transform_sampling_grid(grid, theta_restore)
             return ffhq_to_arcface_112(faces, grid, padding_mode="reflection")
         return ffhq_to_arcface_112(faces, grid)
+
+    def _discriminator_stage_loss(
+        self,
+        stage: Literal["hq", "coarse"],
+        fake: Tensor,
+        real: Tensor,
+        net: Discriminator,
+        train_net: Any,
+        *,
+        r1_enabled: bool,
+        r1_interval: int,
+        r1_gamma: float,
+    ) -> Tensor:
+        """计算单个判别器阶段的 adversarial + lazy R1，总是返回该阶段 D total。"""
+        r1_step = r1_enabled and self.completed_step % r1_interval == 0
+        if r1_step:
+            with autocast(device_type="cuda", enabled=False):
+                fake_img = fake.detach().float()
+                real_img = real.detach().float().requires_grad_(True)
+                fake_score = net(fake_img)
+                real_score = net(real_img)
+                adversarial_loss = self.d_loss(fake_score, real_score)
+                r1_loss_raw = r1_reg_loss(real_score, real_img, gamma=r1_gamma)
+                r1_loss = r1_loss_raw * r1_interval
+            self.log(f"{stage}_r1_loss_raw", r1_loss_raw, force=True)
+            self.log(f"{stage}_r1_loss", r1_loss, force=True)
+            total = adversarial_loss + r1_loss
+        else:
+            with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
+                fake_score = train_net(fake.detach())
+                real_score = train_net(real.detach())
+                adversarial_loss = self.d_loss(fake_score, real_score)
+            total = adversarial_loss
+
+        self.log(f"{stage}_d_loss", adversarial_loss)
+        return total
 
     @torch.no_grad()
     def update_ema(self, decay: float = 0.999) -> None:
@@ -716,7 +742,7 @@ class Trainer:
             "training_state": training_state,
         }
 
-        ckpt_file = self.ckpt_dir / f"step_{completed_step:09d}.pth"
+        ckpt_file = self.run_paths.checkpoints / f"step_{completed_step:09d}.pth"
         temp_file = ckpt_file.with_suffix(".pth.tmp")
         try:
             torch.save(state_dict, temp_file)
@@ -739,16 +765,16 @@ class Trainer:
 
         return h
 
-    def _save_sample(self, sample_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor], current_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor]) -> None:
-        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, _sample_same_mask = sample_batch
+    def _save_sample(self, sample_reference: tuple[Tensor, Tensor, Tensor, Tensor], current_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor]) -> None:
+        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore = (tensor.to(self.device) for tensor in sample_reference)
         src, dst, dst_canonical, theta_restore, _same_mask = current_batch
         with torch.no_grad(), autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-            half = self.batch_size // 2
-            src_vis = torch.cat((sample_src[:half], src[: self.batch_size - half]), dim=0)
-            dst_vis = torch.cat((sample_dst[:half], dst[: self.batch_size - half]), dim=0)
+            half = sample_src.shape[0]
+            src_vis = torch.cat((sample_src, src[: self.batch_size - half]), dim=0)
+            dst_vis = torch.cat((sample_dst, dst[: self.batch_size - half]), dim=0)
 
-            dst_canonical_vis = torch.cat((sample_dst_canonical[:half], dst_canonical[: self.batch_size - half]), dim=0)
-            theta_restore_vis = torch.cat((sample_theta_restore[:half], theta_restore[: self.batch_size - half]), dim=0)
+            dst_canonical_vis = torch.cat((sample_dst_canonical, dst_canonical[: self.batch_size - half]), dim=0)
+            theta_restore_vis = torch.cat((sample_theta_restore, theta_restore[: self.batch_size - half]), dim=0)
 
             source_identity_faces_vis = self.prepare_identity_encoder_faces(src_vis)
             generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
@@ -804,7 +830,7 @@ class Trainer:
             grid = make_grid(grid, nrow=self.batch_size)[[2, 1, 0], :, :]  # RGB → BGR
             grid = grid.permute(1, 2, 0)  # CHW → HWC
             grid_cpu = grid.to(device="cpu", dtype=torch.uint8).numpy()
-        sample_file = self.sample_dir / f"step_{self.completed_step:09d}.png"
+        sample_file = self.run_paths.samples / f"step_{self.completed_step:09d}.png"
         if not cv2.imwrite(sample_file, grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
             raise OSError(f"保存训练 sample 失败：{sample_file}")
 
@@ -812,7 +838,9 @@ class Trainer:
 
         net_coarse, net_hq = self.train_coarse, self.train_hq
         net_d, net_d_coarse = self.train_d, self.train_d_coarse
-        sample_batch = self.fetch_sample()
+        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, _ = self.dataset.next()
+        half = self.batch_size // 2
+        sample_reference = tuple(tensor[:half].detach().cpu() for tensor in (sample_src, sample_dst, sample_dst_canonical, sample_theta_restore))
         d_overflow_streak = 0
 
         with tqdm(total=None, initial=self.completed_step, mininterval=1.0, bar_format="{n_fmt:7} | 速度 {rate_fmt:3} | 训练时间 {elapsed}") as progress:
@@ -820,7 +848,7 @@ class Trainer:
                 if self._stop_requested:
                     raise KeyboardInterrupt
 
-                src, dst, dst_canonical, theta_restore, same_mask = self.fetch_sample()
+                src, dst, dst_canonical, theta_restore, same_mask = self.dataset.next()
                 self._step_in_progress = True
 
                 # ========================= 生成器前向 =========================
@@ -840,50 +868,27 @@ class Trainer:
                 self.net_d.requires_grad_(True)
                 self.net_d_coarse.requires_grad_(True)
                 self.optim_d.zero_grad(set_to_none=True)
-                hq_r1_step = self.enable_hq_r1_loss and self.completed_step % self.hq_r1_reg_step == 0
-                coarse_r1_step = self.enable_coarse_r1_loss and self.completed_step % self.coarse_r1_reg_step == 0
-
-                if hq_r1_step:
-                    with autocast(device_type="cuda", enabled=False):
-                        fake_img = fake.detach().float()
-                        real_img = dst.detach().float().requires_grad_(True)
-                        fake_score = self.net_d(fake_img)
-                        real_score = self.net_d(real_img)
-                        hq_d_loss = self.d_loss(fake_score, real_score)
-                        hq_r1_loss_raw = r1_reg_loss(real_score, real_img, gamma=self.hq_r1_gamma)
-                        hq_r1_loss = hq_r1_loss_raw * self.hq_r1_reg_step
-                        self.log("hq_r1_loss_raw", hq_r1_loss_raw, force=True)
-                        self.log("hq_r1_loss", hq_r1_loss, force=True)
-                        hq_d_total = hq_d_loss + hq_r1_loss
-                else:
-                    with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                        fake_score = net_d(fake.detach())
-                        real_score = net_d(dst.detach())
-                        hq_d_loss = self.d_loss(fake_score, real_score)
-                        hq_d_total = hq_d_loss
-
-                if coarse_r1_step:
-                    with autocast(device_type="cuda", enabled=False):
-                        fake_coarse_img = coarse.detach().float()
-                        real_coarse_img = NF.interpolate(dst.detach().float(), size=(self.coarse_resolution, self.coarse_resolution), mode="bilinear", align_corners=False).requires_grad_(True)
-                        fake_coarse_score = self.net_d_coarse(fake_coarse_img)
-                        real_coarse_score = self.net_d_coarse(real_coarse_img)
-                        coarse_d_loss = self.d_loss(fake_coarse_score, real_coarse_score)
-                        coarse_r1_loss_raw = r1_reg_loss(real_coarse_score, real_coarse_img, gamma=self.coarse_r1_gamma)
-                        coarse_r1_loss = coarse_r1_loss_raw * self.coarse_r1_reg_step
-                        self.log("coarse_r1_loss_raw", coarse_r1_loss_raw, force=True)
-                        self.log("coarse_r1_loss", coarse_r1_loss, force=True)
-                        coarse_d_total = coarse_d_loss + coarse_r1_loss
-                else:
-                    with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                        real_coarse = NF.interpolate(dst.detach(), size=(self.coarse_resolution, self.coarse_resolution), mode="bilinear", align_corners=False)
-                        fake_coarse_score = net_d_coarse(coarse.detach())
-                        real_coarse_score = net_d_coarse(real_coarse)
-                        coarse_d_loss = self.d_loss(fake_coarse_score, real_coarse_score)
-                        coarse_d_total = coarse_d_loss
-
-                self.log("hq_d_loss", hq_d_loss)
-                self.log("coarse_d_loss", coarse_d_loss)
+                hq_d_total = self._discriminator_stage_loss(
+                    "hq",
+                    fake,
+                    dst,
+                    self.net_d,
+                    net_d,
+                    r1_enabled=self.enable_hq_r1_loss,
+                    r1_interval=self.hq_r1_reg_step,
+                    r1_gamma=self.hq_r1_gamma,
+                )
+                real_coarse = NF.interpolate(dst, size=(self.coarse_resolution, self.coarse_resolution), mode="bilinear", align_corners=False)
+                coarse_d_total = self._discriminator_stage_loss(
+                    "coarse",
+                    coarse,
+                    real_coarse,
+                    self.net_d_coarse,
+                    net_d_coarse,
+                    r1_enabled=self.enable_coarse_r1_loss,
+                    r1_interval=self.coarse_r1_reg_step,
+                    r1_gamma=self.coarse_r1_gamma,
+                )
                 d_loss = hq_d_total + coarse_d_total
 
                 _ensure_finite_loss("d_loss", d_loss)
@@ -1034,7 +1039,7 @@ class Trainer:
                     self.save_ckpt()
 
                 if self.completed_step % self.sample_save_every == 0:
-                    self._save_sample(sample_batch, (src, dst, dst_canonical, theta_restore, same_mask))
+                    self._save_sample(sample_reference, (src, dst, dst_canonical, theta_restore, same_mask))
 
 
 def _load_run_config(paths: RunPaths) -> dict[str, Any]:
