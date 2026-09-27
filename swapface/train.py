@@ -688,6 +688,130 @@ class Trainer:
         self.log(f"{stage}_d_loss", adversarial_loss)
         return total
 
+    def _coarse_generator_stage_loss(
+        self,
+        coarse: Tensor,
+        dst_canonical: Tensor,
+        theta_restore: Tensor,
+        source_identity_faces: Tensor,
+        shared_source_identity_embeddings: Tensor | None,
+        restore_grid: Tensor | None,
+    ) -> Tensor:
+        """计算 Coarse stage 的全部 Generator 训练目标。"""
+        coarse_gan_loss = self.coarse_gan_loss(self.train_d_coarse(coarse))
+        self.log("coarse_gan_loss", coarse_gan_loss)
+        total = coarse_gan_loss
+
+        with torch.no_grad():
+            source_identity_embeddings = shared_source_identity_embeddings
+            if source_identity_embeddings is None:
+                source_identity_embeddings = self.coarse_identity_embeddings_forward(source_identity_faces)
+        coarse_identity_embeddings = self.coarse_identity_embeddings_forward(self.prepare_identity_encoder_faces(coarse, theta_restore))
+        coarse_id_loss = self.coarse_id_loss(coarse_identity_embeddings, source_identity_embeddings)
+        self.log("coarse_id_loss", coarse_id_loss)
+        total = total + coarse_id_loss
+
+        geometry_enabled = self.enable_coarse_gaze_loss or self.enable_coarse_hrffa_loss or self.enable_coarse_facs_loss
+        if geometry_enabled:
+            if restore_grid is None:
+                raise RuntimeError("Coarse geometry loss 需要 restore_grid")
+            with autocast(device_type="cuda", enabled=False):
+                coarse_full = NF.interpolate(coarse.float(), size=restore_grid.shape[1:3], mode="bilinear", align_corners=False)
+                coarse_restored = NF.grid_sample(coarse_full, restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+
+            if self.enable_coarse_gaze_loss:
+                coarse_gaze_loss = self.coarse_gaze_loss_forward(coarse_restored, dst_canonical)
+                self.log("coarse_gaze_loss", coarse_gaze_loss)
+                total = total + coarse_gaze_loss
+
+            if self.enable_coarse_hrffa_loss:
+                coarse_hrffa_components = self.coarse_hrffa_loss.forward_components(coarse_restored, dst_canonical)
+                for name, component in coarse_hrffa_components.items():
+                    self.log(f"coarse_hrffa_{name}_loss", component)
+                total = total + torch.stack(tuple(coarse_hrffa_components.values())).sum()
+
+            if self.enable_coarse_facs_loss:
+                coarse_facs_components = self.coarse_facs_loss.forward_components(coarse_restored, dst_canonical)
+                for name, component in coarse_facs_components.items():
+                    self.log(f"coarse_facs_{name}_loss", component)
+                total = total + torch.stack(tuple(coarse_facs_components.values())).sum()
+
+        return total
+
+    def _hq_generator_stage_loss(
+        self,
+        fake: Tensor,
+        dst: Tensor,
+        dst_canonical: Tensor,
+        theta_restore: Tensor,
+        same_mask: Tensor,
+        source_identity_faces: Tensor,
+        shared_source_identity_embeddings: Tensor | None,
+        restore_grid: Tensor | None,
+    ) -> Tensor:
+        """计算 HQ stage 的全部 Generator 训练目标。"""
+        if self.enable_hq_wfm_loss:
+            fake_score, fake_feats = self.train_d(fake, True)
+        else:
+            fake_score = self.train_d(fake)
+        hq_gan_loss = self.hq_gan_loss(fake_score)
+        self.log("hq_gan_loss", hq_gan_loss)
+        total = hq_gan_loss
+
+        if self.enable_hq_wfm_loss:
+            with torch.no_grad():
+                real_feats = self.train_d_features(dst, self.hq_wfm_max_layer)
+            hq_wfm_loss = self.hq_wfm_loss(fake_feats, real_feats)
+            self.log("hq_wfm_loss", hq_wfm_loss)
+            total = total + hq_wfm_loss
+
+        with torch.no_grad():
+            source_identity_embeddings = shared_source_identity_embeddings
+            if source_identity_embeddings is None:
+                source_identity_embeddings = self.hq_identity_embeddings_forward(source_identity_faces)
+        hq_identity_embeddings = self.hq_identity_embeddings_forward(self.prepare_identity_encoder_faces(fake, theta_restore))
+        hq_id_loss = self.hq_id_loss(hq_identity_embeddings, source_identity_embeddings)
+        self.log("hq_id_loss", hq_id_loss)
+        total = total + hq_id_loss
+
+        geometry_enabled = self.enable_hq_gaze_loss or self.enable_hq_hrffa_loss or self.enable_hq_facs_loss
+        if geometry_enabled:
+            if restore_grid is None:
+                raise RuntimeError("HQ geometry loss 需要 restore_grid")
+            with autocast(device_type="cuda", enabled=False):
+                fake_restored = NF.grid_sample(fake.float(), restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+
+            if self.enable_hq_gaze_loss:
+                hq_gaze_loss = self.hq_gaze_loss_forward(fake_restored, dst_canonical)
+                self.log("hq_gaze_loss", hq_gaze_loss)
+                total = total + hq_gaze_loss
+
+            if self.enable_hq_hrffa_loss:
+                hq_hrffa_components = self.hq_hrffa_loss.forward_components(fake_restored, dst_canonical)
+                for name, component in hq_hrffa_components.items():
+                    self.log(f"hq_hrffa_{name}_loss", component)
+                total = total + torch.stack(tuple(hq_hrffa_components.values())).sum()
+
+            if self.enable_hq_facs_loss:
+                hq_facs_components = self.hq_facs_loss.forward_components(fake_restored, dst_canonical)
+                for name, component in hq_facs_components.items():
+                    self.log(f"hq_facs_{name}_loss", component)
+                total = total + torch.stack(tuple(hq_facs_components.values())).sum()
+
+        if self.enable_hq_vgg_loss:
+            hq_vgg_per_sample = self.hq_vgg_loss_forward(fake, dst)
+            hq_vgg_loss = _reduce_reconstruction_loss(hq_vgg_per_sample, same_mask, self.reconstruction_scope)
+            self.log("hq_vgg_loss", hq_vgg_loss)
+            total = total + hq_vgg_loss
+
+        if self.enable_hq_l1_loss:
+            hq_l1_per_sample = self.hq_l1_loss(fake, dst).flatten(1).mean(dim=1)
+            hq_l1_loss = _reduce_reconstruction_loss(hq_l1_per_sample, same_mask, self.reconstruction_scope)
+            self.log("hq_l1_loss", hq_l1_loss)
+            total = total + hq_l1_loss
+
+        return total
+
     @torch.no_grad()
     def update_ema(self, decay: float = 0.999) -> None:
 
@@ -856,11 +980,9 @@ class Trainer:
                     with torch.no_grad():
                         source_identity_faces = self.prepare_identity_encoder_faces(src)
                         generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
-                        hq_source_identity_embeddings = self.hq_identity_embeddings_forward(source_identity_faces)
+                        shared_source_identity_embeddings = None
                         if self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
-                            coarse_source_identity_embeddings = hq_source_identity_embeddings
-                        else:
-                            coarse_source_identity_embeddings = self.coarse_identity_embeddings_forward(source_identity_faces)
+                            shared_source_identity_embeddings = self.hq_identity_embeddings_forward(source_identity_faces)
                     coarse = net_coarse(dst, generator_identity_embeddings)
                     fake = net_hq(dst, coarse.detach())
 
@@ -926,87 +1048,32 @@ class Trainer:
                             fake = net_hq(dst, coarse.detach())
 
                     with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                        # adversarial losses
-                        if self.enable_hq_wfm_loss:
-                            fake_score, fake_feats = net_d(fake, True)
-                        else:
-                            fake_score = net_d(fake)
-                        hq_gan_loss = self.hq_gan_loss(fake_score)
-                        coarse_gan_loss = self.coarse_gan_loss(net_d_coarse(coarse))
-                        self.log("hq_gan_loss", hq_gan_loss)
-                        self.log("coarse_gan_loss", coarse_gan_loss)
-                        g_loss = hq_gan_loss + coarse_gan_loss
-
-                        if self.enable_hq_wfm_loss:
-                            with torch.no_grad():
-                                real_feats = self.train_d_features(dst, self.hq_wfm_max_layer)
-                            hq_wfm_loss = self.hq_wfm_loss(fake_feats, real_feats)
-                            self.log("hq_wfm_loss", hq_wfm_loss)
-                            g_loss = g_loss + hq_wfm_loss
-
-                        hq_identity_embeddings = self.hq_identity_embeddings_forward(self.prepare_identity_encoder_faces(fake, theta_restore))
-                        hq_id_loss = self.hq_id_loss(hq_identity_embeddings, hq_source_identity_embeddings)
-                        self.log("hq_id_loss", hq_id_loss)
-                        g_loss = g_loss + hq_id_loss
-
-                        coarse_identity_embeddings = self.coarse_identity_embeddings_forward(self.prepare_identity_encoder_faces(coarse, theta_restore))
-                        coarse_id_loss = self.coarse_id_loss(coarse_identity_embeddings, coarse_source_identity_embeddings)
-                        self.log("coarse_id_loss", coarse_id_loss)
-                        g_loss = g_loss + coarse_id_loss
-
                         hq_geometry_enabled = self.enable_hq_gaze_loss or self.enable_hq_hrffa_loss or self.enable_hq_facs_loss
                         coarse_geometry_enabled = self.enable_coarse_gaze_loss or self.enable_coarse_hrffa_loss or self.enable_coarse_facs_loss
+                        restore_grid = None
                         if hq_geometry_enabled or coarse_geometry_enabled:
                             with autocast(device_type="cuda", enabled=False):
-                                restore_grid = NF.affine_grid(theta_restore.float(), size=list(fake.shape), align_corners=False)
-                                if hq_geometry_enabled:
-                                    fake_restored = NF.grid_sample(fake.float(), restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
-                                if coarse_geometry_enabled:
-                                    coarse_full = NF.interpolate(coarse.float(), size=fake.shape[-2:], mode="bilinear", align_corners=False)
-                                    coarse_restored = NF.grid_sample(coarse_full, restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+                                restore_grid = NF.affine_grid(theta_restore.float(), size=list(dst.shape), align_corners=False)
 
-                        if self.enable_hq_gaze_loss:
-                            hq_gaze_loss = self.hq_gaze_loss_forward(fake_restored, dst_canonical)
-                            self.log("hq_gaze_loss", hq_gaze_loss)
-                            g_loss = g_loss + hq_gaze_loss
-                        if self.enable_coarse_gaze_loss:
-                            coarse_gaze_loss = self.coarse_gaze_loss_forward(coarse_restored, dst_canonical)
-                            self.log("coarse_gaze_loss", coarse_gaze_loss)
-                            g_loss = g_loss + coarse_gaze_loss
-
-                        if self.enable_hq_hrffa_loss:
-                            hq_hrffa_components = self.hq_hrffa_loss.forward_components(fake_restored, dst_canonical)
-                            for name, component in hq_hrffa_components.items():
-                                self.log(f"hq_hrffa_{name}_loss", component)
-                            g_loss = g_loss + torch.stack(tuple(hq_hrffa_components.values())).sum()
-                        if self.enable_coarse_hrffa_loss:
-                            coarse_hrffa_components = self.coarse_hrffa_loss.forward_components(coarse_restored, dst_canonical)
-                            for name, component in coarse_hrffa_components.items():
-                                self.log(f"coarse_hrffa_{name}_loss", component)
-                            g_loss = g_loss + torch.stack(tuple(coarse_hrffa_components.values())).sum()
-
-                        if self.enable_hq_facs_loss:
-                            hq_facs_components = self.hq_facs_loss.forward_components(fake_restored, dst_canonical)
-                            for name, component in hq_facs_components.items():
-                                self.log(f"hq_facs_{name}_loss", component)
-                            g_loss = g_loss + torch.stack(tuple(hq_facs_components.values())).sum()
-                        if self.enable_coarse_facs_loss:
-                            coarse_facs_components = self.coarse_facs_loss.forward_components(coarse_restored, dst_canonical)
-                            for name, component in coarse_facs_components.items():
-                                self.log(f"coarse_facs_{name}_loss", component)
-                            g_loss = g_loss + torch.stack(tuple(coarse_facs_components.values())).sum()
-
-                        if self.enable_hq_vgg_loss:
-                            hq_vgg_per_sample = self.hq_vgg_loss_forward(fake, dst)
-                            hq_vgg_loss = _reduce_reconstruction_loss(hq_vgg_per_sample, same_mask, self.reconstruction_scope)
-                            self.log("hq_vgg_loss", hq_vgg_loss)
-                            g_loss = g_loss + hq_vgg_loss
-
-                        if self.enable_hq_l1_loss:
-                            hq_l1_per_sample = self.hq_l1_loss(fake, dst).flatten(1).mean(dim=1)
-                            hq_l1_loss = _reduce_reconstruction_loss(hq_l1_per_sample, same_mask, self.reconstruction_scope)
-                            self.log("hq_l1_loss", hq_l1_loss)
-                            g_loss = g_loss + hq_l1_loss
+                        coarse_g_loss = self._coarse_generator_stage_loss(
+                            coarse,
+                            dst_canonical,
+                            theta_restore,
+                            source_identity_faces,
+                            shared_source_identity_embeddings,
+                            restore_grid,
+                        )
+                        hq_g_loss = self._hq_generator_stage_loss(
+                            fake,
+                            dst,
+                            dst_canonical,
+                            theta_restore,
+                            same_mask,
+                            source_identity_faces,
+                            shared_source_identity_embeddings,
+                            restore_grid,
+                        )
+                        g_loss = coarse_g_loss + hq_g_loss
 
                     _ensure_finite_loss("g_loss", g_loss)
                     if _scaled_backward_step(

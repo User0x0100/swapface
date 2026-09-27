@@ -519,7 +519,77 @@ def _check_generator_responsibility_boundary() -> None:
     discriminator_stage_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer._discriminator_stage_loss)))
     r1_branches = [node for node in ast.walk(discriminator_stage_tree) if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "r1_step"]
     assert len(r1_branches) == 1
-    print("PASS: HQ/Coarse gradients and R1 execution paths remain independent")
+
+    generator_stage_calls = [
+        node.func.attr
+        for node in ast.walk(train_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and node.func.attr in {"_coarse_generator_stage_loss", "_hq_generator_stage_loss"}
+    ]
+    assert generator_stage_calls.count("_coarse_generator_stage_loss") == 1
+    assert generator_stage_calls.count("_hq_generator_stage_loss") == 1
+
+    def self_calls(method: object) -> set[str]:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
+        return {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        }
+
+    coarse_calls = self_calls(Trainer._coarse_generator_stage_loss)
+    hq_calls = self_calls(Trainer._hq_generator_stage_loss)
+    assert {"train_d_coarse", "coarse_gan_loss", "coarse_identity_embeddings_forward", "coarse_id_loss"}.issubset(coarse_calls)
+    assert {"train_d", "hq_gan_loss", "hq_identity_embeddings_forward", "hq_id_loss"}.issubset(hq_calls)
+    assert not {"train_d", "hq_gan_loss", "hq_id_loss"} & coarse_calls
+    assert not {"train_d_coarse", "coarse_gan_loss", "coarse_id_loss"} & hq_calls
+
+    def forward_component_owners(method: object) -> set[str]:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
+        owners = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or node.func.attr != "forward_components":
+                continue
+            owner = node.func.value
+            if isinstance(owner, ast.Attribute) and isinstance(owner.value, ast.Name) and owner.value.id == "self":
+                owners.add(owner.attr)
+        return owners
+
+    assert forward_component_owners(Trainer._coarse_generator_stage_loss) == {"coarse_hrffa_loss", "coarse_facs_loss"}
+    assert forward_component_owners(Trainer._hq_generator_stage_loss) == {"hq_hrffa_loss", "hq_facs_loss"}
+
+    affine_grid_calls = [
+        node
+        for node in ast.walk(train_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "affine_grid"
+    ]
+    assert len(affine_grid_calls) == 1
+    size_keyword = next(item for item in affine_grid_calls[0].keywords if item.arg == "size")
+    assert isinstance(size_keyword.value, ast.Call) and isinstance(size_keyword.value.func, ast.Name) and size_keyword.value.func.id == "list"
+    size_arg = size_keyword.value.args[0]
+    assert isinstance(size_arg, ast.Attribute) and isinstance(size_arg.value, ast.Name) and size_arg.value.id == "dst" and size_arg.attr == "shape"
+
+    train_source_teacher_calls = [
+        node
+        for node in ast.walk(train_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and node.func.attr in {"hq_identity_embeddings_forward", "coarse_identity_embeddings_forward"}
+    ]
+    assert len(train_source_teacher_calls) == 1
+    assert train_source_teacher_calls[0].func.attr == "hq_identity_embeddings_forward"
+    assert isinstance(train_source_teacher_calls[0].args[0], ast.Name) and train_source_teacher_calls[0].args[0].id == "source_identity_faces"
+    print("PASS: HQ/Coarse gradients, losses, teachers and R1 execution paths remain independent")
 
 
 def _check_sample_gradient_maps() -> None:
