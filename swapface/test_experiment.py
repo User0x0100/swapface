@@ -1,9 +1,11 @@
 """训练 run / branch / scheduler 的无 GPU 回归检查。"""
 
+import ast
 import copy
 import inspect
 import json
 import tempfile
+import textwrap
 import tomllib
 from pathlib import Path
 from unittest.mock import patch
@@ -17,7 +19,6 @@ from swapface.experiment import RunLock, RunPaths, config_sha256, create_run, lo
 from swapface.train import (
     TRAINING_SEMANTICS_VERSION,
     Trainer,
-    _assert_branch_generator_compatible,
     _branch_model_states,
     _compile_training_callable,
     _load_branch_checkpoint,
@@ -101,7 +102,6 @@ def _check_train_config(root: Path) -> None:
     default_generator["generator"].pop("coarse_num_latent")
     default_generator_resolved = resolve_train_config(default_generator)
     assert default_generator_resolved["generator"]["coarse_num_latent"] == 8
-    _assert_branch_generator_compatible(json.loads(json.dumps(default_generator_resolved)), default_generator_resolved)
 
     paths = create_run(root / "config-runs", source, resolved, name="canonical")
     assert load_resolved_config(paths) == resolved
@@ -410,7 +410,7 @@ def _check_scaled_optimizer_step() -> None:
     print("PASS: FP16 overflow remains recoverable; BF16/FP32 non-finite gradients are blocked before optimizer.step")
 
 
-def _check_joint_generator_gradient() -> None:
+def _check_generator_responsibility_boundary() -> None:
     model = Generator(
         img_resolution=16,
         img_channels=3,
@@ -426,18 +426,44 @@ def _check_joint_generator_gradient() -> None:
     )
     target = torch.randn(2, 3, 16, 16)
     identity = torch.randn(2, 8)
-    fake = model(target, identity)
+
+    coarse = model.coarse(target, identity)
+    fake = model.hq(target, coarse.detach())
     fake.square().mean().backward()
 
     coarse_has_gradient = any(parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0 for parameter in model.coarse.parameters())
     hq_has_gradient = any(parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0 for parameter in model.hq.parameters())
-    assert coarse_has_gradient and hq_has_gradient
-    print("PASS: final Generator loss backpropagates through HQ into Coarse")
+    assert not coarse_has_gradient and hq_has_gradient
+
+    model.zero_grad(set_to_none=True)
+    coarse = model.coarse(target, identity)
+    coarse.square().mean().backward()
+    coarse_has_gradient = any(parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0 for parameter in model.coarse.parameters())
+    assert coarse_has_gradient
+
+    train_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer.train)))
+    detach_boundaries = 0
+    for node in ast.walk(train_tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name) or node.func.id != "net_hq" or len(node.args) < 2:
+            continue
+        coarse_arg = node.args[1]
+        if (
+            isinstance(coarse_arg, ast.Call)
+            and isinstance(coarse_arg.func, ast.Attribute)
+            and coarse_arg.func.attr == "detach"
+            and isinstance(coarse_arg.func.value, ast.Name)
+            and coarse_arg.func.value.id == "coarse"
+            and not coarse_arg.args
+            and not coarse_arg.keywords
+        ):
+            detach_boundaries += 1
+    assert detach_boundaries == 2
+    print("PASS: Final/HQ gradients are isolated from Coarse; Trainer keeps both detach boundaries")
 
 
 def main() -> None:
     _check_reconstruction_scope()
-    _check_joint_generator_gradient()
+    _check_generator_responsibility_boundary()
     _check_step_boundary()
     _check_scaled_optimizer_step()
     # ROCm 不使用 NVIDIA compute capability；CUDA 继续保持 SM80+ 的 compile-BF16 限制。
@@ -506,19 +532,19 @@ def main() -> None:
         ema_g_state = {"marker": torch.tensor(1)}
         train_g_state = {"marker": torch.tensor(2)}
         d_state = {"marker": torch.tensor(3)}
+        coarse_d_state = {"marker": torch.tensor(4)}
         torch.save(
             {
                 "version": CHECKPOINT_VERSION,
                 "step": 7500,
                 "run": {"id": metadata["run_id"], "config_sha256": metadata["config_sha256"]},
-                "training_config": {
-                    "semantics_version": TRAINING_SEMANTICS_VERSION,
-                    "precision": "fp16",
-                    "optimizer": {"lr": 1e-4},
-                    "scheduler": {"type": "none", "t_max": 20000, "min_lr_ratio": 0.1},
-                },
+                "training_config": {"semantics_version": TRAINING_SEMANTICS_VERSION, "precision": "fp16"},
                 "net_g": {"network_cfg": resolved["generator"], "state_dict": ema_g_state},
                 "net_d": {"network_cfg": resolved["discriminator"], "state_dict": d_state},
+                "net_d_coarse": {
+                    "network_cfg": {**resolved["discriminator"], "img_resolution": resolved["generator"]["coarse_resolution"]},
+                    "state_dict": coarse_d_state,
+                },
                 "training_state": {"net_g": train_g_state},
             },
             standalone,
@@ -537,35 +563,53 @@ def main() -> None:
             "config_sha256": metadata["config_sha256"],
             "discriminator": "inherit",
         }
-        branch_g_state, branch_d_state = _branch_model_states(loaded, reset_discriminator=False)
+        branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(loaded, reset_discriminator=False)
         assert branch_g_state["marker"].item() == 2  # training G, not EMA G
         assert branch_d_state is not None and branch_d_state["marker"].item() == 3
-        branch_g_state, branch_d_state = _branch_model_states(loaded, reset_discriminator=True)
-        assert branch_g_state["marker"].item() == 2 and branch_d_state is None
+        assert branch_d_coarse_state is not None and branch_d_coarse_state["marker"].item() == 4
+        branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(loaded, reset_discriminator=True)
+        assert branch_g_state["marker"].item() == 2 and branch_d_state is None and branch_d_coarse_state is None
 
         invalid_training_config = dict(loaded)
+        invalid_training_config["training_config"] = {"precision": "fp16"}
+        try:
+            _require_resume_training_config(invalid_training_config)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("缺少 semantics_version 的 checkpoint 被错误接受")
+
         invalid_training_config["training_config"] = {
+            "semantics_version": str(TRAINING_SEMANTICS_VERSION),
             "precision": "fp16",
-            "optimizer": {"lr": 1e-4},
-            "scheduler": {"type": "none", "t_max": 20000, "min_lr_ratio": 0.1},
         }
         try:
             _require_resume_training_config(invalid_training_config)
         except TypeError:
             pass
         else:
-            raise AssertionError("缺少 semantics_version 的旧训练 checkpoint 被错误接受")
+            raise AssertionError("错误类型的 semantics_version 被错误接受")
+
+        invalid_training_config["training_config"] = {
+            "semantics_version": TRAINING_SEMANTICS_VERSION,
+            "precision": "fp16",
+            "legacy": True,
+        }
+        try:
+            _require_resume_training_config(invalid_training_config)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("含未知字段的 training_config 被错误接受")
 
         parent = dict(standalone_parent)
         branch = create_run(runs_root, source_config, resolved, name="branch", parent=parent)
         assert json.loads(branch.metadata.read_text(encoding="utf-8"))["parent"] == parent
 
-        _assert_branch_generator_compatible(resolved, dict(resolved))
-
         changed_generator = copy.deepcopy(resolved)
         changed_generator["generator"]["coarse_resolution"] = 256
         try:
-            _assert_branch_generator_compatible(resolved, changed_generator)
+            _load_branch_checkpoint(standalone, changed_generator, reset_discriminator=False)
         except ValueError:
             pass
         else:
@@ -584,7 +628,7 @@ def main() -> None:
 
         changed_provider = copy.deepcopy(resolved)
         changed_provider["identity"]["provider"] = "MS1MV3_ARCFACE_R50_FP16"
-        _assert_branch_generator_compatible(resolved, changed_provider)
+        _load_branch_checkpoint(standalone, changed_provider, reset_discriminator=False)
 
         document = json.loads(first.resolved_config.read_text(encoding="utf-8"))
         document["config"]["train"]["batch_size"] = 16
