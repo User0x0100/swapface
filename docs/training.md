@@ -61,7 +61,7 @@ uv run python -m swapface.train \
 
 训练配置只存在一套 canonical schema；`swapface/config.py` 负责默认值、严格校验和 canonical 化，`Trainer` 直接消费该结构，不再维护第二套扁平配置参数。顶层职责为：
 
-- `[train]`：batch、precision、device、compile 与输出周期；
+- `[train]`：训练 stage、batch、precision、device、compile 与输出周期；
 - `[optimizer]` / `[scheduler]`：优化器学习率与调度策略；
 - `[identity]`：Generator 的 source identity 条件编码器；
 - `[loss.*]`：每一种训练损失及其共享 reconstruction 策略；
@@ -73,7 +73,13 @@ Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失�
 
 ## Generator 梯度职责
 
-Coarse 与 HQRefiner 在同一个 iteration、同一个 Generator optimizer 中同时训练，但 HQ 输入使用 `coarse.detach()`。因此 Final/HQ losses 不会反向修改 Coarse；Coarse 只由自己的 coarse losses 更新。
+`[train].stage` 决定 active training stage：
+
+- `joint`：Coarse 与 HQRefiner 在同一个 iteration 中同时训练；
+- `coarse`：只训练 Coarse 与 Coarse Discriminator，不执行 HQ forward、HQ D 或 HQ losses；
+- `hq`：Coarse 作为冻结的 conditioner 在 `no_grad` 下前向，只训练 HQRefiner 与 HQ Discriminator。
+
+三个模式继续共用现有 Generator/Discriminator optimizer、scheduler 与 GradScaler；inactive stage 参数没有 gradient，因此不会被 optimizer 更新。EMA 也只更新 active Generator stage。`hq` 模式下 HQ 输入仍使用冻结 Coarse 的输出；`joint` 模式下 HQ 输入使用 `coarse.detach()`，因此 Final/HQ losses 不会反向修改 Coarse。
 
 - Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、R1，以及 gaze / HRFFA / FACS target 属性监督；
 - HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/R1/WFM、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
@@ -127,7 +133,7 @@ experiments/
 - `metadata.json`：只记录 run ID、状态、配置摘要和可选的 branch 父来源。
 - `latest.json`：很小的最新 checkpoint 指针，不复制大模型文件，适合本地文件系统和对象存储。
 - `checkpoints/`：完整训练状态。
-- `samples/`：与 completed step 对齐的训练可视化；依次包含 src、dst、Coarse、HQ、canonical dst、HQ Identity 输入，以及 Coarse/HQ 各自的判别器梯度图和 Identity 梯度图。
+- `samples/`：与 completed step 对齐的训练可视化；基础图包含 src、dst、Coarse、HQ、canonical dst、HQ Identity 输入，之后仅附加 active stage 的判别器梯度图和 Identity 梯度图。
 - `tensorboard/`：TensorBoard event 文件；一次 resume 可能新增 event 文件，这是正常现象。
 
 `experiments/*.toml` 可以进入 Git；`experiments/*/` 属于运行生成物，默认忽略。
@@ -172,7 +178,7 @@ uv run python -m swapface.train \
 
 ## Branch：从已有 checkpoint 派生新实验
 
-Branch 是一条新的训练时间线，不是 resume。它从父 checkpoint 的**训练态 Generator**继续，默认同时继承父 Discriminator 权重；optimizer、scheduler 和 GradScaler 重新初始化。`completed_step` 默认继承父 checkpoint，便于直接比较分支前后的 TensorBoard loss 趋势：
+Branch 是一条新的训练时间线，不是 resume。它从父 checkpoint 的**训练态 Generator**继续，默认同时继承父 Discriminator 权重；optimizer、scheduler 和 GradScaler 重新初始化。新配置可以改变 `[train].stage`，因此从 joint checkpoint 派生 `hq` 或 `coarse` 单 stage run 应使用 branch，而不是 resume。`completed_step` 默认继承父 checkpoint，便于直接比较分支前后的 TensorBoard loss 趋势：
 
 ```bash
 uv run python -m swapface.train \
@@ -229,7 +235,7 @@ uv run python -m swapface.train \
 
 此时程序比较 checkpoint 中记录的实际 `training_config.precision` 与当前进程实际生效的精度；不一致时拒绝 resume。`--strict-precision` 是本次 resume 的运行时策略，不写入 TOML，也不能用于 fresh training。
 
-训练 checkpoint 还记录 `training_config.semantics_version`。它只约束 resume，用于阻止训练代码语义已经改变时继续恢复旧 optimizer/scheduler/scaler 状态；Branch 不恢复这些状态，因此不检查该版本。纯推理/导出仍只依赖模型 checkpoint 格式。
+训练 checkpoint 还记录 `training_config.semantics_version` 和实际 `stage`。它们约束 resume，用于阻止训练代码语义或 active stage 已经改变时继续恢复旧 optimizer/scheduler/scaler 状态；Branch 不恢复这些状态，因此允许通过新配置切换 stage。纯推理/导出仍只依赖模型 checkpoint 格式。
 
 ## 配置冻结与哈希
 

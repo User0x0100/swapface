@@ -56,7 +56,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 6
+TRAINING_SEMANTICS_VERSION = 7
 
 
 def _configure_training_runtime() -> None:
@@ -136,7 +136,7 @@ def _require_resume_training_config(checkpoint: Mapping[str, Any]) -> dict[str, 
     if not isinstance(training_config, dict):
         raise TypeError("checkpoint.training_config 必须为 dict")
 
-    expected_keys = {"semantics_version", "precision"}
+    expected_keys = {"semantics_version", "precision", "stage"}
     actual_keys = set(training_config)
     if actual_keys != expected_keys:
         missing = sorted(expected_keys - actual_keys)
@@ -154,6 +154,10 @@ def _require_resume_training_config(checkpoint: Mapping[str, Any]) -> dict[str, 
         raise TypeError("checkpoint.training_config.precision 必须为 str")
     if precision not in {"fp32", "fp16", "bf16"}:
         raise ValueError(f"checkpoint.training_config.precision 无效：{precision!r}")
+
+    stage = training_config["stage"]
+    if not isinstance(stage, str) or stage not in {"joint", "coarse", "hq"}:
+        raise ValueError(f"checkpoint.training_config.stage 无效：{stage!r}")
 
     return training_config
 
@@ -206,6 +210,9 @@ class Trainer:
 
         lr = float(optimizer_config["lr"])
         compile_module = bool(train_config["compile_module"])
+        self.train_stage = str(train_config["stage"])
+        self.coarse_stage_active = self.train_stage in {"joint", "coarse"}
+        self.hq_stage_active = self.train_stage in {"joint", "hq"}
         self.batch_size = int(train_config["batch_size"])
         self.log_interval = int(train_config["log_interval"])
         self.sample_save_every = int(train_config["sample_save_every"])
@@ -234,21 +241,21 @@ class Trainer:
         self.coarse_identity_loss_provider = IDEncoderProvider[str(coarse_identity_config["provider"])]
         self.hq_identity_loss_provider = IDEncoderProvider[str(hq_identity_config["provider"])]
         self.reconstruction_scope = reconstruction_scope
-        self.enable_coarse_r1_loss = bool(coarse_r1_config["enable"])
+        self.enable_coarse_r1_loss = self.coarse_stage_active and bool(coarse_r1_config["enable"])
         self.coarse_r1_reg_step = int(coarse_r1_config["interval"])
         self.coarse_r1_gamma = float(coarse_r1_config["gamma"])
-        self.enable_hq_r1_loss = bool(hq_r1_config["enable"])
+        self.enable_hq_r1_loss = self.hq_stage_active and bool(hq_r1_config["enable"])
         self.hq_r1_reg_step = int(hq_r1_config["interval"])
         self.hq_r1_gamma = float(hq_r1_config["gamma"])
-        self.enable_hq_l1_loss = bool(l1_config["enable"])
-        self.enable_coarse_gaze_loss = bool(coarse_gaze_config["enable"])
-        self.enable_hq_gaze_loss = bool(hq_gaze_config["enable"])
-        self.enable_coarse_hrffa_loss = bool(coarse_hrffa_config["enable"])
-        self.enable_hq_hrffa_loss = bool(hq_hrffa_config["enable"])
-        self.enable_coarse_facs_loss = bool(coarse_facs_config["enable"])
-        self.enable_hq_facs_loss = bool(hq_facs_config["enable"])
-        self.enable_hq_vgg_loss = bool(vgg_config["enable"])
-        self.enable_hq_wfm_loss = bool(wfm_config["enable"])
+        self.enable_hq_l1_loss = self.hq_stage_active and bool(l1_config["enable"])
+        self.enable_coarse_gaze_loss = self.coarse_stage_active and bool(coarse_gaze_config["enable"])
+        self.enable_hq_gaze_loss = self.hq_stage_active and bool(hq_gaze_config["enable"])
+        self.enable_coarse_hrffa_loss = self.coarse_stage_active and bool(coarse_hrffa_config["enable"])
+        self.enable_hq_hrffa_loss = self.hq_stage_active and bool(hq_hrffa_config["enable"])
+        self.enable_coarse_facs_loss = self.coarse_stage_active and bool(coarse_facs_config["enable"])
+        self.enable_hq_facs_loss = self.hq_stage_active and bool(hq_facs_config["enable"])
+        self.enable_hq_vgg_loss = self.hq_stage_active and bool(vgg_config["enable"])
+        self.enable_hq_wfm_loss = self.hq_stage_active and bool(wfm_config["enable"])
 
         dataloader_cfg = {**data_config["loader"], **data_config["augmentation"], **data_config["sampling"]}
         dataloader_cfg["decoder_backend"] = ImageDecoderBackend(dataloader_cfg["decoder_backend"])
@@ -292,6 +299,7 @@ class Trainer:
         self.training_config = {
             "semantics_version": TRAINING_SEMANTICS_VERSION,
             "precision": self.precision,
+            "stage": self.train_stage,
         }
 
         if checkpoint_mode not in ("resume", "branch"):
@@ -342,6 +350,9 @@ class Trainer:
 
                 saved_training_config = _require_resume_training_config(checkpoint)
                 saved_precision = str(saved_training_config["precision"])
+                saved_stage = str(saved_training_config["stage"])
+                if saved_stage != self.train_stage:
+                    raise ValueError(f"训练 stage 不一致：checkpoint={saved_stage}, config={self.train_stage}")
                 if strict_precision_resume and saved_precision != self.precision:
                     raise ValueError(f"训练精度不一致：checkpoint={saved_precision}，current={self.precision}")
 
@@ -394,20 +405,37 @@ class Trainer:
             raise ValueError(f"batch_size={self.batch_size} 必须能被判别器 minibatch group_size={group_size} 整除")
 
         self.net_g = net_g.to(self.device).train()
-        self.net_d = net_d.to(self.device).train()
-        self.net_d_coarse = net_d_coarse.to(self.device).train()
+        self.net_g.coarse.requires_grad_(self.coarse_stage_active)
+        self.net_g.hq.requires_grad_(self.hq_stage_active)
+        if not self.coarse_stage_active:
+            self.net_g.coarse.eval()
+        if not self.hq_stage_active:
+            self.net_g.hq.eval()
+
+        self.net_d = net_d.to(self.device).train(self.hq_stage_active).requires_grad_(self.hq_stage_active)
+        self.net_d_coarse = net_d_coarse.to(self.device).train(self.coarse_stage_active).requires_grad_(self.coarse_stage_active)
 
         self.net_g_ema = copy.deepcopy(self.net_g)
         if checkpoint is not None and checkpoint_mode == "resume":
             self.net_g_ema.load_state_dict(checkpoint["net_g"]["state_dict"])
         self.net_g_ema.eval().requires_grad_(False)
-        self._ema_params = tuple(self.net_g_ema.parameters())
-        self._train_g_params = tuple(self.net_g.parameters())
+        if self.train_stage == "joint":
+            self._ema_params = tuple(self.net_g_ema.parameters())
+            self._train_g_params = tuple(self.net_g.parameters())
+        elif self.coarse_stage_active:
+            self._ema_params = tuple(self.net_g_ema.coarse.parameters())
+            self._train_g_params = tuple(self.net_g.coarse.parameters())
+        else:
+            self._ema_params = tuple(self.net_g_ema.hq.parameters())
+            self._train_g_params = tuple(self.net_g.hq.parameters())
 
         # ========================= 优化器 / 调度器 =========================
         self.optim_g = optim.Adam(self.net_g.parameters(), lr=lr, betas=(0.0, 0.99), fused=True)
         self.optim_d = optim.Adam(chain(self.net_d.parameters(), self.net_d_coarse.parameters()), lr=lr, betas=(0.0, 0.99), fused=True)
-        self._d_named_parameters = tuple([(f"final.{name}", parameter) for name, parameter in self.net_d.named_parameters()] + [(f"coarse.{name}", parameter) for name, parameter in self.net_d_coarse.named_parameters()])
+        self._d_named_parameters = tuple(
+            ([(f"final.{name}", parameter) for name, parameter in self.net_d.named_parameters()] if self.hq_stage_active else [])
+            + ([(f"coarse.{name}", parameter) for name, parameter in self.net_d_coarse.named_parameters()] if self.coarse_stage_active else [])
+        )
         scaler_enabled = self.precision == "fp16"
         self.scaler_g = GradScaler("cuda", enabled=scaler_enabled)
         self.scaler_d = GradScaler("cuda", enabled=scaler_enabled)
@@ -433,16 +461,18 @@ class Trainer:
 
         # ========================= 损失 =========================
         self.d_loss = DiscriminatorAdversarialLoss(weight=1.0, reduction="mean").to(self.device)
-        self.coarse_gan_loss = GeneratorAdversarialLoss(weight=float(coarse_gan_config["weight"]), reduction="mean").to(self.device)
-        self.hq_gan_loss = GeneratorAdversarialLoss(weight=float(hq_gan_config["weight"]), reduction="mean").to(self.device)
+        if self.coarse_stage_active:
+            self.coarse_gan_loss = GeneratorAdversarialLoss(weight=float(coarse_gan_config["weight"]), reduction="mean").to(self.device)
+        if self.hq_stage_active:
+            self.hq_gan_loss = GeneratorAdversarialLoss(weight=float(hq_gan_config["weight"]), reduction="mean").to(self.device)
 
         self.generator_id_encoder = IDEncoder(self.generator_id_encoder_provider).to(self.device).eval().requires_grad_(False)
-        self.hq_id_loss = IdentityLoss(weight=float(hq_identity_config["weight"]), provider=self.hq_identity_loss_provider)
-        self.coarse_id_loss = IdentityLoss(weight=float(coarse_identity_config["weight"]), provider=self.coarse_identity_loss_provider)
-        if self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
-            self.coarse_id_loss.id_encoder = self.hq_id_loss.id_encoder
-        self.hq_id_loss.to(self.device)
-        self.coarse_id_loss.to(self.device)
+        if self.hq_stage_active:
+            self.hq_id_loss = IdentityLoss(weight=float(hq_identity_config["weight"]), provider=self.hq_identity_loss_provider).to(self.device)
+        if self.coarse_stage_active:
+            self.coarse_id_loss = IdentityLoss(weight=float(coarse_identity_config["weight"]), provider=self.coarse_identity_loss_provider).to(self.device)
+            if self.hq_stage_active and self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
+                self.coarse_id_loss.id_encoder = self.hq_id_loss.id_encoder
         self.coarse_resolution = int(self.net_g.network_cfg["coarse_resolution"])
         self.identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.img_resolution, self.batch_size, self.device)
         self.coarse_identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.coarse_resolution, self.batch_size, self.device)
@@ -551,19 +581,23 @@ class Trainer:
         )
 
         # ========================= 编译模型 =========================
-        # Coarse/HQ 分开前向：HQ 只读取 detached Coarse，避免 HQ losses 反向改写 Coarse。
+        # Coarse 始终需要前向；HQ/D/loss teacher 仅为 active stage 构建训练热路径。
         if compile_module:
             initialize_upfirdn2d()
             self.train_coarse = _compile_training_callable(self.net_g.coarse)
-            self.train_hq = _compile_training_callable(self.net_g.hq)
-            self.train_d = _compile_training_callable(self.net_d)
-            self.train_d_coarse = _compile_training_callable(self.net_d_coarse)
+            if self.hq_stage_active:
+                self.train_hq = _compile_training_callable(self.net_g.hq)
+                self.train_d = _compile_training_callable(self.net_d)
+            if self.coarse_stage_active:
+                self.train_d_coarse = _compile_training_callable(self.net_d_coarse)
             self.generator_id_encoder_forward = _compile_training_callable(self.generator_id_encoder)
-            self.hq_identity_embeddings_forward = _compile_training_callable(self.hq_id_loss.extract_identity_embeddings)
-            if self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
-                self.coarse_identity_embeddings_forward = self.hq_identity_embeddings_forward
-            else:
-                self.coarse_identity_embeddings_forward = _compile_training_callable(self.coarse_id_loss.extract_identity_embeddings)
+            if self.hq_stage_active:
+                self.hq_identity_embeddings_forward = _compile_training_callable(self.hq_id_loss.extract_identity_embeddings)
+            if self.coarse_stage_active:
+                if self.hq_stage_active and self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
+                    self.coarse_identity_embeddings_forward = self.hq_identity_embeddings_forward
+                else:
+                    self.coarse_identity_embeddings_forward = _compile_training_callable(self.coarse_id_loss.extract_identity_embeddings)
             if self.enable_hq_gaze_loss:
                 self.hq_gaze_loss_forward = _compile_training_callable(self.hq_gaze_loss)
             if self.enable_coarse_gaze_loss:
@@ -587,12 +621,17 @@ class Trainer:
                 self.train_d_features = _compile_training_callable(self.net_d.get_feats)
         else:
             self.train_coarse = self.net_g.coarse
-            self.train_hq = self.net_g.hq
-            self.train_d = self.net_d
-            self.train_d_coarse = self.net_d_coarse
+            if self.hq_stage_active:
+                self.train_hq = self.net_g.hq
+                self.train_d = self.net_d
+                self.hq_identity_embeddings_forward = self.hq_id_loss.extract_identity_embeddings
+            if self.coarse_stage_active:
+                self.train_d_coarse = self.net_d_coarse
+                if self.hq_stage_active and self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
+                    self.coarse_identity_embeddings_forward = self.hq_identity_embeddings_forward
+                else:
+                    self.coarse_identity_embeddings_forward = self.coarse_id_loss.extract_identity_embeddings
             self.generator_id_encoder_forward = self.generator_id_encoder
-            self.hq_identity_embeddings_forward = self.hq_id_loss.extract_identity_embeddings
-            self.coarse_identity_embeddings_forward = self.hq_identity_embeddings_forward if self.coarse_identity_loss_provider is self.hq_identity_loss_provider else self.coarse_id_loss.extract_identity_embeddings
             if self.enable_hq_gaze_loss:
                 self.hq_gaze_loss_forward = self.hq_gaze_loss
             if self.enable_coarse_gaze_loss:
@@ -693,8 +732,7 @@ class Trainer:
         coarse: Tensor,
         dst_canonical: Tensor,
         theta_restore: Tensor,
-        source_identity_faces: Tensor,
-        shared_source_identity_embeddings: Tensor | None,
+        source_identity_embeddings: Tensor,
         restore_grid: Tensor | None,
     ) -> Tensor:
         """计算 Coarse stage 的全部 Generator 训练目标。"""
@@ -702,10 +740,6 @@ class Trainer:
         self.log("coarse_gan_loss", coarse_gan_loss)
         total = coarse_gan_loss
 
-        with torch.no_grad():
-            source_identity_embeddings = shared_source_identity_embeddings
-            if source_identity_embeddings is None:
-                source_identity_embeddings = self.coarse_identity_embeddings_forward(source_identity_faces)
         coarse_identity_embeddings = self.coarse_identity_embeddings_forward(self.prepare_identity_encoder_faces(coarse, theta_restore))
         coarse_id_loss = self.coarse_id_loss(coarse_identity_embeddings, source_identity_embeddings)
         self.log("coarse_id_loss", coarse_id_loss)
@@ -745,8 +779,7 @@ class Trainer:
         dst_canonical: Tensor,
         theta_restore: Tensor,
         same_mask: Tensor,
-        source_identity_faces: Tensor,
-        shared_source_identity_embeddings: Tensor | None,
+        source_identity_embeddings: Tensor,
         restore_grid: Tensor | None,
     ) -> Tensor:
         """计算 HQ stage 的全部 Generator 训练目标。"""
@@ -765,10 +798,6 @@ class Trainer:
             self.log("hq_wfm_loss", hq_wfm_loss)
             total = total + hq_wfm_loss
 
-        with torch.no_grad():
-            source_identity_embeddings = shared_source_identity_embeddings
-            if source_identity_embeddings is None:
-                source_identity_embeddings = self.hq_identity_embeddings_forward(source_identity_faces)
         hq_identity_embeddings = self.hq_identity_embeddings_forward(self.prepare_identity_encoder_faces(fake, theta_restore))
         hq_id_loss = self.hq_id_loss(hq_identity_embeddings, source_identity_embeddings)
         self.log("hq_id_loss", hq_id_loss)
@@ -902,11 +931,13 @@ class Trainer:
 
             source_identity_faces_vis = self.prepare_identity_encoder_faces(src_vis)
             generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
-            hq_source_identity_embeddings_vis = self.hq_identity_embeddings_forward(source_identity_faces_vis)
-            if self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
-                coarse_source_identity_embeddings_vis = hq_source_identity_embeddings_vis
-            else:
-                coarse_source_identity_embeddings_vis = self.coarse_identity_embeddings_forward(source_identity_faces_vis)
+            if self.hq_stage_active:
+                hq_source_identity_embeddings_vis = self.hq_identity_embeddings_forward(source_identity_faces_vis)
+            if self.coarse_stage_active:
+                if self.hq_stage_active and self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
+                    coarse_source_identity_embeddings_vis = hq_source_identity_embeddings_vis
+                else:
+                    coarse_source_identity_embeddings_vis = self.coarse_identity_embeddings_forward(source_identity_faces_vis)
             fake_vis, coarse_vis = self.net_g_ema(dst_vis, generator_identity_embeddings_vis, return_coarse=True)
             coarse_display_vis = NF.interpolate(coarse_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
 
@@ -917,37 +948,39 @@ class Trainer:
 
             grid = [src_vis, dst_vis, coarse_display_vis, fake_vis, dst_canonical_vis, identity_encoder_input_display_vis]
 
-            # ========================= Coarse 判别器梯度图 =========================
-            coarse_for_gan_grad = coarse_vis.detach().requires_grad_(True)
-            with torch.enable_grad():
-                coarse_score_vis = self.train_d_coarse(coarse_for_gan_grad)
-                coarse_gan_loss_vis = self.coarse_gan_loss(coarse_score_vis)
-                coarse_gan_grad_map = self.loss_grad_map(coarse_gan_loss_vis, coarse_for_gan_grad)
-            grid.append(NF.interpolate(coarse_gan_grad_map, size=fake_vis.shape[2:], mode="bilinear", align_corners=False))
+            if self.coarse_stage_active:
+                # ========================= Coarse 判别器梯度图 =========================
+                coarse_for_gan_grad = coarse_vis.detach().requires_grad_(True)
+                with torch.enable_grad():
+                    coarse_score_vis = self.train_d_coarse(coarse_for_gan_grad)
+                    coarse_gan_loss_vis = self.coarse_gan_loss(coarse_score_vis)
+                    coarse_gan_grad_map = self.loss_grad_map(coarse_gan_loss_vis, coarse_for_gan_grad)
+                grid.append(NF.interpolate(coarse_gan_grad_map, size=fake_vis.shape[2:], mode="bilinear", align_corners=False))
 
-            # ========================= Coarse 身份损失梯度图 =========================
-            with torch.enable_grad():
-                coarse_for_id_grad = coarse_vis.detach().requires_grad_(True)
-                coarse_identity_embeddings_vis = self.coarse_identity_embeddings_forward(self.prepare_identity_encoder_faces(coarse_for_id_grad, theta_restore_vis))
-                coarse_id_loss_vis = self.coarse_id_loss(coarse_identity_embeddings_vis, coarse_source_identity_embeddings_vis.detach())
-                coarse_id_grad_map = self.loss_grad_map(coarse_id_loss_vis, coarse_for_id_grad)
-            grid.append(NF.interpolate(coarse_id_grad_map, size=fake_vis.shape[2:], mode="bilinear", align_corners=False))
+                # ========================= Coarse 身份损失梯度图 =========================
+                with torch.enable_grad():
+                    coarse_for_id_grad = coarse_vis.detach().requires_grad_(True)
+                    coarse_identity_embeddings_vis = self.coarse_identity_embeddings_forward(self.prepare_identity_encoder_faces(coarse_for_id_grad, theta_restore_vis))
+                    coarse_id_loss_vis = self.coarse_id_loss(coarse_identity_embeddings_vis, coarse_source_identity_embeddings_vis.detach())
+                    coarse_id_grad_map = self.loss_grad_map(coarse_id_loss_vis, coarse_for_id_grad)
+                grid.append(NF.interpolate(coarse_id_grad_map, size=fake_vis.shape[2:], mode="bilinear", align_corners=False))
 
-            # ========================= HQ 判别器梯度图 =========================
-            fake_for_gan_grad = fake_vis.detach().requires_grad_(True)
-            with torch.enable_grad():
-                fake_score_vis = self.train_d(fake_for_gan_grad)
-                gan_loss_vis = self.hq_gan_loss(fake_score_vis)
-                gan_grad_map = self.loss_grad_map(gan_loss_vis, fake_for_gan_grad)
-            grid.append(gan_grad_map)
+            if self.hq_stage_active:
+                # ========================= HQ 判别器梯度图 =========================
+                fake_for_gan_grad = fake_vis.detach().requires_grad_(True)
+                with torch.enable_grad():
+                    fake_score_vis = self.train_d(fake_for_gan_grad)
+                    gan_loss_vis = self.hq_gan_loss(fake_score_vis)
+                    gan_grad_map = self.loss_grad_map(gan_loss_vis, fake_for_gan_grad)
+                grid.append(gan_grad_map)
 
-            # ========================= HQ 身份损失梯度图 =========================
-            with torch.enable_grad():
-                fake_for_id_grad = fake_vis.detach().requires_grad_(True)
-                generated_identity_embeddings_vis = self.hq_identity_embeddings_forward(self.prepare_identity_encoder_faces(fake_for_id_grad, theta_restore_vis))
-                id_loss_vis = self.hq_id_loss(generated_identity_embeddings_vis, hq_source_identity_embeddings_vis.detach())
-                id_grad_map = self.loss_grad_map(id_loss_vis, fake_for_id_grad)
-            grid.append(id_grad_map)
+                # ========================= HQ 身份损失梯度图 =========================
+                with torch.enable_grad():
+                    fake_for_id_grad = fake_vis.detach().requires_grad_(True)
+                    generated_identity_embeddings_vis = self.hq_identity_embeddings_forward(self.prepare_identity_encoder_faces(fake_for_id_grad, theta_restore_vis))
+                    id_loss_vis = self.hq_id_loss(generated_identity_embeddings_vis, hq_source_identity_embeddings_vis.detach())
+                    id_grad_map = self.loss_grad_map(id_loss_vis, fake_for_id_grad)
+                grid.append(id_grad_map)
 
             grid = torch.cat(grid, dim=0)
             grid.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)
@@ -960,8 +993,7 @@ class Trainer:
 
     def train(self) -> None:
 
-        net_coarse, net_hq = self.train_coarse, self.train_hq
-        net_d, net_d_coarse = self.train_d, self.train_d_coarse
+        net_coarse = self.train_coarse
         sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, _ = self.dataset.next()
         half = self.batch_size // 2
         sample_reference = tuple(tensor[:half].detach().cpu() for tensor in (sample_src, sample_dst, sample_dst_canonical, sample_theta_restore))
@@ -980,38 +1012,51 @@ class Trainer:
                     with torch.no_grad():
                         source_identity_faces = self.prepare_identity_encoder_faces(src)
                         generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
-                        shared_source_identity_embeddings = None
-                        if self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
-                            shared_source_identity_embeddings = self.hq_identity_embeddings_forward(source_identity_faces)
-                    coarse = net_coarse(dst, generator_identity_embeddings)
-                    fake = net_hq(dst, coarse.detach())
+
+                    if self.coarse_stage_active:
+                        coarse = net_coarse(dst, generator_identity_embeddings)
+                    else:
+                        with torch.no_grad():
+                            coarse = net_coarse(dst, generator_identity_embeddings)
+
+                    if self.hq_stage_active:
+                        fake = self.train_hq(dst, coarse.detach())
 
                 # ========================= 训练判别器 =========================
-                self.net_d.requires_grad_(True)
-                self.net_d_coarse.requires_grad_(True)
+                self.net_d.requires_grad_(self.hq_stage_active)
+                self.net_d_coarse.requires_grad_(self.coarse_stage_active)
                 self.optim_d.zero_grad(set_to_none=True)
-                hq_d_total = self._discriminator_stage_loss(
-                    "hq",
-                    fake,
-                    dst,
-                    self.net_d,
-                    net_d,
-                    r1_enabled=self.enable_hq_r1_loss,
-                    r1_interval=self.hq_r1_reg_step,
-                    r1_gamma=self.hq_r1_gamma,
-                )
-                real_coarse = NF.interpolate(dst, size=(self.coarse_resolution, self.coarse_resolution), mode="bilinear", align_corners=False)
-                coarse_d_total = self._discriminator_stage_loss(
-                    "coarse",
-                    coarse,
-                    real_coarse,
-                    self.net_d_coarse,
-                    net_d_coarse,
-                    r1_enabled=self.enable_coarse_r1_loss,
-                    r1_interval=self.coarse_r1_reg_step,
-                    r1_gamma=self.coarse_r1_gamma,
-                )
-                d_loss = hq_d_total + coarse_d_total
+
+                if self.hq_stage_active:
+                    hq_d_total = self._discriminator_stage_loss(
+                        "hq",
+                        fake,
+                        dst,
+                        self.net_d,
+                        self.train_d,
+                        r1_enabled=self.enable_hq_r1_loss,
+                        r1_interval=self.hq_r1_reg_step,
+                        r1_gamma=self.hq_r1_gamma,
+                    )
+                if self.coarse_stage_active:
+                    real_coarse = NF.interpolate(dst, size=(self.coarse_resolution, self.coarse_resolution), mode="bilinear", align_corners=False)
+                    coarse_d_total = self._discriminator_stage_loss(
+                        "coarse",
+                        coarse,
+                        real_coarse,
+                        self.net_d_coarse,
+                        self.train_d_coarse,
+                        r1_enabled=self.enable_coarse_r1_loss,
+                        r1_interval=self.coarse_r1_reg_step,
+                        r1_gamma=self.coarse_r1_gamma,
+                    )
+
+                if self.train_stage == "joint":
+                    d_loss = hq_d_total + coarse_d_total
+                elif self.hq_stage_active:
+                    d_loss = hq_d_total
+                else:
+                    d_loss = coarse_d_total
 
                 _ensure_finite_loss("d_loss", d_loss)
                 d_updated = _scaled_backward_step(
@@ -1034,6 +1079,16 @@ class Trainer:
                 if self.use_cosine_lr:
                     self.lr_scheduler_d.step()
 
+                # source identity teacher 只为 active stage 计算，并跨 G overflow retry 复用。
+                with torch.no_grad():
+                    if self.hq_stage_active:
+                        hq_source_identity_embeddings = self.hq_identity_embeddings_forward(source_identity_faces)
+                    if self.coarse_stage_active:
+                        if self.hq_stage_active and self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
+                            coarse_source_identity_embeddings = hq_source_identity_embeddings
+                        else:
+                            coarse_source_identity_embeddings = self.coarse_identity_embeddings_forward(source_identity_faces)
+
                 # ========================= 训练生成器 =========================
                 self.net_d.requires_grad_(False)
                 self.net_d_coarse.requires_grad_(False)
@@ -1042,38 +1097,51 @@ class Trainer:
                 while True:
                     self.optim_g.zero_grad(set_to_none=True)
                     if g_overflow_retries > 0:
-                        # D 已经成功更新，G overflow 时只重算 G，避免重复执行 D/R1。
+                        # D 已经成功更新，G overflow 时只重算 active Generator stage。
                         with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                            coarse = net_coarse(dst, generator_identity_embeddings)
-                            fake = net_hq(dst, coarse.detach())
+                            if self.coarse_stage_active:
+                                coarse = net_coarse(dst, generator_identity_embeddings)
+                            if self.hq_stage_active:
+                                fake = self.train_hq(dst, coarse.detach())
 
                     with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                        hq_geometry_enabled = self.enable_hq_gaze_loss or self.enable_hq_hrffa_loss or self.enable_hq_facs_loss
-                        coarse_geometry_enabled = self.enable_coarse_gaze_loss or self.enable_coarse_hrffa_loss or self.enable_coarse_facs_loss
                         restore_grid = None
-                        if hq_geometry_enabled or coarse_geometry_enabled:
+                        if (
+                            self.enable_hq_gaze_loss
+                            or self.enable_hq_hrffa_loss
+                            or self.enable_hq_facs_loss
+                            or self.enable_coarse_gaze_loss
+                            or self.enable_coarse_hrffa_loss
+                            or self.enable_coarse_facs_loss
+                        ):
                             with autocast(device_type="cuda", enabled=False):
                                 restore_grid = NF.affine_grid(theta_restore.float(), size=list(dst.shape), align_corners=False)
 
-                        coarse_g_loss = self._coarse_generator_stage_loss(
-                            coarse,
-                            dst_canonical,
-                            theta_restore,
-                            source_identity_faces,
-                            shared_source_identity_embeddings,
-                            restore_grid,
-                        )
-                        hq_g_loss = self._hq_generator_stage_loss(
-                            fake,
-                            dst,
-                            dst_canonical,
-                            theta_restore,
-                            same_mask,
-                            source_identity_faces,
-                            shared_source_identity_embeddings,
-                            restore_grid,
-                        )
-                        g_loss = coarse_g_loss + hq_g_loss
+                        if self.coarse_stage_active:
+                            coarse_g_loss = self._coarse_generator_stage_loss(
+                                coarse,
+                                dst_canonical,
+                                theta_restore,
+                                coarse_source_identity_embeddings,
+                                restore_grid,
+                            )
+                        if self.hq_stage_active:
+                            hq_g_loss = self._hq_generator_stage_loss(
+                                fake,
+                                dst,
+                                dst_canonical,
+                                theta_restore,
+                                same_mask,
+                                hq_source_identity_embeddings,
+                                restore_grid,
+                            )
+
+                        if self.train_stage == "joint":
+                            g_loss = coarse_g_loss + hq_g_loss
+                        elif self.hq_stage_active:
+                            g_loss = hq_g_loss
+                        else:
+                            g_loss = coarse_g_loss
 
                     _ensure_finite_loss("g_loss", g_loss)
                     if _scaled_backward_step(

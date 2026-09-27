@@ -11,6 +11,7 @@ from .dataloader_common import ImageDecoderBackend
 
 DEFAULT_TRAIN_CONFIG: dict[str, Any] = {
     "batch_size": 16,
+    "stage": "joint",
     "precision": "bf16",
     "device": "cuda",
     "compile_module": True,
@@ -223,6 +224,11 @@ def _normalize_train(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("[train].precision 必须显式配置为 fp32、fp16 或 bf16")
     result = _with_defaults(raw, DEFAULT_TRAIN_CONFIG, "[train]")
     result["batch_size"] = _int(result["batch_size"], "train.batch_size", minimum=1)
+    if not isinstance(result["stage"], str):
+        raise TypeError(f"train.stage 必须为字符串，实际为 {type(result['stage']).__name__}")
+    result["stage"] = result["stage"].lower()
+    if result["stage"] not in {"joint", "coarse", "hq"}:
+        raise ValueError(f"train.stage={result['stage']!r} 无效，可选：joint、coarse、hq")
     if not isinstance(result["precision"], str):
         raise TypeError(f"train.precision 必须为字符串，实际为 {type(result['precision']).__name__}")
     result["precision"] = result["precision"].lower()

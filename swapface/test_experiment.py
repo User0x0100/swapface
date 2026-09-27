@@ -71,6 +71,7 @@ def _check_train_config(root: Path) -> None:
     assert loaded == resolved
 
     assert resolved["train"]["batch_size"] == 8
+    assert resolved["train"]["stage"] == "joint"
     assert resolved["train"]["compile_module"] is False
     assert resolved["train"]["precision"] == "fp16"
     assert resolved["optimizer"] == {"lr": 5e-5}
@@ -163,6 +164,20 @@ def _check_train_config(root: Path) -> None:
         assert "unknown_field" in str(error)
     else:
         raise AssertionError("配置错误接受了未知字段")
+
+
+    stage_config = copy.deepcopy(raw)
+    stage_config["train"]["stage"] = "hq"
+    assert resolve_train_config(stage_config)["train"]["stage"] == "hq"
+    stage_config["train"]["stage"] = "coarse"
+    assert resolve_train_config(stage_config)["train"]["stage"] == "coarse"
+    stage_config["train"]["stage"] = "invalid"
+    try:
+        resolve_train_config(stage_config)
+    except ValueError as error:
+        assert "train.stage" in str(error)
+    else:
+        raise AssertionError("配置错误接受了未知 train.stage")
 
     invalid = copy.deepcopy(raw)
     invalid["train"]["precision"] = "fp8"
@@ -475,7 +490,15 @@ def _check_generator_responsibility_boundary() -> None:
     train_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer.train)))
     detach_boundaries = 0
     for node in ast.walk(train_tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name) or node.func.id != "net_hq" or len(node.args) < 2:
+        if not isinstance(node, ast.Call) or len(node.args) < 2:
+            continue
+        is_hq_forward = (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr == "train_hq"
+        )
+        if not is_hq_forward:
             continue
         coarse_arg = node.args[1]
         if (
@@ -532,6 +555,28 @@ def _check_generator_responsibility_boundary() -> None:
     assert generator_stage_calls.count("_coarse_generator_stage_loss") == 1
     assert generator_stage_calls.count("_hq_generator_stage_loss") == 1
 
+    def guarded_calls(stage_attr: str) -> set[str]:
+        calls = set()
+        for node in ast.walk(train_tree):
+            if not isinstance(node, ast.If):
+                continue
+            test = node.test
+            if not (
+                isinstance(test, ast.Attribute)
+                and isinstance(test.value, ast.Name)
+                and test.value.id == "self"
+                and test.attr == stage_attr
+            ):
+                continue
+            for statement in node.body:
+                for child in ast.walk(statement):
+                    if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and isinstance(child.func.value, ast.Name) and child.func.value.id == "self":
+                        calls.add(child.func.attr)
+        return calls
+
+    assert {"train_hq", "_hq_generator_stage_loss"}.issubset(guarded_calls("hq_stage_active"))
+    assert "_coarse_generator_stage_loss" in guarded_calls("coarse_stage_active")
+
     def self_calls(method: object) -> set[str]:
         tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
         return {
@@ -586,9 +631,8 @@ def _check_generator_responsibility_boundary() -> None:
         and node.func.value.id == "self"
         and node.func.attr in {"hq_identity_embeddings_forward", "coarse_identity_embeddings_forward"}
     ]
-    assert len(train_source_teacher_calls) == 1
-    assert train_source_teacher_calls[0].func.attr == "hq_identity_embeddings_forward"
-    assert isinstance(train_source_teacher_calls[0].args[0], ast.Name) and train_source_teacher_calls[0].args[0].id == "source_identity_faces"
+    assert {call.func.attr for call in train_source_teacher_calls} == {"hq_identity_embeddings_forward", "coarse_identity_embeddings_forward"}
+    assert all(isinstance(call.args[0], ast.Name) and call.args[0].id == "source_identity_faces" for call in train_source_teacher_calls)
     print("PASS: HQ/Coarse gradients, losses, teachers and R1 execution paths remain independent")
 
 
@@ -687,7 +731,7 @@ def main() -> None:
                 "version": CHECKPOINT_VERSION,
                 "step": 7500,
                 "run": {"id": metadata["run_id"], "config_sha256": metadata["config_sha256"]},
-                "training_config": {"semantics_version": TRAINING_SEMANTICS_VERSION, "precision": "fp16"},
+                "training_config": {"semantics_version": TRAINING_SEMANTICS_VERSION, "precision": "fp16", "stage": "joint"},
                 "net_g": {"network_cfg": resolved["generator"], "state_dict": ema_g_state},
                 "net_d": {"network_cfg": resolved["discriminator"], "state_dict": d_state},
                 "net_d_coarse": {
@@ -704,6 +748,7 @@ def main() -> None:
         assert _require_resume_training_config(loaded) == {
             "semantics_version": TRAINING_SEMANTICS_VERSION,
             "precision": "fp16",
+            "stage": "joint",
         }
         assert standalone_parent == {
             "run_id": metadata["run_id"],
@@ -731,6 +776,7 @@ def main() -> None:
         invalid_training_config["training_config"] = {
             "semantics_version": str(TRAINING_SEMANTICS_VERSION),
             "precision": "fp16",
+            "stage": "joint",
         }
         try:
             _require_resume_training_config(invalid_training_config)
@@ -742,6 +788,19 @@ def main() -> None:
         invalid_training_config["training_config"] = {
             "semantics_version": TRAINING_SEMANTICS_VERSION,
             "precision": "fp16",
+            "stage": "invalid",
+        }
+        try:
+            _require_resume_training_config(invalid_training_config)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("无效 stage 的 training_config 被错误接受")
+
+        invalid_training_config["training_config"] = {
+            "semantics_version": TRAINING_SEMANTICS_VERSION,
+            "precision": "fp16",
+            "stage": "joint",
             "legacy": True,
         }
         try:
