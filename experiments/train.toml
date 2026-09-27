@@ -16,7 +16,7 @@ batch_size = 12
 stage = "joint"
 
 # 必须显式设置：fp32 / fp16 / bf16。
-precision = "fp16"
+precision = "bf16"
 
 # Trainer 支持 PyTorch CUDA/HIP GPU；ROCm 也沿用 PyTorch 的 "cuda" 设备名。
 device = "cuda"
@@ -70,7 +70,7 @@ weight = 1.0
 
 
 [loss.coarse.identity]
-provider = "MS1MV3_ARCFACE_R50_FP16"
+provider = "BLENDFACE"
 weight = 10.0
 
 
@@ -88,7 +88,7 @@ confidence_weighted = true
 
 
 [loss.coarse.hrffa]
-enable = false
+enable = true
 pose_weight = 1.0
 eye_weight = 1.0
 mouth_weight = 1.0
@@ -98,7 +98,7 @@ occluded_geometry_weight = 0.25
 
 
 [loss.coarse.facs]
-enable = false
+enable = true
 weight = 1.0
 brow_weight = 1.0
 eye_weight = 1.0
@@ -118,13 +118,13 @@ weight = 1.0
 
 
 [loss.hq.identity]
-provider = "MS1MV3_ARCFACE_R50_FP16"
+provider = "BLENDFACE"
 weight = 10.0
 
 
 [loss.hq.l1]
 enable = true
-weight = 8.0
+weight = 10.0
 
 
 [loss.hq.r1]
@@ -141,7 +141,7 @@ confidence_weighted = true
 
 
 [loss.hq.hrffa]
-enable = false
+enable = true
 pose_weight = 1.0
 eye_weight = 1.0
 mouth_weight = 1.0
@@ -151,7 +151,7 @@ occluded_geometry_weight = 0.25
 
 
 [loss.hq.facs]
-enable = false
+enable = true
 weight = 1.0
 brow_weight = 1.0
 eye_weight = 1.0
@@ -165,10 +165,9 @@ asymmetry_weight = 1.0
 enable = true
 
 [loss.hq.vgg.weights]
-conv1_2 = 2.5
-conv2_2 = 2.5
-conv3_3 = 2.5
-conv4_3 = 2.5
+relu1_2 = 1.0
+relu2_2 = 1.0
+relu3_4 = 1.0
 
 
 [loss.hq.wfm]
@@ -198,10 +197,10 @@ brightness = 0.2
 contrast = 0.2
 saturation = 0.2
 flip_prob = 0.5
-rotation_range = [-3.0, 3.0]
-scale_factor_range = [0.95, 1.05]
-tx_range = [-0.05, 0.05]
-ty_range = [-0.05, 0.05]
+rotation_range = [-10.0, 10.0]
+scale_factor_range = [0.85, 1.25]
+tx_range = [-0.15, 0.15]
+ty_range = [-0.15, 0.15]
 
 
 [data.sampling]
