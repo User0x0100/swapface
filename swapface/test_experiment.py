@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import torch
 
+from models.networks import Generator
 from swapface.config import load_train_config, resolve_train_config
 from swapface.contracts import CHECKPOINT_VERSION
 from swapface.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
@@ -17,9 +18,9 @@ from swapface.train import (
     TRAINING_SEMANTICS_VERSION,
     Trainer,
     _assert_branch_generator_compatible,
+    _branch_model_states,
     _compile_training_callable,
     _load_branch_checkpoint,
-    _branch_model_states,
     _load_run_config,
     _reduce_reconstruction_loss,
     _require_resume_training_config,
@@ -409,8 +410,34 @@ def _check_scaled_optimizer_step() -> None:
     print("PASS: FP16 overflow remains recoverable; BF16/FP32 non-finite gradients are blocked before optimizer.step")
 
 
+def _check_joint_generator_gradient() -> None:
+    model = Generator(
+        img_resolution=16,
+        img_channels=3,
+        id_dim=8,
+        coarse_resolution=8,
+        coarse_latent_resolution=4,
+        coarse_num_latent=1,
+        coarse_base_ch=2,
+        coarse_max_ch=8,
+        hq_bottleneck_resolution=4,
+        hq_base_ch=2,
+        hq_max_ch=8,
+    )
+    target = torch.randn(2, 3, 16, 16)
+    identity = torch.randn(2, 8)
+    fake = model(target, identity)
+    fake.square().mean().backward()
+
+    coarse_has_gradient = any(parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0 for parameter in model.coarse.parameters())
+    hq_has_gradient = any(parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0 for parameter in model.hq.parameters())
+    assert coarse_has_gradient and hq_has_gradient
+    print("PASS: final Generator loss backpropagates through HQ into Coarse")
+
+
 def main() -> None:
     _check_reconstruction_scope()
+    _check_joint_generator_gradient()
     _check_step_boundary()
     _check_scaled_optimizer_step()
     # ROCm 不使用 NVIDIA compute capability；CUDA 继续保持 SM80+ 的 compile-BF16 限制。
@@ -479,7 +506,6 @@ def main() -> None:
         ema_g_state = {"marker": torch.tensor(1)}
         train_g_state = {"marker": torch.tensor(2)}
         d_state = {"marker": torch.tensor(3)}
-        coarse_d_state = {"marker": torch.tensor(4)}
         torch.save(
             {
                 "version": CHECKPOINT_VERSION,
@@ -493,10 +519,6 @@ def main() -> None:
                 },
                 "net_g": {"network_cfg": resolved["generator"], "state_dict": ema_g_state},
                 "net_d": {"network_cfg": resolved["discriminator"], "state_dict": d_state},
-                "net_d_coarse": {
-                    "network_cfg": {**resolved["discriminator"], "img_resolution": resolved["generator"]["coarse_resolution"]},
-                    "state_dict": coarse_d_state,
-                },
                 "training_state": {"net_g": train_g_state},
             },
             standalone,
@@ -515,12 +537,11 @@ def main() -> None:
             "config_sha256": metadata["config_sha256"],
             "discriminator": "inherit",
         }
-        branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(loaded, reset_discriminator=False)
+        branch_g_state, branch_d_state = _branch_model_states(loaded, reset_discriminator=False)
         assert branch_g_state["marker"].item() == 2  # training G, not EMA G
         assert branch_d_state is not None and branch_d_state["marker"].item() == 3
-        assert branch_d_coarse_state is not None and branch_d_coarse_state["marker"].item() == 4
-        branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(loaded, reset_discriminator=True)
-        assert branch_g_state["marker"].item() == 2 and branch_d_state is None and branch_d_coarse_state is None
+        branch_g_state, branch_d_state = _branch_model_states(loaded, reset_discriminator=True)
+        assert branch_g_state["marker"].item() == 2 and branch_d_state is None
 
         invalid_training_config = dict(loaded)
         invalid_training_config["training_config"] = {
@@ -530,7 +551,7 @@ def main() -> None:
         }
         try:
             _require_resume_training_config(invalid_training_config)
-        except ValueError:
+        except TypeError:
             pass
         else:
             raise AssertionError("缺少 semantics_version 的旧训练 checkpoint 被错误接受")
@@ -560,7 +581,6 @@ def main() -> None:
             raise AssertionError("branch 默认错误接受了 Discriminator 架构变更")
         _, reset_parent = _load_branch_checkpoint(standalone, changed_discriminator, reset_discriminator=True)
         assert reset_parent["discriminator"] == "reset"
-
 
         changed_provider = copy.deepcopy(resolved)
         changed_provider["identity"]["provider"] = "MS1MV3_ARCFACE_R50_FP16"

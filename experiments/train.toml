@@ -54,7 +54,7 @@ scope = "same"
 
 
 [loss.gan]
-# Final/Coarse Generator adversarial loss 共用此权重；两个 Discriminator adversarial loss 固定为 1.0。
+# Generator final adversarial loss 使用此权重；Discriminator adversarial loss 固定为 1.0。
 weight = 1.0
 
 
@@ -178,7 +178,7 @@ hq_max_ch = 128
 
 
 [discriminator]
-# Final D 使用这里的 img_resolution；Coarse D 复用其余参数，并自动改为 generator.coarse_resolution。
+# 判别器只约束 Generator 最终输出，分辨率必须与 generator.img_resolution 一致。
 img_resolution = 512
 img_channels = 3
 base_ch = 64
