@@ -69,15 +69,15 @@ uv run python -m swapface.train \
 - `[[data.src]]` / `[[data.dst]]`：训练数据源；
 - `[generator]` / `[discriminator]`：模型定义。
 
-Identity Loss teacher 明确位于 `[loss.identity]`，不与 Generator 条件编码器混在 `[identity]`。L1 和 VGG 共享 `[loss.reconstruction].scope`。R1 位于 `[loss.r1]`，不再混入 `[train]`。 `[loss.gan].weight` 只缩放 Generator adversarial loss；Discriminator adversarial loss 固定权重 1.0，避免改变其与 R1 的相对尺度。
+Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、R1、gaze、HRFFA、FACS 均独立配置。L1/VGG/WFM 与 reconstruction scope 只属于 HQ。`gan.weight` 只缩放对应阶段的 Generator adversarial loss；两个 Discriminator adversarial loss 固定权重 1.0。
 
 ## Generator 梯度职责
 
 Coarse 与 HQRefiner 在同一个 iteration、同一个 Generator optimizer 中同时训练，但 HQ 输入使用 `coarse.detach()`。因此 Final/HQ losses 不会反向修改 Coarse；Coarse 只由自己的 coarse losses 更新。
 
-- Coarse：source identity、独立 coarse GAN，以及启用的 gaze / HRFFA / FACS target 属性监督；
-- HQ：final identity、final GAN/WFM、启用的 gaze / HRFFA / FACS，以及按 reconstruction scope 聚合的 L1/VGG；
-- Discriminator：Final 与 Coarse 各有一个判别器；两者共用同一个 D optimizer、scheduler、GradScaler 与 R1 周期。
+- Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、R1，以及 gaze / HRFFA / FACS target 属性监督；
+- HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/R1/WFM、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
+- Discriminator：HQ 与 Coarse 各有一个判别器；两者共用同一个 D optimizer、scheduler、GradScaler，但 R1 enable/interval/gamma 分别由各自 stage 配置控制。
 
 Coarse GAN 的 real 是将真实 `dst` 双线性缩放到 `coarse_resolution`，fake 是 Coarse 原始输出；它只负责约束真实人脸分布，不引入 Coarse L1/VGG target reconstruction。Coarse 的 target 属性监督则先将低分辨率输出双线性上采样到训练分辨率，再使用与 Final 相同的 `theta_restore` 恢复到 canonical 坐标系，与 `dst_canonical` 比较。
 
@@ -194,7 +194,7 @@ uv run python -m swapface.train \
 
 `--step 0` 可以让新分支从 0 重新计数。这个值就是新 run 的实际 `completed_step` 起点，因此也会同时影响 R1 周期、EMA decay、sample/checkpoint 保存周期和文件名；它不是单独的 TensorBoard 显示偏移。
 
-Branch 始终要求 `[generator]` 与父 checkpoint 完全一致。默认还要求 `[discriminator]` 一致，并同时加载父 Final/Coarse D 权重。若需要重新初始化 D（例如修改 D 架构或主动打破旧 GAN 平衡），使用：
+Branch 始终要求 `[generator]` 与父 checkpoint 完全一致。默认还要求 `[discriminator]` 一致，并同时加载父 HQ/Coarse D 权重。若需要重新初始化 D（例如修改 D 架构或主动打破旧 GAN 平衡），使用：
 
 ```bash
 uv run python -m swapface.train \

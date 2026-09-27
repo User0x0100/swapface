@@ -59,34 +59,52 @@ DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
     "conv4_3": 2.5,
 }
 DEFAULT_WFM_LOSS_WEIGHT: dict[int, float] = {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.1}
-DEFAULT_LOSS_CONFIG: dict[str, Any] = {
+DEFAULT_GAN_LOSS_CONFIG = {"weight": 1.0}
+DEFAULT_IDENTITY_LOSS_CONFIG = {"provider": DEFAULT_IDENTITY_LOSS_PROVIDER.name, "weight": 10.0}
+DEFAULT_R1_LOSS_CONFIG = {"enable": True, "interval": 16, "gamma": 10.0}
+DEFAULT_GAZE_LOSS_CONFIG = {"enable": False, "weight": 1.0, "distribution_weight": 0.1, "confidence_weighted": True}
+DEFAULT_HRFFA_LOSS_CONFIG = {
+    "enable": False,
+    "pose_weight": 1.0,
+    "eye_weight": 1.0,
+    "mouth_weight": 1.0,
+    "contour_weight": 1.0,
+    "contour_shape_weight": 0.5,
+    "occluded_geometry_weight": 0.25,
+}
+DEFAULT_FACS_LOSS_CONFIG = {
+    "enable": False,
+    "weight": 1.0,
+    "brow_weight": 1.0,
+    "eye_weight": 1.0,
+    "nose_weight": 1.0,
+    "mouth_weight": 1.0,
+    "lower_face_weight": 1.0,
+    "asymmetry_weight": 1.0,
+}
+DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
+    "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
+    "identity": dict(DEFAULT_IDENTITY_LOSS_CONFIG),
+    "r1": dict(DEFAULT_R1_LOSS_CONFIG),
+    "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
+    "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
+    "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
+}
+DEFAULT_HQ_LOSS_CONFIG: dict[str, Any] = {
+    "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
+    "identity": dict(DEFAULT_IDENTITY_LOSS_CONFIG),
+    "r1": dict(DEFAULT_R1_LOSS_CONFIG),
+    "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
+    "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
+    "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
     "reconstruction": {"scope": "same"},
-    "gan": {"weight": 1.0},
-    "identity": {"provider": DEFAULT_IDENTITY_LOSS_PROVIDER.name, "weight": 10.0},
     "l1": {"enable": True, "weight": 10.0},
-    "r1": {"enable": True, "interval": 16, "gamma": 10.0},
-    "gaze": {"enable": False, "weight": 1.0, "distribution_weight": 0.1, "confidence_weighted": True},
-    "hrffa": {
-        "enable": False,
-        "pose_weight": 1.0,
-        "eye_weight": 1.0,
-        "mouth_weight": 1.0,
-        "contour_weight": 1.0,
-        "contour_shape_weight": 0.5,
-        "occluded_geometry_weight": 0.25,
-    },
-    "facs": {
-        "enable": False,
-        "weight": 1.0,
-        "brow_weight": 1.0,
-        "eye_weight": 1.0,
-        "nose_weight": 1.0,
-        "mouth_weight": 1.0,
-        "lower_face_weight": 1.0,
-        "asymmetry_weight": 1.0,
-    },
-    "vgg": {"enable": True, "weights": DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT},
-    "wfm": {"enable": True, "weights": DEFAULT_WFM_LOSS_WEIGHT},
+    "vgg": {"enable": True, "weights": dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)},
+    "wfm": {"enable": True, "weights": dict(DEFAULT_WFM_LOSS_WEIGHT)},
+}
+DEFAULT_LOSS_CONFIG: dict[str, Any] = {
+    "coarse": DEFAULT_COARSE_LOSS_CONFIG,
+    "hq": DEFAULT_HQ_LOSS_CONFIG,
 }
 
 DEFAULT_DATA_CONFIG: dict[str, Any] = {
@@ -244,86 +262,92 @@ def _normalize_identity(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _normalize_loss(config: dict[str, Any]) -> dict[str, Any]:
-    loss = _table(config, "loss", "[loss]")
-    unknown = set(loss) - set(DEFAULT_LOSS_CONFIG)
+def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, hq: bool) -> dict[str, Any]:
+    defaults = DEFAULT_HQ_LOSS_CONFIG if hq else DEFAULT_COARSE_LOSS_CONFIG
+    unknown = set(loss) - set(defaults)
     if unknown:
-        raise ValueError(f"[loss] 包含未知字段：{sorted(unknown)}")
+        raise ValueError(f"[loss.{stage}] 包含未知字段：{sorted(unknown)}")
+    prefix = f"loss.{stage}"
 
-    reconstruction = _with_defaults(_table(loss, "reconstruction", "[loss.reconstruction]"), DEFAULT_LOSS_CONFIG["reconstruction"], "[loss.reconstruction]")
+    gan = _with_defaults(_table(loss, "gan", f"[{prefix}.gan]"), defaults["gan"], f"[{prefix}.gan]")
+    gan["weight"] = _float(gan["weight"], f"{prefix}.gan.weight", minimum=0.0)
+
+    identity = _with_defaults(_table(loss, "identity", f"[{prefix}.identity]"), defaults["identity"], f"[{prefix}.identity]")
+    identity["provider"] = _provider(identity["provider"], f"{prefix}.identity.provider")
+    identity["weight"] = _float(identity["weight"], f"{prefix}.identity.weight", minimum=0.0)
+
+    r1 = _with_defaults(_table(loss, "r1", f"[{prefix}.r1]"), defaults["r1"], f"[{prefix}.r1]")
+    r1["enable"] = _bool(r1["enable"], f"{prefix}.r1.enable")
+    r1["interval"] = _int(r1["interval"], f"{prefix}.r1.interval", minimum=1)
+    r1["gamma"] = _float(r1["gamma"], f"{prefix}.r1.gamma", minimum=0.0)
+
+    gaze = _with_defaults(_table(loss, "gaze", f"[{prefix}.gaze]"), defaults["gaze"], f"[{prefix}.gaze]")
+    gaze["enable"] = _bool(gaze["enable"], f"{prefix}.gaze.enable")
+    gaze["weight"] = _float(gaze["weight"], f"{prefix}.gaze.weight", minimum=0.0)
+    gaze["distribution_weight"] = _float(gaze["distribution_weight"], f"{prefix}.gaze.distribution_weight", minimum=0.0)
+    gaze["confidence_weighted"] = _bool(gaze["confidence_weighted"], f"{prefix}.gaze.confidence_weighted")
+
+    hrffa = _with_defaults(_table(loss, "hrffa", f"[{prefix}.hrffa]"), defaults["hrffa"], f"[{prefix}.hrffa]")
+    hrffa["enable"] = _bool(hrffa["enable"], f"{prefix}.hrffa.enable")
+    for key in ("pose_weight", "eye_weight", "mouth_weight", "contour_weight", "contour_shape_weight"):
+        hrffa[key] = _float(hrffa[key], f"{prefix}.hrffa.{key}", minimum=0.0)
+    hrffa["occluded_geometry_weight"] = _float(hrffa["occluded_geometry_weight"], f"{prefix}.hrffa.occluded_geometry_weight", minimum=0.0, maximum=1.0)
+
+    facs = _with_defaults(_table(loss, "facs", f"[{prefix}.facs]"), defaults["facs"], f"[{prefix}.facs]")
+    facs["enable"] = _bool(facs["enable"], f"{prefix}.facs.enable")
+    for key in ("weight", "brow_weight", "eye_weight", "nose_weight", "mouth_weight", "lower_face_weight", "asymmetry_weight"):
+        facs[key] = _float(facs[key], f"{prefix}.facs.{key}", minimum=0.0)
+
+    result = {"gan": gan, "identity": identity, "r1": r1, "gaze": gaze, "hrffa": hrffa, "facs": facs}
+    if not hq:
+        return result
+
+    reconstruction = _with_defaults(_table(loss, "reconstruction", f"[{prefix}.reconstruction]"), defaults["reconstruction"], f"[{prefix}.reconstruction]")
     scope = reconstruction["scope"]
     if not isinstance(scope, str):
-        raise TypeError(f"loss.reconstruction.scope 必须为字符串，实际为 {type(scope).__name__}")
+        raise TypeError(f"{prefix}.reconstruction.scope 必须为字符串，实际为 {type(scope).__name__}")
     if scope not in {"same", "all"}:
-        raise ValueError(f"loss.reconstruction.scope={scope!r} 无效，可选：same、all")
+        raise ValueError(f"{prefix}.reconstruction.scope={scope!r} 无效，可选：same、all")
 
-    gan = _with_defaults(_table(loss, "gan", "[loss.gan]"), DEFAULT_LOSS_CONFIG["gan"], "[loss.gan]")
-    gan["weight"] = _float(gan["weight"], "loss.gan.weight", minimum=0.0)
+    l1 = _with_defaults(_table(loss, "l1", f"[{prefix}.l1]"), defaults["l1"], f"[{prefix}.l1]")
+    l1["enable"] = _bool(l1["enable"], f"{prefix}.l1.enable")
+    l1["weight"] = _float(l1["weight"], f"{prefix}.l1.weight", minimum=0.0)
 
-    identity = _with_defaults(_table(loss, "identity", "[loss.identity]"), DEFAULT_LOSS_CONFIG["identity"], "[loss.identity]")
-    identity["provider"] = _provider(identity["provider"], "loss.identity.provider")
-    identity["weight"] = _float(identity["weight"], "loss.identity.weight", minimum=0.0)
-
-    l1 = _with_defaults(_table(loss, "l1", "[loss.l1]"), DEFAULT_LOSS_CONFIG["l1"], "[loss.l1]")
-    l1["enable"] = _bool(l1["enable"], "loss.l1.enable")
-    l1["weight"] = _float(l1["weight"], "loss.l1.weight", minimum=0.0)
-
-    r1 = _with_defaults(_table(loss, "r1", "[loss.r1]"), DEFAULT_LOSS_CONFIG["r1"], "[loss.r1]")
-    r1["enable"] = _bool(r1["enable"], "loss.r1.enable")
-    r1["interval"] = _int(r1["interval"], "loss.r1.interval", minimum=1)
-    r1["gamma"] = _float(r1["gamma"], "loss.r1.gamma", minimum=0.0)
-
-    gaze = _with_defaults(_table(loss, "gaze", "[loss.gaze]"), DEFAULT_LOSS_CONFIG["gaze"], "[loss.gaze]")
-    gaze["enable"] = _bool(gaze["enable"], "loss.gaze.enable")
-    gaze["weight"] = _float(gaze["weight"], "loss.gaze.weight", minimum=0.0)
-    gaze["distribution_weight"] = _float(gaze["distribution_weight"], "loss.gaze.distribution_weight", minimum=0.0)
-    gaze["confidence_weighted"] = _bool(gaze["confidence_weighted"], "loss.gaze.confidence_weighted")
-
-    hrffa = _with_defaults(_table(loss, "hrffa", "[loss.hrffa]"), DEFAULT_LOSS_CONFIG["hrffa"], "[loss.hrffa]")
-    hrffa["enable"] = _bool(hrffa["enable"], "loss.hrffa.enable")
-    for key in ("pose_weight", "eye_weight", "mouth_weight", "contour_weight", "contour_shape_weight"):
-        hrffa[key] = _float(hrffa[key], f"loss.hrffa.{key}", minimum=0.0)
-    hrffa["occluded_geometry_weight"] = _float(hrffa["occluded_geometry_weight"], "loss.hrffa.occluded_geometry_weight", minimum=0.0, maximum=1.0)
-
-    facs = _with_defaults(_table(loss, "facs", "[loss.facs]"), DEFAULT_LOSS_CONFIG["facs"], "[loss.facs]")
-    facs["enable"] = _bool(facs["enable"], "loss.facs.enable")
-    for key in ("weight", "brow_weight", "eye_weight", "nose_weight", "mouth_weight", "lower_face_weight", "asymmetry_weight"):
-        facs[key] = _float(facs[key], f"loss.facs.{key}", minimum=0.0)
-
-    vgg = _with_defaults(_table(loss, "vgg", "[loss.vgg]"), DEFAULT_LOSS_CONFIG["vgg"], "[loss.vgg]")
-    vgg["enable"] = _bool(vgg["enable"], "loss.vgg.enable")
+    vgg = _with_defaults(_table(loss, "vgg", f"[{prefix}.vgg]"), defaults["vgg"], f"[{prefix}.vgg]")
+    vgg["enable"] = _bool(vgg["enable"], f"{prefix}.vgg.enable")
     raw_vgg_weights = vgg["weights"]
     if not isinstance(raw_vgg_weights, dict) or (vgg["enable"] and not raw_vgg_weights):
-        raise ValueError("[loss.vgg.weights] 必须为非空表/对象")
-    vgg["weights"] = {str(layer): _float(weight, f"loss.vgg.weights.{layer}", minimum=0.0) for layer, weight in raw_vgg_weights.items()}
+        raise ValueError(f"[{prefix}.vgg.weights] 必须为非空表/对象")
+    vgg["weights"] = {str(layer): _float(weight, f"{prefix}.vgg.weights.{layer}", minimum=0.0) for layer, weight in raw_vgg_weights.items()}
 
-    wfm = _with_defaults(_table(loss, "wfm", "[loss.wfm]"), DEFAULT_LOSS_CONFIG["wfm"], "[loss.wfm]")
-    wfm["enable"] = _bool(wfm["enable"], "loss.wfm.enable")
+    wfm = _with_defaults(_table(loss, "wfm", f"[{prefix}.wfm]"), defaults["wfm"], f"[{prefix}.wfm]")
+    wfm["enable"] = _bool(wfm["enable"], f"{prefix}.wfm.enable")
     raw_wfm_weights = wfm["weights"]
     if not isinstance(raw_wfm_weights, dict) or (wfm["enable"] and not raw_wfm_weights):
-        raise ValueError("[loss.wfm.weights] 必须为非空表/对象")
+        raise ValueError(f"[{prefix}.wfm.weights] 必须为非空表/对象")
     normalized_wfm_weights: dict[str, float] = {}
     for index, weight in raw_wfm_weights.items():
         try:
             layer_index = int(index)
         except (TypeError, ValueError) as exc:
-            raise ValueError("[loss.wfm.weights] 的键必须是非负整数层索引") from exc
+            raise ValueError(f"[{prefix}.wfm.weights] 的键必须是非负整数层索引") from exc
         if layer_index < 0 or str(layer_index) != str(index):
-            raise ValueError(f"loss.wfm.weights 层索引无效：{index!r}")
-        normalized_wfm_weights[str(layer_index)] = _float(weight, f"loss.wfm.weights.{layer_index}", minimum=0.0)
+            raise ValueError(f"{prefix}.wfm.weights 层索引无效：{index!r}")
+        normalized_wfm_weights[str(layer_index)] = _float(weight, f"{prefix}.wfm.weights.{layer_index}", minimum=0.0)
     wfm["weights"] = normalized_wfm_weights
 
+    result.update({"reconstruction": reconstruction, "l1": l1, "vgg": vgg, "wfm": wfm})
+    return result
+
+
+def _normalize_loss(config: dict[str, Any]) -> dict[str, Any]:
+    loss = _table(config, "loss", "[loss]")
+    unknown = set(loss) - set(DEFAULT_LOSS_CONFIG)
+    if unknown:
+        raise ValueError(f"[loss] 包含未知字段：{sorted(unknown)}")
     return {
-        "reconstruction": reconstruction,
-        "gan": gan,
-        "identity": identity,
-        "l1": l1,
-        "r1": r1,
-        "gaze": gaze,
-        "hrffa": hrffa,
-        "facs": facs,
-        "vgg": vgg,
-        "wfm": wfm,
+        "coarse": _normalize_stage_loss(_table(loss, "coarse", "[loss.coarse]"), "coarse", hq=False),
+        "hq": _normalize_stage_loss(_table(loss, "hq", "[loss.hq]"), "hq", hq=True),
     }
 
 

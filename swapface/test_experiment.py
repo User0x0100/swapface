@@ -13,7 +13,7 @@ from unittest.mock import patch
 import torch
 
 from models.networks import Generator
-from swapface.config import load_train_config, resolve_train_config
+from swapface.config import DEFAULT_LOSS_CONFIG, load_train_config, resolve_train_config
 from swapface.contracts import CHECKPOINT_VERSION
 from swapface.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
 from swapface.train import (
@@ -38,14 +38,20 @@ def _check_train_config(root: Path) -> None:
         '[scheduler]\ntype = "cosine"\nt_max = 1234\nmin_lr_ratio = 0.2\n'
         "[generator]\ncoarse_num_latent = 7\n"
         '[identity]\nprovider = "MS1MV3_ARCFACE_R50_FP16"\n'
-        '[loss.reconstruction]\nscope = "all"\n'
-        "[loss.gan]\nweight = 0.8\n"
-        '[loss.identity]\nprovider = "BLENDFACE"\nweight = 9.0\n'
-        "[loss.l1]\nenable = true\nweight = 7.0\n"
-        "[loss.gaze]\nenable = true\nweight = 0.75\ndistribution_weight = 0.2\nconfidence_weighted = false\n"
-        "[loss.hrffa]\nenable = true\npose_weight = 0.5\neye_weight = 1.25\nmouth_weight = 1.5\ncontour_weight = 2.0\ncontour_shape_weight = 0.4\noccluded_geometry_weight = 0.1\n"
-        "[loss.facs]\nenable = true\nweight = 0.8\nbrow_weight = 1.1\neye_weight = 1.2\nnose_weight = 0.9\nmouth_weight = 1.3\nlower_face_weight = 0.7\nasymmetry_weight = 1.4\n"
-        "[loss.wfm.weights]\n2 = 0.25\n"
+        "[loss.coarse.gan]\nweight = 0.6\n"
+        '[loss.coarse.identity]\nprovider = "BLENDFACE"\nweight = 7.0\n'
+        "[loss.coarse.r1]\nenable = true\ninterval = 8\ngamma = 5.0\n"
+        "[loss.coarse.gaze]\nenable = true\nweight = 0.4\ndistribution_weight = 0.05\nconfidence_weighted = true\n"
+        "[loss.coarse.hrffa]\nenable = true\npose_weight = 0.4\neye_weight = 0.8\nmouth_weight = 1.1\ncontour_weight = 1.2\ncontour_shape_weight = 0.3\noccluded_geometry_weight = 0.2\n"
+        '[loss.hq.reconstruction]\nscope = "all"\n'
+        "[loss.hq.gan]\nweight = 0.8\n"
+        '[loss.hq.identity]\nprovider = "MS1MV3_ARCFACE_R50_FP16"\nweight = 9.0\n'
+        "[loss.hq.l1]\nenable = true\nweight = 7.0\n"
+        "[loss.hq.r1]\nenable = true\ninterval = 32\ngamma = 12.0\n"
+        "[loss.hq.gaze]\nenable = true\nweight = 0.75\ndistribution_weight = 0.2\nconfidence_weighted = false\n"
+        "[loss.hq.hrffa]\nenable = true\npose_weight = 0.5\neye_weight = 1.25\nmouth_weight = 1.5\ncontour_weight = 2.0\ncontour_shape_weight = 0.4\noccluded_geometry_weight = 0.1\n"
+        "[loss.hq.facs]\nenable = true\nweight = 0.8\nbrow_weight = 1.1\neye_weight = 1.2\nnose_weight = 0.9\nmouth_weight = 1.3\nlower_face_weight = 0.7\nasymmetry_weight = 1.4\n"
+        "[loss.hq.wfm.weights]\n2 = 0.25\n"
         "[data.augmentation]\nrotation_range = [-3, 3]\n"
         "[data.sampling]\nsame_prob = 0.25\n"
         '[[data.src]]\npath = "source"\nadjustment = 1\n'
@@ -59,6 +65,8 @@ def _check_train_config(root: Path) -> None:
     assert raw == original
     assert resolve_train_config(resolved) == resolved
     assert json.loads(json.dumps(resolved)) == resolved
+    for loss_name in ("gan", "identity", "r1", "gaze", "hrffa", "facs"):
+        assert DEFAULT_LOSS_CONFIG["coarse"][loss_name] is not DEFAULT_LOSS_CONFIG["hq"][loss_name]
     loaded = load_train_config(source)
     assert loaded == resolved
 
@@ -68,14 +76,28 @@ def _check_train_config(root: Path) -> None:
     assert resolved["optimizer"] == {"lr": 5e-5}
     assert resolved["scheduler"] == {"type": "cosine", "t_max": 1234, "min_lr_ratio": 0.2}
     assert resolved["identity"]["provider"] == raw["identity"]["provider"]
-    assert resolved["loss"]["gan"] == {"weight": 0.8}
-    assert resolved["loss"]["identity"] == {"provider": "BLENDFACE", "weight": 9.0}
-    assert resolved["loss"]["l1"] == {"enable": True, "weight": 7.0}
-    assert resolved["loss"]["reconstruction"] == {"scope": "all"}
+    assert resolved["loss"]["coarse"]["gan"] == {"weight": 0.6}
+    assert resolved["loss"]["coarse"]["identity"] == {"provider": "BLENDFACE", "weight": 7.0}
+    assert resolved["loss"]["coarse"]["r1"] == {"enable": True, "interval": 8, "gamma": 5.0}
+    assert resolved["loss"]["hq"]["gan"] == {"weight": 0.8}
+    assert resolved["loss"]["hq"]["identity"] == {"provider": "MS1MV3_ARCFACE_R50_FP16", "weight": 9.0}
+    assert resolved["loss"]["hq"]["l1"] == {"enable": True, "weight": 7.0}
+    assert resolved["loss"]["hq"]["r1"] == {"enable": True, "interval": 32, "gamma": 12.0}
+    assert resolved["loss"]["hq"]["reconstruction"] == {"scope": "all"}
     assert resolved["data"]["augmentation"]["rotation_range"] == [-3.0, 3.0]
     assert abs(resolved["data"]["sampling"]["same_prob"] - 0.25) < 1e-12
-    assert resolved["loss"]["gaze"] == {"enable": True, "weight": 0.75, "distribution_weight": 0.2, "confidence_weighted": False}
-    assert resolved["loss"]["hrffa"] == {
+    assert resolved["loss"]["coarse"]["gaze"] == {"enable": True, "weight": 0.4, "distribution_weight": 0.05, "confidence_weighted": True}
+    assert resolved["loss"]["hq"]["gaze"] == {"enable": True, "weight": 0.75, "distribution_weight": 0.2, "confidence_weighted": False}
+    assert resolved["loss"]["coarse"]["hrffa"] == {
+        "enable": True,
+        "pose_weight": 0.4,
+        "eye_weight": 0.8,
+        "mouth_weight": 1.1,
+        "contour_weight": 1.2,
+        "contour_shape_weight": 0.3,
+        "occluded_geometry_weight": 0.2,
+    }
+    assert resolved["loss"]["hq"]["hrffa"] == {
         "enable": True,
         "pose_weight": 0.5,
         "eye_weight": 1.25,
@@ -84,7 +106,7 @@ def _check_train_config(root: Path) -> None:
         "contour_shape_weight": 0.4,
         "occluded_geometry_weight": 0.1,
     }
-    assert resolved["loss"]["facs"] == {
+    assert resolved["loss"]["hq"]["facs"] == {
         "enable": True,
         "weight": 0.8,
         "brow_weight": 1.1,
@@ -94,7 +116,7 @@ def _check_train_config(root: Path) -> None:
         "lower_face_weight": 0.7,
         "asymmetry_weight": 1.4,
     }
-    assert resolved["loss"]["wfm"]["weights"] == {"2": 0.25}
+    assert resolved["loss"]["hq"]["wfm"]["weights"] == {"2": 0.25}
     assert resolved["data"]["src"][0]["adjustment"] == 1 and resolved["data"]["dst"][0]["adjustment"] == -1
 
     assert resolved["generator"]["coarse_num_latent"] == 7
@@ -117,7 +139,7 @@ def _check_train_config(root: Path) -> None:
     invalid_frozen_configs.append(old_precision)
 
     missing_scope = copy.deepcopy(resolved)
-    missing_scope["loss"]["reconstruction"].pop("scope")
+    missing_scope["loss"]["hq"]["reconstruction"].pop("scope")
     invalid_frozen_configs.append(missing_scope)
 
     missing_same_prob = copy.deepcopy(resolved)
@@ -161,13 +183,22 @@ def _check_train_config(root: Path) -> None:
         raise AssertionError("配置错误接受了未显式声明的训练精度")
 
     invalid = copy.deepcopy(raw)
-    invalid["loss"]["reconstruction"]["scope"] = "cross"
+    invalid["loss"]["hq"]["reconstruction"]["scope"] = "cross"
     try:
         resolve_train_config(invalid)
     except ValueError as error:
-        assert "loss.reconstruction.scope" in str(error)
+        assert "loss.hq.reconstruction.scope" in str(error)
     else:
         raise AssertionError("配置错误接受了未知 reconstruction scope")
+
+    obsolete = copy.deepcopy(raw)
+    obsolete["loss"]["gan"] = {"weight": 1.0}
+    try:
+        resolve_train_config(obsolete)
+    except ValueError as error:
+        assert "gan" in str(error)
+    else:
+        raise AssertionError("配置错误接受了已移除的共享 loss.gan")
 
     obsolete = copy.deepcopy(raw)
     obsolete["loss"]["rec_loss_scope"] = "same"
@@ -187,7 +218,7 @@ def _check_train_config(root: Path) -> None:
     else:
         raise AssertionError("配置错误接受了 same_prob > 1")
 
-    for section, key, value in (("optimizer", "lr", True), ("loss.gan", "weight", True), ("loss.gan", "weight", "0.5")):
+    for section, key, value in (("optimizer", "lr", True), ("loss.coarse.gan", "weight", True), ("loss.hq.gan", "weight", "0.5")):
         invalid = copy.deepcopy(raw)
         target = invalid
         for part in section.split("."):
@@ -255,7 +286,7 @@ def _check_train_config(root: Path) -> None:
 
     for key, value in (("pose_weight", float("nan")), ("eye_weight", float("inf")), ("occluded_geometry_weight", float("nan"))):
         invalid = copy.deepcopy(raw)
-        invalid["loss"]["hrffa"][key] = value
+        invalid["loss"]["hq"]["hrffa"][key] = value
         try:
             resolve_train_config(invalid)
         except ValueError as error:
@@ -458,7 +489,17 @@ def _check_generator_responsibility_boundary() -> None:
         ):
             detach_boundaries += 1
     assert detach_boundaries == 2
-    print("PASS: Final/HQ gradients are isolated from Coarse; Trainer keeps both detach boundaries")
+
+    r1_branch_names = []
+    for node in ast.walk(train_tree):
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id in {"hq_r1_step", "coarse_r1_step"}:
+            r1_branch_names.append(node.test.id)
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+            names = {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
+            assert not {"hq_r1_step", "coarse_r1_step"}.issubset(names)
+    assert r1_branch_names.count("hq_r1_step") == 1
+    assert r1_branch_names.count("coarse_r1_step") == 1
+    print("PASS: HQ/Coarse gradients and R1 execution paths remain independent")
 
 
 def main() -> None:

@@ -93,7 +93,7 @@ def main() -> None:
         checkpoint = {
             "version": CHECKPOINT_VERSION,
             "step": 123,
-            "identity_encoders": {"generator": provider.name, "identity_loss": "BLENDFACE"},
+            "identity_encoders": {"generator": provider.name, "coarse_identity_loss": "BLENDFACE", "hq_identity_loss": "BLENDFACE"},
             "net_g": {"network_cfg": model.network_cfg, "state_dict": model.state_dict()},
             "training_state": {"net_g": {key: torch.zeros_like(value) for key, value in model.state_dict().items()}},
         }

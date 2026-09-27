@@ -47,48 +47,29 @@ min_lr_ratio = 0.1
 provider = "BLENDFACE"
 
 
-[loss.reconstruction]
-# L1/VGG reconstruction 的共享作用范围：
-# "same" 仅 same self-reconstruction；"all" 对 batch 内所有 src/dst pair 生效。
-scope = "same"
-
-
-[loss.gan]
-# Final/Coarse Generator adversarial loss 共用此权重；两个 Discriminator adversarial loss 固定为 1.0。
+[loss.coarse.gan]
 weight = 1.0
 
 
-[loss.identity]
-# Identity Loss teacher 与权重。
+[loss.coarse.identity]
 provider = "MS1MV3_ARCFACE_R50_FP16"
 weight = 10.0
 
 
-[loss.l1]
+[loss.coarse.r1]
 enable = true
-weight = 8.0
-
-
-[loss.r1]
-enable = true
-
-# Lazy R1：每隔多少个 completed step 执行一次；首个 step 即执行。
 interval = 16
-
-# R1 gamma。实际 lazy R1 会再乘以 interval 做间隔补偿。
 gamma = 10.0
 
 
-[loss.gaze]
-# L2CS-Net gaze consistency：restore fake 后与 dst_canonical 比较视线方向。
+[loss.coarse.gaze]
 enable = true
 weight = 1.0
 distribution_weight = 0.1
 confidence_weighted = true
 
 
-[loss.hrffa]
-# HRFFA vitt-256 面部几何一致性损失。
+[loss.coarse.hrffa]
 enable = false
 pose_weight = 1.0
 eye_weight = 1.0
@@ -98,8 +79,7 @@ contour_shape_weight = 0.5
 occluded_geometry_weight = 0.25
 
 
-[loss.facs]
-# OpenGraphAU / MEFARG Stage-2 连续 FACS Action Unit 一致性损失。
+[loss.coarse.facs]
 enable = false
 weight = 1.0
 brow_weight = 1.0
@@ -110,22 +90,73 @@ lower_face_weight = 1.0
 asymmetry_weight = 1.0
 
 
-[loss.vgg]
-# VGG19 perceptual reconstruction。与 L1 共用 loss.reconstruction.scope。
+[loss.hq.reconstruction]
+# L1/VGG reconstruction 的共享作用范围："same" 仅 self-reconstruction；"all" 为全部 pair。
+scope = "same"
+
+
+[loss.hq.gan]
+weight = 1.0
+
+
+[loss.hq.identity]
+provider = "MS1MV3_ARCFACE_R50_FP16"
+weight = 10.0
+
+
+[loss.hq.l1]
+enable = true
+weight = 8.0
+
+
+[loss.hq.r1]
+enable = true
+interval = 16
+gamma = 10.0
+
+
+[loss.hq.gaze]
+enable = true
+weight = 1.0
+distribution_weight = 0.1
+confidence_weighted = true
+
+
+[loss.hq.hrffa]
+enable = false
+pose_weight = 1.0
+eye_weight = 1.0
+mouth_weight = 1.0
+contour_weight = 1.0
+contour_shape_weight = 0.5
+occluded_geometry_weight = 0.25
+
+
+[loss.hq.facs]
+enable = false
+weight = 1.0
+brow_weight = 1.0
+eye_weight = 1.0
+nose_weight = 1.0
+mouth_weight = 1.0
+lower_face_weight = 1.0
+asymmetry_weight = 1.0
+
+
+[loss.hq.vgg]
 enable = true
 
-[loss.vgg.weights]
+[loss.hq.vgg.weights]
 conv1_2 = 2.5
 conv2_2 = 2.5
 conv3_3 = 2.5
 conv4_3 = 2.5
 
 
-[loss.wfm]
-# 判别器中间特征 Weighted Feature Matching。
+[loss.hq.wfm]
 enable = false
 
-[loss.wfm.weights]
+[loss.hq.wfm.weights]
 0 = 0.1
 1 = 0.1
 2 = 0.1
@@ -178,7 +209,7 @@ hq_max_ch = 128
 
 
 [discriminator]
-# Final D 使用这里的 img_resolution；Coarse D 复用其余参数，并自动改为 generator.coarse_resolution。
+# HQ D 使用这里的 img_resolution；Coarse D 复用其余参数，并自动改为 generator.coarse_resolution。
 img_resolution = 512
 img_channels = 3
 base_ch = 64
