@@ -55,7 +55,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 9
+TRAINING_SEMANTICS_VERSION = 10
 
 
 def _configure_training_runtime() -> None:
@@ -204,9 +204,9 @@ class Trainer:
         loss_config = config["loss"]
         data_config = config["data"]
         net_g_cfg = dict(config["generator"])
-        net_d_cfg = dict(config["discriminator"])
+        net_d_cfg = dict(config["discriminator"]["hq"])
+        net_d_coarse_cfg = dict(config["discriminator"]["coarse"])
         coarse_resolution = int(net_g_cfg["coarse_resolution"])
-        net_d_coarse_cfg = {**net_d_cfg, "img_resolution": coarse_resolution}
 
         generator_optimizer_config = optimizer_config["generator"]
         hq_d_optimizer_config = optimizer_config["hq_discriminator"]
@@ -405,15 +405,28 @@ class Trainer:
 
         d_resolution = int(net_d.network_cfg["img_resolution"])
         if d_resolution != self.img_resolution:
-            raise ValueError(f"生成器与判别器分辨率不一致：{self.img_resolution} != {d_resolution}")
+            raise ValueError(f"生成器与 HQ Discriminator 分辨率不一致：{self.img_resolution} != {d_resolution}")
 
         coarse_d_resolution = int(net_d_coarse.network_cfg["img_resolution"])
         if coarse_d_resolution != coarse_resolution:
             raise ValueError(f"Coarse 与 Coarse Discriminator 分辨率不一致：{coarse_resolution} != {coarse_d_resolution}")
 
-        group_size = min(int(net_d.network_cfg["group_size"]), self.batch_size)
-        if self.batch_size % group_size != 0:
-            raise ValueError(f"batch_size={self.batch_size} 必须能被判别器 minibatch group_size={group_size} 整除")
+        generator_channels = int(net_g.network_cfg["img_channels"])
+        hq_d_channels = int(net_d.network_cfg["img_channels"])
+        if hq_d_channels != generator_channels:
+            raise ValueError(f"Generator 与 HQ Discriminator 通道数不一致：{generator_channels} != {hq_d_channels}")
+
+        coarse_d_channels = int(net_d_coarse.network_cfg["img_channels"])
+        if coarse_d_channels != generator_channels:
+            raise ValueError(f"Generator 与 Coarse Discriminator 通道数不一致：{generator_channels} != {coarse_d_channels}")
+
+        hq_group_size = min(int(net_d.network_cfg["group_size"]), self.batch_size)
+        if self.hq_stage_active and self.batch_size % hq_group_size != 0:
+            raise ValueError(f"batch_size={self.batch_size} 必须能被 HQ Discriminator minibatch group_size={hq_group_size} 整除")
+
+        coarse_group_size = min(int(net_d_coarse.network_cfg["group_size"]), self.batch_size)
+        if self.coarse_stage_active and self.batch_size % coarse_group_size != 0:
+            raise ValueError(f"batch_size={self.batch_size} 必须能被 Coarse Discriminator minibatch group_size={coarse_group_size} 整除")
 
         self.net_g = net_g.to(self.device).train()
         self.net_g.coarse.requires_grad_(self.coarse_stage_active)
@@ -1295,11 +1308,10 @@ def _load_branch_checkpoint(
         raise ValueError("branch 不能修改 Generator 架构")
 
     checkpoint["net_d_coarse"]
-    if not reset_hq_discriminator and dict(checkpoint["net_d"]["network_cfg"]) != resolved["discriminator"]:
+    if not reset_hq_discriminator and dict(checkpoint["net_d"]["network_cfg"]) != resolved["discriminator"]["hq"]:
         raise ValueError("branch 继承 HQ Discriminator 时要求架构一致；如需新建请使用 --reset-hq-discriminator")
 
-    expected_coarse_d_cfg = {**resolved["discriminator"], "img_resolution": int(resolved["generator"]["coarse_resolution"])}
-    if not reset_coarse_discriminator and dict(checkpoint["net_d_coarse"]["network_cfg"]) != expected_coarse_d_cfg:
+    if not reset_coarse_discriminator and dict(checkpoint["net_d_coarse"]["network_cfg"]) != resolved["discriminator"]["coarse"]:
         raise ValueError("branch 继承 Coarse Discriminator 时要求架构一致；如需新建请使用 --reset-coarse-discriminator")
 
     _branch_model_states(

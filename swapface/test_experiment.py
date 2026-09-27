@@ -41,6 +41,8 @@ def _check_train_config(root: Path) -> None:
         '[scheduler.hq_discriminator]\ntype = "cosine"\nt_max = 2345\nmin_lr_ratio = 0.3\n'
         '[scheduler.coarse_discriminator]\ntype = "none"\nt_max = 3456\nmin_lr_ratio = 0.4\n'
         "[generator]\ncoarse_num_latent = 7\n"
+        "[discriminator.hq]\nbase_ch = 96\ngroup_size = 8\n"
+        "[discriminator.coarse]\nbase_ch = 32\nmax_ch = 256\ngroup_size = 4\n"
         '[identity]\nprovider = "MS1MV3_ARCFACE_R50_FP16"\n'
         "[loss.coarse.gan]\nweight = 0.6\n"
         '[loss.coarse.identity]\nprovider = "BLENDFACE"\nweight = 7.0\n'
@@ -131,6 +133,11 @@ def _check_train_config(root: Path) -> None:
     }
     assert resolved["loss"]["hq"]["wfm"]["weights"] == {"2": 0.25}
     assert resolved["data"]["src"][0]["adjustment"] == 1 and resolved["data"]["dst"][0]["adjustment"] == -1
+
+    assert resolved["discriminator"] == {
+        "hq": {"img_resolution": 512, "img_channels": 3, "base_ch": 96, "max_ch": 512, "group_size": 8},
+        "coarse": {"img_resolution": 128, "img_channels": 3, "base_ch": 32, "max_ch": 256, "group_size": 4},
+    }
 
     assert resolved["generator"]["coarse_num_latent"] == 7
     default_generator = copy.deepcopy(raw)
@@ -278,10 +285,13 @@ def _check_train_config(root: Path) -> None:
 
     for section, key, value in (
         ("generator", "img_resolution", True),
-        ("discriminator", "group_size", "4"),
+        ("discriminator.hq", "group_size", "4"),
     ):
         invalid = copy.deepcopy(raw)
-        invalid.setdefault(section, {})[key] = value
+        target = invalid
+        for part in section.split("."):
+            target = target.setdefault(part, {})
+        target[key] = value
         try:
             resolve_train_config(invalid)
         except TypeError:
@@ -686,6 +696,18 @@ def _check_generator_responsibility_boundary() -> None:
     assert {"train_hq", "_hq_generator_stage_loss", "_update_discriminator_stage"}.issubset(guarded_calls("hq_stage_active"))
     assert {"_coarse_generator_stage_loss", "_update_discriminator_stage"}.issubset(guarded_calls("coarse_stage_active"))
 
+    init_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer.__init__)))
+    channel_mismatch_pairs = set()
+    for node in ast.walk(init_tree):
+        if not isinstance(node, ast.Compare) or len(node.ops) != 1 or not isinstance(node.ops[0], ast.NotEq) or len(node.comparators) != 1:
+            continue
+        left = node.left
+        right = node.comparators[0]
+        if isinstance(left, ast.Name) and isinstance(right, ast.Name):
+            channel_mismatch_pairs.add((left.id, right.id))
+    assert ("hq_d_channels", "generator_channels") in channel_mismatch_pairs
+    assert ("coarse_d_channels", "generator_channels") in channel_mismatch_pairs
+
     def self_calls(method: object) -> set[str]:
         tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
         return {
@@ -817,7 +839,15 @@ def main() -> None:
         assert _compile_training_callable(object()) is compile_target
         assert compile_mock.call_args.kwargs["mode"] == "max-autotune-no-cudagraphs"
 
-    resolved = {"train": {"batch_size": 8}, "generator": {"coarse_resolution": 128}, "discriminator": {"base_ch": 64}, "identity": {"provider": "BLENDFACE"}}
+    resolved = {
+        "train": {"batch_size": 8},
+        "generator": {"coarse_resolution": 128},
+        "discriminator": {
+            "hq": {"base_ch": 64},
+            "coarse": {"base_ch": 32},
+        },
+        "identity": {"provider": "BLENDFACE"},
+    }
 
     with tempfile.TemporaryDirectory(prefix="swapface-run-check-") as temporary:
         root = Path(temporary)
@@ -872,9 +902,9 @@ def main() -> None:
                 "run": {"id": metadata["run_id"], "config_sha256": metadata["config_sha256"]},
                 "training_config": {"semantics_version": TRAINING_SEMANTICS_VERSION, "precision": "fp16", "stage": "joint"},
                 "net_g": {"network_cfg": resolved["generator"], "state_dict": ema_g_state},
-                "net_d": {"network_cfg": resolved["discriminator"], "state_dict": d_state},
+                "net_d": {"network_cfg": resolved["discriminator"]["hq"], "state_dict": d_state},
                 "net_d_coarse": {
-                    "network_cfg": {**resolved["discriminator"], "img_resolution": resolved["generator"]["coarse_resolution"]},
+                    "network_cfg": resolved["discriminator"]["coarse"],
                     "state_dict": coarse_d_state,
                 },
                 "training_state": {"net_g": train_g_state},
@@ -993,56 +1023,84 @@ def main() -> None:
         else:
             raise AssertionError("branch 错误接受了 Generator 架构变更")
 
-        changed_discriminator = copy.deepcopy(resolved)
-        changed_discriminator["discriminator"]["base_ch"] = 128
+        changed_hq_discriminator = copy.deepcopy(resolved)
+        changed_hq_discriminator["discriminator"]["hq"]["base_ch"] = 128
         try:
             _load_branch_checkpoint(
                 standalone,
-                changed_discriminator,
+                changed_hq_discriminator,
                 reset_hq_discriminator=False,
                 reset_coarse_discriminator=False,
             )
         except ValueError:
             pass
         else:
-            raise AssertionError("branch 默认错误接受了 Discriminator 架构变更")
+            raise AssertionError("branch 错误继承了架构已变化的 HQ Discriminator")
 
-        # discriminator schema 目前由 HQ/Coarse 共用；只 reset 一边时，另一边仍要求架构一致。
-        for reset_hq, reset_coarse in ((True, False), (False, True)):
-            try:
-                _load_branch_checkpoint(
-                    standalone,
-                    changed_discriminator,
-                    reset_hq_discriminator=reset_hq,
-                    reset_coarse_discriminator=reset_coarse,
-                )
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("只 reset 一个 D 时错误接受了共享 Discriminator 架构变更")
+        _, hq_reset_parent = _load_branch_checkpoint(
+            standalone,
+            changed_hq_discriminator,
+            reset_hq_discriminator=True,
+            reset_coarse_discriminator=False,
+        )
+        assert hq_reset_parent["discriminator"] == {"hq": "reset", "coarse": "inherit"}
 
+        changed_coarse_discriminator = copy.deepcopy(resolved)
+        changed_coarse_discriminator["discriminator"]["coarse"]["base_ch"] = 96
+        try:
+            _load_branch_checkpoint(
+                standalone,
+                changed_coarse_discriminator,
+                reset_hq_discriminator=False,
+                reset_coarse_discriminator=False,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("branch 错误继承了架构已变化的 Coarse Discriminator")
+
+        _, coarse_reset_parent = _load_branch_checkpoint(
+            standalone,
+            changed_coarse_discriminator,
+            reset_hq_discriminator=False,
+            reset_coarse_discriminator=True,
+        )
+        assert coarse_reset_parent["discriminator"] == {"hq": "inherit", "coarse": "reset"}
+
+        changed_both_discriminators = copy.deepcopy(resolved)
+        changed_both_discriminators["discriminator"]["hq"]["base_ch"] = 128
+        changed_both_discriminators["discriminator"]["coarse"]["base_ch"] = 96
         _, reset_parent = _load_branch_checkpoint(
             standalone,
-            changed_discriminator,
+            changed_both_discriminators,
             reset_hq_discriminator=True,
             reset_coarse_discriminator=True,
         )
         assert reset_parent["discriminator"] == {"hq": "reset", "coarse": "reset"}
 
-        _, hq_reset_parent = _load_branch_checkpoint(
-            standalone,
-            resolved,
-            reset_hq_discriminator=True,
-            reset_coarse_discriminator=False,
-        )
-        assert hq_reset_parent["discriminator"] == {"hq": "reset", "coarse": "inherit"}
-        _, coarse_reset_parent = _load_branch_checkpoint(
-            standalone,
-            resolved,
-            reset_hq_discriminator=False,
-            reset_coarse_discriminator=True,
-        )
-        assert coarse_reset_parent["discriminator"] == {"hq": "inherit", "coarse": "reset"}
+        # 只 reset 一边不能掩盖另一边自己的不兼容变更。
+        try:
+            _load_branch_checkpoint(
+                standalone,
+                changed_both_discriminators,
+                reset_hq_discriminator=True,
+                reset_coarse_discriminator=False,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("reset HQ D 时错误忽略了 Coarse D 架构不兼容")
+        try:
+            _load_branch_checkpoint(
+                standalone,
+                changed_both_discriminators,
+                reset_hq_discriminator=False,
+                reset_coarse_discriminator=True,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("reset Coarse D 时错误忽略了 HQ D 架构不兼容")
 
         changed_provider = copy.deepcopy(resolved)
         changed_provider["identity"]["provider"] = "MS1MV3_ARCFACE_R50_FP16"

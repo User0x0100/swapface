@@ -52,11 +52,20 @@ DEFAULT_GENERATOR_CONFIG: dict[str, Any] = {
 }
 
 DEFAULT_DISCRIMINATOR_CONFIG: dict[str, Any] = {
-    "img_resolution": 512,
-    "img_channels": 3,
-    "base_ch": 64,
-    "max_ch": 512,
-    "group_size": 4,
+    "hq": {
+        "img_resolution": 512,
+        "img_channels": 3,
+        "base_ch": 64,
+        "max_ch": 512,
+        "group_size": 4,
+    },
+    "coarse": {
+        "img_resolution": 128,
+        "img_channels": 3,
+        "base_ch": 64,
+        "max_ch": 512,
+        "group_size": 4,
+    },
 }
 DEFAULT_GENERATOR_ID_ENCODER_PROVIDER = IDEncoderProvider.BLENDFACE
 DEFAULT_IDENTITY_LOSS_PROVIDER = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16
@@ -437,10 +446,22 @@ def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_discriminator(config: dict[str, Any]) -> dict[str, Any]:
-    result = _with_defaults(_table(config, "discriminator", "[discriminator]"), DEFAULT_DISCRIMINATOR_CONFIG, "[discriminator]")
-    for key in ("img_resolution", "img_channels", "base_ch", "max_ch"):
-        result[key] = _int(result[key], f"discriminator.{key}")
-    result["group_size"] = _int(result["group_size"], "discriminator.group_size", minimum=1)
+    discriminator = _table(config, "discriminator", "[discriminator]")
+    unknown = set(discriminator) - set(DEFAULT_DISCRIMINATOR_CONFIG)
+    if unknown:
+        raise ValueError(f"[discriminator] 包含未知字段：{sorted(unknown)}")
+
+    result: dict[str, Any] = {}
+    for stage, defaults in DEFAULT_DISCRIMINATOR_CONFIG.items():
+        stage_config = _with_defaults(
+            _table(discriminator, stage, f"[discriminator.{stage}]"),
+            defaults,
+            f"[discriminator.{stage}]",
+        )
+        for key in ("img_resolution", "img_channels", "base_ch", "max_ch"):
+            stage_config[key] = _int(stage_config[key], f"discriminator.{stage}.{key}")
+        stage_config["group_size"] = _int(stage_config["group_size"], f"discriminator.{stage}.group_size", minimum=1)
+        result[stage] = stage_config
     return result
 
 

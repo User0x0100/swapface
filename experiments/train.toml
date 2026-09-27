@@ -226,14 +226,20 @@ hq_base_ch = 8
 hq_max_ch = 128
 
 
-[discriminator]
-# HQ D 使用这里的 img_resolution；Coarse D 复用其余参数，并自动改为 generator.coarse_resolution。
+[discriminator.hq]
+# HQ Discriminator 独立架构；img_resolution / img_channels 必须匹配 Generator 输出。
 img_resolution = 512
 img_channels = 3
 base_ch = 64
 max_ch = 512
+group_size = 4
 
-# MinibatchStd group size；batch_size 必须能被 effective group 整除。
+[discriminator.coarse]
+# Coarse Discriminator 独立架构；img_resolution 必须匹配 generator.coarse_resolution，img_channels 必须匹配 Generator 输出。
+img_resolution = 128
+img_channels = 3
+base_ch = 64
+max_ch = 512
 group_size = 4
 
 

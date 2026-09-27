@@ -67,11 +67,13 @@ uv run python -m swapface.train \
 - `[loss.*]`：每一种训练损失及其共享 reconstruction 策略；
 - `[data.loader]` / `[data.augmentation]` / `[data.sampling]`：数据执行、增强和配对采样；
 - `[[data.src]]` / `[[data.dst]]`：训练数据源；
-- `[generator]` / `[discriminator]`：模型定义。
+- `[generator]` / `[discriminator.hq]` / `[discriminator.coarse]`：Generator 与两个 Discriminator 的独立模型定义。
 
 Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、R1、gaze、HRFFA、FACS 均独立配置。L1/VGG/WFM 与 reconstruction scope 只属于 HQ。`gan.weight` 只缩放对应阶段的 Generator adversarial loss；两个 Discriminator adversarial loss 固定权重 1.0。
 
 优化策略按训练实体分开配置：`[optimizer.generator]`、`[optimizer.hq_discriminator]`、`[optimizer.coarse_discriminator]` 分别设置 LR；对应的 `[scheduler.generator]`、`[scheduler.hq_discriminator]`、`[scheduler.coarse_discriminator]` 分别设置 `type / t_max / min_lr_ratio`。Adam 的 `betas=(0.0, 0.99)` 与 fused 实现仍固定在训练代码中。
+
+两个 Discriminator 的架构也完全独立：`[discriminator.hq].img_resolution` 必须等于 `generator.img_resolution`，`[discriminator.coarse].img_resolution` 必须等于 `generator.coarse_resolution`；两者的 `img_channels` 都必须等于 `generator.img_channels`。`base_ch`、`max_ch` 与 minibatch group size 可以分别设置。
 
 ## Generator 梯度职责
 
@@ -218,7 +220,7 @@ uv run python -m swapface.train \
   --reset-coarse-discriminator
 ```
 
-需要两个 D 都重建时同时传入两个开关。Branch metadata 会分别记录 HQ/Coarse D 的 `inherit` / `reset`。由于当前 HQ/Coarse D 共用同一 `[discriminator]` 架构参数表，如果修改该架构，则所有仍选择 inherit 的 D 都必须与父 checkpoint 保持兼容。无论是否恢复 D，Branch 都不会继承 G/D optimizer、scheduler 或 GradScaler；step 默认继承父 checkpoint，也可以由 `--step` 指定。
+需要两个 D 都重建时同时传入两个开关。Branch metadata 会分别记录 HQ/Coarse D 的 `inherit` / `reset`。HQ D 与 Coarse D 的架构分别由 `[discriminator.hq]` 和 `[discriminator.coarse]` 控制，因此可以只修改并 reset 其中一个；任何选择 inherit 的 D 都只要求自己的架构与父 checkpoint 保持一致。无论是否恢复 D，Branch 都不会继承 G/D optimizer、scheduler 或 GradScaler；step 默认继承父 checkpoint，也可以由 `--step` 指定。
 
 因此三种入口的语义为：
 
