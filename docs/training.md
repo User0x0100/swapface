@@ -69,7 +69,7 @@ uv run python -m swapface.train \
 - `[[data.src]]` / `[[data.dst]]`：训练数据源；
 - `[generator]` / `[discriminator.hq]` / `[discriminator.coarse]`：Generator 与两个 Discriminator 的独立模型定义。
 
-Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、R1、gaze、HRFFA、FACS 均独立配置。L1/VGG/WFM 与 reconstruction scope 只属于 HQ。`gan.weight` 只缩放对应阶段的 Generator adversarial loss；两个 Discriminator adversarial loss 固定权重 1.0。
+Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、R1、gaze、HRFFA、FACS、L1/VGG 与 reconstruction scope 均独立配置；WFM 只属于 HQ。`gan.weight` 只缩放对应阶段的 Generator adversarial loss；两个 Discriminator adversarial loss 固定权重 1.0。
 
 优化策略按训练实体分开配置：`[optimizer.generator]`、`[optimizer.hq_discriminator]`、`[optimizer.coarse_discriminator]` 分别设置 LR；对应的 `[scheduler.generator]`、`[scheduler.hq_discriminator]`、`[scheduler.coarse_discriminator]` 分别设置 `type / t_max / min_lr_ratio`。Adam 的 `betas=(0.0, 0.99)` 与 fused 实现仍固定在训练代码中。
 
@@ -85,11 +85,11 @@ Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失�
 
 Generator、HQ Discriminator、Coarse Discriminator 分别拥有独立的 optimizer/scheduler/GradScaler。inactive Discriminator 保持在 CPU，不创建 optimizer/scaler/scheduler，也不占用训练 GPU 显存；inactive Generator stage 参数没有 gradient。EMA 只更新 active Generator stage。`hq` 模式下 HQ 输入仍使用冻结 Coarse 的输出；`joint` 模式下 HQ 输入使用 `coarse.detach()`，因此 Final/HQ losses 不会反向修改 Coarse。
 
-- Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、R1，以及 gaze / HRFFA / FACS target 属性监督；
+- Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、R1、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
 - HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/R1/WFM、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
 - Discriminator：HQ 与 Coarse 各有一个判别器，并分别维护自己的 D optimizer、scheduler、GradScaler 与 R1 enable/interval/gamma。joint 模式下两个 D 各自完成一次更新；某个 D 的 FP16 overflow 只重试该 D。
 
-Coarse GAN 的 real 是将真实 `dst` 双线性缩放到 `coarse_resolution`，fake 是 Coarse 原始输出；它只负责约束真实人脸分布，不引入 Coarse L1/VGG target reconstruction。Coarse 的 target 属性监督则先将低分辨率输出双线性上采样到训练分辨率，再使用与 Final 相同的 `theta_restore` 恢复到 canonical 坐标系，与 `dst_canonical` 比较。
+Coarse 内部首先将真实 `dst` 双线性缩放到 `coarse_resolution`；训练时通过 `return_resize_in=True` 复用这一实际模型输入作为 Coarse Discriminator real，以及 L1/VGG reconstruction target，不在 Trainer 中重复 resize。Coarse L1/VGG 由 `[loss.coarse.reconstruction].scope` 控制作用范围；默认 `same`，只对 self-reconstruction pair 生效。Coarse 的 target 属性监督则先将低分辨率输出双线性上采样到训练分辨率，再使用与 Final 相同的 `theta_restore` 恢复到 canonical 坐标系，与 `dst_canonical` 比较。
 
 ## 训练数据源
 

@@ -44,11 +44,14 @@ def _check_train_config(root: Path) -> None:
         "[discriminator.hq]\nbase_ch = 96\ngroup_size = 8\n"
         "[discriminator.coarse]\nbase_ch = 32\nmax_ch = 256\ngroup_size = 4\n"
         '[identity]\nprovider = "MS1MV3_ARCFACE_R50_FP16"\n'
+        '[loss.coarse.reconstruction]\nscope = "same"\n'
         "[loss.coarse.gan]\nweight = 0.6\n"
         '[loss.coarse.identity]\nprovider = "BLENDFACE"\nweight = 7.0\n'
+        "[loss.coarse.l1]\nenable = true\nweight = 6.0\n"
         "[loss.coarse.r1]\nenable = true\ninterval = 8\ngamma = 5.0\n"
         "[loss.coarse.gaze]\nenable = true\nweight = 0.4\ndistribution_weight = 0.05\nconfidence_weighted = true\n"
         "[loss.coarse.hrffa]\nenable = true\npose_weight = 0.4\neye_weight = 0.8\nmouth_weight = 1.1\ncontour_weight = 1.2\ncontour_shape_weight = 0.3\noccluded_geometry_weight = 0.2\n"
+        "[loss.coarse.vgg.weights]\nrelu2_2 = 0.5\n"
         '[loss.hq.reconstruction]\nscope = "all"\n'
         "[loss.hq.gan]\nweight = 0.8\n"
         '[loss.hq.identity]\nprovider = "MS1MV3_ARCFACE_R50_FP16"\nweight = 9.0\n'
@@ -71,7 +74,7 @@ def _check_train_config(root: Path) -> None:
     assert raw == original
     assert resolve_train_config(resolved) == resolved
     assert json.loads(json.dumps(resolved)) == resolved
-    for loss_name in ("gan", "identity", "r1", "gaze", "hrffa", "facs"):
+    for loss_name in ("gan", "identity", "r1", "gaze", "hrffa", "facs", "reconstruction", "l1", "vgg"):
         assert DEFAULT_LOSS_CONFIG["coarse"][loss_name] is not DEFAULT_LOSS_CONFIG["hq"][loss_name]
     loaded = load_train_config(source)
     assert loaded == resolved
@@ -93,6 +96,9 @@ def _check_train_config(root: Path) -> None:
     assert resolved["identity"]["provider"] == raw["identity"]["provider"]
     assert resolved["loss"]["coarse"]["gan"] == {"weight": 0.6}
     assert resolved["loss"]["coarse"]["identity"] == {"provider": "BLENDFACE", "weight": 7.0}
+    assert resolved["loss"]["coarse"]["reconstruction"] == {"scope": "same"}
+    assert resolved["loss"]["coarse"]["l1"] == {"enable": True, "weight": 6.0}
+    assert resolved["loss"]["coarse"]["vgg"]["weights"] == {"relu2_2": 0.5}
     assert resolved["loss"]["coarse"]["r1"] == {"enable": True, "interval": 8, "gamma": 5.0}
     assert resolved["loss"]["hq"]["gan"] == {"weight": 0.8}
     assert resolved["loss"]["hq"]["identity"] == {"provider": "MS1MV3_ARCFACE_R50_FP16", "weight": 9.0}
@@ -162,6 +168,10 @@ def _check_train_config(root: Path) -> None:
     missing_scope["loss"]["hq"]["reconstruction"].pop("scope")
     invalid_frozen_configs.append(missing_scope)
 
+    missing_coarse_scope = copy.deepcopy(resolved)
+    missing_coarse_scope["loss"]["coarse"]["reconstruction"].pop("scope")
+    invalid_frozen_configs.append(missing_coarse_scope)
+
     missing_same_prob = copy.deepcopy(resolved)
     missing_same_prob["data"]["sampling"].pop("same_prob")
     invalid_frozen_configs.append(missing_same_prob)
@@ -183,7 +193,6 @@ def _check_train_config(root: Path) -> None:
         assert "unknown_field" in str(error)
     else:
         raise AssertionError("配置错误接受了未知字段")
-
 
     stage_config = copy.deepcopy(raw)
     stage_config["train"]["stage"] = "hq"
@@ -234,14 +243,15 @@ def _check_train_config(root: Path) -> None:
     else:
         raise AssertionError("配置错误接受了未显式声明的训练精度")
 
-    invalid = copy.deepcopy(raw)
-    invalid["loss"]["hq"]["reconstruction"]["scope"] = "cross"
-    try:
-        resolve_train_config(invalid)
-    except ValueError as error:
-        assert "loss.hq.reconstruction.scope" in str(error)
-    else:
-        raise AssertionError("配置错误接受了未知 reconstruction scope")
+    for stage in ("coarse", "hq"):
+        invalid = copy.deepcopy(raw)
+        invalid["loss"][stage]["reconstruction"]["scope"] = "cross"
+        try:
+            resolve_train_config(invalid)
+        except ValueError as error:
+            assert f"loss.{stage}.reconstruction.scope" in str(error)
+        else:
+            raise AssertionError(f"配置错误接受了未知 {stage} reconstruction scope")
 
     obsolete = copy.deepcopy(raw)
     obsolete["loss"]["gan"] = {"weight": 1.0}
@@ -570,6 +580,10 @@ def _check_generator_responsibility_boundary() -> None:
     identity = torch.randn(2, 8)
 
     coarse = model.coarse(target, identity)
+    coarse_with_resize, resize_in = model.coarse(target, identity, return_resize_in=True)
+    torch.testing.assert_close(coarse_with_resize, coarse)
+    torch.testing.assert_close(resize_in, torch.nn.functional.interpolate(target, size=8, mode="bilinear", align_corners=False))
+
     fake = model.hq(target, coarse.detach())
     fake.square().mean().backward()
 
@@ -588,12 +602,7 @@ def _check_generator_responsibility_boundary() -> None:
     for node in ast.walk(train_tree):
         if not isinstance(node, ast.Call) or len(node.args) < 2:
             continue
-        is_hq_forward = (
-            isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "self"
-            and node.func.attr == "train_hq"
-        )
+        is_hq_forward = isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "self" and node.func.attr == "train_hq"
         if not is_hq_forward:
             continue
         coarse_arg = node.args[1]
@@ -612,11 +621,7 @@ def _check_generator_responsibility_boundary() -> None:
     discriminator_stage_calls = [
         node
         for node in ast.walk(train_tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "self"
-        and node.func.attr == "_update_discriminator_stage"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "self" and node.func.attr == "_update_discriminator_stage"
     ]
     assert len(discriminator_stage_calls) == 2
     calls_by_stage = {call.args[0].value: call for call in discriminator_stage_calls if isinstance(call.args[0], ast.Constant)}
@@ -649,12 +654,7 @@ def _check_generator_responsibility_boundary() -> None:
 
     discriminator_update_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer._update_discriminator_stage)))
     update_self_calls = {
-        node.func.attr
-        for node in ast.walk(discriminator_update_tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "self"
+        node.func.attr for node in ast.walk(discriminator_update_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"
     }
     assert "_discriminator_stage_loss" in update_self_calls
 
@@ -674,18 +674,25 @@ def _check_generator_responsibility_boundary() -> None:
     assert generator_stage_calls.count("_coarse_generator_stage_loss") == 1
     assert generator_stage_calls.count("_hq_generator_stage_loss") == 1
 
+    coarse_stage_call = next(
+        node
+        for node in ast.walk(train_tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "self" and node.func.attr == "_coarse_generator_stage_loss"
+    )
+    assert isinstance(coarse_stage_call.args[1], ast.Name) and coarse_stage_call.args[1].id == "coarse_resize_in"
+    assert isinstance(coarse_stage_call.args[4], ast.Name) and coarse_stage_call.args[4].id == "same_mask"
+
+    coarse_forward_calls = [node for node in ast.walk(train_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "net_coarse"]
+    active_coarse_calls = [call for call in coarse_forward_calls if any(keyword.arg == "return_resize_in" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True for keyword in call.keywords)]
+    assert len(active_coarse_calls) == 2
+
     def guarded_calls(stage_attr: str) -> set[str]:
         calls = set()
         for node in ast.walk(train_tree):
             if not isinstance(node, ast.If):
                 continue
             test = node.test
-            if not (
-                isinstance(test, ast.Attribute)
-                and isinstance(test.value, ast.Name)
-                and test.value.id == "self"
-                and test.attr == stage_attr
-            ):
+            if not (isinstance(test, ast.Attribute) and isinstance(test.value, ast.Name) and test.value.id == "self" and test.attr == stage_attr):
                 continue
             for statement in node.body:
                 for child in ast.walk(statement):
@@ -710,19 +717,19 @@ def _check_generator_responsibility_boundary() -> None:
 
     def self_calls(method: object) -> set[str]:
         tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
-        return {
-            node.func.attr
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "self"
-        }
+        return {node.func.attr for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"}
 
     coarse_calls = self_calls(Trainer._coarse_generator_stage_loss)
     hq_calls = self_calls(Trainer._hq_generator_stage_loss)
-    assert {"train_d_coarse", "coarse_gan_loss", "coarse_identity_embeddings_forward", "coarse_id_loss"}.issubset(coarse_calls)
-    assert {"train_d", "hq_gan_loss", "hq_identity_embeddings_forward", "hq_id_loss"}.issubset(hq_calls)
+    assert {
+        "train_d_coarse",
+        "coarse_gan_loss",
+        "coarse_identity_embeddings_forward",
+        "coarse_id_loss",
+        "coarse_vgg_loss_forward",
+        "coarse_l1_loss",
+    }.issubset(coarse_calls)
+    assert {"train_d", "hq_gan_loss", "hq_identity_embeddings_forward", "hq_id_loss", "hq_vgg_loss_forward", "hq_l1_loss"}.issubset(hq_calls)
     assert not {"train_d", "hq_gan_loss", "hq_id_loss"} & coarse_calls
     assert not {"train_d_coarse", "coarse_gan_loss", "coarse_id_loss"} & hq_calls
 
@@ -740,13 +747,7 @@ def _check_generator_responsibility_boundary() -> None:
     assert forward_component_owners(Trainer._coarse_generator_stage_loss) == {"coarse_hrffa_loss", "coarse_facs_loss"}
     assert forward_component_owners(Trainer._hq_generator_stage_loss) == {"hq_hrffa_loss", "hq_facs_loss"}
 
-    affine_grid_calls = [
-        node
-        for node in ast.walk(train_tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "affine_grid"
-    ]
+    affine_grid_calls = [node for node in ast.walk(train_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "affine_grid"]
     assert len(affine_grid_calls) == 1
     size_keyword = next(item for item in affine_grid_calls[0].keywords if item.arg == "size")
     assert isinstance(size_keyword.value, ast.Call) and isinstance(size_keyword.value.func, ast.Name) and size_keyword.value.func.id == "list"
@@ -776,11 +777,7 @@ def _check_discriminator_training_state_split() -> None:
         target = node.targets[0]
         if not isinstance(target, ast.Name) or target.id != "training_state" or not isinstance(node.value, ast.Dict):
             continue
-        training_state_keys = {
-            key.value
-            for key in node.value.keys
-            if isinstance(key, ast.Constant) and isinstance(key.value, str)
-        }
+        training_state_keys = {key.value for key in node.value.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
         break
     assert training_state_keys is not None
     assert {

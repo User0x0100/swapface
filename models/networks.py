@@ -1,7 +1,8 @@
 import math
+
 import torch
-from torch import Tensor, nn
 import torch.nn.functional as F
+from torch import Tensor, nn
 
 
 class AdaIN(nn.Module):
@@ -184,7 +185,7 @@ class Coarse(nn.Module):
         self.decoder = nn.Sequential(*[UpSample(features[-(i + 1)], features[-(i + 2)]) for i in range(num_depth)])
         self.to_rgb = ToRGB(base_ch, img_channels)
 
-    def forward(self, x: Tensor, id_feat: Tensor) -> Tensor:
+    def forward(self, x: Tensor, id_feat: Tensor, return_resize_in: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         w_space = self.w_space_map(id_feat)
 
         resize_in = F.interpolate(x, size=self.img_resolution, mode="bilinear", align_corners=False)
@@ -193,8 +194,11 @@ class Coarse(nn.Module):
         encoder_feat = self.encoder(feat)
         latent_feat = self.latent_space(encoder_feat, w_space)
         decoder_feat = self.decoder(latent_feat)
+        output = self.to_rgb(decoder_feat)
 
-        return self.to_rgb(decoder_feat)
+        if return_resize_in:
+            return output, resize_in
+        return output
 
 
 class HQRefiner(nn.Module):

@@ -65,12 +65,22 @@ min_lr_ratio = 0.1
 provider = "BLENDFACE"
 
 
+[loss.coarse.reconstruction]
+# Coarse L1/VGG 的共享作用范围；默认仅 same pair 做 self-reconstruction。
+scope = "same"
+
+
 [loss.coarse.gan]
 weight = 1.0
 
 
 [loss.coarse.identity]
 provider = "BLENDFACE"
+weight = 10.0
+
+
+[loss.coarse.l1]
+enable = true
 weight = 10.0
 
 
@@ -106,6 +116,15 @@ nose_weight = 1.0
 mouth_weight = 1.0
 lower_face_weight = 1.0
 asymmetry_weight = 1.0
+
+
+[loss.coarse.vgg]
+enable = true
+
+[loss.coarse.vgg.weights]
+relu1_2 = 1.0
+relu2_2 = 1.0
+relu3_4 = 1.0
 
 
 [loss.hq.reconstruction]

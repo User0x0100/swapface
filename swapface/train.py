@@ -55,7 +55,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 10
+TRAINING_SEMANTICS_VERSION = 11
 
 
 def _configure_training_runtime() -> None:
@@ -240,29 +240,35 @@ class Trainer:
         hq_hrffa_config = hq_loss_config["hrffa"]
         coarse_facs_config = coarse_loss_config["facs"]
         hq_facs_config = hq_loss_config["facs"]
-        reconstruction_scope = str(hq_loss_config["reconstruction"]["scope"])
-        l1_config = hq_loss_config["l1"]
-        vgg_config = hq_loss_config["vgg"]
+        coarse_reconstruction_scope = str(coarse_loss_config["reconstruction"]["scope"])
+        hq_reconstruction_scope = str(hq_loss_config["reconstruction"]["scope"])
+        coarse_l1_config = coarse_loss_config["l1"]
+        hq_l1_config = hq_loss_config["l1"]
+        coarse_vgg_config = coarse_loss_config["vgg"]
+        hq_vgg_config = hq_loss_config["vgg"]
         wfm_config = hq_loss_config["wfm"]
 
         self.generator_id_encoder_provider = IDEncoderProvider[str(identity_config["provider"])]
         self.coarse_identity_loss_provider = IDEncoderProvider[str(coarse_identity_config["provider"])]
         self.hq_identity_loss_provider = IDEncoderProvider[str(hq_identity_config["provider"])]
-        self.reconstruction_scope = reconstruction_scope
+        self.coarse_reconstruction_scope = coarse_reconstruction_scope
+        self.hq_reconstruction_scope = hq_reconstruction_scope
         self.enable_coarse_r1_loss = self.coarse_stage_active and bool(coarse_r1_config["enable"])
         self.coarse_r1_reg_step = int(coarse_r1_config["interval"])
         self.coarse_r1_gamma = float(coarse_r1_config["gamma"])
         self.enable_hq_r1_loss = self.hq_stage_active and bool(hq_r1_config["enable"])
         self.hq_r1_reg_step = int(hq_r1_config["interval"])
         self.hq_r1_gamma = float(hq_r1_config["gamma"])
-        self.enable_hq_l1_loss = self.hq_stage_active and bool(l1_config["enable"])
+        self.enable_coarse_l1_loss = self.coarse_stage_active and bool(coarse_l1_config["enable"])
+        self.enable_hq_l1_loss = self.hq_stage_active and bool(hq_l1_config["enable"])
         self.enable_coarse_gaze_loss = self.coarse_stage_active and bool(coarse_gaze_config["enable"])
         self.enable_hq_gaze_loss = self.hq_stage_active and bool(hq_gaze_config["enable"])
         self.enable_coarse_hrffa_loss = self.coarse_stage_active and bool(coarse_hrffa_config["enable"])
         self.enable_hq_hrffa_loss = self.hq_stage_active and bool(hq_hrffa_config["enable"])
         self.enable_coarse_facs_loss = self.coarse_stage_active and bool(coarse_facs_config["enable"])
         self.enable_hq_facs_loss = self.hq_stage_active and bool(hq_facs_config["enable"])
-        self.enable_hq_vgg_loss = self.hq_stage_active and bool(vgg_config["enable"])
+        self.enable_coarse_vgg_loss = self.coarse_stage_active and bool(coarse_vgg_config["enable"])
+        self.enable_hq_vgg_loss = self.hq_stage_active and bool(hq_vgg_config["enable"])
         self.enable_hq_wfm_loss = self.hq_stage_active and bool(wfm_config["enable"])
 
         dataloader_cfg = {**data_config["loader"], **data_config["augmentation"], **data_config["sampling"]}
@@ -537,8 +543,10 @@ class Trainer:
         self.identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.img_resolution, self.batch_size, self.device)
         self.coarse_identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.coarse_resolution, self.batch_size, self.device)
 
+        if self.enable_coarse_l1_loss:
+            self.coarse_l1_loss = make_l1_loss(weight=float(coarse_l1_config["weight"]), reduction="none")
         if self.enable_hq_l1_loss:
-            self.hq_l1_loss = make_l1_loss(weight=float(l1_config["weight"]), reduction="none")
+            self.hq_l1_loss = make_l1_loss(weight=float(hq_l1_config["weight"]), reduction="none")
 
         if self.enable_hq_gaze_loss:
             self.hq_gaze_loss = GazeLoss(
@@ -612,7 +620,12 @@ class Trainer:
             self.coarse_facs_loss.to(self.device)
 
         if self.enable_hq_vgg_loss:
-            self.hq_vgg_loss = VGGPerceptualLoss(layer_weights=vgg_config["weights"], reduction="none").to(self.device)
+            self.hq_vgg_loss = VGGPerceptualLoss(layer_weights=hq_vgg_config["weights"], reduction="none").to(self.device)
+        if self.enable_coarse_vgg_loss:
+            if self.enable_hq_vgg_loss and coarse_vgg_config["weights"] == hq_vgg_config["weights"]:
+                self.coarse_vgg_loss = self.hq_vgg_loss
+            else:
+                self.coarse_vgg_loss = VGGPerceptualLoss(layer_weights=coarse_vgg_config["weights"], reduction="none").to(self.device)
 
         if self.enable_hq_wfm_loss:
             wfm_weights = {int(index): float(weight) for index, weight in wfm_config["weights"].items()}
@@ -677,6 +690,11 @@ class Trainer:
                         self.coarse_facs_loss.au_model = compiled_au_model
             if self.enable_hq_vgg_loss:
                 self.hq_vgg_loss_forward = _compile_training_callable(self.hq_vgg_loss)
+            if self.enable_coarse_vgg_loss:
+                if self.enable_hq_vgg_loss and self.coarse_vgg_loss is self.hq_vgg_loss:
+                    self.coarse_vgg_loss_forward = self.hq_vgg_loss_forward
+                else:
+                    self.coarse_vgg_loss_forward = _compile_training_callable(self.coarse_vgg_loss)
             if self.enable_hq_wfm_loss:
                 self.train_d_features = _compile_training_callable(self.net_d.get_feats)
         else:
@@ -698,6 +716,8 @@ class Trainer:
                 self.coarse_gaze_loss_forward = self.coarse_gaze_loss
             if self.enable_hq_vgg_loss:
                 self.hq_vgg_loss_forward = self.hq_vgg_loss
+            if self.enable_coarse_vgg_loss:
+                self.coarse_vgg_loss_forward = self.coarse_vgg_loss
             if self.enable_hq_wfm_loss:
                 self.train_d_features = self.net_d.get_feats
 
@@ -834,8 +854,10 @@ class Trainer:
     def _coarse_generator_stage_loss(
         self,
         coarse: Tensor,
+        coarse_resize_in: Tensor,
         dst_canonical: Tensor,
         theta_restore: Tensor,
+        same_mask: Tensor,
         source_identity_embeddings: Tensor,
         restore_grid: Tensor | None,
     ) -> Tensor:
@@ -873,6 +895,18 @@ class Trainer:
                 for name, component in coarse_facs_components.items():
                     self.log(f"coarse_facs_{name}_loss", component)
                 total = total + torch.stack(tuple(coarse_facs_components.values())).sum()
+
+        if self.enable_coarse_vgg_loss:
+            coarse_vgg_per_sample = self.coarse_vgg_loss_forward(coarse, coarse_resize_in)
+            coarse_vgg_loss = _reduce_reconstruction_loss(coarse_vgg_per_sample, same_mask, self.coarse_reconstruction_scope)
+            self.log("coarse_vgg_loss", coarse_vgg_loss)
+            total = total + coarse_vgg_loss
+
+        if self.enable_coarse_l1_loss:
+            coarse_l1_per_sample = self.coarse_l1_loss(coarse, coarse_resize_in).flatten(1).mean(dim=1)
+            coarse_l1_loss = _reduce_reconstruction_loss(coarse_l1_per_sample, same_mask, self.coarse_reconstruction_scope)
+            self.log("coarse_l1_loss", coarse_l1_loss)
+            total = total + coarse_l1_loss
 
         return total
 
@@ -933,13 +967,13 @@ class Trainer:
 
         if self.enable_hq_vgg_loss:
             hq_vgg_per_sample = self.hq_vgg_loss_forward(fake, dst)
-            hq_vgg_loss = _reduce_reconstruction_loss(hq_vgg_per_sample, same_mask, self.reconstruction_scope)
+            hq_vgg_loss = _reduce_reconstruction_loss(hq_vgg_per_sample, same_mask, self.hq_reconstruction_scope)
             self.log("hq_vgg_loss", hq_vgg_loss)
             total = total + hq_vgg_loss
 
         if self.enable_hq_l1_loss:
             hq_l1_per_sample = self.hq_l1_loss(fake, dst).flatten(1).mean(dim=1)
-            hq_l1_loss = _reduce_reconstruction_loss(hq_l1_per_sample, same_mask, self.reconstruction_scope)
+            hq_l1_loss = _reduce_reconstruction_loss(hq_l1_per_sample, same_mask, self.hq_reconstruction_scope)
             self.log("hq_l1_loss", hq_l1_loss)
             total = total + hq_l1_loss
 
@@ -1119,7 +1153,7 @@ class Trainer:
                         generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
 
                     if self.coarse_stage_active:
-                        coarse = net_coarse(dst, generator_identity_embeddings)
+                        coarse, coarse_resize_in = net_coarse(dst, generator_identity_embeddings, return_resize_in=True)
                     else:
                         with torch.no_grad():
                             coarse = net_coarse(dst, generator_identity_embeddings)
@@ -1150,12 +1184,11 @@ class Trainer:
                         self.lr_scheduler_d_hq.step()
 
                 if self.coarse_stage_active:
-                    real_coarse = NF.interpolate(dst, size=(self.coarse_resolution, self.coarse_resolution), mode="bilinear", align_corners=False)
                     assert self.optim_d_coarse is not None and self.scaler_d_coarse is not None
                     self._update_discriminator_stage(
                         "coarse",
                         coarse,
-                        real_coarse,
+                        coarse_resize_in,
                         self.net_d_coarse,
                         self.train_d_coarse,
                         self.optim_d_coarse,
@@ -1189,28 +1222,23 @@ class Trainer:
                         # D 已经成功更新，G overflow 时只重算 active Generator stage。
                         with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                             if self.coarse_stage_active:
-                                coarse = net_coarse(dst, generator_identity_embeddings)
+                                coarse, coarse_resize_in = net_coarse(dst, generator_identity_embeddings, return_resize_in=True)
                             if self.hq_stage_active:
                                 fake = self.train_hq(dst, coarse.detach())
 
                     with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                         restore_grid = None
-                        if (
-                            self.enable_hq_gaze_loss
-                            or self.enable_hq_hrffa_loss
-                            or self.enable_hq_facs_loss
-                            or self.enable_coarse_gaze_loss
-                            or self.enable_coarse_hrffa_loss
-                            or self.enable_coarse_facs_loss
-                        ):
+                        if self.enable_hq_gaze_loss or self.enable_hq_hrffa_loss or self.enable_hq_facs_loss or self.enable_coarse_gaze_loss or self.enable_coarse_hrffa_loss or self.enable_coarse_facs_loss:
                             with autocast(device_type="cuda", enabled=False):
                                 restore_grid = NF.affine_grid(theta_restore.float(), size=list(dst.shape), align_corners=False)
 
                         if self.coarse_stage_active:
                             coarse_g_loss = self._coarse_generator_stage_loss(
                                 coarse,
+                                coarse_resize_in,
                                 dst_canonical,
                                 theta_restore,
+                                same_mask,
                                 coarse_source_identity_embeddings,
                                 restore_grid,
                             )

@@ -109,6 +109,9 @@ DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
     "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
     "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
+    "reconstruction": {"scope": "same"},
+    "l1": {"enable": True, "weight": 10.0},
+    "vgg": {"enable": True, "weights": dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)},
 }
 DEFAULT_HQ_LOSS_CONFIG: dict[str, Any] = {
     "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
@@ -348,8 +351,6 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, hq: bool) -> dict
         facs[key] = _float(facs[key], f"{prefix}.facs.{key}", minimum=0.0)
 
     result = {"gan": gan, "identity": identity, "r1": r1, "gaze": gaze, "hrffa": hrffa, "facs": facs}
-    if not hq:
-        return result
 
     reconstruction = _with_defaults(_table(loss, "reconstruction", f"[{prefix}.reconstruction]"), defaults["reconstruction"], f"[{prefix}.reconstruction]")
     scope = reconstruction["scope"]
@@ -369,6 +370,10 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, hq: bool) -> dict
         raise ValueError(f"[{prefix}.vgg.weights] 必须为非空表/对象")
     vgg["weights"] = {str(layer): _float(weight, f"{prefix}.vgg.weights.{layer}", minimum=0.0) for layer, weight in raw_vgg_weights.items()}
 
+    result.update({"reconstruction": reconstruction, "l1": l1, "vgg": vgg})
+    if not hq:
+        return result
+
     wfm = _with_defaults(_table(loss, "wfm", f"[{prefix}.wfm]"), defaults["wfm"], f"[{prefix}.wfm]")
     wfm["enable"] = _bool(wfm["enable"], f"{prefix}.wfm.enable")
     raw_wfm_weights = wfm["weights"]
@@ -385,7 +390,7 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, hq: bool) -> dict
         normalized_wfm_weights[str(layer_index)] = _float(weight, f"{prefix}.wfm.weights.{layer_index}", minimum=0.0)
     wfm["weights"] = normalized_wfm_weights
 
-    result.update({"reconstruction": reconstruction, "l1": l1, "vgg": vgg, "wfm": wfm})
+    result["wfm"] = wfm
     return result
 
 
