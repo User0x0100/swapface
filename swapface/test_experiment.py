@@ -769,7 +769,88 @@ def _check_generator_responsibility_boundary() -> None:
     ]
     assert {call.func.attr for call in train_source_teacher_calls} == {"hq_identity_embeddings_forward", "coarse_identity_embeddings_forward"}
     assert all(isinstance(call.args[0], ast.Name) and call.args[0].id == "source_identity_faces" for call in train_source_teacher_calls)
-    print("PASS: HQ/Coarse gradients, D optimizers, losses, teachers and R1 execution paths remain independent")
+
+    reuse_assignments = []
+    for node in ast.walk(train_tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (isinstance(test, ast.Attribute) and isinstance(test.value, ast.Name) and test.value.id == "self" and test.attr == "reuse_generator_identity_for_coarse_source"):
+            continue
+        reuse_assignments.extend(statement for statement in node.body if isinstance(statement, ast.Assign))
+    assert len(reuse_assignments) == 1
+    reuse_assignment = reuse_assignments[0]
+    assert len(reuse_assignment.targets) == 1 and isinstance(reuse_assignment.targets[0], ast.Name)
+    assert reuse_assignment.targets[0].id == "coarse_source_identity_embeddings"
+    assert isinstance(reuse_assignment.value, ast.Name) and reuse_assignment.value.id == "generator_identity_embeddings"
+
+    init_assignments = [
+        node
+        for node in ast.walk(init_tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Attribute)
+        and isinstance(node.targets[0].value, ast.Name)
+        and node.targets[0].value.id == "self"
+        and node.targets[0].attr == "reuse_generator_identity_for_coarse_source"
+    ]
+    assert len(init_assignments) == 1
+
+    hq_reuse_assignments = []
+    for node in ast.walk(train_tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (isinstance(test, ast.Attribute) and isinstance(test.value, ast.Name) and test.value.id == "self" and test.attr == "reuse_generator_identity_for_hq_source"):
+            continue
+        hq_reuse_assignments.extend(statement for statement in node.body if isinstance(statement, ast.Assign))
+    assert len(hq_reuse_assignments) == 1
+    hq_reuse_assignment = hq_reuse_assignments[0]
+    assert len(hq_reuse_assignment.targets) == 1 and isinstance(hq_reuse_assignment.targets[0], ast.Name)
+    assert hq_reuse_assignment.targets[0].id == "hq_source_identity_embeddings"
+    assert isinstance(hq_reuse_assignment.value, ast.Name) and hq_reuse_assignment.value.id == "generator_identity_embeddings"
+
+    hq_init_assignments = [
+        node
+        for node in ast.walk(init_tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Attribute)
+        and isinstance(node.targets[0].value, ast.Name)
+        and node.targets[0].value.id == "self"
+        and node.targets[0].attr == "reuse_generator_identity_for_hq_source"
+    ]
+    assert len(hq_init_assignments) == 1
+
+    sample_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer._save_sample)))
+    sample_reuse_assignments = []
+    for node in ast.walk(sample_tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (isinstance(test, ast.Attribute) and isinstance(test.value, ast.Name) and test.value.id == "self" and test.attr == "reuse_generator_identity_for_coarse_source"):
+            continue
+        sample_reuse_assignments.extend(statement for statement in node.body if isinstance(statement, ast.Assign))
+    assert len(sample_reuse_assignments) == 1
+    sample_reuse_assignment = sample_reuse_assignments[0]
+    assert len(sample_reuse_assignment.targets) == 1 and isinstance(sample_reuse_assignment.targets[0], ast.Name)
+    assert sample_reuse_assignment.targets[0].id == "coarse_source_identity_embeddings_vis"
+    assert isinstance(sample_reuse_assignment.value, ast.Name) and sample_reuse_assignment.value.id == "generator_identity_embeddings_vis"
+
+    sample_hq_reuse_assignments = []
+    for node in ast.walk(sample_tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (isinstance(test, ast.Attribute) and isinstance(test.value, ast.Name) and test.value.id == "self" and test.attr == "reuse_generator_identity_for_hq_source"):
+            continue
+        sample_hq_reuse_assignments.extend(statement for statement in node.body if isinstance(statement, ast.Assign))
+    assert len(sample_hq_reuse_assignments) == 1
+    sample_hq_reuse_assignment = sample_hq_reuse_assignments[0]
+    assert len(sample_hq_reuse_assignment.targets) == 1 and isinstance(sample_hq_reuse_assignment.targets[0], ast.Name)
+    assert sample_hq_reuse_assignment.targets[0].id == "hq_source_identity_embeddings_vis"
+    assert isinstance(sample_hq_reuse_assignment.value, ast.Name) and sample_hq_reuse_assignment.value.id == "generator_identity_embeddings_vis"
+    print("PASS: HQ/Coarse gradients, D optimizers, losses, teachers and identity source reuse remain independent")
 
 
 def _check_discriminator_training_state_split() -> None:

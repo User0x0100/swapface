@@ -261,6 +261,8 @@ class Trainer:
         self.generator_id_encoder_provider = IDEncoderProvider[str(identity_config["provider"])]
         self.coarse_identity_loss_provider = IDEncoderProvider[str(coarse_identity_config["provider"])]
         self.hq_identity_loss_provider = IDEncoderProvider[str(hq_identity_config["provider"])]
+        self.reuse_generator_identity_for_coarse_source = self.coarse_stage_active and self.generator_id_encoder_provider is self.coarse_identity_loss_provider
+        self.reuse_generator_identity_for_hq_source = self.hq_stage_active and self.generator_id_encoder_provider is self.hq_identity_loss_provider
         self.coarse_reconstruction_scope = coarse_reconstruction_scope
         self.hq_reconstruction_scope = hq_reconstruction_scope
         self.enable_coarse_r1_loss = self.coarse_stage_active and bool(coarse_r1_config["enable"])
@@ -1104,9 +1106,14 @@ class Trainer:
             source_identity_faces_vis = self.prepare_identity_encoder_faces(src_vis)
             generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
             if self.hq_stage_active:
-                hq_source_identity_embeddings_vis = self.hq_identity_embeddings_forward(source_identity_faces_vis)
+                if self.reuse_generator_identity_for_hq_source:
+                    hq_source_identity_embeddings_vis = generator_identity_embeddings_vis
+                else:
+                    hq_source_identity_embeddings_vis = self.hq_identity_embeddings_forward(source_identity_faces_vis)
             if self.coarse_stage_active:
-                if self.hq_stage_active and self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
+                if self.reuse_generator_identity_for_coarse_source:
+                    coarse_source_identity_embeddings_vis = generator_identity_embeddings_vis
+                elif self.hq_stage_active and self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
                     coarse_source_identity_embeddings_vis = hq_source_identity_embeddings_vis
                 else:
                     coarse_source_identity_embeddings_vis = self.coarse_identity_embeddings_forward(source_identity_faces_vis)
@@ -1235,9 +1242,14 @@ class Trainer:
                 # source identity teacher 只为 active stage 计算，并跨 G overflow retry 复用。
                 with torch.no_grad():
                     if self.hq_stage_active:
-                        hq_source_identity_embeddings = self.hq_identity_embeddings_forward(source_identity_faces)
+                        if self.reuse_generator_identity_for_hq_source:
+                            hq_source_identity_embeddings = generator_identity_embeddings
+                        else:
+                            hq_source_identity_embeddings = self.hq_identity_embeddings_forward(source_identity_faces)
                     if self.coarse_stage_active:
-                        if self.hq_stage_active and self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
+                        if self.reuse_generator_identity_for_coarse_source:
+                            coarse_source_identity_embeddings = generator_identity_embeddings
+                        elif self.hq_stage_active and self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
                             coarse_source_identity_embeddings = hq_source_identity_embeddings
                         else:
                             coarse_source_identity_embeddings = self.coarse_identity_embeddings_forward(source_identity_faces)
