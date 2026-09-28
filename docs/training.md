@@ -182,7 +182,7 @@ uv run python -m swapface.train \
 
 ## Branch：从已有 checkpoint 派生新实验
 
-Branch 是一条新的训练时间线，不是 resume。它从父 checkpoint 的**训练态 Generator**继续，默认同时继承父 Discriminator 权重；optimizer、scheduler 和 GradScaler 重新初始化。新配置可以改变 `[train].stage`，因此从 joint checkpoint 派生 `hq` 或 `coarse` 单 stage run 应使用 branch，而不是 resume。`completed_step` 默认继承父 checkpoint，便于直接比较分支前后的 TensorBoard loss 趋势：
+Branch 是一条新的训练时间线，不是 resume。普通 branch 从父 checkpoint 的**训练态 Generator**继续，默认同时继承父 Discriminator 权重；optimizer、scheduler 和 GradScaler 重新初始化。新配置可以改变 `[train].stage`，因此从 joint checkpoint 派生 `hq` 或 `coarse` 单 stage run 应使用 branch，而不是 resume。普通 branch 的 `completed_step` 默认继承父 checkpoint，便于直接比较分支前后的 TensorBoard loss 趋势：
 
 ```bash
 uv run python -m swapface.train \
@@ -191,7 +191,7 @@ uv run python -m swapface.train \
   --name new-experiment
 ```
 
-`--branch-from` 必须显式提供 `--config`。新 run 的 `metadata.json.parent` 会记录父 `run_id`、checkpoint、父 step、配置摘要，以及两个 Discriminator 是 `inherit` 还是 `reset`。
+`--branch-from` 必须显式提供 `--config`。新 run 的 `metadata.json.parent` 会记录父 `run_id`、checkpoint、父 step、配置摘要、branch mode，以及 Generator 的 Coarse/HQ 和两个 Discriminator 分别是 `inherit` 还是 `reset`。
 
 默认继承父 checkpoint 的 step。如果希望从其他 step 开始，单独指定 `--step`：
 
@@ -204,7 +204,7 @@ uv run python -m swapface.train \
 
 `--step 0` 可以让新分支从 0 重新计数。这个值就是新 run 的实际 `completed_step` 起点，因此也会同时影响 R1 周期、EMA decay、sample/checkpoint 保存周期和文件名；它不是单独的 TensorBoard 显示偏移。
 
-Branch 始终要求 `[generator]` 与父 checkpoint 完全一致。默认还要求被继承的 Discriminator 架构一致。HQ D 与 Coarse D 可以分别重建：
+普通 branch 要求 `[generator]` 与父 checkpoint 完全一致。默认还要求被继承的 Discriminator 架构一致。HQ D 与 Coarse D 可以分别重建：
 
 ```bash
 # 只重建 HQ D
@@ -222,11 +222,58 @@ uv run python -m swapface.train \
 
 需要两个 D 都重建时同时传入两个开关。Branch metadata 会分别记录 HQ/Coarse D 的 `inherit` / `reset`。HQ D 与 Coarse D 的架构分别由 `[discriminator.hq]` 和 `[discriminator.coarse]` 控制，因此可以只修改并 reset 其中一个；任何选择 inherit 的 D 都只要求自己的架构与父 checkpoint 保持一致。无论是否恢复 D，Branch 都不会继承 G/D optimizer、scheduler 或 GradScaler；step 默认继承父 checkpoint，也可以由 `--step` 指定。
 
+### HQ rebuild：继承 Coarse，用新分辨率从零训练 HQ
+
+当新配置使用 `train.stage = "hq"` 且 Generator 架构与父 checkpoint 不同时，Branch 会进入 **HQ rebuild** 模式。该模式只允许 HQ 部分变化；Coarse 的结构参数必须与父 checkpoint 完全一致，并且 `[identity].provider` 必须保持一致，因为冻结 Coarse 仍依赖同一 identity embedding 空间。
+
+HQ rebuild 的固定语义为：
+
+- 从父 checkpoint 的 `training_state.net_g` 中只提取并严格加载 `coarse.*`；
+- 新配置重新创建 HQ，旧 HQ 权重完全不加载；
+- HQ Discriminator 自动重新初始化，不需要额外传 `--reset-hq-discriminator`；
+- Coarse 冻结并保持 `eval()`，HQ 为唯一可训练 Generator stage；
+- Generator optimizer 只包含 HQ 参数；HQ D optimizer/scheduler/GradScaler 全部重新初始化；
+- 新 run 强制从 `step 0` 开始，省略 `--step` 即可；显式非零 `--step` 会被拒绝；
+- EMA 从“继承后的 Coarse + 新初始化 HQ”复制得到，后续只更新 HQ EMA，因此训练态/EMA 的冻结 Coarse 始终一致。
+- 启动时会打印所有实际发生变化的 HQ Generator 配置项（`old -> new`），以及 Coarse/HQ/HQ D 的 inherit/reset 状态、identity provider 和起始 step。
+
+例如，从一个 HQ256/Coarse128 checkpoint 开始训练新的 HQ512：
+
+```bash
+uv run python -m swapface.train \
+  --branch-from experiments/runs/<run_id>/checkpoints/step_000080000.pth \
+  --config experiments/train-hq512.toml \
+  --name hq512
+```
+
+新配置应保持 Coarse 参数不变，只修改 HQ/full-resolution 相关配置，例如：
+
+```toml
+[train]
+stage = "hq"
+
+[generator]
+img_resolution = 512
+coarse_resolution = 128
+coarse_latent_resolution = 32
+coarse_num_latent = 8
+coarse_base_ch = 64
+coarse_max_ch = 512
+hq_bottleneck_resolution = 16
+hq_base_ch = 8
+hq_max_ch = 128
+
+[discriminator.hq]
+img_resolution = 512
+```
+
+`img_resolution`、`hq_bottleneck_resolution`、`hq_base_ch`、`hq_max_ch` 等 HQ 结构参数都可以改变，因为 HQ 会完整重建；`img_channels`、`id_dim` 和所有 `coarse_*` 结构参数属于 Coarse compatibility signature，不允许变化。
+
 因此三种入口的语义为：
 
 - **fresh**：新 Generator、新 Discriminator、新训练状态；
 - **resume**：原 run、原冻结配置、latest checkpoint，完整恢复训练态 Generator、EMA、Discriminator、optimizer、scheduler、GradScaler 与 step；
-- **branch**：新 run，继承父训练态 Generator，默认也继承 Discriminator 权重；optimizer/scheduler/GradScaler 重新初始化，step 默认继承父 checkpoint。
+- **branch**：新 run；普通 branch 继承父训练态 Generator，HQ rebuild 只继承 Coarse 并重建 HQ/HQ D；optimizer/scheduler/GradScaler 均重新初始化。普通 branch 的 step 默认继承父 checkpoint，HQ rebuild 固定从 0 开始。
 
 Branch 不检查 `training_config.semantics_version`，因为它不恢复父训练状态；resume 仍严格检查该版本。
 

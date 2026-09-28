@@ -13,19 +13,23 @@ from unittest.mock import patch
 import torch
 
 from models.networks import Generator
-from swapface.config import DEFAULT_LOSS_CONFIG, load_train_config, resolve_train_config
+from swapface.config import DEFAULT_GENERATOR_CONFIG, DEFAULT_LOSS_CONFIG, load_train_config, resolve_train_config
 from swapface.contracts import CHECKPOINT_VERSION
 from swapface.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
 from swapface.train import (
     TRAINING_SEMANTICS_VERSION,
     Trainer,
+    _branch_generator_mode,
     _branch_model_states,
     _compile_training_callable,
     _load_branch_checkpoint,
     _load_run_config,
+    _print_hq_rebuild_summary,
     _reduce_reconstruction_loss,
     _require_resume_training_config,
+    _resolve_branch_start_step,
     _scaled_backward_step,
+    _submodule_state_dict,
     _supports_compiled_bf16,
 )
 
@@ -837,8 +841,8 @@ def main() -> None:
         assert compile_mock.call_args.kwargs["mode"] == "max-autotune-no-cudagraphs"
 
     resolved = {
-        "train": {"batch_size": 8},
-        "generator": {"coarse_resolution": 128},
+        "train": {"batch_size": 8, "stage": "joint"},
+        "generator": dict(DEFAULT_GENERATOR_CONFIG),
         "discriminator": {
             "hq": {"base_ch": 64},
             "coarse": {"base_ch": 32},
@@ -898,6 +902,11 @@ def main() -> None:
                 "step": 7500,
                 "run": {"id": metadata["run_id"], "config_sha256": metadata["config_sha256"]},
                 "training_config": {"semantics_version": TRAINING_SEMANTICS_VERSION, "precision": "fp16", "stage": "joint"},
+                "identity_encoders": {
+                    "generator": resolved["identity"]["provider"],
+                    "coarse_identity_loss": "BLENDFACE",
+                    "hq_identity_loss": "BLENDFACE",
+                },
                 "net_g": {"network_cfg": resolved["generator"], "state_dict": ema_g_state},
                 "net_d": {"network_cfg": resolved["discriminator"]["hq"], "state_dict": d_state},
                 "net_d_coarse": {
@@ -926,8 +935,21 @@ def main() -> None:
             "checkpoint": standalone.name,
             "step": 7500,
             "config_sha256": metadata["config_sha256"],
+            "branch_mode": "inherit",
+            "generator": {"coarse": "inherit", "hq": "inherit"},
             "discriminator": {"hq": "inherit", "coarse": "inherit"},
         }
+        assert _resolve_branch_start_step("inherit", 7500, None) == 7500
+        assert _resolve_branch_start_step("inherit", 7500, 123) == 123
+        assert _resolve_branch_start_step("hq_rebuild", 7500, None) == 0
+        assert _resolve_branch_start_step("hq_rebuild", 7500, 0) == 0
+        try:
+            _resolve_branch_start_step("hq_rebuild", 7500, 1)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("HQ rebuild 错误接受了非零起始 step")
+
         branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(
             loaded,
             reset_hq_discriminator=False,
@@ -1005,6 +1027,136 @@ def main() -> None:
         parent = dict(standalone_parent)
         branch = create_run(runs_root, source_config, resolved, name="branch", parent=parent)
         assert json.loads(branch.metadata.read_text(encoding="utf-8"))["parent"] == parent
+
+        # HQ rebuild：允许 HQ 分辨率/结构变化，只继承训练态 Coarse；HQ/HQ D 从零开始，step 固定为 0。
+        parent_generator_cfg = {
+            "img_resolution": 16,
+            "img_channels": 3,
+            "id_dim": 8,
+            "coarse_resolution": 8,
+            "coarse_latent_resolution": 4,
+            "coarse_num_latent": 1,
+            "coarse_base_ch": 2,
+            "coarse_max_ch": 8,
+            "hq_bottleneck_resolution": 4,
+            "hq_base_ch": 2,
+            "hq_max_ch": 8,
+        }
+        rebuilt_generator_cfg = dict(parent_generator_cfg)
+        rebuilt_generator_cfg["img_resolution"] = 32
+        rebuilt_generator_cfg["hq_base_ch"] = 4
+        rebuilt_generator_cfg["hq_max_ch"] = 16
+
+        parent_generator_model = Generator(**parent_generator_cfg)
+        parent_training_state = parent_generator_model.state_dict()
+        rebuild_checkpoint_path = root / "step_000007501.pth"
+        parent_hq_d_cfg = dict(resolved["discriminator"]["hq"])
+        parent_hq_d_cfg["img_resolution"] = 16
+        rebuild_resolved = copy.deepcopy(resolved)
+        rebuild_resolved["train"]["stage"] = "hq"
+        rebuild_resolved["generator"] = rebuilt_generator_cfg
+        rebuild_resolved["discriminator"]["hq"]["img_resolution"] = 32
+        rebuild_resolved["identity"]["provider"] = resolved["identity"]["provider"]
+        torch.save(
+            {
+                "version": CHECKPOINT_VERSION,
+                "step": 7501,
+                "run": {"id": metadata["run_id"], "config_sha256": metadata["config_sha256"]},
+                "identity_encoders": {
+                    "generator": resolved["identity"]["provider"],
+                    "coarse_identity_loss": "BLENDFACE",
+                    "hq_identity_loss": "BLENDFACE",
+                },
+                "net_g": {"network_cfg": parent_generator_cfg, "state_dict": parent_training_state},
+                "net_d": {"network_cfg": parent_hq_d_cfg, "state_dict": d_state},
+                "net_d_coarse": {"network_cfg": rebuild_resolved["discriminator"]["coarse"], "state_dict": coarse_d_state},
+                "training_state": {"net_g": parent_training_state},
+            },
+            rebuild_checkpoint_path,
+        )
+        rebuild_checkpoint, rebuild_parent = _load_branch_checkpoint(
+            rebuild_checkpoint_path,
+            rebuild_resolved,
+            reset_hq_discriminator=False,
+            reset_coarse_discriminator=False,
+        )
+        assert _branch_generator_mode(rebuild_checkpoint, rebuild_resolved) == "hq_rebuild"
+        assert rebuild_parent["branch_mode"] == "hq_rebuild"
+        assert rebuild_parent["generator"] == {"coarse": "inherit", "hq": "reset"}
+        assert rebuild_parent["discriminator"] == {"hq": "reset", "coarse": "inherit"}
+        assert _resolve_branch_start_step(rebuild_parent["branch_mode"], 7501, None) == 0
+        with patch("builtins.print") as print_mock:
+            _print_hq_rebuild_summary(rebuild_checkpoint, rebuild_resolved, 0)
+        printed_lines = [call.args[0] for call in print_mock.call_args_list]
+        assert printed_lines == [
+            "HQ rebuild:",
+            "  HQ 配置变化:",
+            "    img_resolution            : 16 -> 32",
+            "    hq_base_ch                : 2 -> 4",
+            "    hq_max_ch                 : 8 -> 16",
+            "  Coarse                  : inherit + frozen",
+            "  HQ                      : reset",
+            "  HQ Discriminator        : reset",
+            f"  Generator identity      : {resolved['identity']['provider']}",
+            "  起始 step                : 0",
+        ]
+
+        rebuild_g_state, rebuild_hq_d_state, rebuild_coarse_d_state = _branch_model_states(
+            rebuild_checkpoint,
+            reset_hq_discriminator=False,
+            reset_coarse_discriminator=False,
+            hq_rebuild=True,
+        )
+        assert rebuild_hq_d_state is None and rebuild_coarse_d_state is not None
+        rebuilt_model = Generator(**rebuilt_generator_cfg)
+        fresh_hq_state = {name: tensor.clone() for name, tensor in rebuilt_model.hq.state_dict().items()}
+        rebuilt_model.coarse.load_state_dict(_submodule_state_dict(rebuild_g_state, "coarse"), strict=True)
+        for name, tensor in parent_generator_model.coarse.state_dict().items():
+            torch.testing.assert_close(rebuilt_model.coarse.state_dict()[name], tensor)
+        for name, tensor in fresh_hq_state.items():
+            torch.testing.assert_close(rebuilt_model.hq.state_dict()[name], tensor)
+
+        incompatible_coarse = copy.deepcopy(rebuild_resolved)
+        incompatible_coarse["generator"]["coarse_base_ch"] = 4
+        try:
+            _load_branch_checkpoint(
+                rebuild_checkpoint_path,
+                incompatible_coarse,
+                reset_hq_discriminator=False,
+                reset_coarse_discriminator=False,
+            )
+        except ValueError as error:
+            assert "Coarse" in str(error)
+        else:
+            raise AssertionError("HQ rebuild 错误接受了 Coarse 架构变化")
+
+        incompatible_provider = copy.deepcopy(rebuild_resolved)
+        incompatible_provider["identity"]["provider"] = "BLENDFACE" if resolved["identity"]["provider"] != "BLENDFACE" else "MS1MV3_ARCFACE_R50_FP16"
+        try:
+            _load_branch_checkpoint(
+                rebuild_checkpoint_path,
+                incompatible_provider,
+                reset_hq_discriminator=False,
+                reset_coarse_discriminator=False,
+            )
+        except ValueError as error:
+            assert "identity provider" in str(error)
+        else:
+            raise AssertionError("HQ rebuild 错误接受了 Generator identity provider 变化")
+
+        joint_rebuild = copy.deepcopy(rebuild_resolved)
+        joint_rebuild["train"]["stage"] = "joint"
+        try:
+            _load_branch_checkpoint(
+                rebuild_checkpoint_path,
+                joint_rebuild,
+                reset_hq_discriminator=False,
+                reset_coarse_discriminator=False,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("非 HQ-only branch 错误接受了 Generator 架构变化")
 
         changed_generator = copy.deepcopy(resolved)
         changed_generator["generator"]["coarse_resolution"] = 256
@@ -1108,6 +1260,20 @@ def main() -> None:
             reset_coarse_discriminator=False,
         )
 
+        changed_provider_hq_only = copy.deepcopy(changed_provider)
+        changed_provider_hq_only["train"]["stage"] = "hq"
+        try:
+            _load_branch_checkpoint(
+                standalone,
+                changed_provider_hq_only,
+                reset_hq_discriminator=False,
+                reset_coarse_discriminator=False,
+            )
+        except ValueError as error:
+            assert "identity provider" in str(error)
+        else:
+            raise AssertionError("HQ-only branch 错误接受了 Generator identity provider 变化")
+
         document = json.loads(first.resolved_config.read_text(encoding="utf-8"))
         document["config"]["train"]["batch_size"] = 16
         first.resolved_config.write_text(json.dumps(document), encoding="utf-8")
@@ -1118,7 +1284,7 @@ def main() -> None:
         else:
             raise AssertionError("被修改的 resolved config 未被拒绝")
 
-    print("PASS: run layout, latest/resume, simple branch semantics and config digest")
+    print("PASS: run layout, latest/resume, branch/HQ rebuild semantics and config digest")
 
 
 if __name__ == "__main__":

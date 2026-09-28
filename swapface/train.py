@@ -55,7 +55,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 11
+TRAINING_SEMANTICS_VERSION = 12
+
+COARSE_GENERATOR_CONFIG_KEYS = (
+    "img_channels",
+    "id_dim",
+    "coarse_resolution",
+    "coarse_latent_resolution",
+    "coarse_num_latent",
+    "coarse_base_ch",
+    "coarse_max_ch",
+)
 
 
 def _configure_training_runtime() -> None:
@@ -347,8 +357,12 @@ class Trainer:
             print_mapping("net_d", checkpoint["net_d"]["network_cfg"])
 
             saved_net_g_cfg = dict(checkpoint["net_g"]["network_cfg"])
-            if saved_net_g_cfg != net_g_cfg:
-                raise ValueError("checkpoint Generator 架构与当前配置不一致")
+            branch_mode: Literal["inherit", "hq_rebuild"] = "inherit"
+            if checkpoint_mode == "resume":
+                if saved_net_g_cfg != net_g_cfg:
+                    raise ValueError("checkpoint Generator 架构与当前配置不一致")
+            else:
+                branch_mode = _branch_generator_mode(checkpoint, config)
 
             self.img_resolution = int(net_g_cfg["img_resolution"])
             net_g = Generator(**net_g_cfg)
@@ -389,14 +403,25 @@ class Trainer:
                 net_d.load_state_dict(checkpoint["net_d"]["state_dict"])
                 net_d_coarse.load_state_dict(checkpoint["net_d_coarse"]["state_dict"])
             else:
-                # Branch 继承父模型，但 optimizer/scheduler/scaler 重新初始化。
-                self._completed_step = checkpoint_step if start_step is None else start_step
+                # Branch 不恢复 optimizer/scheduler/scaler。HQ rebuild 只继承训练态 Coarse，HQ/HQ D 从零初始化。
+                hq_rebuild = branch_mode == "hq_rebuild"
+                if hq_rebuild:
+                    if start_step not in (None, 0):
+                        raise ValueError("HQ rebuild 必须从 step 0 开始")
+                    self._completed_step = 0
+                else:
+                    self._completed_step = checkpoint_step if start_step is None else start_step
+
                 branch_g_state, branch_d_state, branch_d_coarse_state = _branch_model_states(
                     checkpoint,
                     reset_hq_discriminator=reset_hq_discriminator,
                     reset_coarse_discriminator=reset_coarse_discriminator,
+                    hq_rebuild=hq_rebuild,
                 )
-                net_g.load_state_dict(branch_g_state)
+                if hq_rebuild:
+                    net_g.coarse.load_state_dict(_submodule_state_dict(branch_g_state, "coarse"), strict=True)
+                else:
+                    net_g.load_state_dict(branch_g_state)
                 if branch_d_state is not None:
                     net_d.load_state_dict(branch_d_state)
                 if branch_d_coarse_state is not None:
@@ -464,7 +489,13 @@ class Trainer:
             self._train_g_params = tuple(self.net_g.hq.parameters())
 
         # ========================= 优化器 / 调度器 =========================
-        self.optim_g = optim.Adam(self.net_g.parameters(), lr=generator_lr, betas=(0.0, 0.99), fused=True)
+        if self.train_stage == "joint":
+            self._g_named_parameters = tuple(self.net_g.named_parameters())
+        elif self.coarse_stage_active:
+            self._g_named_parameters = tuple((f"coarse.{name}", parameter) for name, parameter in self.net_g.coarse.named_parameters())
+        else:
+            self._g_named_parameters = tuple((f"hq.{name}", parameter) for name, parameter in self.net_g.hq.named_parameters())
+        self.optim_g = optim.Adam((parameter for _, parameter in self._g_named_parameters), lr=generator_lr, betas=(0.0, 0.99), fused=True)
         self.optim_d_hq = optim.Adam(self.net_d.parameters(), lr=hq_d_lr, betas=(0.0, 0.99), fused=True) if self.hq_stage_active else None
         self.optim_d_coarse = optim.Adam(self.net_d_coarse.parameters(), lr=coarse_d_lr, betas=(0.0, 0.99), fused=True) if self.coarse_stage_active else None
         self._hq_d_named_parameters = tuple((f"hq.{name}", parameter) for name, parameter in self.net_d.named_parameters()) if self.hq_stage_active else ()
@@ -1266,7 +1297,7 @@ class Trainer:
                         self.optim_g,
                         self.scaler_g,
                         name="Generator",
-                        named_parameters=self.net_g.named_parameters(),
+                        named_parameters=self._g_named_parameters,
                     ):
                         break
 
@@ -1302,15 +1333,80 @@ def _load_run_config(paths: RunPaths) -> dict[str, Any]:
     return resolved
 
 
+def _coarse_generator_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """提取决定 Coarse 参数结构与 identity 输入空间的 Generator 配置。"""
+    return {key: config[key] for key in COARSE_GENERATOR_CONFIG_KEYS}
+
+
+def _branch_generator_mode(checkpoint: Mapping[str, Any], resolved: Mapping[str, Any]) -> Literal["inherit", "hq_rebuild"]:
+    """决定 branch 是完整继承 Generator，还是仅继承 Coarse 并重建 HQ。"""
+    parent_generator = dict(checkpoint["net_g"]["network_cfg"])
+    current_generator = dict(resolved["generator"])
+    hq_only = resolved["train"]["stage"] == "hq"
+
+    if hq_only:
+        identity_encoders = checkpoint.get("identity_encoders")
+        if not isinstance(identity_encoders, Mapping):
+            raise TypeError("HQ-only branch 要求父 checkpoint 记录 identity_encoders")
+        parent_generator_provider = identity_encoders.get("generator")
+        current_generator_provider = resolved["identity"]["provider"]
+        if parent_generator_provider != current_generator_provider:
+            raise ValueError(f"HQ-only branch 要求 Generator identity provider 一致：checkpoint={parent_generator_provider!r}, config={current_generator_provider!r}")
+
+    if parent_generator == current_generator:
+        return "inherit"
+    if not hq_only:
+        raise ValueError("branch 修改 Generator 架构仅允许 train.stage='hq' 的 HQ rebuild")
+    if _coarse_generator_config(parent_generator) != _coarse_generator_config(current_generator):
+        raise ValueError("HQ rebuild 要求 Coarse 架构保持一致")
+    return "hq_rebuild"
+
+
+def _resolve_branch_start_step(branch_mode: Literal["inherit", "hq_rebuild"], checkpoint_step: int, requested_step: int | None) -> int:
+    """普通 branch 可继承/重设 step；HQ rebuild 始终从 0 开始。"""
+    if branch_mode == "hq_rebuild":
+        if requested_step not in (None, 0):
+            raise ValueError("HQ rebuild 必须从 --step 0 开始；省略 --step 即自动从 0 开始")
+        return 0
+    return checkpoint_step if requested_step is None else requested_step
+
+
+def _print_hq_rebuild_summary(checkpoint: Mapping[str, Any], resolved: Mapping[str, Any], start_step: int) -> None:
+    """打印 HQ rebuild 的关键继承/重建语义和实际 HQ 配置变化。"""
+    parent_generator = checkpoint["net_g"]["network_cfg"]
+    current_generator = resolved["generator"]
+    changed_hq_config = [(key, parent_generator.get(key), value) for key, value in current_generator.items() if key not in COARSE_GENERATOR_CONFIG_KEYS and parent_generator.get(key) != value]
+
+    print("HQ rebuild:")
+    print("  HQ 配置变化:")
+    for key, old_value, new_value in changed_hq_config:
+        print(f"    {key:26}: {old_value} -> {new_value}")
+    print("  Coarse                  : inherit + frozen")
+    print("  HQ                      : reset")
+    print("  HQ Discriminator        : reset")
+    print(f"  Generator identity      : {resolved['identity']['provider']}")
+    print(f"  起始 step                : {start_step}")
+
+
+def _submodule_state_dict(state_dict: Mapping[str, Tensor], prefix: str) -> dict[str, Tensor]:
+    """从完整 Generator state_dict 中严格提取一个子模块的 state_dict。"""
+    full_prefix = f"{prefix}."
+    result = {key.removeprefix(full_prefix): value for key, value in state_dict.items() if key.startswith(full_prefix)}
+    if not result:
+        raise ValueError(f"Generator checkpoint 缺少 {prefix} state_dict")
+    return result
+
+
 def _branch_model_states(
     checkpoint: Mapping[str, Any],
     *,
     reset_hq_discriminator: bool,
     reset_coarse_discriminator: bool,
+    hq_rebuild: bool = False,
 ) -> tuple[Mapping[str, Tensor], Mapping[str, Tensor] | None, Mapping[str, Tensor] | None]:
-    """Branch 继承训练态 G；HQ/Coarse D 可分别继承或重建。"""
+    """Branch 继承训练态 G；HQ rebuild 时 HQ D 必定重建。"""
     g_state = checkpoint["training_state"]["net_g"]
-    hq_d_state = None if reset_hq_discriminator else checkpoint["net_d"]["state_dict"]
+    hq_d_state = None if (reset_hq_discriminator or hq_rebuild) else checkpoint["net_d"]["state_dict"]
     coarse_d_state = None if reset_coarse_discriminator else checkpoint["net_d_coarse"]["state_dict"]
     return g_state, hq_d_state, coarse_d_state
 
@@ -1332,11 +1428,12 @@ def _load_branch_checkpoint(
     if filename_step != checkpoint_step:
         raise ValueError(f"checkpoint 文件名 step 与内部状态不一致：filename={filename_step}, checkpoint={checkpoint_step}")
 
-    if dict(checkpoint["net_g"]["network_cfg"]) != resolved["generator"]:
-        raise ValueError("branch 不能修改 Generator 架构")
+    branch_mode = _branch_generator_mode(checkpoint, resolved)
+    hq_rebuild = branch_mode == "hq_rebuild"
+    effective_reset_hq_discriminator = reset_hq_discriminator or hq_rebuild
 
     checkpoint["net_d_coarse"]
-    if not reset_hq_discriminator and dict(checkpoint["net_d"]["network_cfg"]) != resolved["discriminator"]["hq"]:
+    if not effective_reset_hq_discriminator and dict(checkpoint["net_d"]["network_cfg"]) != resolved["discriminator"]["hq"]:
         raise ValueError("branch 继承 HQ Discriminator 时要求架构一致；如需新建请使用 --reset-hq-discriminator")
 
     if not reset_coarse_discriminator and dict(checkpoint["net_d_coarse"]["network_cfg"]) != resolved["discriminator"]["coarse"]:
@@ -1346,6 +1443,7 @@ def _load_branch_checkpoint(
         checkpoint,
         reset_hq_discriminator=reset_hq_discriminator,
         reset_coarse_discriminator=reset_coarse_discriminator,
+        hq_rebuild=hq_rebuild,
     )
     checkpoint_run = checkpoint["run"]
     parent = {
@@ -1353,8 +1451,13 @@ def _load_branch_checkpoint(
         "checkpoint": checkpoint_path.name,
         "step": checkpoint_step,
         "config_sha256": checkpoint_run["config_sha256"],
+        "branch_mode": branch_mode,
+        "generator": {
+            "coarse": "inherit",
+            "hq": "reset" if hq_rebuild else "inherit",
+        },
         "discriminator": {
-            "hq": "reset" if reset_hq_discriminator else "inherit",
+            "hq": "reset" if effective_reset_hq_discriminator else "inherit",
             "coarse": "reset" if reset_coarse_discriminator else "inherit",
         },
     }
@@ -1369,8 +1472,8 @@ def main() -> None:
     parser.add_argument("--runs-root", type=Path, default=None, help=f"新 run 根目录，默认：{DEFAULT_RUNS_ROOT}")
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument("--resume", type=Path, default=None, help="严格恢复原 run，只允许 latest checkpoint，并使用原 run 冻结配置")
-    source_group.add_argument("--branch-from", type=Path, default=None, help="从 checkpoint 创建新 run；继承训练态 Generator，默认也继承 Discriminator 权重")
-    parser.add_argument("--reset-hq-discriminator", action="store_true", help="仅用于 branch：重新初始化 HQ Discriminator")
+    source_group.add_argument("--branch-from", type=Path, default=None, help="从 checkpoint 创建新 run；默认继承训练态 Generator，HQ rebuild 仅继承 Coarse")
+    parser.add_argument("--reset-hq-discriminator", action="store_true", help="仅用于 branch：重新初始化 HQ Discriminator；HQ rebuild 会自动执行")
     parser.add_argument("--reset-coarse-discriminator", action="store_true", help="仅用于 branch：重新初始化 Coarse Discriminator")
     parser.add_argument("--step", type=int, default=None, help="仅用于 branch：新 run 的起始 step；默认继承父 checkpoint step")
     parser.add_argument("--strict-precision", action="store_true", help="仅用于 resume：要求当前实际训练精度与 checkpoint 一致；默认允许变化")
@@ -1417,7 +1520,12 @@ def main() -> None:
             reset_hq_discriminator=args.reset_hq_discriminator,
             reset_coarse_discriminator=args.reset_coarse_discriminator,
         )
-        start_step = int(preloaded_checkpoint["step"]) if args.step is None else args.step
+        try:
+            start_step = _resolve_branch_start_step(parent["branch_mode"], int(preloaded_checkpoint["step"]), args.step)
+        except ValueError as error:
+            parser.error(str(error))
+        if parent["branch_mode"] == "hq_rebuild":
+            _print_hq_rebuild_summary(preloaded_checkpoint, resolved, start_step)
 
         run_paths = create_run(args.runs_root or DEFAULT_RUNS_ROOT, args.config, resolved, name=args.name, parent=parent)
         checkpoint_mode = "branch"
