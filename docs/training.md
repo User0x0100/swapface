@@ -73,7 +73,7 @@ Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失�
 
 优化策略按训练实体分开配置：`[optimizer.generator]`、`[optimizer.hq_discriminator]`、`[optimizer.coarse_discriminator]` 分别设置 LR；对应的 `[scheduler.generator]`、`[scheduler.hq_discriminator]`、`[scheduler.coarse_discriminator]` 分别设置 `type / t_max / min_lr_ratio`。Adam 的 `betas=(0.0, 0.99)` 与 fused 实现仍固定在训练代码中。
 
-两个 Discriminator 的架构也完全独立：`[discriminator.hq].img_resolution` 必须等于 `generator.img_resolution`，`[discriminator.coarse].img_resolution` 必须等于 `generator.coarse_resolution`；两者的 `img_channels` 都必须等于 `generator.img_channels`。`base_ch` 与 `max_ch` 可以分别设置。两个阶段都使用带 Spectral Normalization 的 U-Net dense Discriminator，输出与输入同空间分辨率的真假 logit map。
+两个 Discriminator 的架构也完全独立：`[discriminator.hq].img_resolution` 必须等于 `generator.img_resolution`，`[discriminator.coarse].img_resolution` 必须等于 `generator.coarse_resolution`；两者的 `img_channels` 都必须等于 `generator.img_channels`。`base_ch` 与 `max_ch` 可以分别设置。两个阶段都使用 Global + Dense 双头 Discriminator：共享 Encoder 通过 SpectralNorm residual block 与 FIR 抗混叠下采样到 `bottleneck_resolution=8`；Global Head 再下采样到 4x4，经 MinibatchStd/Conv/Linear 输出每图一个 logit；Dense Head 从 8x8 通过 U-Net skip 恢复到输入分辨率并输出 dense logit map。
 
 ## Generator 梯度职责
 
@@ -87,7 +87,7 @@ Generator、HQ Discriminator、Coarse Discriminator 分别拥有独立的 optimi
 
 - Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
 - HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/WFM、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
-- Discriminator：HQ 与 Coarse 各有一个 U-Net dense 判别器，并分别维护自己的 D optimizer、scheduler 与 GradScaler。判别器使用 Spectral Normalization，不再使用 R1。joint 模式下两个 D 各自完成一次更新；某个 D 的 FP16 overflow 只重试该 D。
+- Discriminator：HQ 与 Coarse 各有一个 Global + Dense 双头判别器，并分别维护自己的 D optimizer、scheduler 与 GradScaler。两个 head 的 adversarial loss 各自先归约为标量后直接相加，因此 Dense map 不会因空间元素数量压倒 Global Head，同时 Global/Dense 各自保留完整 GAN 强度。判别器全路径使用 Spectral Normalization，不使用 R1；Encoder 下采样使用 FIR 抗混叠。joint 模式下两个 D 各自完成一次更新；某个 D 的 FP16 overflow 只重试该 D。
 
 Coarse 内部首先将真实 `dst` 双线性缩放到 `coarse_resolution`；训练时通过 `return_resize_in=True` 复用这一实际模型输入作为 Coarse Discriminator real，以及 L1/VGG reconstruction target，不在 Trainer 中重复 resize。Coarse L1/VGG 由 `[loss.coarse.reconstruction].scope` 控制作用范围；默认 `same`，只对 self-reconstruction pair 生效。Coarse 的 target 属性监督则先将低分辨率输出双线性上采样到训练分辨率，再使用与 Final 相同的 `theta_restore` 恢复到 canonical 坐标系，与 `dst_canonical` 比较。
 
@@ -222,7 +222,7 @@ uv run python -m swapface.train \
 
 需要两个 D 都重建时同时传入两个开关。Branch metadata 会分别记录 HQ/Coarse D 的 `inherit` / `reset`。HQ D 与 Coarse D 的架构分别由 `[discriminator.hq]` 和 `[discriminator.coarse]` 控制，因此可以只修改并 reset 其中一个；任何选择 inherit 的 D 都只要求自己的架构与父 checkpoint 保持一致。无论是否恢复 D，Branch 都不会继承 G/D optimizer、scheduler 或 GradScaler；step 默认继承父 checkpoint，也可以由 `--step` 指定。
 
-训练语义 v13 起两个 D 均改为 SpectralNorm U-Net dense Discriminator，并移除 R1 与 `group_size`。从 v12 或更早的 global Discriminator checkpoint 建 branch 时，必须同时使用 `--reset-hq-discriminator --reset-coarse-discriminator`；Generator 仍可按 branch 规则继承。
+训练语义 v14 起两个 D 改为深层 anti-aliased Global + Dense 双头 Discriminator：共享 Encoder 到 8x8，Global 分支继续到 4x4 并恢复 MinibatchStd，Dense 分支通过 U-Net skip 返回原分辨率；全路径使用 SpectralNorm，仍不使用 R1。由于判别器架构与 loss 语义均变化，从 v13 或更早 checkpoint 建 branch 时必须重建对应 Discriminator；Generator 仍可按 branch 规则继承。
 
 ### HQ rebuild：继承 Coarse，用新分辨率从零训练 HQ
 

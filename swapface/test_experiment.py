@@ -142,8 +142,22 @@ def _check_train_config(root: Path) -> None:
     assert resolved["data"]["src"][0]["adjustment"] == 1 and resolved["data"]["dst"][0]["adjustment"] == -1
 
     assert resolved["discriminator"] == {
-        "hq": {"img_resolution": 512, "img_channels": 3, "base_ch": 96, "max_ch": 512},
-        "coarse": {"img_resolution": 128, "img_channels": 3, "base_ch": 32, "max_ch": 256},
+        "hq": {
+            "img_resolution": 512,
+            "img_channels": 3,
+            "base_ch": 96,
+            "max_ch": 512,
+            "bottleneck_resolution": 8,
+            "minibatch_std_group_size": 4,
+        },
+        "coarse": {
+            "img_resolution": 128,
+            "img_channels": 3,
+            "base_ch": 32,
+            "max_ch": 256,
+            "bottleneck_resolution": 8,
+            "minibatch_std_group_size": 4,
+        },
     }
 
     assert resolved["generator"]["coarse_num_latent"] == 7
@@ -568,31 +582,60 @@ def _check_discriminator_overflow_isolation() -> None:
     print("PASS: HQ discriminator FP16 overflow retry does not touch Coarse discriminator state")
 
 
-def _check_unet_discriminator() -> None:
+def _check_dual_head_discriminator() -> None:
     model = Discriminator(img_resolution=32, img_channels=3, base_ch=8, max_ch=32)
     x = torch.randn(2, 3, 32, 32)
-    score, feats = model(x, return_feats=True)
-    assert score.shape == (2, 1, 32, 32)
+    (global_score, dense_score), feats = model(x, return_feats=True)
+    assert global_score.shape == (2, 1)
+    assert dense_score.shape == (2, 1, 32, 32)
     assert [tuple(feature.shape) for feature in feats] == [
         (2, 8, 32, 32),
         (2, 16, 16, 16),
         (2, 32, 8, 8),
-        (2, 32, 4, 4),
     ]
-    assert model.feature_count == 4
+    assert model.feature_count == 3
     assert len(feats) == model.feature_count
     assert len(model.get_feats(x, max_layer=2)) == 3
-    for layer_name in ("conv1", "conv2", "conv3", "conv4", "conv5", "conv6", "conv7", "conv8"):
-        layer = getattr(model, layer_name)
-        assert hasattr(layer, "weight_orig") and hasattr(layer, "weight_u")
-    assert not hasattr(model.conv0, "weight_orig") and not hasattr(model.conv9, "weight_orig")
+    assert model.global_down(torch.randn(2, 32, 8, 8)).shape[-2:] == (4, 4)
 
-    spectral_buffers_before = {name: value.detach().clone() for name, value in model.state_dict().items() if name.endswith(("weight_u", "weight_v"))}
+    learned_layers = [
+        module
+        for module in model.modules()
+        if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear))
+    ]
+    assert learned_layers
+    assert all(hasattr(layer, "weight_orig") and hasattr(layer, "weight_u") for layer in learned_layers)
+    assert all(block.conv0.bias is not None and block.conv1.bias is not None for block in [*model.down_blocks, model.global_down])
+    assert model.global_conv.bias is not None
+    assert all(block.shortcut_conv.bias is None for block in [*model.down_blocks, model.global_down])
+
+    # MinibatchStd 不能假定 batch size 能整除 group_size。
+    odd_global, odd_dense = model(torch.randn(5, 3, 32, 32))
+    assert odd_global.shape == (5, 1) and odd_dense.shape == (5, 1, 32, 32)
+
+    model.zero_grad(set_to_none=True)
+    grad_global, grad_dense = model(torch.randn(2, 3, 32, 32))
+    (grad_global.mean() + grad_dense.mean()).backward()
+    assert torch.count_nonzero(model.global_fc1.weight_orig.grad).item() > 0
+    assert torch.count_nonzero(model.dense_out.weight_orig.grad).item() > 0
+    assert torch.count_nonzero(model.from_rgb.weight_orig.grad).item() > 0
+    model.zero_grad(set_to_none=True)
+
+    spectral_buffers_before = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+        if name.endswith(("weight_u", "weight_v"))
+    }
     model.eval().requires_grad_(False)
-    model(x.requires_grad_(True)).mean().backward()
-    spectral_buffers_after = {name: value.detach().clone() for name, value in model.state_dict().items() if name.endswith(("weight_u", "weight_v"))}
+    eval_global, eval_dense = model(x.requires_grad_(True))
+    (eval_global.mean() + eval_dense.mean()).backward()
+    spectral_buffers_after = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+        if name.endswith(("weight_u", "weight_v"))
+    }
     assert all(torch.equal(spectral_buffers_before[name], spectral_buffers_after[name]) for name in spectral_buffers_before)
-    print("PASS: U-Net discriminator keeps dense logits, encoder features and spectral normalization")
+    print("PASS: dual-head discriminator keeps global/dense logits, anti-aliased encoder features and spectral normalization")
 
 
 def _check_generator_responsibility_boundary() -> None:
@@ -695,9 +738,10 @@ def _check_generator_responsibility_boundary() -> None:
     assert "r1" not in discriminator_stage_source.lower()
     discriminator_stage_tree = ast.parse(discriminator_stage_source)
     train_net_calls = [node for node in ast.walk(discriminator_stage_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "train_net"]
-    assert len(train_net_calls) == 1
-    assert "torch.cat((fake.detach(), real.detach()), dim=0)" in discriminator_stage_source
-    assert "scores.chunk(2, dim=0)" in discriminator_stage_source
+    assert len(train_net_calls) == 2
+    assert "train_net(fake.detach())" in discriminator_stage_source
+    assert "train_net(real.detach())" in discriminator_stage_source
+    assert "adversarial_loss = global_loss + dense_loss" in discriminator_stage_source
 
     generator_stage_calls = [
         node.func.attr
@@ -929,7 +973,7 @@ def _check_sample_gradient_maps() -> None:
 
 def main() -> None:
     _check_reconstruction_scope()
-    _check_unet_discriminator()
+    _check_dual_head_discriminator()
     _check_generator_responsibility_boundary()
     _check_discriminator_training_state_split()
     _check_sample_gradient_maps()

@@ -55,14 +55,18 @@ DEFAULT_DISCRIMINATOR_CONFIG: dict[str, Any] = {
     "hq": {
         "img_resolution": 512,
         "img_channels": 3,
-        "base_ch": 64,
+        "base_ch": 32,
         "max_ch": 512,
+        "bottleneck_resolution": 8,
+        "minibatch_std_group_size": 4,
     },
     "coarse": {
         "img_resolution": 128,
         "img_channels": 3,
-        "base_ch": 64,
+        "base_ch": 32,
         "max_ch": 512,
+        "bottleneck_resolution": 8,
+        "minibatch_std_group_size": 4,
     },
 }
 DEFAULT_GENERATOR_ID_ENCODER_PROVIDER = IDEncoderProvider.BLENDFACE
@@ -453,12 +457,15 @@ def _normalize_discriminator(config: dict[str, Any]) -> dict[str, Any]:
             defaults,
             f"[discriminator.{stage}]",
         )
-        for key in ("img_resolution", "img_channels", "base_ch", "max_ch"):
+        for key in ("img_resolution", "img_channels", "base_ch", "max_ch", "bottleneck_resolution", "minibatch_std_group_size"):
             stage_config[key] = _int(stage_config[key], f"discriminator.{stage}.{key}", minimum=1)
         if stage_config["max_ch"] < stage_config["base_ch"]:
             raise ValueError(f"discriminator.{stage}.max_ch 必须 >= discriminator.{stage}.base_ch")
-        if stage_config["img_resolution"] % 8 != 0:
-            raise ValueError(f"discriminator.{stage}.img_resolution 必须能被 8 整除")
+        resolution = stage_config["img_resolution"]
+        if resolution < 16 or resolution & (resolution - 1):
+            raise ValueError(f"discriminator.{stage}.img_resolution 必须是 >=16 的 2 的整数次幂")
+        if stage_config["bottleneck_resolution"] != 8:
+            raise ValueError(f"discriminator.{stage}.bottleneck_resolution 当前必须为 8")
         result[stage] = stage_config
     return result
 
