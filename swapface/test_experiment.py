@@ -166,6 +166,15 @@ def _check_train_config(root: Path) -> None:
     default_generator_resolved = resolve_train_config(default_generator)
     assert default_generator_resolved["generator"]["coarse_num_latent"] == 8
 
+    invalid_batch = copy.deepcopy(raw)
+    invalid_batch["train"]["batch_size"] = 10
+    try:
+        resolve_train_config(invalid_batch)
+    except ValueError as error:
+        assert "minibatch_std_group_size" in str(error)
+    else:
+        raise AssertionError("不能整除 minibatch_std_group_size 的 batch_size 被错误接受")
+
     paths = create_run(root / "config-runs", source, resolved, name="canonical")
     assert load_resolved_config(paths) == resolved
     metadata = json.loads(paths.metadata.read_text(encoding="utf-8"))
@@ -609,6 +618,21 @@ def _check_dual_head_discriminator() -> None:
     assert model.global_conv.bias is not None
     assert all(block.shortcut_conv.bias is None for block in [*model.down_blocks, model.global_down])
 
+    # D step 可在一次 forward 中处理 fake/real，同时让 Global MinibatchStd 分开统计。
+    model.eval()
+    fake = torch.randn(4, 3, 32, 32)
+    real = torch.randn(4, 3, 32, 32)
+    fake_global, fake_dense = model(fake)
+    real_global, real_dense = model(real)
+    paired_global, paired_dense = model(torch.cat((fake, real), dim=0), split_minibatch_std=True)
+    paired_fake_global, paired_real_global = paired_global.chunk(2, dim=0)
+    paired_fake_dense, paired_real_dense = paired_dense.chunk(2, dim=0)
+    torch.testing.assert_close(paired_fake_global, fake_global)
+    torch.testing.assert_close(paired_real_global, real_global)
+    torch.testing.assert_close(paired_fake_dense, fake_dense)
+    torch.testing.assert_close(paired_real_dense, real_dense)
+    model.train()
+
     # MinibatchStd 不能假定 batch size 能整除 group_size。
     odd_global, odd_dense = model(torch.randn(5, 3, 32, 32))
     assert odd_global.shape == (5, 1) and odd_dense.shape == (5, 1, 32, 32)
@@ -738,9 +762,14 @@ def _check_generator_responsibility_boundary() -> None:
     assert "r1" not in discriminator_stage_source.lower()
     discriminator_stage_tree = ast.parse(discriminator_stage_source)
     train_net_calls = [node for node in ast.walk(discriminator_stage_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "train_net"]
-    assert len(train_net_calls) == 2
-    assert "train_net(fake.detach())" in discriminator_stage_source
-    assert "train_net(real.detach())" in discriminator_stage_source
+    assert len(train_net_calls) == 1
+    assert "torch.cat((fake.detach(), real.detach()), dim=0)" in discriminator_stage_source
+    train_net_call = train_net_calls[0]
+    assert len(train_net_call.args) == 3
+    assert isinstance(train_net_call.args[1], ast.Constant) and train_net_call.args[1].value is False
+    assert isinstance(train_net_call.args[2], ast.Constant) and train_net_call.args[2].value is True
+    assert "global_scores.chunk(2, dim=0)" in discriminator_stage_source
+    assert "dense_scores.chunk(2, dim=0)" in discriminator_stage_source
     assert "adversarial_loss = global_loss + dense_loss" in discriminator_stage_source
 
     generator_stage_calls = [

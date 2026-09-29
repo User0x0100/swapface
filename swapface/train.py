@@ -796,8 +796,13 @@ class Trainer:
     ) -> Tensor:
         """计算单个双头判别器阶段的 Global + Dense adversarial loss。"""
         with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-            fake_global, fake_dense = train_net(fake.detach())
-            real_global, real_dense = train_net(real.detach())
+            global_scores, dense_scores = train_net(
+                torch.cat((fake.detach(), real.detach()), dim=0),
+                False,
+                True,
+            )
+            fake_global, real_global = global_scores.chunk(2, dim=0)
+            fake_dense, real_dense = dense_scores.chunk(2, dim=0)
             global_loss = self.d_loss(fake_global, real_global)
             dense_loss = self.d_loss(fake_dense, real_dense)
             adversarial_loss = global_loss + dense_loss

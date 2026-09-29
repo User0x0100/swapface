@@ -149,9 +149,15 @@ class Discriminator(nn.Module):
     def get_feats(self, x: Tensor, max_layer: int | None = None) -> list[Tensor]:
         return self._encode(x, max_layer)
 
-    def _global_head(self, bottleneck: Tensor) -> Tensor:
+    def _global_head(self, bottleneck: Tensor, split_minibatch_std: bool = False) -> Tensor:
         x = self.global_down(bottleneck)
-        x = self.global_std(x)
+        if split_minibatch_std:
+            if x.shape[0] % 2:
+                raise ValueError(f"split_minibatch_std 要求偶数 batch，实际为 {x.shape[0]}")
+            first, second = x.chunk(2, dim=0)
+            x = torch.cat((self.global_std(first), self.global_std(second)), dim=0)
+        else:
+            x = self.global_std(x)
         x = F.leaky_relu(self.global_conv(x), negative_slope=0.2)
         x = x.flatten(1)
         x = F.leaky_relu(self.global_fc0(x), negative_slope=0.2)
@@ -169,6 +175,7 @@ class Discriminator(nn.Module):
         self,
         x: Tensor,
         return_feats: bool = False,
+        split_minibatch_std: bool = False,
     ) -> tuple[Tensor, Tensor] | tuple[tuple[Tensor, Tensor], list[Tensor]]:
         expected = (
             self.network_cfg["img_channels"],
@@ -181,5 +188,5 @@ class Discriminator(nn.Module):
             )
 
         feats = self._encode(x)
-        scores = (self._global_head(feats[-1]), self._dense_head(feats))
+        scores = (self._global_head(feats[-1], split_minibatch_std), self._dense_head(feats))
         return (scores, feats) if return_feats else scores

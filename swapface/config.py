@@ -516,15 +516,24 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
     if unknown_sections:
         raise ValueError(f"配置包含未知顶层字段：{sorted(unknown_sections)}")
 
+    train = _normalize_train(config)
+    discriminator = _normalize_discriminator(config)
+    for stage, stage_config in discriminator.items():
+        group_size = stage_config["minibatch_std_group_size"]
+        if train["batch_size"] % group_size:
+            raise ValueError(
+                f"train.batch_size={train['batch_size']} 必须能被 discriminator.{stage}.minibatch_std_group_size={group_size} 整除"
+            )
+
     return {
-        "train": _normalize_train(config),
+        "train": train,
         "optimizer": _normalize_optimizer(config),
         "scheduler": _normalize_scheduler(config),
         "identity": _normalize_identity(config),
         "loss": _normalize_loss(config),
         "data": _normalize_data(config),
         "generator": _normalize_generator(config),
-        "discriminator": _normalize_discriminator(config),
+        "discriminator": discriminator,
     }
 
 
