@@ -25,12 +25,11 @@ from losses import (
     VGGPerceptualLoss,
     WeightedFeatureMatchingLoss,
     make_l1_loss,
-    r1_reg_loss,
 )
 from misc.face_alignment import ffhq_to_arcface_112, make_ffhq_to_arcface_112_grid, transform_sampling_grid
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
 from models.discriminator import Discriminator
-from models.discriminator.upfirdn2d import initialize_upfirdn2d, is_rocm_gfx1100
+from models.discriminator.upfirdn2d import is_rocm_gfx1100
 from models.networks import Generator
 
 from .config import load_train_config, resolve_train_config
@@ -55,7 +54,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 12
+TRAINING_SEMANTICS_VERSION = 13
 
 COARSE_GENERATOR_CONFIG_KEYS = (
     "img_channels",
@@ -242,8 +241,6 @@ class Trainer:
         hq_gan_config = hq_loss_config["gan"]
         coarse_identity_config = coarse_loss_config["identity"]
         hq_identity_config = hq_loss_config["identity"]
-        coarse_r1_config = coarse_loss_config["r1"]
-        hq_r1_config = hq_loss_config["r1"]
         coarse_gaze_config = coarse_loss_config["gaze"]
         hq_gaze_config = hq_loss_config["gaze"]
         coarse_hrffa_config = coarse_loss_config["hrffa"]
@@ -265,12 +262,6 @@ class Trainer:
         self.reuse_generator_identity_for_hq_source = self.hq_stage_active and self.generator_id_encoder_provider is self.hq_identity_loss_provider
         self.coarse_reconstruction_scope = coarse_reconstruction_scope
         self.hq_reconstruction_scope = hq_reconstruction_scope
-        self.enable_coarse_r1_loss = self.coarse_stage_active and bool(coarse_r1_config["enable"])
-        self.coarse_r1_reg_step = int(coarse_r1_config["interval"])
-        self.coarse_r1_gamma = float(coarse_r1_config["gamma"])
-        self.enable_hq_r1_loss = self.hq_stage_active and bool(hq_r1_config["enable"])
-        self.hq_r1_reg_step = int(hq_r1_config["interval"])
-        self.hq_r1_gamma = float(hq_r1_config["gamma"])
         self.enable_coarse_l1_loss = self.coarse_stage_active and bool(coarse_l1_config["enable"])
         self.enable_hq_l1_loss = self.hq_stage_active and bool(hq_l1_config["enable"])
         self.enable_coarse_gaze_loss = self.coarse_stage_active and bool(coarse_gaze_config["enable"])
@@ -452,14 +443,6 @@ class Trainer:
         coarse_d_channels = int(net_d_coarse.network_cfg["img_channels"])
         if coarse_d_channels != generator_channels:
             raise ValueError(f"Generator 与 Coarse Discriminator 通道数不一致：{generator_channels} != {coarse_d_channels}")
-
-        hq_group_size = min(int(net_d.network_cfg["group_size"]), self.batch_size)
-        if self.hq_stage_active and self.batch_size % hq_group_size != 0:
-            raise ValueError(f"batch_size={self.batch_size} 必须能被 HQ Discriminator minibatch group_size={hq_group_size} 整除")
-
-        coarse_group_size = min(int(net_d_coarse.network_cfg["group_size"]), self.batch_size)
-        if self.coarse_stage_active and self.batch_size % coarse_group_size != 0:
-            raise ValueError(f"batch_size={self.batch_size} 必须能被 Coarse Discriminator minibatch group_size={coarse_group_size} 整除")
 
         self.net_g = net_g.to(self.device).train()
         self.net_g.coarse.requires_grad_(self.coarse_stage_active)
@@ -662,7 +645,7 @@ class Trainer:
 
         if self.enable_hq_wfm_loss:
             wfm_weights = {int(index): float(weight) for index, weight in wfm_config["weights"].items()}
-            feature_count = len(self.net_d.down_blocks)
+            feature_count = self.net_d.feature_count
             invalid_layers = sorted(index for index in wfm_weights if index >= feature_count)
             if invalid_layers:
                 raise ValueError(f"loss.hq.wfm.weights 层索引超出判别器特征范围 0~{feature_count - 1}：{invalid_layers}")
@@ -689,7 +672,6 @@ class Trainer:
         # ========================= 编译模型 =========================
         # Coarse 始终需要前向；HQ/D/loss teacher 仅为 active stage 构建训练热路径。
         if compile_module:
-            initialize_upfirdn2d()
             self.train_coarse = _compile_training_callable(self.net_g.coarse)
             if self.hq_stage_active:
                 self.train_hq = _compile_training_callable(self.net_g.hq)
@@ -809,66 +791,32 @@ class Trainer:
         stage: Literal["hq", "coarse"],
         fake: Tensor,
         real: Tensor,
-        net: Discriminator,
         train_net: Any,
-        *,
-        r1_enabled: bool,
-        r1_interval: int,
-        r1_gamma: float,
     ) -> Tensor:
-        """计算单个判别器阶段的 adversarial + lazy R1，总是返回该阶段 D total。"""
-        r1_step = r1_enabled and self.completed_step % r1_interval == 0
-        if r1_step:
-            with autocast(device_type="cuda", enabled=False):
-                fake_img = fake.detach().float()
-                real_img = real.detach().float().requires_grad_(True)
-                fake_score = net(fake_img)
-                real_score = net(real_img)
-                adversarial_loss = self.d_loss(fake_score, real_score)
-                r1_loss_raw = r1_reg_loss(real_score, real_img, gamma=r1_gamma)
-                r1_loss = r1_loss_raw * r1_interval
-            self.log(f"{stage}_r1_loss_raw", r1_loss_raw, force=True)
-            self.log(f"{stage}_r1_loss", r1_loss, force=True)
-            total = adversarial_loss + r1_loss
-        else:
-            with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                fake_score = train_net(fake.detach())
-                real_score = train_net(real.detach())
-                adversarial_loss = self.d_loss(fake_score, real_score)
-            total = adversarial_loss
+        """计算单个 U-Net 判别器阶段的 dense adversarial loss。"""
+        with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
+            scores = train_net(torch.cat((fake.detach(), real.detach()), dim=0))
+            fake_score, real_score = scores.chunk(2, dim=0)
+            adversarial_loss = self.d_loss(fake_score, real_score)
 
         self.log(f"{stage}_d_loss", adversarial_loss)
-        return total
+        return adversarial_loss
 
     def _update_discriminator_stage(
         self,
         stage: Literal["hq", "coarse"],
         fake: Tensor,
         real: Tensor,
-        net: Discriminator,
         train_net: Any,
         optimizer: optim.Optimizer,
         scaler: GradScaler,
         named_parameters: Iterable[tuple[str, Tensor]],
-        *,
-        r1_enabled: bool,
-        r1_interval: int,
-        r1_gamma: float,
     ) -> None:
         """独立完成一个判别器 stage 的 backward/step；FP16 overflow 只重试当前 stage。"""
         overflow_retries = 0
         while True:
             optimizer.zero_grad(set_to_none=True)
-            loss = self._discriminator_stage_loss(
-                stage,
-                fake,
-                real,
-                net,
-                train_net,
-                r1_enabled=r1_enabled,
-                r1_interval=r1_interval,
-                r1_gamma=r1_gamma,
-            )
+            loss = self._discriminator_stage_loss(stage, fake, real, train_net)
             _ensure_finite_loss(f"{stage}_d_loss", loss)
             if _scaled_backward_step(
                 loss,
@@ -1129,11 +1077,17 @@ class Trainer:
 
             if self.coarse_stage_active:
                 # ========================= Coarse 判别器梯度图 =========================
+                # SpectralNorm 在 train mode 会更新 power-iteration buffer；sample 可视化不能改变训练状态。
                 coarse_for_gan_grad = coarse_vis.detach().requires_grad_(True)
-                with torch.enable_grad():
-                    coarse_score_vis = self.train_d_coarse(coarse_for_gan_grad)
-                    coarse_gan_loss_vis = self.coarse_gan_loss(coarse_score_vis)
-                    coarse_gan_grad_map = self.loss_grad_map(coarse_gan_loss_vis, coarse_for_gan_grad)
+                coarse_d_training = self.net_d_coarse.training
+                self.net_d_coarse.eval()
+                try:
+                    with torch.enable_grad():
+                        coarse_score_vis = self.net_d_coarse(coarse_for_gan_grad)
+                        coarse_gan_loss_vis = self.coarse_gan_loss(coarse_score_vis)
+                        coarse_gan_grad_map = self.loss_grad_map(coarse_gan_loss_vis, coarse_for_gan_grad)
+                finally:
+                    self.net_d_coarse.train(coarse_d_training)
                 grid.append(NF.interpolate(coarse_gan_grad_map, size=fake_vis.shape[2:], mode="bilinear", align_corners=False))
 
                 # ========================= Coarse 身份损失梯度图 =========================
@@ -1147,10 +1101,15 @@ class Trainer:
             if self.hq_stage_active:
                 # ========================= HQ 判别器梯度图 =========================
                 fake_for_gan_grad = fake_vis.detach().requires_grad_(True)
-                with torch.enable_grad():
-                    fake_score_vis = self.train_d(fake_for_gan_grad)
-                    gan_loss_vis = self.hq_gan_loss(fake_score_vis)
-                    gan_grad_map = self.loss_grad_map(gan_loss_vis, fake_for_gan_grad)
+                hq_d_training = self.net_d.training
+                self.net_d.eval()
+                try:
+                    with torch.enable_grad():
+                        fake_score_vis = self.net_d(fake_for_gan_grad)
+                        gan_loss_vis = self.hq_gan_loss(fake_score_vis)
+                        gan_grad_map = self.loss_grad_map(gan_loss_vis, fake_for_gan_grad)
+                finally:
+                    self.net_d.train(hq_d_training)
                 grid.append(gan_grad_map)
 
                 # ========================= HQ 身份损失梯度图 =========================
@@ -1209,14 +1168,10 @@ class Trainer:
                         "hq",
                         fake,
                         dst,
-                        self.net_d,
                         self.train_d,
                         self.optim_d_hq,
                         self.scaler_d_hq,
                         self._hq_d_named_parameters,
-                        r1_enabled=self.enable_hq_r1_loss,
-                        r1_interval=self.hq_r1_reg_step,
-                        r1_gamma=self.hq_r1_gamma,
                     )
                     if self.use_cosine_lr_d_hq:
                         self.lr_scheduler_d_hq.step()
@@ -1227,14 +1182,10 @@ class Trainer:
                         "coarse",
                         coarse,
                         coarse_resize_in,
-                        self.net_d_coarse,
                         self.train_d_coarse,
                         self.optim_d_coarse,
                         self.scaler_d_coarse,
                         self._coarse_d_named_parameters,
-                        r1_enabled=self.enable_coarse_r1_loss,
-                        r1_interval=self.coarse_r1_reg_step,
-                        r1_gamma=self.coarse_r1_gamma,
                     )
                     if self.use_cosine_lr_d_coarse:
                         self.lr_scheduler_d_coarse.step()
@@ -1257,6 +1208,10 @@ class Trainer:
                 # ========================= 训练生成器 =========================
                 self.net_d.requires_grad_(False)
                 self.net_d_coarse.requires_grad_(False)
+                hq_d_training = self.net_d.training
+                coarse_d_training = self.net_d_coarse.training
+                self.net_d.eval()
+                self.net_d_coarse.eval()
                 g_overflow_retries = 0
 
                 while True:
@@ -1317,6 +1272,9 @@ class Trainer:
                     self.optim_g.zero_grad(set_to_none=True)
                     if g_overflow_retries >= MAX_AMP_OVERFLOW_RETRIES:
                         raise FloatingPointError(f"Generator 连续 {MAX_AMP_OVERFLOW_RETRIES} 次 FP16 gradient overflow，停止训练")
+
+                self.net_d.train(hq_d_training)
+                self.net_d_coarse.train(coarse_d_training)
 
                 if self.use_cosine_lr_g:
                     self.lr_scheduler_g.step()

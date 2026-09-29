@@ -69,11 +69,11 @@ uv run python -m swapface.train \
 - `[[data.src]]` / `[[data.dst]]`：训练数据源；
 - `[generator]` / `[discriminator.hq]` / `[discriminator.coarse]`：Generator 与两个 Discriminator 的独立模型定义。
 
-Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、R1、gaze、HRFFA、FACS、L1/VGG 与 reconstruction scope 均独立配置；WFM 只属于 HQ。`gan.weight` 只缩放对应阶段的 Generator adversarial loss；两个 Discriminator adversarial loss 固定权重 1.0。
+Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、gaze、HRFFA、FACS、L1/VGG 与 reconstruction scope 均独立配置；WFM 只属于 HQ。`gan.weight` 只缩放对应阶段的 Generator adversarial loss；两个 Discriminator adversarial loss 固定权重 1.0。
 
 优化策略按训练实体分开配置：`[optimizer.generator]`、`[optimizer.hq_discriminator]`、`[optimizer.coarse_discriminator]` 分别设置 LR；对应的 `[scheduler.generator]`、`[scheduler.hq_discriminator]`、`[scheduler.coarse_discriminator]` 分别设置 `type / t_max / min_lr_ratio`。Adam 的 `betas=(0.0, 0.99)` 与 fused 实现仍固定在训练代码中。
 
-两个 Discriminator 的架构也完全独立：`[discriminator.hq].img_resolution` 必须等于 `generator.img_resolution`，`[discriminator.coarse].img_resolution` 必须等于 `generator.coarse_resolution`；两者的 `img_channels` 都必须等于 `generator.img_channels`。`base_ch`、`max_ch` 与 minibatch group size 可以分别设置。
+两个 Discriminator 的架构也完全独立：`[discriminator.hq].img_resolution` 必须等于 `generator.img_resolution`，`[discriminator.coarse].img_resolution` 必须等于 `generator.coarse_resolution`；两者的 `img_channels` 都必须等于 `generator.img_channels`。`base_ch` 与 `max_ch` 可以分别设置。两个阶段都使用带 Spectral Normalization 的 U-Net dense Discriminator，输出与输入同空间分辨率的真假 logit map。
 
 ## Generator 梯度职责
 
@@ -85,9 +85,9 @@ Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失�
 
 Generator、HQ Discriminator、Coarse Discriminator 分别拥有独立的 optimizer/scheduler/GradScaler。inactive Discriminator 保持在 CPU，不创建 optimizer/scaler/scheduler，也不占用训练 GPU 显存；inactive Generator stage 参数没有 gradient。EMA 只更新 active Generator stage。`hq` 模式下 HQ 输入仍使用冻结 Coarse 的输出；`joint` 模式下 HQ 输入使用 `coarse.detach()`，因此 Final/HQ losses 不会反向修改 Coarse。
 
-- Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、R1、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
-- HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/R1/WFM、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
-- Discriminator：HQ 与 Coarse 各有一个判别器，并分别维护自己的 D optimizer、scheduler、GradScaler 与 R1 enable/interval/gamma。joint 模式下两个 D 各自完成一次更新；某个 D 的 FP16 overflow 只重试该 D。
+- Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
+- HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/WFM、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
+- Discriminator：HQ 与 Coarse 各有一个 U-Net dense 判别器，并分别维护自己的 D optimizer、scheduler 与 GradScaler。判别器使用 Spectral Normalization，不再使用 R1。joint 模式下两个 D 各自完成一次更新；某个 D 的 FP16 overflow 只重试该 D。
 
 Coarse 内部首先将真实 `dst` 双线性缩放到 `coarse_resolution`；训练时通过 `return_resize_in=True` 复用这一实际模型输入作为 Coarse Discriminator real，以及 L1/VGG reconstruction target，不在 Trainer 中重复 resize。Coarse L1/VGG 由 `[loss.coarse.reconstruction].scope` 控制作用范围；默认 `same`，只对 self-reconstruction pair 生效。Coarse 的 target 属性监督则先将低分辨率输出双线性上采样到训练分辨率，再使用与 Final 相同的 `theta_restore` 恢复到 canonical 坐标系，与 `dst_canonical` 比较。
 
@@ -202,7 +202,7 @@ uv run python -m swapface.train \
   --step 30000
 ```
 
-`--step 0` 可以让新分支从 0 重新计数。这个值就是新 run 的实际 `completed_step` 起点，因此也会同时影响 R1 周期、EMA decay、sample/checkpoint 保存周期和文件名；它不是单独的 TensorBoard 显示偏移。
+`--step 0` 可以让新分支从 0 重新计数。这个值就是新 run 的实际 `completed_step` 起点，因此也会同时影响 EMA decay、sample/checkpoint 保存周期和文件名；它不是单独的 TensorBoard 显示偏移。
 
 普通 branch 要求 `[generator]` 与父 checkpoint 完全一致。默认还要求被继承的 Discriminator 架构一致。HQ D 与 Coarse D 可以分别重建：
 
@@ -221,6 +221,8 @@ uv run python -m swapface.train \
 ```
 
 需要两个 D 都重建时同时传入两个开关。Branch metadata 会分别记录 HQ/Coarse D 的 `inherit` / `reset`。HQ D 与 Coarse D 的架构分别由 `[discriminator.hq]` 和 `[discriminator.coarse]` 控制，因此可以只修改并 reset 其中一个；任何选择 inherit 的 D 都只要求自己的架构与父 checkpoint 保持一致。无论是否恢复 D，Branch 都不会继承 G/D optimizer、scheduler 或 GradScaler；step 默认继承父 checkpoint，也可以由 `--step` 指定。
+
+训练语义 v13 起两个 D 均改为 SpectralNorm U-Net dense Discriminator，并移除 R1 与 `group_size`。从 v12 或更早的 global Discriminator checkpoint 建 branch 时，必须同时使用 `--reset-hq-discriminator --reset-coarse-discriminator`；Generator 仍可按 branch 规则继承。
 
 ### HQ rebuild：继承 Coarse，用新分辨率从零训练 HQ
 
@@ -279,7 +281,7 @@ Branch 不检查 `training_config.semantics_version`，因为它不恢复父训�
 
 ### 可选严格校验训练精度
 
-`[train].precision` 必须显式配置，支持 `fp32`、`fp16`、`bf16`。FP16 使用 Generator、HQ Discriminator、Coarse Discriminator 三个独立 `GradScaler`；BF16 不使用 loss scaling。R1、仿射恢复与 HRFFA 的数值敏感几何求解继续固定为 FP32。
+`[train].precision` 必须显式配置，支持 `fp32`、`fp16`、`bf16`。FP16 使用 Generator、HQ Discriminator、Coarse Discriminator 三个独立 `GradScaler`；BF16 不使用 loss scaling。仿射恢复与 HRFFA 的数值敏感几何求解继续固定为 FP32。
 
 FP16 中只有实际执行了 optimizer update 的阶段才推进对应 scheduler。D overflow 时当前 global step 不推进；D 已成功而 G overflow 时只重算并重试 G，直到 G 成功后才更新 EMA 和 `completed_step`。任一 active D stage 的 loss 或 `g_loss` 出现 NaN/Inf 时直接终止，避免把非有限值误当作可通过降低 loss scale 恢复的 overflow。BF16/FP32 在 backward 后、`optimizer.step()` 前额外检查参数梯度；若任一梯度出现 NaN/Inf，则报告首个异常参数并终止，避免污染模型参数和 optimizer state。FP16 的梯度 overflow 仍由 `GradScaler` 负责跳过 update 和动态调整 scale，不走该 fatal gradient guard。
 

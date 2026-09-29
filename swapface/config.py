@@ -57,14 +57,12 @@ DEFAULT_DISCRIMINATOR_CONFIG: dict[str, Any] = {
         "img_channels": 3,
         "base_ch": 64,
         "max_ch": 512,
-        "group_size": 4,
     },
     "coarse": {
         "img_resolution": 128,
         "img_channels": 3,
         "base_ch": 64,
         "max_ch": 512,
-        "group_size": 4,
     },
 }
 DEFAULT_GENERATOR_ID_ENCODER_PROVIDER = IDEncoderProvider.BLENDFACE
@@ -81,7 +79,6 @@ DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
 DEFAULT_WFM_LOSS_WEIGHT: dict[int, float] = {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.1}
 DEFAULT_GAN_LOSS_CONFIG = {"weight": 1.0}
 DEFAULT_IDENTITY_LOSS_CONFIG = {"provider": DEFAULT_IDENTITY_LOSS_PROVIDER.name, "weight": 10.0}
-DEFAULT_R1_LOSS_CONFIG = {"enable": True, "interval": 16, "gamma": 10.0}
 DEFAULT_GAZE_LOSS_CONFIG = {"enable": False, "weight": 1.0, "distribution_weight": 0.1, "confidence_weighted": True}
 DEFAULT_HRFFA_LOSS_CONFIG = {
     "enable": False,
@@ -105,7 +102,6 @@ DEFAULT_FACS_LOSS_CONFIG = {
 DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
     "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
     "identity": dict(DEFAULT_IDENTITY_LOSS_CONFIG),
-    "r1": dict(DEFAULT_R1_LOSS_CONFIG),
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
     "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
     "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
@@ -116,7 +112,6 @@ DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
 DEFAULT_HQ_LOSS_CONFIG: dict[str, Any] = {
     "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
     "identity": dict(DEFAULT_IDENTITY_LOSS_CONFIG),
-    "r1": dict(DEFAULT_R1_LOSS_CONFIG),
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
     "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
     "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
@@ -328,11 +323,6 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, hq: bool) -> dict
     identity["provider"] = _provider(identity["provider"], f"{prefix}.identity.provider")
     identity["weight"] = _float(identity["weight"], f"{prefix}.identity.weight", minimum=0.0)
 
-    r1 = _with_defaults(_table(loss, "r1", f"[{prefix}.r1]"), defaults["r1"], f"[{prefix}.r1]")
-    r1["enable"] = _bool(r1["enable"], f"{prefix}.r1.enable")
-    r1["interval"] = _int(r1["interval"], f"{prefix}.r1.interval", minimum=1)
-    r1["gamma"] = _float(r1["gamma"], f"{prefix}.r1.gamma", minimum=0.0)
-
     gaze = _with_defaults(_table(loss, "gaze", f"[{prefix}.gaze]"), defaults["gaze"], f"[{prefix}.gaze]")
     gaze["enable"] = _bool(gaze["enable"], f"{prefix}.gaze.enable")
     gaze["weight"] = _float(gaze["weight"], f"{prefix}.gaze.weight", minimum=0.0)
@@ -350,7 +340,7 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, hq: bool) -> dict
     for key in ("weight", "brow_weight", "eye_weight", "nose_weight", "mouth_weight", "lower_face_weight", "asymmetry_weight"):
         facs[key] = _float(facs[key], f"{prefix}.facs.{key}", minimum=0.0)
 
-    result = {"gan": gan, "identity": identity, "r1": r1, "gaze": gaze, "hrffa": hrffa, "facs": facs}
+    result = {"gan": gan, "identity": identity, "gaze": gaze, "hrffa": hrffa, "facs": facs}
 
     reconstruction = _with_defaults(_table(loss, "reconstruction", f"[{prefix}.reconstruction]"), defaults["reconstruction"], f"[{prefix}.reconstruction]")
     scope = reconstruction["scope"]
@@ -464,8 +454,11 @@ def _normalize_discriminator(config: dict[str, Any]) -> dict[str, Any]:
             f"[discriminator.{stage}]",
         )
         for key in ("img_resolution", "img_channels", "base_ch", "max_ch"):
-            stage_config[key] = _int(stage_config[key], f"discriminator.{stage}.{key}")
-        stage_config["group_size"] = _int(stage_config["group_size"], f"discriminator.{stage}.group_size", minimum=1)
+            stage_config[key] = _int(stage_config[key], f"discriminator.{stage}.{key}", minimum=1)
+        if stage_config["max_ch"] < stage_config["base_ch"]:
+            raise ValueError(f"discriminator.{stage}.max_ch 必须 >= discriminator.{stage}.base_ch")
+        if stage_config["img_resolution"] % 8 != 0:
+            raise ValueError(f"discriminator.{stage}.img_resolution 必须能被 8 整除")
         result[stage] = stage_config
     return result
 

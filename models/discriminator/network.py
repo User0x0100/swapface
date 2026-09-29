@@ -1,108 +1,80 @@
-import math
-
-import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
-
-from .upfirdn2d import DownFIRDn2d
-
-
-class MinibatchStdLayer(nn.Module):
-    def __init__(self, group_size: int = 5, num_channels: int = 1) -> None:
-        super().__init__()
-
-        self.group_size = group_size
-        self.num_channels = num_channels
-
-    def forward(self, x: Tensor) -> Tensor:
-
-        N, C, H, W = x.shape
-        G = min(self.group_size, N)
-        F = self.num_channels
-        c = C // F
-
-        y = x.reshape(G, -1, F, c, H, W)
-        y = y - y.mean(dim=0)
-        y = y.square().mean(dim=0)
-        y = (y + 1e-8).sqrt()
-        y = y.mean(dim=[2, 3, 4])
-        y = y.reshape(-1, F, 1, 1)
-        y = y.repeat(G, 1, H, W)
-        x = torch.cat([x, y], dim=1)
-        return x
-
-
-class DownRB(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-
-        self.shortcut = nn.Sequential(
-            DownFIRDn2d(),
-            nn.Conv2d(in_ch, out_ch, 1, 1, 0, bias=False),
-        )
-
-        self.residual = nn.Sequential(
-            nn.Conv2d(in_ch, in_ch, 3, 1, 1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(in_ch, out_ch, 3, 1, 1),
-            nn.LeakyReLU(0.2),
-            DownFIRDn2d(),
-        )
-
-        self.scale = 1.0 / math.sqrt(2)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return (self.shortcut(x) + self.residual(x)) * self.scale
+from torch.nn.utils import spectral_norm
 
 
 class Discriminator(nn.Module):
-    def __init__(self, img_resolution: int = 256, img_channels: int = 3, base_ch: int = 64, max_ch: int = 512, group_size: int = 4):
+    """U-Net dense discriminator with spectral normalization.
+
+    The encoder builds a large receptive field while the decoder restores spatial
+    resolution, producing one realism logit per output location instead of a
+    single image-level score.
+    """
+
+    feature_count = 4
+
+    def __init__(self, img_resolution: int = 256, img_channels: int = 3, base_ch: int = 64, max_ch: int = 512) -> None:
         super().__init__()
 
         self.network_cfg = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
 
-        self.from_rgb = nn.Sequential(
-            nn.Conv2d(img_channels, base_ch, 1),
-            nn.LeakyReLU(0.2),
-        )
+        c0 = base_ch
+        c1 = min(max_ch, base_ch * 2)
+        c2 = min(max_ch, base_ch * 4)
+        c3 = min(max_ch, base_ch * 8)
 
-        features = [min(max_ch, base_ch * (2**i)) for i in range(int(math.log2(img_resolution)) - 1)]
-        n_blocks = len(features) - 1
+        self.conv0 = nn.Conv2d(img_channels, c0, kernel_size=3, stride=1, padding=1)
 
-        self.down_blocks = nn.ModuleList([DownRB(features[i], features[i + 1]) for i in range(n_blocks)])
+        self.conv1 = spectral_norm(nn.Conv2d(c0, c1, kernel_size=4, stride=2, padding=1, bias=False))
+        self.conv2 = spectral_norm(nn.Conv2d(c1, c2, kernel_size=4, stride=2, padding=1, bias=False))
+        self.conv3 = spectral_norm(nn.Conv2d(c2, c3, kernel_size=4, stride=2, padding=1, bias=False))
 
-        final_features = features[-1] + 1
-        self.final_conv = nn.Sequential(
-            MinibatchStdLayer(group_size),
-            nn.Conv2d(final_features, final_features, 3, 1, 1),
-            nn.LeakyReLU(0.2),
-            nn.Flatten(),
-            nn.Linear(4 * 4 * final_features, final_features),
-            nn.LeakyReLU(0.2),
-            nn.Linear(final_features, 1),
-        )
+        self.conv4 = spectral_norm(nn.Conv2d(c3, c2, kernel_size=3, stride=1, padding=1, bias=False))
+        self.conv5 = spectral_norm(nn.Conv2d(c2, c1, kernel_size=3, stride=1, padding=1, bias=False))
+        self.conv6 = spectral_norm(nn.Conv2d(c1, c0, kernel_size=3, stride=1, padding=1, bias=False))
 
-    def get_feats(self, x: Tensor, max_layer: int | None = None) -> list[Tensor]:
-        x = self.from_rgb(x)
+        self.conv7 = spectral_norm(nn.Conv2d(c0, c0, kernel_size=3, stride=1, padding=1, bias=False))
+        self.conv8 = spectral_norm(nn.Conv2d(c0, c0, kernel_size=3, stride=1, padding=1, bias=False))
+        self.conv9 = nn.Conv2d(c0, 1, kernel_size=3, stride=1, padding=1)
 
-        feats = []
-        for layer_index, down_block in enumerate(self.down_blocks):
-            x = down_block(x)
-            feats.append(x)
-            if max_layer is not None and layer_index >= max_layer:
-                break
+    def _encode(self, x: Tensor, max_layer: int | None = None) -> list[Tensor]:
+        feats = [F.leaky_relu(self.conv0(x), negative_slope=0.2)]
+        if max_layer == 0:
+            return feats
 
+        feats.append(F.leaky_relu(self.conv1(feats[-1]), negative_slope=0.2))
+        if max_layer == 1:
+            return feats
+
+        feats.append(F.leaky_relu(self.conv2(feats[-1]), negative_slope=0.2))
+        if max_layer == 2:
+            return feats
+
+        feats.append(F.leaky_relu(self.conv3(feats[-1]), negative_slope=0.2))
         return feats
 
+    def get_feats(self, x: Tensor, max_layer: int | None = None) -> list[Tensor]:
+        if max_layer is not None and not 0 <= max_layer <= 3:
+            raise ValueError(f"max_layer 必须在 [0, 3]，实际为 {max_layer}")
+        return self._encode(x, max_layer)
+
     def forward(self, x: Tensor, return_feats: bool = False) -> Tensor | tuple[Tensor, list[Tensor]]:
+        x0, x1, x2, x3 = self._encode(x)
 
-        x = self.from_rgb(x)
+        x4 = F.interpolate(x3, scale_factor=2, mode="bilinear", align_corners=False)
+        x4 = F.leaky_relu(self.conv4(x4), negative_slope=0.2)
+        x4 = x4 + x2
 
-        feats = [] if return_feats else None
-        for down_block in self.down_blocks:
-            x = down_block(x)
-            if feats is not None:
-                feats.append(x)
+        x5 = F.interpolate(x4, scale_factor=2, mode="bilinear", align_corners=False)
+        x5 = F.leaky_relu(self.conv5(x5), negative_slope=0.2)
+        x5 = x5 + x1
 
-        x = self.final_conv(x)
+        x6 = F.interpolate(x5, scale_factor=2, mode="bilinear", align_corners=False)
+        x6 = F.leaky_relu(self.conv6(x6), negative_slope=0.2)
+        x6 = x6 + x0
 
-        return (x, feats) if feats is not None else x
+        out = F.leaky_relu(self.conv7(x6), negative_slope=0.2)
+        out = F.leaky_relu(self.conv8(out), negative_slope=0.2)
+        out = self.conv9(out)
+
+        return (out, [x0, x1, x2, x3]) if return_feats else out

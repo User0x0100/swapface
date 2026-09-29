@@ -9,7 +9,7 @@
 # checkpoint 只接受当前训练语义；旧配置/旧训练状态不做迁移或 alias。
 
 [train]
-# 每个训练 batch 的样本数。当前判别器的 minibatch group_size 必须能整除该值。
+# 每个训练 batch 的样本数。
 batch_size = 12
 
 # 训练阶段：joint 同时训练 Coarse/HQ；coarse 或 hq 仅训练对应模块。
@@ -84,11 +84,6 @@ enable = true
 weight = 10.0
 
 
-[loss.coarse.r1]
-enable = true
-interval = 16
-gamma = 10.0
-
 
 [loss.coarse.gaze]
 enable = true
@@ -145,11 +140,6 @@ weight = 10.0
 enable = true
 weight = 10.0
 
-
-[loss.hq.r1]
-enable = true
-interval = 16
-gamma = 10.0
 
 
 [loss.hq.gaze]
@@ -245,20 +235,18 @@ hq_max_ch = 128
 
 
 [discriminator.hq]
-# HQ Discriminator 独立架构；img_resolution / img_channels 必须匹配 Generator 输出。
+# HQ U-Net dense Discriminator；img_resolution / img_channels 必须匹配 Generator 输出。
 img_resolution = 512
 img_channels = 3
 base_ch = 64
 max_ch = 512
-group_size = 4
 
 [discriminator.coarse]
-# Coarse Discriminator 独立架构；img_resolution 必须匹配 generator.coarse_resolution，img_channels 必须匹配 Generator 输出。
+# Coarse U-Net dense Discriminator；img_resolution 必须匹配 generator.coarse_resolution，img_channels 必须匹配 Generator 输出。
 img_resolution = 128
 img_channels = 3
 base_ch = 64
 max_ch = 512
-group_size = 4
 
 
 # 身份来源数据池。采样权重为 sqrt(file_count) * 2**adjustment。
