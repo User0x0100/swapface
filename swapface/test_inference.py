@@ -121,6 +121,10 @@ def main() -> None:
             torch.testing.assert_close(native.swap_faces(faces, identity), expected)
             assert native.swap_faces(faces[:0], identity).shape == (0, 3, 16, 16)
 
+            coarse_only = swapper.SwapFace(str(checkpoint_path), device="cpu", lookup_coarse=True)
+            expected_coarse = NF.interpolate(coarse, size=faces.shape[-2:], mode="bilinear", align_corners=False)
+            torch.testing.assert_close(coarse_only.swap_faces(faces, identity), expected_coarse)
+
             # 源图身份提取直接组合 raw->FFHQ->ArcFace 网格，只允许一次图像重采样。
             image = torch.randint(0, 256, (3, 32, 32), dtype=torch.uint8)
             image_path = directory / "source.png"
