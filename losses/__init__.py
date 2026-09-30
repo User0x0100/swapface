@@ -16,7 +16,6 @@ from .identity import IdentityLoss, IFSRLoss
 from .perceptual import (
     DINOv2PerceptualLoss,
     VGGPerceptualLoss,
-    WeightedFeatureMatchingLoss,
 )
 from .structural import DSSIMLoss
 from .vgg import get_supported_vgg_types, get_vgg_layer_names
@@ -33,7 +32,6 @@ __all__ = [
     "IdentityLoss",
     "LabStyleLoss",
     "VGGPerceptualLoss",
-    "WeightedFeatureMatchingLoss",
     "get_supported_vgg_types",
     "get_vgg_layer_names",
     "make_bce_loss",

@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import torch
 
+from losses import DiscriminatorAdversarialLoss
 from models.discriminator import Discriminator
 from models.networks import Generator
 from swapface.config import DEFAULT_GENERATOR_CONFIG, DEFAULT_LOSS_CONFIG, load_train_config, resolve_train_config
@@ -53,6 +54,7 @@ def _check_train_config(root: Path) -> None:
         "[loss.coarse.gan]\nweight = 0.6\n"
         '[loss.coarse.identity]\nprovider = "BLENDFACE"\nweight = 7.0\n'
         "[loss.coarse.l1]\nenable = true\nweight = 6.0\n"
+        "[loss.coarse.r1]\nenable = true\ninterval = 8\ngamma = 5.0\n"
         "[loss.coarse.gaze]\nenable = true\nweight = 0.4\ndistribution_weight = 0.05\nconfidence_weighted = true\n"
         "[loss.coarse.hrffa]\nenable = true\npose_weight = 0.4\neye_weight = 0.8\nmouth_weight = 1.1\ncontour_weight = 1.2\ncontour_shape_weight = 0.3\noccluded_geometry_weight = 0.2\n"
         "[loss.coarse.vgg.weights]\nrelu2_2 = 0.5\n"
@@ -60,10 +62,10 @@ def _check_train_config(root: Path) -> None:
         "[loss.hq.gan]\nweight = 0.8\n"
         '[loss.hq.identity]\nprovider = "MS1MV3_ARCFACE_R50_FP16"\nweight = 9.0\n'
         "[loss.hq.l1]\nenable = true\nweight = 7.0\n"
+        "[loss.hq.r1]\nenable = false\ninterval = 4\ngamma = 2.0\n"
         "[loss.hq.gaze]\nenable = true\nweight = 0.75\ndistribution_weight = 0.2\nconfidence_weighted = false\n"
         "[loss.hq.hrffa]\nenable = true\npose_weight = 0.5\neye_weight = 1.25\nmouth_weight = 1.5\ncontour_weight = 2.0\ncontour_shape_weight = 0.4\noccluded_geometry_weight = 0.1\n"
         "[loss.hq.facs]\nenable = true\nweight = 0.8\nbrow_weight = 1.1\neye_weight = 1.2\nnose_weight = 0.9\nmouth_weight = 1.3\nlower_face_weight = 0.7\nasymmetry_weight = 1.4\n"
-        "[loss.hq.wfm.weights]\n2 = 0.25\n"
         "[data.augmentation]\nrotation_range = [-3, 3]\n"
         "[data.sampling]\nsame_prob = 0.25\n"
         '[[data.src]]\npath = "source"\nadjustment = 1\n'
@@ -77,7 +79,7 @@ def _check_train_config(root: Path) -> None:
     assert raw == original
     assert resolve_train_config(resolved) == resolved
     assert json.loads(json.dumps(resolved)) == resolved
-    for loss_name in ("gan", "identity", "gaze", "hrffa", "facs", "reconstruction", "l1", "vgg"):
+    for loss_name in ("gan", "identity", "r1", "gaze", "hrffa", "facs", "reconstruction", "l1", "vgg"):
         assert DEFAULT_LOSS_CONFIG["coarse"][loss_name] is not DEFAULT_LOSS_CONFIG["hq"][loss_name]
     loaded = load_train_config(source)
     assert loaded == resolved
@@ -101,10 +103,12 @@ def _check_train_config(root: Path) -> None:
     assert resolved["loss"]["coarse"]["identity"] == {"provider": "BLENDFACE", "weight": 7.0}
     assert resolved["loss"]["coarse"]["reconstruction"] == {"scope": "same"}
     assert resolved["loss"]["coarse"]["l1"] == {"enable": True, "weight": 6.0}
+    assert resolved["loss"]["coarse"]["r1"] == {"enable": True, "interval": 8, "gamma": 5.0}
     assert resolved["loss"]["coarse"]["vgg"]["weights"] == {"relu2_2": 0.5}
     assert resolved["loss"]["hq"]["gan"] == {"weight": 0.8}
     assert resolved["loss"]["hq"]["identity"] == {"provider": "MS1MV3_ARCFACE_R50_FP16", "weight": 9.0}
     assert resolved["loss"]["hq"]["l1"] == {"enable": True, "weight": 7.0}
+    assert resolved["loss"]["hq"]["r1"] == {"enable": False, "interval": 4, "gamma": 2.0}
     assert resolved["loss"]["hq"]["reconstruction"] == {"scope": "all"}
     assert resolved["data"]["augmentation"]["rotation_range"] == [-3.0, 3.0]
     assert abs(resolved["data"]["sampling"]["same_prob"] - 0.25) < 1e-12
@@ -138,7 +142,6 @@ def _check_train_config(root: Path) -> None:
         "lower_face_weight": 0.7,
         "asymmetry_weight": 1.4,
     }
-    assert resolved["loss"]["hq"]["wfm"]["weights"] == {"2": 0.25}
     assert resolved["data"]["src"][0]["adjustment"] == 1 and resolved["data"]["dst"][0]["adjustment"] == -1
 
     assert resolved["discriminator"] == {
@@ -372,13 +375,22 @@ def _check_train_config(root: Path) -> None:
         raise AssertionError("配置错误接受了已移除的 discriminator.hq.group_size")
 
     invalid = copy.deepcopy(raw)
-    invalid.setdefault("loss", {}).setdefault("coarse", {})["r1"] = {"enable": True, "interval": 16, "gamma": 10.0}
+    invalid["loss"]["coarse"]["r1"]["interval"] = 0
     try:
         resolve_train_config(invalid)
     except ValueError as error:
-        assert "r1" in str(error)
+        assert "loss.coarse.r1.interval" in str(error)
     else:
-        raise AssertionError("配置错误接受了已移除的 loss.coarse.r1")
+        raise AssertionError("配置错误接受了 r1.interval=0")
+
+    invalid = copy.deepcopy(raw)
+    invalid["loss"]["hq"]["r1"]["gamma"] = -1.0
+    try:
+        resolve_train_config(invalid)
+    except ValueError as error:
+        assert "loss.hq.r1.gamma" in str(error)
+    else:
+        raise AssertionError("配置错误接受了负数 r1.gamma")
 
     for key, value in (("pose_weight", float("nan")), ("eye_weight", float("inf")), ("occluded_geometry_weight", float("nan"))):
         invalid = copy.deepcopy(raw)
@@ -575,9 +587,13 @@ def _check_discriminator_overflow_isolation() -> None:
         torch.empty(0),
         torch.empty(0),
         torch.nn.Identity(),
+        torch.nn.Identity(),
         hq_optimizer,
         hq_scaler,
         [("hq.weight", hq_parameter)],
+        r1_enabled=False,
+        r1_interval=16,
+        r1_gamma=10.0,
     )
 
     assert hq_scaler.attempts == 2
@@ -592,17 +608,8 @@ def _check_discriminator_overflow_isolation() -> None:
 def _check_global_discriminator() -> None:
     model = Discriminator(img_resolution=32, img_channels=3, base_ch=8, max_ch=32)
     x = torch.randn(2, 3, 32, 32)
-    score, feats = model(x, return_feats=True)
+    score = model(x)
     assert score.shape == (2, 1)
-    assert [tuple(feature.shape) for feature in feats] == [
-        (2, 8, 32, 32),
-        (2, 16, 16, 16),
-        (2, 32, 8, 8),
-        (2, 32, 4, 4),
-    ]
-    assert model.feature_count == 4
-    assert len(feats) == model.feature_count
-    assert len(model.get_feats(x, max_layer=2)) == 3
     assert not hasattr(model, "up_blocks")
     assert not hasattr(model, "dense_out")
 
@@ -612,12 +619,13 @@ def _check_global_discriminator() -> None:
         if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear))
     ]
     assert learned_layers
-    assert all(hasattr(layer, "weight_orig") and hasattr(layer, "weight_u") for layer in learned_layers)
+    assert all(not hasattr(layer, "weight_orig") and not hasattr(layer, "weight_u") for layer in learned_layers)
+    assert not any(name.endswith(("weight_orig", "weight_u", "weight_v")) for name in model.state_dict())
     assert all(block.conv0.bias is not None and block.conv1.bias is not None for block in model.down_blocks)
     assert model.final_conv.bias is not None
     assert all(block.shortcut_conv.bias is None for block in model.down_blocks)
 
-    # D step 只做一次 SpectralNorm forward，但 fake/real 的 MinibatchStd 必须分开统计。
+    # 普通 D step 仍可合并 fake/real forward，但 MinibatchStd 必须分开统计。
     model.eval()
     fake = torch.randn(4, 3, 32, 32)
     real = torch.randn(4, 3, 32, 32)
@@ -634,24 +642,59 @@ def _check_global_discriminator() -> None:
 
     model.zero_grad(set_to_none=True)
     model(torch.randn(2, 3, 32, 32)).mean().backward()
-    assert torch.count_nonzero(model.final_fc1.weight_orig.grad).item() > 0
-    assert torch.count_nonzero(model.from_rgb.weight_orig.grad).item() > 0
+    assert torch.count_nonzero(model.final_fc1.weight.grad).item() > 0
+    assert torch.count_nonzero(model.from_rgb.weight.grad).item() > 0
     model.zero_grad(set_to_none=True)
+    print("PASS: global discriminator keeps anti-aliased deep encoder and minibatch std without spectral normalization")
 
-    spectral_buffers_before = {
-        name: value.detach().clone()
-        for name, value in model.state_dict().items()
-        if name.endswith(("weight_u", "weight_v"))
-    }
-    model.eval().requires_grad_(False)
-    model(x.requires_grad_(True)).mean().backward()
-    spectral_buffers_after = {
-        name: value.detach().clone()
-        for name, value in model.state_dict().items()
-        if name.endswith(("weight_u", "weight_v"))
-    }
-    assert all(torch.equal(spectral_buffers_before[name], spectral_buffers_after[name]) for name in spectral_buffers_before)
-    print("PASS: global discriminator keeps anti-aliased deep encoder, minibatch std and spectral normalization")
+
+def _check_r1_discriminator_path() -> None:
+    trainer = Trainer.__new__(Trainer)
+    trainer._completed_step = 0
+    trainer.amp_dtype = None
+    trainer.amp_enabled = False
+    trainer.d_loss = DiscriminatorAdversarialLoss(weight=1.0, reduction="mean")
+
+    logs: dict[str, float] = {}
+    trainer.log = lambda key, value, **_kwargs: logs.__setitem__(key, float(value.detach()))
+
+    model = Discriminator(img_resolution=32, img_channels=3, base_ch=8, max_ch=32)
+    fake = torch.randn(4, 3, 32, 32)
+    real = torch.randn(4, 3, 32, 32)
+    loss = trainer._discriminator_stage_loss(
+        "coarse",
+        fake,
+        real,
+        model,
+        model,
+        r1_enabled=True,
+        r1_interval=16,
+        r1_gamma=10.0,
+    )
+    loss.backward()
+    assert {"coarse_d_loss", "coarse_r1_loss_raw", "coarse_r1_loss"}.issubset(logs)
+    assert abs(logs["coarse_r1_loss"] - logs["coarse_r1_loss_raw"] * 16) < 1e-8
+    assert torch.isfinite(loss)
+    assert all(parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in model.parameters())
+
+    model.zero_grad(set_to_none=True)
+    logs.clear()
+    trainer._completed_step = 1
+    loss = trainer._discriminator_stage_loss(
+        "coarse",
+        fake,
+        real,
+        model,
+        model,
+        r1_enabled=True,
+        r1_interval=16,
+        r1_gamma=10.0,
+    )
+    loss.backward()
+    assert "coarse_d_loss" in logs
+    assert "coarse_r1_loss_raw" not in logs and "coarse_r1_loss" not in logs
+    assert torch.isfinite(loss)
+    print("PASS: lazy R1 uses real-only FP32 second-order path and skips non-interval steps")
 
 
 def _check_generator_responsibility_boundary() -> None:
@@ -732,13 +775,28 @@ def _check_generator_responsibility_boundary() -> None:
         assert isinstance(value.value, ast.Name) and value.value.id == "self"
         return value.attr
 
-    assert positional_attribute(calls_by_stage["hq"], 4) == "optim_d_hq"
-    assert positional_attribute(calls_by_stage["hq"], 5) == "scaler_d_hq"
-    assert positional_attribute(calls_by_stage["hq"], 6) == "_hq_d_named_parameters"
-    assert positional_attribute(calls_by_stage["coarse"], 4) == "optim_d_coarse"
-    assert positional_attribute(calls_by_stage["coarse"], 5) == "scaler_d_coarse"
-    assert positional_attribute(calls_by_stage["coarse"], 6) == "_coarse_d_named_parameters"
-    assert all(not call.keywords for call in discriminator_stage_calls)
+    def keyword_attribute(call: ast.Call, keyword_name: str) -> str:
+        keyword = next(item for item in call.keywords if item.arg == keyword_name)
+        assert isinstance(keyword.value, ast.Attribute)
+        assert isinstance(keyword.value.value, ast.Name) and keyword.value.value.id == "self"
+        return keyword.value.attr
+
+    assert positional_attribute(calls_by_stage["hq"], 3) == "net_d"
+    assert positional_attribute(calls_by_stage["hq"], 4) == "train_d"
+    assert positional_attribute(calls_by_stage["hq"], 5) == "optim_d_hq"
+    assert positional_attribute(calls_by_stage["hq"], 6) == "scaler_d_hq"
+    assert positional_attribute(calls_by_stage["hq"], 7) == "_hq_d_named_parameters"
+    assert positional_attribute(calls_by_stage["coarse"], 3) == "net_d_coarse"
+    assert positional_attribute(calls_by_stage["coarse"], 4) == "train_d_coarse"
+    assert positional_attribute(calls_by_stage["coarse"], 5) == "optim_d_coarse"
+    assert positional_attribute(calls_by_stage["coarse"], 6) == "scaler_d_coarse"
+    assert positional_attribute(calls_by_stage["coarse"], 7) == "_coarse_d_named_parameters"
+    assert keyword_attribute(calls_by_stage["hq"], "r1_enabled") == "enable_hq_r1_loss"
+    assert keyword_attribute(calls_by_stage["hq"], "r1_interval") == "hq_r1_reg_step"
+    assert keyword_attribute(calls_by_stage["hq"], "r1_gamma") == "hq_r1_gamma"
+    assert keyword_attribute(calls_by_stage["coarse"], "r1_enabled") == "enable_coarse_r1_loss"
+    assert keyword_attribute(calls_by_stage["coarse"], "r1_interval") == "coarse_r1_reg_step"
+    assert keyword_attribute(calls_by_stage["coarse"], "r1_gamma") == "coarse_r1_gamma"
 
     discriminator_update_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer._update_discriminator_stage)))
     update_self_calls = {
@@ -747,19 +805,20 @@ def _check_generator_responsibility_boundary() -> None:
     assert "_discriminator_stage_loss" in update_self_calls
 
     init_source = textwrap.dedent(inspect.getsource(Trainer.__init__))
-    assert "feature_count = self.net_d.feature_count" in init_source
     assert "self.net_d.down_blocks" not in init_source
 
     discriminator_stage_source = textwrap.dedent(inspect.getsource(Trainer._discriminator_stage_loss))
-    assert "r1" not in discriminator_stage_source.lower()
     discriminator_stage_tree = ast.parse(discriminator_stage_source)
+    r1_calls = [node for node in ast.walk(discriminator_stage_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "r1_reg_loss"]
+    assert len(r1_calls) == 1
+    assert "real.detach().float().requires_grad_(True)" in discriminator_stage_source
+    assert "r1_loss_raw * r1_interval" in discriminator_stage_source
     train_net_calls = [node for node in ast.walk(discriminator_stage_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "train_net"]
     assert len(train_net_calls) == 1
     assert "torch.cat((fake.detach(), real.detach()), dim=0)" in discriminator_stage_source
     train_net_call = train_net_calls[0]
-    assert len(train_net_call.args) == 3
-    assert isinstance(train_net_call.args[1], ast.Constant) and train_net_call.args[1].value is False
-    assert isinstance(train_net_call.args[2], ast.Constant) and train_net_call.args[2].value is True
+    assert len(train_net_call.args) == 2
+    assert isinstance(train_net_call.args[1], ast.Constant) and train_net_call.args[1].value is True
     assert "scores.chunk(2, dim=0)" in discriminator_stage_source
     assert "dense" not in discriminator_stage_source.lower()
     assert "self.d_loss(fake_score, real_score)" in discriminator_stage_source
@@ -995,6 +1054,7 @@ def _check_sample_gradient_maps() -> None:
 def main() -> None:
     _check_reconstruction_scope()
     _check_global_discriminator()
+    _check_r1_discriminator_path()
     _check_generator_responsibility_boundary()
     _check_discriminator_training_state_split()
     _check_sample_gradient_maps()

@@ -55,7 +55,7 @@ uv run python -m swapface.train \
 
 `--name` 只参与 run ID，不改变实验配置。默认结果根目录为 `experiments/runs`；如确有需要，可用 `--runs-root PATH` 覆盖。
 
-`[train].compile_module` 控制训练路径的 `torch.compile`：启用时，由 Trainer 分别编译 Coarse、HQRefiner、Discriminator、Generator 身份编码与 Identity Loss embedding 提取，以及启用的 VGG/WFM 热路径；设为 `false` 时，训练路径全部保持 eager。
+`[train].compile_module` 控制训练路径的 `torch.compile`：启用时，由 Trainer 分别编译 Coarse、HQRefiner、Discriminator、Generator 身份编码与 Identity Loss embedding 提取，以及启用的 VGG 热路径；设为 `false` 时，训练路径全部保持 eager。
 
 ## 配置职责
 
@@ -69,11 +69,11 @@ uv run python -m swapface.train \
 - `[[data.src]]` / `[[data.dst]]`：训练数据源；
 - `[generator]` / `[discriminator.hq]` / `[discriminator.coarse]`：Generator 与两个 Discriminator 的独立模型定义。
 
-Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、gaze、HRFFA、FACS、L1/VGG 与 reconstruction scope 均独立配置；WFM 只属于 HQ。`gan.weight` 只缩放对应阶段的 Generator adversarial loss；两个 Discriminator adversarial loss 固定权重 1.0。
+Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、R1、gaze、HRFFA、FACS、L1/VGG 与 reconstruction scope 均独立配置。`gan.weight` 只缩放对应阶段的 Generator adversarial loss；两个 Discriminator adversarial loss 固定权重 1.0。
 
 优化策略按训练实体分开配置：`[optimizer.generator]`、`[optimizer.hq_discriminator]`、`[optimizer.coarse_discriminator]` 分别设置 LR；对应的 `[scheduler.generator]`、`[scheduler.hq_discriminator]`、`[scheduler.coarse_discriminator]` 分别设置 `type / t_max / min_lr_ratio`。Adam 的 `betas=(0.0, 0.99)` 与 fused 实现仍固定在训练代码中。
 
-两个 Discriminator 的架构也完全独立：`[discriminator.hq].img_resolution` 必须等于 `generator.img_resolution`，`[discriminator.coarse].img_resolution` 必须等于 `generator.coarse_resolution`；两者的 `img_channels` 都必须等于 `generator.img_channels`。`base_ch` 与 `max_ch` 可以分别设置。两个阶段都使用单 Global Discriminator：Encoder 通过 SpectralNorm residual block 与 FIR 抗混叠逐级下采样到 4x4，再经 MinibatchStd、3x3 Conv 和两层 Linear 输出每图一个 logit。
+两个 Discriminator 的架构也完全独立：`[discriminator.hq].img_resolution` 必须等于 `generator.img_resolution`，`[discriminator.coarse].img_resolution` 必须等于 `generator.coarse_resolution`；两者的 `img_channels` 都必须等于 `generator.img_channels`。`base_ch` 与 `max_ch` 可以分别设置。两个阶段都使用单 Global Discriminator：Encoder 通过 residual block 与 FIR 抗混叠逐级下采样到 4x4，再经 MinibatchStd、3x3 Conv 和两层 Linear 输出每图一个 logit。判别器权重不使用 Spectral Normalization。
 
 ## Generator 梯度职责
 
@@ -85,9 +85,9 @@ Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失�
 
 Generator、HQ Discriminator、Coarse Discriminator 分别拥有独立的 optimizer/scheduler/GradScaler。inactive Discriminator 保持在 CPU，不创建 optimizer/scaler/scheduler，也不占用训练 GPU 显存；inactive Generator stage 参数没有 gradient。EMA 只更新 active Generator stage。`hq` 模式下 HQ 输入仍使用冻结 Coarse 的输出；`joint` 模式下 HQ 输入使用 `coarse.detach()`，因此 Final/HQ losses 不会反向修改 Coarse。
 
-- Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
-- HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/WFM、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
-- Discriminator：HQ 与 Coarse 各有一个单 Global 判别器，并分别维护自己的 D optimizer、scheduler 与 GradScaler。判别器全路径使用 Spectral Normalization，不使用 R1；Encoder 下采样使用 FIR 抗混叠，4x4 端使用 MinibatchStd。D step 将 fake/real 合并为一次 SpectralNorm forward，但在 MinibatchStd 处仍分开统计，避免 fake/real 统计混合。joint 模式下两个 D 各自完成一次更新；某个 D 的 FP16 overflow 只重试该 D。
+- Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、R1、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
+- HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/R1、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
+- Discriminator：HQ 与 Coarse 各有一个单 Global 判别器，并分别维护自己的 D optimizer、scheduler、GradScaler 与 R1 enable/interval/gamma。Encoder 下采样使用 FIR 抗混叠，4x4 端使用 MinibatchStd。普通 D step 将 fake/real 合并为一次 forward，但在 MinibatchStd 处仍分开统计；lazy R1 step 只对 real 输入计算梯度惩罚，固定使用未编译的 FP32 判别器路径，并将 raw R1 乘以 interval 保持期望正则强度。joint 模式下两个 D 各自完成一次更新；某个 D 的 FP16 overflow 只重试该 D。
 
 Coarse 内部首先将真实 `dst` 双线性缩放到 `coarse_resolution`；训练时通过 `return_resize_in=True` 复用这一实际模型输入作为 Coarse Discriminator real，以及 L1/VGG reconstruction target，不在 Trainer 中重复 resize。Coarse L1/VGG 由 `[loss.coarse.reconstruction].scope` 控制作用范围；默认 `same`，只对 self-reconstruction pair 生效。Coarse 的 target 属性监督则先将低分辨率输出双线性上采样到训练分辨率，再使用与 Final 相同的 `theta_restore` 恢复到 canonical 坐标系，与 `dst_canonical` 比较。
 
@@ -222,7 +222,7 @@ uv run python -m swapface.train \
 
 需要两个 D 都重建时同时传入两个开关。Branch metadata 会分别记录 HQ/Coarse D 的 `inherit` / `reset`。HQ D 与 Coarse D 的架构分别由 `[discriminator.hq]` 和 `[discriminator.coarse]` 控制，因此可以只修改并 reset 其中一个；任何选择 inherit 的 D 都只要求自己的架构与父 checkpoint 保持一致。无论是否恢复 D，Branch 都不会继承 G/D optimizer、scheduler 或 GradScaler；step 默认继承父 checkpoint，也可以由 `--step` 指定。
 
-当前训练语义使用单 Global Discriminator：Encoder 直接下采样到 4x4，保留 FIR 抗混叠、SpectralNorm 与 MinibatchStd，不使用 R1。Resume 与 Branch 都只接受当前训练语义版本的 checkpoint，不提供旧训练结果迁移兼容。
+当前训练语义使用单 Global Discriminator：Encoder 直接下采样到 4x4，保留 FIR 抗混叠与 MinibatchStd，移除 SpectralNorm，并使用 real-only lazy R1。Resume 与 Branch 都只接受当前训练语义版本的 checkpoint，不提供旧训练结果迁移兼容。
 
 ### HQ rebuild：继承 Coarse，用新分辨率从零训练 HQ
 
@@ -312,7 +312,7 @@ config.resolved.json  # 完整、显式、可哈希的规范配置
 - Generator / Discriminator 的协议默认值；
 - dataloader 的协议默认值；
 - Identity encoder 的协议默认值；
-- VGG / WFM 的协议默认权重；
+- VGG 的协议默认权重；
 - 本地数据源 path/adjustment。
 
 其规范 JSON 内容计算 SHA-256 并写入 `metadata.json`。新 checkpoint 也记录同一摘要与 run ID；resume 时若摘要或 run ID 不一致，会拒绝继续训练。

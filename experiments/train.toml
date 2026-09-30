@@ -84,6 +84,11 @@ enable = true
 weight = 10.0
 
 
+[loss.coarse.r1]
+enable = true
+interval = 16
+gamma = 10.0
+
 
 [loss.coarse.gaze]
 enable = true
@@ -141,6 +146,11 @@ enable = true
 weight = 10.0
 
 
+[loss.hq.r1]
+enable = true
+interval = 16
+gamma = 10.0
+
 
 [loss.hq.gaze]
 enable = true
@@ -177,16 +187,6 @@ enable = true
 relu1_2 = 1.0
 relu2_2 = 1.0
 relu3_4 = 1.0
-
-
-[loss.hq.wfm]
-enable = false
-
-[loss.hq.wfm.weights]
-0 = 0.1
-1 = 0.1
-2 = 0.1
-3 = 0.1
 
 
 [data.loader]
@@ -235,10 +235,10 @@ hq_max_ch = 128
 
 
 [discriminator.hq]
-# HQ 单全局 Discriminator；FIR + SpectralNorm residual blocks 下采样到 4x4。
+# HQ 单全局 Discriminator；FIR residual blocks 下采样到 4x4，使用 lazy R1 正则。
 img_resolution = 512
 img_channels = 3
-base_ch = 32
+base_ch = 64
 max_ch = 512
 minibatch_std_group_size = 4
 
@@ -246,7 +246,7 @@ minibatch_std_group_size = 4
 # Coarse 单全局 Discriminator；img_resolution 必须匹配 generator.coarse_resolution。
 img_resolution = 128
 img_channels = 3
-base_ch = 32
+base_ch = 64
 max_ch = 512
 minibatch_std_group_size = 4
 

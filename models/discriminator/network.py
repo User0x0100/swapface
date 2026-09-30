@@ -3,7 +3,6 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.nn.utils import spectral_norm
 
 from .upfirdn2d import DownFIRDn2d
 
@@ -37,10 +36,10 @@ class DownBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
         self.shortcut_filter = DownFIRDn2d()
-        self.shortcut_conv = spectral_norm(nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False))
+        self.shortcut_conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
 
-        self.conv0 = spectral_norm(nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1))
-        self.conv1 = spectral_norm(nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1))
+        self.conv0 = nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
         self.residual_filter = DownFIRDn2d()
         self.scale = 1.0 / math.sqrt(2.0)
 
@@ -54,13 +53,13 @@ class DownBlock(nn.Module):
 
 
 class Discriminator(nn.Module):
-    """FIR 抗混叠 + SpectralNorm 的单全局判别器。"""
+    """FIR 抗混叠 + MinibatchStd 的单全局判别器。"""
 
     def __init__(
         self,
         img_resolution: int = 256,
         img_channels: int = 3,
-        base_ch: int = 32,
+        base_ch: int = 64,
         max_ch: int = 512,
         minibatch_std_group_size: int = 4,
     ) -> None:
@@ -78,34 +77,21 @@ class Discriminator(nn.Module):
         num_down = int(math.log2(img_resolution)) - 2
         channels = [min(max_ch, base_ch * (2**level)) for level in range(num_down + 1)]
 
-        self.from_rgb = spectral_norm(nn.Conv2d(img_channels, channels[0], kernel_size=1))
+        self.from_rgb = nn.Conv2d(img_channels, channels[0], kernel_size=1)
         self.down_blocks = nn.ModuleList(
             [DownBlock(channels[index], channels[index + 1]) for index in range(num_down)]
         )
-        self.feature_count = len(channels)
-
         self.minibatch_std = MinibatchStdLayer(minibatch_std_group_size)
         final_ch = channels[-1] + 1
-        self.final_conv = spectral_norm(nn.Conv2d(final_ch, final_ch, kernel_size=3, padding=1))
-        self.final_fc0 = spectral_norm(nn.Linear(4 * 4 * final_ch, final_ch))
-        self.final_fc1 = spectral_norm(nn.Linear(final_ch, 1))
+        self.final_conv = nn.Conv2d(final_ch, final_ch, kernel_size=3, padding=1)
+        self.final_fc0 = nn.Linear(4 * 4 * final_ch, final_ch)
+        self.final_fc1 = nn.Linear(final_ch, 1)
 
-    def _encode(self, x: Tensor, max_layer: int | None = None) -> list[Tensor]:
-        if max_layer is not None and not 0 <= max_layer < self.feature_count:
-            raise ValueError(f"max_layer 必须在 [0, {self.feature_count - 1}]，实际为 {max_layer}")
-
-        feats = [F.leaky_relu(self.from_rgb(x), negative_slope=0.2)]
-        if max_layer == 0:
-            return feats
-
-        for layer_index, block in enumerate(self.down_blocks, start=1):
-            feats.append(block(feats[-1]))
-            if max_layer == layer_index:
-                break
-        return feats
-
-    def get_feats(self, x: Tensor, max_layer: int | None = None) -> list[Tensor]:
-        return self._encode(x, max_layer)
+    def _encode(self, x: Tensor) -> Tensor:
+        x = F.leaky_relu(self.from_rgb(x), negative_slope=0.2)
+        for block in self.down_blocks:
+            x = block(x)
+        return x
 
     def _score(self, x: Tensor, split_minibatch_std: bool = False) -> Tensor:
         if split_minibatch_std:
@@ -124,9 +110,8 @@ class Discriminator(nn.Module):
     def forward(
         self,
         x: Tensor,
-        return_feats: bool = False,
         split_minibatch_std: bool = False,
-    ) -> Tensor | tuple[Tensor, list[Tensor]]:
+    ) -> Tensor:
         expected = (
             self.network_cfg["img_channels"],
             self.network_cfg["img_resolution"],
@@ -137,6 +122,4 @@ class Discriminator(nn.Module):
                 f"x 必须为 [B,{expected[0]},{expected[1]},{expected[2]}]，实际为 {tuple(x.shape)}"
             )
 
-        feats = self._encode(x)
-        score = self._score(feats[-1], split_minibatch_std)
-        return (score, feats) if return_feats else score
+        return self._score(self._encode(x), split_minibatch_std)

@@ -55,14 +55,14 @@ DEFAULT_DISCRIMINATOR_CONFIG: dict[str, Any] = {
     "hq": {
         "img_resolution": 512,
         "img_channels": 3,
-        "base_ch": 32,
+        "base_ch": 64,
         "max_ch": 512,
         "minibatch_std_group_size": 4,
     },
     "coarse": {
         "img_resolution": 128,
         "img_channels": 3,
-        "base_ch": 32,
+        "base_ch": 64,
         "max_ch": 512,
         "minibatch_std_group_size": 4,
     },
@@ -78,9 +78,9 @@ DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
     "conv3_3": 2.5,
     "conv4_3": 2.5,
 }
-DEFAULT_WFM_LOSS_WEIGHT: dict[int, float] = {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.1}
 DEFAULT_GAN_LOSS_CONFIG = {"weight": 1.0}
 DEFAULT_IDENTITY_LOSS_CONFIG = {"provider": DEFAULT_IDENTITY_LOSS_PROVIDER.name, "weight": 10.0}
+DEFAULT_R1_LOSS_CONFIG = {"enable": True, "interval": 16, "gamma": 10.0}
 DEFAULT_GAZE_LOSS_CONFIG = {"enable": False, "weight": 1.0, "distribution_weight": 0.1, "confidence_weighted": True}
 DEFAULT_HRFFA_LOSS_CONFIG = {
     "enable": False,
@@ -104,6 +104,7 @@ DEFAULT_FACS_LOSS_CONFIG = {
 DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
     "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
     "identity": dict(DEFAULT_IDENTITY_LOSS_CONFIG),
+    "r1": dict(DEFAULT_R1_LOSS_CONFIG),
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
     "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
     "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
@@ -114,13 +115,13 @@ DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
 DEFAULT_HQ_LOSS_CONFIG: dict[str, Any] = {
     "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
     "identity": dict(DEFAULT_IDENTITY_LOSS_CONFIG),
+    "r1": dict(DEFAULT_R1_LOSS_CONFIG),
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
     "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
     "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
     "reconstruction": {"scope": "same"},
     "l1": {"enable": True, "weight": 10.0},
     "vgg": {"enable": True, "weights": dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)},
-    "wfm": {"enable": True, "weights": dict(DEFAULT_WFM_LOSS_WEIGHT)},
 }
 DEFAULT_LOSS_CONFIG: dict[str, Any] = {
     "coarse": DEFAULT_COARSE_LOSS_CONFIG,
@@ -311,8 +312,8 @@ def _normalize_identity(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, hq: bool) -> dict[str, Any]:
-    defaults = DEFAULT_HQ_LOSS_CONFIG if hq else DEFAULT_COARSE_LOSS_CONFIG
+def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
+    defaults = DEFAULT_HQ_LOSS_CONFIG if stage == "hq" else DEFAULT_COARSE_LOSS_CONFIG
     unknown = set(loss) - set(defaults)
     if unknown:
         raise ValueError(f"[loss.{stage}] 包含未知字段：{sorted(unknown)}")
@@ -324,6 +325,11 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, hq: bool) -> dict
     identity = _with_defaults(_table(loss, "identity", f"[{prefix}.identity]"), defaults["identity"], f"[{prefix}.identity]")
     identity["provider"] = _provider(identity["provider"], f"{prefix}.identity.provider")
     identity["weight"] = _float(identity["weight"], f"{prefix}.identity.weight", minimum=0.0)
+
+    r1 = _with_defaults(_table(loss, "r1", f"[{prefix}.r1]"), defaults["r1"], f"[{prefix}.r1]")
+    r1["enable"] = _bool(r1["enable"], f"{prefix}.r1.enable")
+    r1["interval"] = _int(r1["interval"], f"{prefix}.r1.interval", minimum=1)
+    r1["gamma"] = _float(r1["gamma"], f"{prefix}.r1.gamma", minimum=0.0)
 
     gaze = _with_defaults(_table(loss, "gaze", f"[{prefix}.gaze]"), defaults["gaze"], f"[{prefix}.gaze]")
     gaze["enable"] = _bool(gaze["enable"], f"{prefix}.gaze.enable")
@@ -342,7 +348,7 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, hq: bool) -> dict
     for key in ("weight", "brow_weight", "eye_weight", "nose_weight", "mouth_weight", "lower_face_weight", "asymmetry_weight"):
         facs[key] = _float(facs[key], f"{prefix}.facs.{key}", minimum=0.0)
 
-    result = {"gan": gan, "identity": identity, "gaze": gaze, "hrffa": hrffa, "facs": facs}
+    result = {"gan": gan, "identity": identity, "r1": r1, "gaze": gaze, "hrffa": hrffa, "facs": facs}
 
     reconstruction = _with_defaults(_table(loss, "reconstruction", f"[{prefix}.reconstruction]"), defaults["reconstruction"], f"[{prefix}.reconstruction]")
     scope = reconstruction["scope"]
@@ -363,26 +369,6 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, hq: bool) -> dict
     vgg["weights"] = {str(layer): _float(weight, f"{prefix}.vgg.weights.{layer}", minimum=0.0) for layer, weight in raw_vgg_weights.items()}
 
     result.update({"reconstruction": reconstruction, "l1": l1, "vgg": vgg})
-    if not hq:
-        return result
-
-    wfm = _with_defaults(_table(loss, "wfm", f"[{prefix}.wfm]"), defaults["wfm"], f"[{prefix}.wfm]")
-    wfm["enable"] = _bool(wfm["enable"], f"{prefix}.wfm.enable")
-    raw_wfm_weights = wfm["weights"]
-    if not isinstance(raw_wfm_weights, dict) or (wfm["enable"] and not raw_wfm_weights):
-        raise ValueError(f"[{prefix}.wfm.weights] 必须为非空表/对象")
-    normalized_wfm_weights: dict[str, float] = {}
-    for index, weight in raw_wfm_weights.items():
-        try:
-            layer_index = int(index)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"[{prefix}.wfm.weights] 的键必须是非负整数层索引") from exc
-        if layer_index < 0 or str(layer_index) != str(index):
-            raise ValueError(f"{prefix}.wfm.weights 层索引无效：{index!r}")
-        normalized_wfm_weights[str(layer_index)] = _float(weight, f"{prefix}.wfm.weights.{layer_index}", minimum=0.0)
-    wfm["weights"] = normalized_wfm_weights
-
-    result["wfm"] = wfm
     return result
 
 
@@ -392,8 +378,8 @@ def _normalize_loss(config: dict[str, Any]) -> dict[str, Any]:
     if unknown:
         raise ValueError(f"[loss] 包含未知字段：{sorted(unknown)}")
     return {
-        "coarse": _normalize_stage_loss(_table(loss, "coarse", "[loss.coarse]"), "coarse", hq=False),
-        "hq": _normalize_stage_loss(_table(loss, "hq", "[loss.hq]"), "hq", hq=True),
+        "coarse": _normalize_stage_loss(_table(loss, "coarse", "[loss.coarse]"), "coarse"),
+        "hq": _normalize_stage_loss(_table(loss, "hq", "[loss.hq]"), "hq"),
     }
 
 

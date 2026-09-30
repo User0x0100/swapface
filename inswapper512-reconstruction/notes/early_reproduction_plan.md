@@ -123,7 +123,7 @@ StyleSwap 不是 InSwapper，但它提供了与 style-based face swap 高度相�
 
 - source identity 映射到 style latent；
 - target attribute 用空间 feature 表示；
-- adversarial / identity / weak feature matching 用于普通 swap；
+- adversarial / identity 用于普通 swap；
 - L1 + VGG reconstruction 只用于有 pixel-level ground truth 的 self/cross-view same-identity 样本；
 - cross-view 同身份重建使用同一个人的不同视频帧；
 - identity encoder 输入使用 color jitter，减少 illumination 泄漏；
@@ -155,7 +155,6 @@ StyleSwap 不是 InSwapper，但它提供了与 style-based face swap 高度相�
 5. 当前 `FromRGB/ToRGB` 在高分辨率上各做两次 dense convolution，不适合 12G 预算。
 6. 当前 `data.sampling.same_prob` 只能产生“同一张图片”的 self reconstruction，没有 identity-aware cross-view pairing。
 7. 当前 `loss.reconstruction.scope` 同时控制 L1 与 VGG perceptual reconstruction；默认 `same` 时 different-ID pair 不承受这两类 reconstruction 约束。
-8. 当前 WFM 默认关闭；StyleSwap 中 weak feature matching 更适合作为 ordinary different-ID pair 上的弱 target-attribute 约束。
 
 ## 4. Live512-V1：首选结构假设
 
@@ -445,19 +444,7 @@ L_rec = lambda_l1 * L1 + lambda_vgg * VGG
 
 当前实现已由 `loss.reconstruction.scope` 同时控制 L1/VGG；默认 `same` 时 different-ID pair 不承受 reconstruction 约束。
 
-### 7.3 Weak Feature Matching
-
-different-ID 没有像素 ground truth，但 target attribute 仍需保持。
-
-因此 ordinary swap 上不用 VGG(fake, target) 强拉像素，而使用 discriminator feature matching 作为更弱的 attribute constraint：
-
-```
-L_wfm = Σ ||D_k(fake) - stopgrad(D_k(target))||_1
-```
-
-第一版只使用中/深层，避免最浅层过度复制 target identity/纹理。
-
-### 7.4 GAN
+### 7.3 GAN
 
 先保留当前经过验证的 discriminator 与 lazy R1，不同时重写 G/D。
 
@@ -474,7 +461,7 @@ EMA = current implementation
 
 先不引入新的复杂 scheduler。
 
-### 7.5 暂不进入 baseline 的损失
+### 7.4 暂不进入 baseline 的损失
 
 以下全部作为后续 ablation：
 
@@ -519,7 +506,6 @@ EMA = current implementation
 - current discriminator；
 - GAN；
 - ID；
-- WFM；
 - scoped L1/VGG；
 - mixed different-ID/cross-view/self sampler。
 
@@ -659,12 +645,6 @@ FLOPs  ≈ 14.59G
 
 这是训练设计的关键实验，不是可选小修。
 
-### E4 — E3 + WFM
-
-检查 target expression/pose 与 original-face fallback 的平衡。
-
-只有 E1~E4 完成后，才讨论 mask/AAD/更多 teacher loss。
-
 ## 11. 对当前代码的预计改造点
 
 ### `models/networks.py`
@@ -698,7 +678,6 @@ architecture = "live512_v1"
 - 通过 factory 构造 Generator；
 - reconstruction mask 同时控制 L1 和 VGG；
 - 加入 cross-view sample type；
-- WFM 继续沿用已有实现；
 - checkpoint 保存 architecture。
 
 ### `swapface/dataloader_common.py` / DALI / native
