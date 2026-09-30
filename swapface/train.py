@@ -54,7 +54,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 14
+TRAINING_SEMANTICS_VERSION = 15
 
 COARSE_GENERATOR_CONFIG_KEYS = (
     "img_channels",
@@ -138,7 +138,7 @@ def _ensure_finite_loss(name: str, loss: Tensor) -> None:
         raise FloatingPointError(f"{name} 出现 NaN/Inf：{loss.detach().float().cpu().item()}")
 
 
-def _require_resume_training_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
+def _require_training_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     """严格校验当前 checkpoint 的训练运行时协议。"""
     training_config = checkpoint.get("training_config")
     if not isinstance(training_config, dict):
@@ -368,7 +368,7 @@ class Trainer:
                 if checkpoint_run["id"] != run_id or checkpoint_run["config_sha256"] != resolved_config_sha256:
                     raise ValueError("checkpoint 不属于当前 run 或冻结配置已变化")
 
-                saved_training_config = _require_resume_training_config(checkpoint)
+                saved_training_config = _require_training_config(checkpoint)
                 saved_precision = str(saved_training_config["precision"])
                 saved_stage = str(saved_training_config["stage"])
                 if saved_stage != self.train_stage:
@@ -794,21 +794,16 @@ class Trainer:
         real: Tensor,
         train_net: Any,
     ) -> Tensor:
-        """计算单个双头判别器阶段的 Global + Dense adversarial loss。"""
+        """计算单个全局判别器阶段的 adversarial loss。"""
         with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-            global_scores, dense_scores = train_net(
+            scores = train_net(
                 torch.cat((fake.detach(), real.detach()), dim=0),
                 False,
                 True,
             )
-            fake_global, real_global = global_scores.chunk(2, dim=0)
-            fake_dense, real_dense = dense_scores.chunk(2, dim=0)
-            global_loss = self.d_loss(fake_global, real_global)
-            dense_loss = self.d_loss(fake_dense, real_dense)
-            adversarial_loss = global_loss + dense_loss
+            fake_score, real_score = scores.chunk(2, dim=0)
+            adversarial_loss = self.d_loss(fake_score, real_score)
 
-        self.log(f"{stage}_d_global_loss", global_loss)
-        self.log(f"{stage}_d_dense_loss", dense_loss)
         self.log(f"{stage}_d_loss", adversarial_loss)
         return adversarial_loss
 
@@ -853,12 +848,8 @@ class Trainer:
         restore_grid: Tensor | None,
     ) -> Tensor:
         """计算 Coarse stage 的全部 Generator 训练目标。"""
-        coarse_global_score, coarse_dense_score = self.train_d_coarse(coarse)
-        coarse_gan_global_loss = self.coarse_gan_loss(coarse_global_score)
-        coarse_gan_dense_loss = self.coarse_gan_loss(coarse_dense_score)
-        coarse_gan_loss = coarse_gan_global_loss + coarse_gan_dense_loss
-        self.log("coarse_gan_global_loss", coarse_gan_global_loss)
-        self.log("coarse_gan_dense_loss", coarse_gan_dense_loss)
+        coarse_score = self.train_d_coarse(coarse)
+        coarse_gan_loss = self.coarse_gan_loss(coarse_score)
         self.log("coarse_gan_loss", coarse_gan_loss)
         total = coarse_gan_loss
 
@@ -918,14 +909,10 @@ class Trainer:
     ) -> Tensor:
         """计算 HQ stage 的全部 Generator 训练目标。"""
         if self.enable_hq_wfm_loss:
-            (hq_global_score, hq_dense_score), fake_feats = self.train_d(fake, True)
+            hq_score, fake_feats = self.train_d(fake, True)
         else:
-            hq_global_score, hq_dense_score = self.train_d(fake)
-        hq_gan_global_loss = self.hq_gan_loss(hq_global_score)
-        hq_gan_dense_loss = self.hq_gan_loss(hq_dense_score)
-        hq_gan_loss = hq_gan_global_loss + hq_gan_dense_loss
-        self.log("hq_gan_global_loss", hq_gan_global_loss)
-        self.log("hq_gan_dense_loss", hq_gan_dense_loss)
+            hq_score = self.train_d(fake)
+        hq_gan_loss = self.hq_gan_loss(hq_score)
         self.log("hq_gan_loss", hq_gan_loss)
         total = hq_gan_loss
 
@@ -1102,8 +1089,8 @@ class Trainer:
                 self.net_d_coarse.eval()
                 try:
                     with torch.enable_grad():
-                        coarse_global_score_vis, coarse_dense_score_vis = self.net_d_coarse(coarse_for_gan_grad)
-                        coarse_gan_loss_vis = self.coarse_gan_loss(coarse_global_score_vis) + self.coarse_gan_loss(coarse_dense_score_vis)
+                        coarse_score_vis = self.net_d_coarse(coarse_for_gan_grad)
+                        coarse_gan_loss_vis = self.coarse_gan_loss(coarse_score_vis)
                         coarse_gan_grad_map = self.loss_grad_map(coarse_gan_loss_vis, coarse_for_gan_grad)
                 finally:
                     self.net_d_coarse.train(coarse_d_training)
@@ -1124,8 +1111,8 @@ class Trainer:
                 self.net_d.eval()
                 try:
                     with torch.enable_grad():
-                        hq_global_score_vis, hq_dense_score_vis = self.net_d(fake_for_gan_grad)
-                        gan_loss_vis = self.hq_gan_loss(hq_global_score_vis) + self.hq_gan_loss(hq_dense_score_vis)
+                        hq_score_vis = self.net_d(fake_for_gan_grad)
+                        gan_loss_vis = self.hq_gan_loss(hq_score_vis)
                         gan_grad_map = self.loss_grad_map(gan_loss_vis, fake_for_gan_grad)
                 finally:
                     self.net_d.train(hq_d_training)
@@ -1417,11 +1404,11 @@ def _load_branch_checkpoint(
     if filename_step != checkpoint_step:
         raise ValueError(f"checkpoint 文件名 step 与内部状态不一致：filename={filename_step}, checkpoint={checkpoint_step}")
 
+    _require_training_config(checkpoint)
     branch_mode = _branch_generator_mode(checkpoint, resolved)
     hq_rebuild = branch_mode == "hq_rebuild"
     effective_reset_hq_discriminator = reset_hq_discriminator or hq_rebuild
 
-    checkpoint["net_d_coarse"]
     if not effective_reset_hq_discriminator and dict(checkpoint["net_d"]["network_cfg"]) != resolved["discriminator"]["hq"]:
         raise ValueError("branch 继承 HQ Discriminator 时要求架构一致；如需新建请使用 --reset-hq-discriminator")
 

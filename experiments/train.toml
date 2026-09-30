@@ -235,21 +235,19 @@ hq_max_ch = 128
 
 
 [discriminator.hq]
-# HQ Global + Dense 双头 Discriminator；shared encoder 到 8x8，Global 再到 4x4。
+# HQ 单全局 Discriminator；FIR + SpectralNorm residual blocks 下采样到 4x4。
 img_resolution = 512
 img_channels = 3
 base_ch = 32
 max_ch = 512
-bottleneck_resolution = 8
 minibatch_std_group_size = 4
 
 [discriminator.coarse]
-# Coarse Global + Dense 双头 Discriminator；img_resolution 必须匹配 generator.coarse_resolution。
+# Coarse 单全局 Discriminator；img_resolution 必须匹配 generator.coarse_resolution。
 img_resolution = 128
 img_channels = 3
 base_ch = 32
 max_ch = 512
-bottleneck_resolution = 8
 minibatch_std_group_size = 4
 
 
