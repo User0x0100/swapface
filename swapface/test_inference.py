@@ -190,6 +190,7 @@ def main() -> None:
                 crop = (faces[:1] + 1) * 127.5
                 theta = torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]])
                 decoder = Mock()
+                decoder.metadata.average_fps = 25.0
                 decoder.__len__ = Mock(return_value=2)
                 decoder.__getitem__ = Mock(side_effect=[Mock(data=original.clone()), Mock(data=original.clone())])
                 context = Mock()
@@ -209,9 +210,12 @@ def main() -> None:
                     assert isinstance(detect.call_args_list[0].args[0], list) == (not full_resolution and detection_size < 32)
                     assert detect.call_args_list[0].kwargs == {"confidence_threshold": 0.99, "iou_threshold": 0.2, "min_face_size": (256, 256)}
                     torch.testing.assert_close(align.call_args_list[0].args[3], engine.alignment_template)
+                context.Queue.assert_called_once_with(maxsize=3)
                 queue = context.Queue.return_value
                 assert queue.put.call_count == 3  # 两批视频帧 + 结束标记。
-                assert queue.put.call_args_list[0].args[0].shape == (1, 8, 16, 3)
+                preview_frames, batch_elapsed = queue.put.call_args_list[0].args[0]
+                assert preview_frames.shape == (1, 8, 16, 3)
+                assert batch_elapsed >= 0.0
                 assert queue.put.call_args_list[-1].args == (None,)
 
             # 预览减复制不能改变像素：覆盖非 4 整除宽度、重叠人脸、无脸帧。
@@ -223,6 +227,19 @@ def main() -> None:
                     expected_preview = NF.interpolate(torch.cat((original, restored), dim=3), scale_factor=0.25, mode="bilinear", align_corners=False)
                     actual_preview = swapper.SwapFace._make_preview(original.clone(), test_faces, test_theta, lengths)
                     torch.testing.assert_close(actual_preview, expected_preview, atol=0, rtol=0)
+            preview_queue = Mock()
+            preview_queue.get.side_effect = [([object()] * 8, 0.8), ([object()] * 8, 0.32), None]
+            preview_waits = []
+            with (
+                patch.object(swapper.cv2, "imshow"),
+                patch.object(swapper.cv2, "waitKey", side_effect=lambda wait_ms: preview_waits.append(wait_ms) or -1),
+                patch.object(swapper.cv2, "destroyAllWindows"),
+            ):
+                swapper.SwapFace._display_worker(preview_queue, 25.0)
+            assert len(preview_waits) == 16
+            assert min(preview_waits[:8]) >= 90
+            assert max(preview_waits[8:]) < min(preview_waits[:8])
+
             try:
                 native.swap_video("unused.mp4", "unused.png", batch_size=0)
             except ValueError:

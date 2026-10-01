@@ -1,6 +1,7 @@
 import argparse
 import multiprocessing as mp
 import random
+import time
 from pathlib import Path
 
 import cv2
@@ -233,14 +234,32 @@ class SwapFace:
         return swapped.permute(0, 3, 1, 2).contiguous() if self.ort_layout == "NHWC" else swapped
 
     @staticmethod
-    def _display_worker(display_queue: mp.Queue, fps: int = 25) -> None:
+    def _display_worker(display_queue: mp.Queue, source_fps: float) -> None:
+        source_interval = 1.0 / source_fps
+        frame_interval = source_interval
         while True:
-            frames = display_queue.get()
-            if frames is None:
+            item = display_queue.get()
+            if item is None:
                 break
+            frames, batch_elapsed = item
+            if len(frames) == 0:
+                continue
+
+            # 预览不能比输入视频更快；若处理速度更慢，则按实际吞吐平滑降速。
+            # 吞吐下降时立即跟随，恢复时缓慢加速，避免在 batch 边界反复耗尽队列。
+            measured_interval = batch_elapsed / len(frames)
+            target_interval = max(source_interval, measured_interval)
+            if target_interval > frame_interval:
+                frame_interval = target_interval
+            else:
+                frame_interval = frame_interval * 0.9 + target_interval * 0.1
+
             for frame in frames:
+                started = time.perf_counter()
                 cv2.imshow("swapped", frame)
-                cv2.waitKey(max(1, int(1000 / fps)))
+                display_elapsed = time.perf_counter() - started
+                wait_ms = max(1, round((frame_interval - display_elapsed) * 1000.0))
+                cv2.waitKey(wait_ms)
         cv2.destroyAllWindows()
 
     @staticmethod
@@ -265,12 +284,22 @@ class SwapFace:
             raise ValueError("batch_size 必须为正数")
         identity_embedding = self.extract_identity_embedding(identity_image_path)
         decoder = VideoDecoder(str(video_path), device=self.device)
+        source_fps = decoder.metadata.average_fps
+        if source_fps is None:
+            raise ValueError("视频缺少有效帧率：average_fps=None")
+        source_fps = float(source_fps)
+        if not np.isfinite(source_fps) or source_fps <= 0:
+            raise ValueError(f"视频缺少有效帧率：average_fps={source_fps!r}")
+        print(f"Preview source FPS={source_fps:.3f}; display cadence adapts to processing throughput")
+
         context = mp.get_context("spawn")
-        display_queue = context.Queue(maxsize=15)
-        display_process = context.Process(target=self._display_worker, args=(display_queue,), daemon=True)
+        # 仅保留少量 batch 吸收短时抖动；大队列会掩盖吞吐不足，并在耗尽后形成周期性卡顿。
+        display_queue = context.Queue(maxsize=3)
+        display_process = context.Process(target=self._display_worker, args=(display_queue, source_fps), daemon=True)
         display_process.start()
         try:
             for start in range(0, len(decoder), batch_size):
+                batch_started = time.perf_counter()
                 original_frames = decoder[start : start + batch_size].data.to(device=self.device, dtype=torch.float32)
                 # 大帧复用检测器原生 resize/padding 路径；检测结果已还原到原图坐标。
                 # 小帧直接检测，避免上采样或 padding 反而增加工作量。
@@ -290,7 +319,9 @@ class SwapFace:
                     swapped_faces = faces * (1.0 - face_mask) + swapped_faces * face_mask
                 frames = self._make_preview(original_frames, swapped_faces, grid_theta, segment_lengths)
                 frames = frames.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)[:, [2, 1, 0]]
-                display_queue.put(frames.permute(0, 2, 3, 1).to(device="cpu", dtype=torch.uint8).numpy())
+                preview_frames = frames.permute(0, 2, 3, 1).to(device="cpu", dtype=torch.uint8).numpy()
+                batch_elapsed = time.perf_counter() - batch_started
+                display_queue.put((preview_frames, batch_elapsed))
             display_queue.put(None)
             display_process.join()
         finally:
