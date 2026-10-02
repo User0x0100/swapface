@@ -22,14 +22,26 @@ from .dataloader_native import _RandomImagePairDataset
 
 def main():
     raw=tomllib.loads((Path(__file__).parents[1]/'experiments/train.toml').read_text())
-    legacy=resolve_train_config(raw)
-    explicit=copy.deepcopy(raw)
+    resolved=resolve_train_config(raw)
+    assert any(entry.get('alignment')=='arcface' for entry in resolved['data']['src'])
+
+    # Legacy configs omitted alignment entirely and therefore default to FFHQ.
+    legacy_raw=copy.deepcopy(raw)
+    legacy_raw['data']['src']=[
+        {key:value for key,value in entry.items() if key!='alignment'}
+        for entry in raw['data']['src']
+        if entry.get('alignment','ffhq')=='ffhq'
+    ]
+    for entry in legacy_raw['data']['dst']:
+        entry.pop('alignment',None)
+    legacy=resolve_train_config(legacy_raw)
+    explicit=copy.deepcopy(legacy_raw)
     for section in ('src','dst'):
         for entry in explicit['data'][section]:
             entry['alignment']='ffhq'
     assert resolve_train_config(explicit)==legacy
     assert config_sha256(resolve_train_config(explicit))==config_sha256(legacy)
-    mixed=copy.deepcopy(raw)
+    mixed=copy.deepcopy(legacy_raw)
     mixed['data']['src'].append({'path':'asian','adjustment':-0.5,'alignment':'arcface'})
     assert resolve_train_config(mixed)['data']['src'][-1]['alignment']=='arcface'
     for bad in ('unknown',None,112,[]):

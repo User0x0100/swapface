@@ -252,25 +252,57 @@ minibatch_std_group_size = 4
 
 
 # 身份来源数据池。采样权重为 sqrt(file_count) * 2**adjustment。
+# alignment 省略时默认为 ffhq；已预对齐到 canonical ArcFace 112 的 src 使用 arcface。
 [[data.src]]
-path = "/path/to/source_faces_a"
+path = "/path/to/source_faces"
 adjustment = 0.0
+alignment = "ffhq"
+
+# FairFace 后处理结果按人种目录保存；训练扫描不递归，因此每个目录分别配置。
+[[data.src]]
+path = "datasets/fairface-arcface112/asian"
+adjustment = 0.0
+alignment = "arcface"
 
 [[data.src]]
-path = "/path/to/source_faces_b"
+path = "datasets/fairface-arcface112/indian"
 adjustment = 0.0
+alignment = "arcface"
+
+[[data.src]]
+path = "datasets/fairface-arcface112/black"
+adjustment = 0.0
+alignment = "arcface"
+
+[[data.src]]
+path = "datasets/fairface-arcface112/white"
+adjustment = 0.0
+alignment = "arcface"
+
+[[data.src]]
+path = "datasets/fairface-arcface112/middle_eastern"
+adjustment = 0.0
+alignment = "arcface"
+
+[[data.src]]
+path = "datasets/fairface-arcface112/latino"
+adjustment = 0.0
+alignment = "arcface"
 
 
-# 目标/姿态/表情数据池，语义与 data.src 相同。
+# 目标/姿态/表情数据池必须使用 FFHQ 对齐；data.dst 不接受 alignment = "arcface"。
 [[data.dst]]
 path = "/path/to/target_faces_a"
 adjustment = 0.0
+alignment = "ffhq"
 
 [[data.dst]]
 path = "/path/to/target_faces_b"
 adjustment = 0.0
+alignment = "ffhq"
 
 # adjustment=1.0 表示相对基础权重乘 2，可提高困难数据采样概率。
 [[data.dst]]
 path = "/path/to/occlusion_faces"
 adjustment = 1.0
+alignment = "ffhq"
