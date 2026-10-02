@@ -10,7 +10,6 @@ import os
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 
 from .config import DEFAULT_DATA_CONFIG, resolve_train_config
@@ -66,7 +65,7 @@ def main():
         for resolution in (256,512):
             torch.manual_seed(42)
             loader=TrainingDataLoader(batch_size=16,device=torch.device('cpu'),img_resolution=resolution,src=[ffhq,(arc,0.0,'arcface')],dst=[dst],**cfg)
-            src,target,canonical,theta,same,identity=loader.next()
+            src,target,canonical,_theta,same,identity=loader.next()
             assert src.shape==target.shape==canonical.shape==(16,3,resolution,resolution)
             assert identity.shape==(16,3,112,112) and identity.dtype==torch.float32
             # 两个池使用同一张图；展示图相同，但身份裁剪应分成两组。
@@ -105,7 +104,7 @@ def main():
         # Exercise DALI Python source without importing the unavailable CUDA-only SDK.
         source_tree=ast.parse(Path(__file__).with_name('dataloader_dali.py').read_text())
         source_node=next(n for n in source_tree.body if isinstance(n,ast.ClassDef) and n.name=='_RandomImagePairSource')
-        namespace={'np':np,'ndarray':np.ndarray,'os':os,'Sequence':Sequence,'Any':Any,'ImageSource':ImageSource,'LocalImagePool':LocalImagePool,'build_image_pools':build_image_pools,'print_image_pools':print_image_pools}
+        namespace: dict[str, Any] = {'np':np,'ndarray':np.ndarray,'os':os,'Sequence':Sequence,'Any':Any,'ImageSource':ImageSource,'LocalImagePool':LocalImagePool,'build_image_pools':build_image_pools,'print_image_pools':print_image_pools}
         exec(compile(ast.Module(body=[source_node],type_ignores=[]),'<DALI source>','exec'),namespace)
         source_type=namespace['_RandomImagePairSource']
         dali=source_type([(arc,0.0,'arcface')],[dst],0.0)
