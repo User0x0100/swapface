@@ -50,6 +50,29 @@ DATASETS: dict[str, tuple[Artifact, ...]] = {
             output=Path("ffhq/FFHQ-1024-2.zip"),
         ),
     ),
+    "fairface": (
+        Artifact(
+            name="FairFace-0.25-0",
+            repo_id="HuggingFaceM4/FairFace",
+            revision="54d573cdb8b5af490ba8da9da2799628f6e5c496",
+            filename="0.25/train-00000-of-00002-d405faba4f4b9b85.parquet",
+            output=Path("fairface/part-00000.parquet"),
+        ),
+        Artifact(
+            name="FairFace-0.25-1",
+            repo_id="HuggingFaceM4/FairFace",
+            revision="54d573cdb8b5af490ba8da9da2799628f6e5c496",
+            filename="0.25/train-00001-of-00002-dd3cb68164727418.parquet",
+            output=Path("fairface/part-00001.parquet"),
+        ),
+        Artifact(
+            name="FairFace-0.25-2",
+            repo_id="HuggingFaceM4/FairFace",
+            revision="54d573cdb8b5af490ba8da9da2799628f6e5c496",
+            filename="0.25/validation-00000-of-00001-951dbd63c8724ee1.parquet",
+            output=Path("fairface/part-00002.parquet"),
+        ),
+    ),
 }
 
 

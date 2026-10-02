@@ -93,19 +93,32 @@ Coarse 内部首先将真实 `dst` 双线性缩放到 `coarse_resolution`；训�
 
 ## 训练数据源
 
-训练数据只支持本地图片目录，不再由训练进程访问 Hugging Face、ModelScope 或其他在线数据集。`[[data.src]]` / `[[data.dst]]` 的 schema 只包含：
+训练数据只支持本地图片目录，不再由训练进程访问 Hugging Face、ModelScope 或其他在线数据集。`[[data.src]]` / `[[data.dst]]` 的 schema 只包含本地路径、权重调整和可选对齐方式：
 
 ```toml
 [[data.src]]
 path = "/path/to/source_faces"
 adjustment = 0.0
+alignment = "ffhq"  # 可省略；src 也可设为 arcface
 
 [[data.dst]]
 path = "/path/to/target_faces"
 adjustment = 0.0
 ```
 
-多个目录仍按 `sqrt(file_count) * 2**adjustment` 分配目录采样权重。`backend`、`repo_id`、`revision`、`path_prefix`、在线数据集 proxy/cache 等旧字段均不再接受。模型权重仍可由各模型模块通过 Hugging Face Hub 获取；这与训练数据源是两个独立职责。
+`alignment = "arcface"` 仅允许用于 `data.src`。这类目录中的图片应已经是 canonical ArcFace 对齐；训练管线会直接保留其 112×112 身份分支，不再经过 FFHQ→ArcFace 裁剪。`data.dst` 固定使用 FFHQ 对齐。多个目录仍按 `sqrt(file_count) * 2**adjustment` 分配目录采样权重。`backend`、`repo_id`、`revision`、`path_prefix`、在线数据集 proxy/cache 等旧字段均不再接受。模型权重仍可由各模型模块通过 Hugging Face Hub 获取；这与训练数据源是两个独立职责。
+
+FairFace 可直接作为额外的 source identity 池。项目固定下载 `HuggingFaceM4/FairFace` 的 `0.25` 配置，并将官方 `train` 与 `validation` 三个 Parquet 统一映射为一个本地 identity pool；这里不保留训练/验证语义，因为 FairFace 仅作为 source ID 素材使用。随后通过项目 RetinaFace 5 点检测重新对齐到 ArcFace 112，而不是简单缩放原始图像：
+
+```bash
+uv run --no-sync python tools/download_datasets.py fairface --root datasets/downloads
+uv run --no-sync python tools/postprocess_dataset.py \
+  datasets/downloads/fairface/*.parquet \
+  --format fairface \
+  --output datasets/fairface-arcface112
+```
+
+输出按粗粒度目录组织为 `asian/`、`indian/`、`black/`、`white/`、`middle_eastern/`、`latino/`。FairFace 原始 `East Asian` 与 `Southeast Asian` 归入 `asian/`；`Indian` 保留为独立 `indian/`，避免将南亚身份混入主要用于补充东亚/东南亚身份的 source pool。由于训练数据扫描不递归，使用这些目录时应分别配置为 `[[data.src]]`，并设置 `alignment = "arcface"`。
 
 ## Run 目录
 

@@ -17,6 +17,7 @@ dependencies = [
     "ninja",
     "scipy",
     "httpx[socks]>=0.28.1",
+    "pyarrow>=25.0.1",
 ]
 
 [dependency-groups]

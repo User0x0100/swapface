@@ -103,6 +103,23 @@ class DownloaderTests(unittest.TestCase):
             self.assertEqual(result.resolve(), new_cache.resolve())
             self.assertEqual(result.read_bytes(), b"new")
 
+    def test_fairface_artifacts_merge_train_and_validation_into_one_pool(self) -> None:
+        artifacts = downloader.DATASETS["fairface"]
+        self.assertEqual(len(artifacts), 3)
+        self.assertTrue(all(artifact.repo_id == "HuggingFaceM4/FairFace" for artifact in artifacts))
+        self.assertTrue(all(artifact.revision == "54d573cdb8b5af490ba8da9da2799628f6e5c496" for artifact in artifacts))
+        self.assertTrue(all(artifact.filename.startswith("0.25/") and artifact.filename.endswith(".parquet") for artifact in artifacts))
+        self.assertEqual(
+            [artifact.output for artifact in artifacts],
+            [
+                Path("fairface/part-00000.parquet"),
+                Path("fairface/part-00001.parquet"),
+                Path("fairface/part-00002.parquet"),
+            ],
+        )
+        self.assertEqual(sum("/train-" in artifact.filename for artifact in artifacts), 2)
+        self.assertEqual(sum("/validation-" in artifact.filename for artifact in artifacts), 1)
+
     def test_regular_destination_is_not_replaced(self) -> None:
         artifact = downloader.Artifact(
             name="TEST",
@@ -160,6 +177,37 @@ class PostprocessTests(unittest.TestCase):
             workers=2,
         )
 
+
+    def test_fairface_race_grouping(self) -> None:
+        self.assertEqual(postprocess.fairface_group(0), "asian")
+        self.assertEqual(postprocess.fairface_group(1), "indian")
+        self.assertEqual(postprocess.fairface_group(6), "asian")
+        self.assertEqual(postprocess.fairface_group(2), "black")
+        self.assertEqual(postprocess.fairface_group(3), "white")
+        self.assertEqual(postprocess.fairface_group(4), "middle_eastern")
+        self.assertEqual(postprocess.fairface_group(5), "latino")
+        with self.assertRaisesRegex(ValueError, "unsupported FairFace race label"):
+            postprocess.fairface_group(7)
+
+    def test_fairface_item_key_is_stable_across_shards(self) -> None:
+        self.assertEqual(
+            postprocess.fairface_item_key(Path("part-00000.parquet"), 42),
+            "part-00000_000042",
+        )
+        self.assertEqual(
+            postprocess.fairface_item_key(Path("part-00002.parquet"), 3),
+            "part-00002_000003",
+        )
+
+    def test_fairface_manifest_survives_json_round_trip(self) -> None:
+        args = argparse.Namespace(mobilenet=False, confidence=0.9)
+        manifest = postprocess.fairface_manifest_value(
+            args,
+            [postprocess.ArchiveIdentity(path="/tmp/a.parquet", size=10, mtime_ns=20)],
+        )
+        import json
+
+        self.assertEqual(json.loads(json.dumps(manifest)), manifest)
 
     def test_output_lock_rejects_second_instance(self) -> None:
         with tempfile.TemporaryDirectory() as td:
