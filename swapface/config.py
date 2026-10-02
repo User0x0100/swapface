@@ -223,18 +223,27 @@ def _normalize_image_sources(entries: object, section: str) -> list[dict[str, An
         raise ValueError(f"[[{section}]] 数据源不能为空")
 
     normalized: list[dict[str, Any]] = []
-    allowed_fields = {"path", "adjustment"}
+    allowed_fields = {"path", "adjustment", "alignment"}
     for index, raw_entry in enumerate(entries):
         if not isinstance(raw_entry, dict):
             raise TypeError(f"[[{section}]] 第 {index} 项必须是表/对象")
         entry = dict(raw_entry)
         unknown = set(entry) - allowed_fields
         if unknown:
-            raise ValueError(f"[[{section}]] 第 {index} 项包含未知字段：{sorted(unknown)}；训练数据源仅支持本地 path/adjustment")
+            raise ValueError(f"[[{section}]] 第 {index} 项包含未知字段：{sorted(unknown)}；训练数据源仅支持本地 path/adjustment/alignment")
         path = entry.get("path")
         if not isinstance(path, str) or not path:
             raise ValueError(f"[[{section}]] 第 {index} 项 path 必须为非空字符串")
-        normalized.append({"path": path, "adjustment": _float(entry.get("adjustment", 0.0), f"{section}[{index}].adjustment")})
+        alignment = entry.get("alignment", "ffhq")
+        if alignment not in ("ffhq", "arcface"):
+            raise ValueError(f"{section}[{index}].alignment 必须为 ffhq 或 arcface，实际为 {alignment!r}")
+        if section == "data.dst" and alignment != "ffhq":
+            raise ValueError("data.dst 仅支持 ffhq 对齐；arcface 仅用于 source identity")
+        item = {"path": path, "adjustment": _float(entry.get("adjustment", 0.0), f"{section}[{index}].adjustment")}
+        # 默认 FFHQ 保留旧 canonical 表示及冻结 run/checkpoint 的配置哈希。
+        if alignment != "ffhq":
+            item["alignment"] = alignment
+        normalized.append(item)
     return normalized
 
 

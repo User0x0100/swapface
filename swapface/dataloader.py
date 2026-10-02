@@ -43,8 +43,8 @@ class TrainingDataLoader:
             **config,
         )
 
-    def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """返回 ``src``、``dst``、``dst_canonical``、``theta_restore`` 与 ``same_mask``。"""
+    def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """返回 ``src``、``dst``、``dst_canonical``、``theta_restore`` 、``same_mask`` 与 ``src_identity_faces``（RGB、112×112、[-1, 1]）。"""
         return self._loader.next()
 
 

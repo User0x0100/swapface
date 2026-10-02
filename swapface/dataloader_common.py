@@ -8,16 +8,21 @@ from pathlib import Path
 
 import numpy as np
 from numpy import ndarray
+import torch
+from torch import Tensor
+
+from misc.face_alignment import ffhq_to_arcface_112
 
 type ImagePath = str | os.PathLike[str]
 type FloatRange = tuple[float, float]
-type ImageSource = ImagePath | tuple[ImagePath, float]
+type ImageSource = ImagePath | tuple[ImagePath, float] | tuple[ImagePath, float, str]
 
 
 @dataclass(frozen=True, slots=True)
 class LocalImagePool:
     root: str
     file_names: tuple[str, ...]
+    alignment: str = "ffhq"
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp")
@@ -60,17 +65,21 @@ def build_image_pools(sources: Sequence[ImageSource]) -> tuple[tuple[LocalImageP
 
     for source in sources:
         if isinstance(source, (str, os.PathLike)):
-            path, adjustment = source, 0.0
-        elif isinstance(source, tuple) and len(source) == 2 and isinstance(source[0], (str, os.PathLike)):
-            path, adjustment = source
+            path, adjustment, alignment = source, 0.0, "ffhq"
+        elif isinstance(source, tuple) and len(source) in (2, 3) and isinstance(source[0], (str, os.PathLike)):
+            path, adjustment = source[:2]
+            alignment = source[2] if len(source) == 3 else "ffhq"
         else:
-            raise TypeError(f"图片源必须为路径或 (路径, 权重调整)，实际为 {source!r}")
+            raise TypeError(f"图片源必须为路径、(路径, 权重调整) 或 (路径, 权重调整, 对齐方式)，实际为 {source!r}")
 
         adjustment = float(adjustment)
         if not np.isfinite(adjustment):
             raise ValueError(f"权重调整必须为有限数值，实际为 {adjustment!r}")
 
-        pool = scan_image_files(path)
+        if alignment not in ("ffhq", "arcface"):
+            raise ValueError(f"alignment 必须为 ffhq 或 arcface，实际为 {alignment!r}")
+        scanned = scan_image_files(path)
+        pool = LocalImagePool(scanned.root, scanned.file_names, alignment)
         pools.append(pool)
         counts.append(len(pool.file_names))
         adjustments.append(adjustment)
@@ -84,6 +93,12 @@ def build_image_pools(sources: Sequence[ImageSource]) -> tuple[tuple[LocalImageP
 
     info = tuple((pool.root, count, float(weight)) for pool, count, weight in zip(pools, counts, weights, strict=True))
     return tuple(pools), cdf, info
+
+
+def prepare_source_identity_faces(src: Tensor, arcface_faces: Tensor, src_arcface_mask: Tensor, ffhq_grid: Tensor) -> Tensor:
+    """FFHQ 使用原裁剪；ArcFace 使用独立保留的 112 像素，避免展示分辨率往返缩放。"""
+    ffhq_faces = ffhq_to_arcface_112(src, ffhq_grid)
+    return torch.where(src_arcface_mask[:, None, None, None], arcface_faces, ffhq_faces)
 
 
 def print_image_pools(title: str, info: tuple[tuple[str, int, float], ...]) -> None:

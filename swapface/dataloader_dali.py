@@ -10,7 +10,7 @@
        将生成结果映射回仿射增强前的目标坐标系。
 
 图片源:
-    每个源可以是路径，也可以是 ``(path, adjustment)``。文件夹首先按
+    每个源可以是路径、``(path, adjustment)`` 或 ``(path, adjustment, alignment)``。alignment 默认为 ffhq；arcface 仅用于 src。文件夹首先按
     ``sqrt(file_count) * 2**adjustment`` 分配采样概率，再在选中的文件夹内均匀
     采样图片。训练数据只从本地目录读取，不包含网络访问或远程数据源状态。
     ``adjustment=1`` 表示将该数据源的基础权重翻倍，``-1`` 表示减半。
@@ -27,6 +27,9 @@
     ``theta_restore``: ``float32``，形状 ``(B, 2, 3)``，可直接传给
     ``torch.nn.functional.affine_grid(..., align_corners=False)``。
     ``same_mask``: ``bool``，形状 ``(B,)``，标记 src/dst 是否来自同一张原图。
+    ``src_arcface_mask``: ``bool``，形状 ``(B,)``，标记 src 是否已经使用 ArcFace 对齐；same pair 为 False。
+    ``src_arcface_faces``: 原始解码图的独立 112×112 身份分支，使用与展示 src 相同的 flip。
+    适配器在 PyTorch 中选择 FFHQ 裁剪或 ArcFace 身份分支，统一返回六项。
 """
 
 import os
@@ -39,7 +42,8 @@ from nvidia.dali import fn, pipeline_def
 from nvidia.dali.math import clamp
 from nvidia.dali.types import DALIDataType, DALIImageType, DALIInterpType
 
-from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, validate_range
+from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, prepare_source_identity_faces, validate_range
+from misc.face_alignment import make_ffhq_to_arcface_112_grid
 
 
 class _RandomImagePairSource:
@@ -51,6 +55,8 @@ class _RandomImagePairSource:
         self.same_prob = same_prob
         self.src_pools, self.src_cdf, src_info = build_image_pools(src)
         self.dst_pools, self.dst_cdf, dst_info = build_image_pools(dst)
+        if any(pool.alignment != "ffhq" for pool in self.dst_pools):
+            raise ValueError("dst 数据池必须使用 ffhq 对齐")
         self.rng = np.random.default_rng()
         print_image_pools("SRC Sources", src_info)
         print_image_pools("DST Sources", dst_info)
@@ -64,17 +70,17 @@ class _RandomImagePairSource:
         self.__dict__.update(state)
         self.rng = np.random.default_rng()
 
-    def _sample_encoded(self, pools: tuple[LocalImagePool, ...], cdf: ndarray) -> ndarray:
+    def _sample_encoded(self, pools: tuple[LocalImagePool, ...], cdf: ndarray) -> tuple[ndarray, bool]:
         pool_index = min(int(np.searchsorted(cdf, self.rng.random(), side="right")), len(pools) - 1)
         pool = pools[pool_index]
         file_name = pool.file_names[int(self.rng.integers(len(pool.file_names)))]
-        return np.fromfile(os.path.join(pool.root, file_name), dtype=np.uint8)
+        return np.fromfile(os.path.join(pool.root, file_name), dtype=np.uint8), pool.alignment == "arcface"
 
-    def __call__(self, _sample_info) -> tuple[ndarray, ndarray, ndarray]:
-        dst = self._sample_encoded(self.dst_pools, self.dst_cdf)
+    def __call__(self, _sample_info) -> tuple[ndarray, ndarray, ndarray, ndarray]:
+        dst, _ = self._sample_encoded(self.dst_pools, self.dst_cdf)
         same = self.rng.random() < self.same_prob
-        src = dst if same else self._sample_encoded(self.src_pools, self.src_cdf)
-        return src, dst, np.asarray(same, dtype=np.bool_)
+        src, arcface = (dst, False) if same else self._sample_encoded(self.src_pools, self.src_cdf)
+        return src, dst, np.asarray(same, dtype=np.bool_), np.asarray(arcface, dtype=np.bool_)
 
 
 def _random_affine_matrices(img_resolution: int, rotation_range: FloatRange, scale_factor_range: FloatRange, tx_range: FloatRange, ty_range: FloatRange):
@@ -177,7 +183,7 @@ def create_dataloader_pipeline(
         ty_range: ``dst`` 垂直平移范围，相对于图像高度。
 
     返回:
-        五个 DALI DataNode：``src``、``dst``、``dst_canonical``、``theta_restore`` 和 ``same_mask``。
+        七个 DALI DataNode：``src``、``dst``、``dst_canonical``、``theta_restore`` 、``same_mask`` 、``src_arcface_mask`` 和 ``src_arcface_faces``。
         图像输出均为 RGB/NCHW/float32/``[-1, 1]``；``dst_canonical`` 保留与 ``dst``
         相同的 flip/color，但未做几何仿射；``theta_restore`` 为 ``(2, 3)`` 每样本矩阵，
         batch 经 DALIGenericIterator 后形状为 ``(B, 2, 3)``；``same_mask`` 为逐样本 bool。
@@ -201,24 +207,28 @@ def create_dataloader_pipeline(
     if not 0.0 <= same_prob <= 1.0:
         raise ValueError(f"same_prob 必须位于 [0, 1]，实际为 {same_prob}")
 
-    src_raw, dst_raw, same_mask = fn.external_source(
+    src_raw, dst_raw, same_mask, src_arcface_mask = fn.external_source(
         source=_RandomImagePairSource(src, dst, same_prob),
-        num_outputs=3,
+        num_outputs=4,
         device="cpu",
         parallel=True,
         prefetch_queue_depth=reader_prefetch_queue_depth,
-        dtype=(DALIDataType.UINT8, DALIDataType.UINT8, DALIDataType.BOOL),
-        ndim=(1, 1, 0),
+        dtype=(DALIDataType.UINT8, DALIDataType.UINT8, DALIDataType.BOOL, DALIDataType.BOOL),
+        ndim=(1, 1, 0, 0),
         batch=False,
     )
 
     src_image = _decode(src_raw, decoder_backend, decoder_hw_load)
+    # 身份分支从原始解码图生成；112 输入不会经过展示分辨率。
+    src_arcface_faces = fn.resize(src_image, device="gpu", size=112, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
     dst_image = _decode(dst_raw, decoder_backend, decoder_hw_load)
 
     src_image = fn.resize(src_image, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
     dst_image = fn.resize(dst_image, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
 
-    src_image = fn.flip(src_image, device="gpu", horizontal=fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.INT32))
+    src_flip = fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.INT32)
+    src_image = fn.flip(src_image, device="gpu", horizontal=src_flip)
+    src_arcface_faces = fn.flip(src_arcface_faces, device="gpu", horizontal=src_flip)
     dst_image = fn.flip(dst_image, device="gpu", horizontal=fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.INT32))
 
     dst_image = fn.color_twist(
@@ -233,7 +243,7 @@ def create_dataloader_pipeline(
     affine_matrix, theta_restore = _random_affine_matrices(img_resolution, rotation_range, scale_factor_range, tx_range, ty_range)
     dst_image = fn.warp_affine(dst_image, affine_matrix, device="gpu", inverse_map=False, fill_value=-1.0)
 
-    return _normalize_chw(src_image), _normalize_chw(dst_image), dst_canonical, theta_restore, fn.copy(same_mask, device="gpu")
+    return _normalize_chw(src_image), _normalize_chw(dst_image), dst_canonical, theta_restore, fn.copy(same_mask, device="gpu"), fn.copy(src_arcface_mask, device="gpu"), _normalize_chw(src_arcface_faces)
 
 
 class _DALITrainingDataLoader:
@@ -252,6 +262,7 @@ class _DALITrainingDataLoader:
         import torch
         from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 
+        self._source_ffhq_grid = make_ffhq_to_arcface_112_grid(img_resolution, batch_size, device)
         device_id = device.index if device.index is not None else torch.cuda.current_device()
         pipe = create_dataloader_pipeline(
             batch_size=batch_size,
@@ -261,7 +272,7 @@ class _DALITrainingDataLoader:
             dst=dst,
             **config,
         )
-        self._output_map = ["src", "dst", "dst_canonical", "theta_restore", "same_mask"]
+        self._output_map = ["src", "dst", "dst_canonical", "theta_restore", "same_mask", "src_arcface_mask", "src_arcface_faces"]
         self._iterator = DALIGenericIterator(
             pipelines=pipe,
             output_map=self._output_map,
@@ -271,4 +282,5 @@ class _DALITrainingDataLoader:
 
     def next(self):
         data = self._iterator.next()[0]
-        return tuple(data[key] for key in self._output_map)
+        identity = prepare_source_identity_faces(data["src"], data["src_arcface_faces"], data["src_arcface_mask"], self._source_ffhq_grid)
+        return data["src"], data["dst"], data["dst_canonical"], data["theta_restore"], data["same_mask"], identity

@@ -11,10 +11,11 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 
-from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, validate_range
+from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, prepare_source_identity_faces, validate_range
+from misc.face_alignment import make_ffhq_to_arcface_112_grid
 
 
-class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool]]):
+class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool, bool, Tensor]]):
     """在 CPU worker 中随机采样、解码并 Lanczos resize 成固定尺寸。"""
 
     def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource], img_resolution: int, same_prob: float) -> None:
@@ -27,15 +28,17 @@ class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool]]):
         self.same_prob = same_prob
         self.src_pools, self.src_cdf, src_info = build_image_pools(src)
         self.dst_pools, self.dst_cdf, dst_info = build_image_pools(dst)
+        if any(pool.alignment != "ffhq" for pool in self.dst_pools):
+            raise ValueError("dst 数据池必须使用 ffhq 对齐")
         print_image_pools("SRC Sources", src_info)
         print_image_pools("DST Sources", dst_info)
 
     @staticmethod
-    def _sample_path(rng: np.random.Generator, pools: tuple[LocalImagePool, ...], cdf: np.ndarray) -> str:
+    def _sample_path(rng: np.random.Generator, pools: tuple[LocalImagePool, ...], cdf: np.ndarray) -> tuple[str, str]:
         pool_index = min(int(np.searchsorted(cdf, rng.random(), side="right")), len(pools) - 1)
         pool = pools[pool_index]
         file_name = pool.file_names[int(rng.integers(len(pool.file_names)))]
-        return os.path.join(pool.root, file_name)
+        return os.path.join(pool.root, file_name), pool.alignment
 
     def _decode_resize(self, path: str) -> Tensor:
         with Image.open(path) as image:
@@ -45,19 +48,32 @@ class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool]]):
             array = np.asarray(image, dtype=np.uint8).copy()
         return torch.from_numpy(array).permute(2, 0, 1)
 
-    def __iter__(self) -> Iterator[tuple[Tensor, Tensor, bool]]:
+    def _decode_source(self, path: str, arcface: bool) -> tuple[Tensor, Tensor]:
+        if not arcface:
+            return self._decode_resize(path), torch.zeros((3, 112, 112), dtype=torch.uint8)
+        with Image.open(path) as opened:
+            image = opened.convert("RGB")
+            identity = image if image.size == (112, 112) else image.resize((112, 112), resample=Image.Resampling.LANCZOS)
+            identity_array = np.asarray(identity, dtype=np.uint8).copy()
+            display = image if image.size == (self.img_resolution, self.img_resolution) else image.resize((self.img_resolution, self.img_resolution), resample=Image.Resampling.LANCZOS)
+            display_array = np.asarray(display, dtype=np.uint8).copy()
+        return torch.from_numpy(display_array).permute(2, 0, 1), torch.from_numpy(identity_array).permute(2, 0, 1)
+
+    def __iter__(self) -> Iterator[tuple[Tensor, Tensor, bool, bool, Tensor]]:
         # DataLoader 会为每个 worker 设置独立 torch seed；以它初始化 NumPy RNG，
         # 避免 spawn/fork worker 复制出相同采样序列。
         rng = np.random.default_rng(torch.initial_seed())
         while True:
-            dst_path = self._sample_path(rng, self.dst_pools, self.dst_cdf)
+            dst_path, _ = self._sample_path(rng, self.dst_pools, self.dst_cdf)
             same = bool(rng.random() < self.same_prob)
-            src_path = dst_path if same else self._sample_path(rng, self.src_pools, self.src_cdf)
+            src_path, alignment = (dst_path, "ffhq") if same else self._sample_path(rng, self.src_pools, self.src_cdf)
             if same:
                 image = self._decode_resize(dst_path)
-                yield image, image, True
+                yield image, image, True, False, torch.zeros((3, 112, 112), dtype=torch.uint8)
             else:
-                yield self._decode_resize(src_path), self._decode_resize(dst_path), False
+                arcface = alignment == "arcface"
+                display, identity = self._decode_source(src_path, arcface)
+                yield display, self._decode_resize(dst_path), False, arcface, identity
 
 
 def _uniform(batch_size: int, value_range: FloatRange, device: torch.device) -> Tensor:
@@ -186,6 +202,7 @@ class _NativeTrainingDataLoader:
 
         self.device = device
         self.img_resolution = img_resolution
+        self.source_ffhq_grid = make_ffhq_to_arcface_112_grid(img_resolution, batch_size, device)
         self.brightness = brightness
         self.contrast = contrast
         self.saturation = saturation
@@ -215,17 +232,20 @@ class _NativeTrainingDataLoader:
         print(f"PyTorch 数据管线：CPU Pillow/Lanczos 解码缩放，workers={py_num_workers}, prefetch_factor={reader_prefetch_queue_depth}；批量增强在 {device} 执行")
 
     @torch.no_grad()
-    def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        src, dst, same_mask = next(self.iterator)
+    def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        src, dst, same_mask, src_arcface_mask, arcface_faces = next(self.iterator)
         src = src.to(device=self.device, dtype=torch.float32, non_blocking=True)
         dst = dst.to(device=self.device, dtype=torch.float32, non_blocking=True)
         same_mask = same_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        src_arcface_mask = src_arcface_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        arcface_faces = arcface_faces.to(device=self.device, dtype=torch.float32, non_blocking=True)
         batch_size = src.shape[0]
 
         if self.flip_prob > 0.0:
             src_flip = torch.rand((batch_size, 1, 1, 1), device=self.device) < self.flip_prob
             dst_flip = torch.rand((batch_size, 1, 1, 1), device=self.device) < self.flip_prob
             src = torch.where(src_flip, src.flip(-1), src)
+            arcface_faces = torch.where(src_flip, arcface_faces.flip(-1), arcface_faces)
             dst = torch.where(dst_flip, dst.flip(-1), dst)
 
         dst = _color_twist(dst, self.brightness, self.contrast, self.saturation)
@@ -246,4 +266,6 @@ class _NativeTrainingDataLoader:
         src = src.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
         dst = dst.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
         dst_canonical = dst_canonical.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
-        return src, dst, dst_canonical, theta_restore, same_mask
+        arcface_faces = arcface_faces.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
+        source_identity_faces = prepare_source_identity_faces(src, arcface_faces, src_arcface_mask, self.source_ffhq_grid)
+        return src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces

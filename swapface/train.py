@@ -282,7 +282,7 @@ class Trainer:
 
         dataloader_cfg = {**data_config["loader"], **data_config["augmentation"], **data_config["sampling"]}
         dataloader_cfg["decoder_backend"] = ImageDecoderBackend(dataloader_cfg["decoder_backend"])
-        src = [(str(entry["path"]), float(entry["adjustment"])) for entry in data_config["src"]]
+        src = [(str(entry["path"]), float(entry["adjustment"]), str(entry.get("alignment", "ffhq"))) for entry in data_config["src"]]
         dst = [(str(entry["path"]), float(entry["adjustment"])) for entry in data_config["dst"]]
 
         print_mapping("训练配置", config)
@@ -1064,9 +1064,9 @@ class Trainer:
 
         return h
 
-    def _save_sample(self, sample_reference: tuple[Tensor, Tensor, Tensor, Tensor], current_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor]) -> None:
-        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore = (tensor.to(self.device) for tensor in sample_reference)
-        src, dst, dst_canonical, theta_restore, _same_mask = current_batch
+    def _save_sample(self, sample_reference: tuple[Tensor, Tensor, Tensor, Tensor, Tensor], current_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]) -> None:
+        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_src_identity_faces = (tensor.to(self.device) for tensor in sample_reference)
+        src, dst, dst_canonical, theta_restore, _same_mask, source_identity_faces = current_batch
         with torch.no_grad(), autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
             half = sample_src.shape[0]
             src_vis = torch.cat((sample_src, src[: self.batch_size - half]), dim=0)
@@ -1075,7 +1075,7 @@ class Trainer:
             dst_canonical_vis = torch.cat((sample_dst_canonical, dst_canonical[: self.batch_size - half]), dim=0)
             theta_restore_vis = torch.cat((sample_theta_restore, theta_restore[: self.batch_size - half]), dim=0)
 
-            source_identity_faces_vis = self.prepare_identity_encoder_faces(src_vis)
+            source_identity_faces_vis = torch.cat((sample_src_identity_faces, source_identity_faces[: self.batch_size - half]), dim=0)
             generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
             if self.hq_stage_active:
                 if self.reuse_generator_identity_for_hq_source:
@@ -1156,21 +1156,20 @@ class Trainer:
     def train(self) -> None:
 
         net_coarse = self.train_coarse
-        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, _ = self.dataset.next()
+        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, _, sample_src_identity_faces = self.dataset.next()
         half = self.batch_size // 2
-        sample_reference = tuple(tensor[:half].detach().cpu() for tensor in (sample_src, sample_dst, sample_dst_canonical, sample_theta_restore))
+        sample_reference = tuple(tensor[:half].detach().cpu() for tensor in (sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_src_identity_faces))
         with tqdm(total=None, initial=self.completed_step, mininterval=1.0, bar_format="{n_fmt:7} | 速度 {rate_fmt:3} | 训练时间 {elapsed}") as progress:
             while True:
                 if self._stop_requested:
                     raise KeyboardInterrupt
 
-                src, dst, dst_canonical, theta_restore, same_mask = self.dataset.next()
+                src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces = self.dataset.next()
                 self._step_in_progress = True
 
                 # ========================= 生成器前向 =========================
                 with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                     with torch.no_grad():
-                        source_identity_faces = self.prepare_identity_encoder_faces(src)
                         generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
 
                     if self.coarse_stage_active:
@@ -1324,7 +1323,7 @@ class Trainer:
                     self.save_ckpt()
 
                 if self.completed_step % self.sample_save_every == 0:
-                    self._save_sample(sample_reference, (src, dst, dst_canonical, theta_restore, same_mask))
+                    self._save_sample(sample_reference, (src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces))
 
 
 def _load_run_config(paths: RunPaths) -> dict[str, Any]:
