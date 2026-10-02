@@ -80,6 +80,7 @@ weight = 10.0
 
 
 [loss.coarse.l1]
+# 先按分辨率做轻微 Gaussian blur（sigma=resolution/256），再计算 L1。
 enable = true
 weight = 10.0
 
@@ -142,6 +143,7 @@ weight = 10.0
 
 
 [loss.hq.l1]
+# 先按分辨率做轻微 Gaussian blur（sigma=resolution/256），再计算 L1。
 enable = true
 weight = 10.0
 

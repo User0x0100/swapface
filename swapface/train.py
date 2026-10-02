@@ -23,7 +23,7 @@ from losses import (
     HRFFAFacialGeometryLoss,
     IdentityLoss,
     VGGPerceptualLoss,
-    make_l1_loss,
+    make_blurred_l1_loss,
     r1_reg_loss,
 )
 from misc.face_alignment import ffhq_to_arcface_112, make_ffhq_to_arcface_112_grid, transform_sampling_grid
@@ -54,7 +54,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 16
+TRAINING_SEMANTICS_VERSION = 17
 
 COARSE_GENERATOR_CONFIG_KEYS = (
     "img_channels",
@@ -566,9 +566,9 @@ class Trainer:
         self.coarse_identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.coarse_resolution, self.batch_size, self.device)
 
         if self.enable_coarse_l1_loss:
-            self.coarse_l1_loss = make_l1_loss(weight=float(coarse_l1_config["weight"]), reduction="none")
+            self.coarse_l1_loss = make_blurred_l1_loss(weight=float(coarse_l1_config["weight"]), resolution=self.coarse_resolution, reduction="none")
         if self.enable_hq_l1_loss:
-            self.hq_l1_loss = make_l1_loss(weight=float(hq_l1_config["weight"]), reduction="none")
+            self.hq_l1_loss = make_blurred_l1_loss(weight=float(hq_l1_config["weight"]), resolution=self.img_resolution, reduction="none")
 
         if self.enable_hq_gaze_loss:
             self.hq_gaze_loss = GazeLoss(
@@ -1429,7 +1429,8 @@ def _load_branch_checkpoint(
     if filename_step != checkpoint_step:
         raise ValueError(f"checkpoint 文件名 step 与内部状态不一致：filename={filename_step}, checkpoint={checkpoint_step}")
 
-    _require_training_config(checkpoint)
+    # Branch 创建新的训练 run，只要求 checkpoint 的模型/状态结构可被当前配置安全载入。
+    # training_config/semantics_version 只用于严格 resume，不限制 branch。
     branch_mode = _branch_generator_mode(checkpoint, resolved)
     hq_rebuild = branch_mode == "hq_rebuild"
     effective_reset_hq_discriminator = reset_hq_discriminator or hq_rebuild

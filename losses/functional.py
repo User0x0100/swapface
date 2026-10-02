@@ -1,3 +1,4 @@
+import math
 from collections.abc import Callable
 from typing import Literal
 
@@ -122,6 +123,68 @@ def make_l1_loss(weight: float = 1.0, reduction: Reduction = "mean") -> LossFn:
         接受 ``(prediction, target)`` 并返回张量的损失函数。
     """
     return _make_weighted_loss(F.l1_loss, weight, reduction)
+
+
+def _gaussian_blur_parameters(resolution: int) -> tuple[float, int]:
+    """按图像分辨率计算轻微 Gaussian blur：sigma 恒为边长的 1/256。"""
+    if resolution <= 0:
+        raise ValueError(f"resolution must be > 0, got {resolution}")
+    sigma = resolution / 256.0
+    radius = max(1, math.ceil(3.0 * sigma))
+    return sigma, radius * 2 + 1
+
+
+def _make_gaussian_kernel(sigma: float, kernel_size: int) -> Tensor:
+    """构造归一化的一维 FP32 Gaussian kernel。"""
+    radius = kernel_size // 2
+    coordinates = torch.arange(-radius, radius + 1, dtype=torch.float32)
+    kernel = torch.exp(coordinates.square().mul_(-0.5 / (sigma * sigma)))
+    return kernel.div_(kernel.sum())
+
+
+def _gaussian_blur(image: Tensor, kernel: Tensor) -> Tensor:
+    """使用预计算的一维 kernel 做 separable depthwise Gaussian blur。"""
+    kernel_size = kernel.numel()
+    radius = kernel_size // 2
+    channels = image.shape[-3]
+
+    horizontal = kernel.view(1, 1, 1, kernel_size).expand(channels, 1, 1, kernel_size)
+    vertical = kernel.view(1, 1, kernel_size, 1).expand(channels, 1, kernel_size, 1)
+    blurred = F.pad(image, (radius, radius, 0, 0), mode="reflect")
+    blurred = F.conv2d(blurred, horizontal, groups=channels)
+    blurred = F.pad(blurred, (0, 0, radius, radius), mode="reflect")
+    return F.conv2d(blurred, vertical, groups=channels)
+
+
+def make_blurred_l1_loss(weight: float, resolution: int, reduction: Reduction = "mean") -> LossFn:
+    """创建先做轻微 Gaussian blur、再计算 L1 的重建损失。
+
+    ``sigma = resolution / 256``，因此 128/256/512 分辨率分别使用
+    0.5/1.0/2.0 px sigma。kernel 覆盖约 ``±3 sigma``。
+
+    对 prediction/target 使用同一个线性 Gaussian filter 后再相减，等价于
+    先相减再滤波。这里采用后一种写法，将卷积开销减半。
+    """
+    sigma, kernel_size = _gaussian_blur_parameters(resolution)
+    kernel_cpu = _make_gaussian_kernel(sigma, kernel_size)
+    cached_kernel = kernel_cpu
+
+    def loss(prediction: Tensor, target: Tensor) -> Tensor:
+        nonlocal cached_kernel
+        if prediction.shape != target.shape:
+            raise ValueError(f"blurred L1 input shape mismatch: {tuple(prediction.shape)} != {tuple(target.shape)}")
+        if prediction.shape[-2:] != (resolution, resolution):
+            raise ValueError(f"blurred L1 expected {resolution}x{resolution}, got {tuple(prediction.shape[-2:])}")
+        if cached_kernel.device != prediction.device:
+            cached_kernel = kernel_cpu.to(device=prediction.device)
+
+        # 当前 ROCm/CUDA 测试中 3-channel depthwise Gaussian conv 的 FP32 路径比 autocast BF16/FP16 更快，
+        # 同时避免低精度 kernel/卷积给重建误差额外引入量化噪声。
+        with autocast(device_type=prediction.device.type, enabled=False):
+            difference = _gaussian_blur(prediction.float() - target.float(), cached_kernel).abs_()
+            return weight * _reduce_loss(difference, reduction)
+
+    return loss
 
 
 def make_mse_loss(weight: float = 1.0, reduction: Reduction = "mean") -> LossFn:

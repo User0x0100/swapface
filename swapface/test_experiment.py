@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import torch
 
-from losses import DiscriminatorAdversarialLoss
+from losses import DiscriminatorAdversarialLoss, make_blurred_l1_loss
 from models.discriminator import Discriminator
 from models.networks import Generator
 from swapface.config import DEFAULT_GENERATOR_CONFIG, DEFAULT_LOSS_CONFIG, load_train_config, resolve_train_config
@@ -433,6 +433,28 @@ def _check_reconstruction_scope() -> None:
     torch.testing.assert_close(all_pairs, torch.tensor(16.0 / 3.0))
     torch.testing.assert_close(no_same, torch.tensor(0.0))
     print("PASS: reconstruction loss scope same/all")
+
+
+def _check_blurred_l1_loss() -> None:
+    ratios = []
+    for resolution in (128, 256, 512):
+        y, x = torch.meshgrid(torch.arange(resolution), torch.arange(resolution), indexing="ij")
+        checkerboard = ((x + y) % 2).float().mul_(2.0).sub_(1.0)
+        prediction = checkerboard.expand(1, 3, -1, -1).clone().requires_grad_(True)
+        target = torch.zeros_like(prediction)
+        loss = make_blurred_l1_loss(weight=1.0, resolution=resolution)(prediction, target)
+        ratios.append(float(loss.detach()))
+        assert loss < prediction.abs().mean()
+        loss.backward()
+        assert prediction.grad is not None and torch.isfinite(prediction.grad).all()
+
+    assert ratios[0] > ratios[1] > ratios[2]
+
+    constant = torch.full((2, 3, 256, 256), 0.25)
+    zero = torch.zeros_like(constant)
+    constant_loss = make_blurred_l1_loss(weight=2.0, resolution=256)(constant, zero)
+    torch.testing.assert_close(constant_loss, torch.tensor(0.5), atol=1e-6, rtol=0)
+    print(f"PASS: blurred L1 scales with resolution (128/256/512={ratios})")
 
 
 def _check_step_boundary() -> None:
@@ -1053,6 +1075,7 @@ def _check_sample_gradient_maps() -> None:
 
 def main() -> None:
     _check_reconstruction_scope()
+    _check_blurred_l1_loss()
     _check_global_discriminator()
     _check_r1_discriminator_path()
     _check_generator_responsibility_boundary()
@@ -1264,22 +1287,32 @@ def main() -> None:
         else:
             raise AssertionError("含未知字段的 training_config 被错误接受")
 
+        # Branch 是新训练 run：旧 semantics_version 或缺少 training_config 都不应阻止加载。
         old_semantics = copy.deepcopy(loaded)
         old_semantics["step"] = 7502
         old_semantics["training_config"]["semantics_version"] = TRAINING_SEMANTICS_VERSION - 1
         old_semantics_path = root / "step_000007502.pth"
         torch.save(old_semantics, old_semantics_path)
-        try:
-            _load_branch_checkpoint(
-                old_semantics_path,
-                resolved,
-                reset_hq_discriminator=True,
-                reset_coarse_discriminator=True,
-            )
-        except ValueError as error:
-            assert "训练语义版本不匹配" in str(error)
-        else:
-            raise AssertionError("branch 错误接受了旧训练语义 checkpoint")
+        old_loaded, _ = _load_branch_checkpoint(
+            old_semantics_path,
+            resolved,
+            reset_hq_discriminator=True,
+            reset_coarse_discriminator=True,
+        )
+        assert old_loaded["training_config"]["semantics_version"] == TRAINING_SEMANTICS_VERSION - 1
+
+        no_training_config = copy.deepcopy(loaded)
+        no_training_config["step"] = 7503
+        no_training_config.pop("training_config")
+        no_training_config_path = root / "step_000007503.pth"
+        torch.save(no_training_config, no_training_config_path)
+        no_config_loaded, _ = _load_branch_checkpoint(
+            no_training_config_path,
+            resolved,
+            reset_hq_discriminator=True,
+            reset_coarse_discriminator=True,
+        )
+        assert "training_config" not in no_config_loaded
 
         parent = dict(standalone_parent)
         branch = create_run(runs_root, source_config, resolved, name="branch", parent=parent)

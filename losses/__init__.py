@@ -4,6 +4,7 @@ from .facs import FACSConsistencyLoss
 from .functional import (
     make_bce_loss,
     make_bce_with_logits_loss,
+    make_blurred_l1_loss,
     make_charbonnier_loss,
     make_l1_loss,
     make_mse_loss,
@@ -36,6 +37,7 @@ __all__ = [
     "get_vgg_layer_names",
     "make_bce_loss",
     "make_bce_with_logits_loss",
+    "make_blurred_l1_loss",
     "make_charbonnier_loss",
     "make_l1_loss",
     "make_mse_loss",
