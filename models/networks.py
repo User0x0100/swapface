@@ -88,31 +88,6 @@ class DownSample(nn.Sequential):
         )
 
 
-class DenseBottleneck(nn.Module):
-    def __init__(self, channels: int, spatial_resolution: int, bottleneck_dim: int) -> None:
-        super().__init__()
-
-        if spatial_resolution <= 0:
-            raise ValueError(f"spatial_resolution must be greater than 0, got {spatial_resolution}")
-
-        self.channels = channels
-        self.spatial_resolution = spatial_resolution
-
-        feature_dim = channels * spatial_resolution * spatial_resolution
-        self.compress = nn.Linear(feature_dim, bottleneck_dim)
-        self.expand = nn.Linear(bottleneck_dim, feature_dim)
-
-    def forward(self, x: Tensor) -> Tensor:
-        expected = (self.channels, self.spatial_resolution, self.spatial_resolution)
-        if x.ndim != 4 or x.shape[1:] != expected:
-            raise ValueError(f"x must be [B,{self.channels},{self.spatial_resolution},{self.spatial_resolution}], got {tuple(x.shape)}")
-
-        x = x.flatten(1)
-        x = self.compress(x)
-        x = self.expand(x)
-        return x.reshape(x.shape[0], self.channels, self.spatial_resolution, self.spatial_resolution)
-
-
 class WSpaceMap(nn.Module):
     def __init__(self, id_dim: int, num: int, num_share_layers: int = 4, num_w_p_layers: int = 2) -> None:
         super().__init__()
@@ -176,7 +151,6 @@ class Coarse(nn.Module):
         img_resolution: int = 512,
         img_channels: int = 3,
         latent_resolution: int = 32,
-        bottleneck_dim: int = 256,
         num_latent: int = 6,
         base_ch: int = 64,
         max_ch: int = 512,
@@ -185,8 +159,8 @@ class Coarse(nn.Module):
         super().__init__()
 
         assert max_ch >= base_ch, f"max_ch={max_ch} must be >= base_ch={base_ch}"
-        if latent_resolution < 2 or latent_resolution % 2 != 0:
-            raise ValueError(f"latent_resolution must be an even integer >= 2, got {latent_resolution}")
+        if latent_resolution <= 0:
+            raise ValueError(f"latent_resolution must be greater than 0, got {latent_resolution}")
 
         if latent_resolution > img_resolution:
             raise ValueError(f"latent_resolution={latent_resolution} must be <= img_resolution={img_resolution}")
@@ -207,7 +181,6 @@ class Coarse(nn.Module):
 
         self.from_rgb = FromRGB(img_channels, base_ch)
         self.encoder = nn.Sequential(*[DownSample(features[i], features[i + 1]) for i in range(num_depth)])
-        self.bottleneck = DenseBottleneck(features[-1], latent_resolution, bottleneck_dim)
         self.latent_space = LatentBlock(features[-1], id_dim, num_latent)
         self.decoder = nn.Sequential(*[UpSample(features[-(i + 1)], features[-(i + 2)]) for i in range(num_depth)])
         self.to_rgb = ToRGB(base_ch, img_channels)
@@ -219,8 +192,7 @@ class Coarse(nn.Module):
 
         feat = self.from_rgb(resize_in)
         encoder_feat = self.encoder(feat)
-        bottleneck_feat = self.bottleneck(encoder_feat)
-        latent_feat = self.latent_space(bottleneck_feat, w_space)
+        latent_feat = self.latent_space(encoder_feat, w_space)
         decoder_feat = self.decoder(latent_feat)
         output = self.to_rgb(decoder_feat)
 
@@ -335,7 +307,6 @@ class Generator(nn.Module):
         id_dim: int = 512,
         coarse_resolution: int = 128,
         coarse_latent_resolution: int = 32,
-        coarse_bottleneck_dim: int = 256,
         coarse_num_latent: int = 8,
         coarse_base_ch: int = 64,
         coarse_max_ch: int = 512,
@@ -351,7 +322,6 @@ class Generator(nn.Module):
             "id_dim": id_dim,
             "coarse_resolution": coarse_resolution,
             "coarse_latent_resolution": coarse_latent_resolution,
-            "coarse_bottleneck_dim": coarse_bottleneck_dim,
             "coarse_num_latent": coarse_num_latent,
             "coarse_base_ch": coarse_base_ch,
             "coarse_max_ch": coarse_max_ch,
@@ -368,7 +338,6 @@ class Generator(nn.Module):
             img_resolution=coarse_resolution,
             img_channels=img_channels,
             latent_resolution=coarse_latent_resolution,
-            bottleneck_dim=coarse_bottleneck_dim,
             num_latent=coarse_num_latent,
             base_ch=coarse_base_ch,
             max_ch=coarse_max_ch,
@@ -408,11 +377,10 @@ if __name__ == "__main__":
         "img_channels": 3,
         "id_dim": 512,
         "coarse_resolution": 128,
-        "coarse_latent_resolution": 16,
-        "coarse_bottleneck_dim": 256,
-        "coarse_num_latent": 16,
-        "coarse_base_ch": 32,
-        "coarse_max_ch": 1024,
+        "coarse_latent_resolution": 32,
+        "coarse_num_latent": 8,
+        "coarse_base_ch": 64,
+        "coarse_max_ch": 512,
         "hq_bottleneck_resolution": 16,
         "hq_base_ch": 8,
         "hq_max_ch": 128,
