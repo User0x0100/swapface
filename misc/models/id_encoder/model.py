@@ -106,18 +106,18 @@ class IDEncoder(nn.Module):
             x: 输入图像张量 [B, C, H, W]，值域 [-1, 1]，RGB
 
         Returns:
-            归一化的 FP32 特征向量 [B, 512]
+            归一化的身份特征向量 [B, 512]；计算精度跟随调用方 autocast 上下文。
         """
 
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            x = x.float()
-            if x.shape[2:] != ID_ENCODER_INPUT_SIZE:
-                x = F.interpolate(x, ID_ENCODER_INPUT_SIZE, mode="bilinear", align_corners=False)
-            if self.input_mean is not None and self.input_std is not None:
-                x = (x + 1.0) * 0.5
-                x = (x - self.input_mean) / self.input_std
-            features = self.backbone(x)
-            return F.normalize(features, p=2, dim=1)
+        if x.shape[2:] != ID_ENCODER_INPUT_SIZE:
+            x = F.interpolate(x, ID_ENCODER_INPUT_SIZE, mode="bilinear", align_corners=False)
+        input_mean = self.input_mean
+        input_std = self.input_std
+        if isinstance(input_mean, Tensor) and isinstance(input_std, Tensor):
+            x = (x + 1.0) * 0.5
+            x = (x - input_mean) / input_std
+        features = self.backbone(x)
+        return F.normalize(features, p=2, dim=1)
 
 
 if __name__ == "__main__":
