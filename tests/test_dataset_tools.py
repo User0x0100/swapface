@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
+import os
+import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,93 +19,318 @@ from tools import postprocess_dataset as postprocess
 
 
 class DownloaderTests(unittest.TestCase):
-    def test_endpoint_selection(self) -> None:
-        self.assertIsNone(downloader.selected_endpoint(None))
-        self.assertEqual(
-            downloader.selected_endpoint("direct"),
-            "https://huggingface.co",
-        )
-        self.assertEqual(
-            downloader.selected_endpoint("mirror"),
-            "https://hf-mirror.com",
-        )
-
-    def test_download_uses_huggingface_hub_and_creates_symlink(self) -> None:
-        artifact = downloader.Artifact(
-            name="TEST",
-            repo_id="owner/repo",
-            revision="deadbeef",
-            filename="nested/data.bin",
-            output=Path("test/data.bin"),
-        )
-
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            cache_file = root / "cache/data.bin"
-            cache_file.parent.mkdir(parents=True)
-            cache_file.write_bytes(b"data")
-
-            def fake_hf_hub_download(**kwargs: object) -> str:
-                self.assertEqual(kwargs["repo_id"], "owner/repo")
-                self.assertEqual(kwargs["filename"], "nested/data.bin")
-                self.assertEqual(kwargs["repo_type"], "dataset")
-                self.assertEqual(kwargs["revision"], "deadbeef")
-                self.assertEqual(kwargs["endpoint"], "https://hf-mirror.com")
-                self.assertFalse(kwargs["force_download"])
-                self.assertNotIn("local_dir", kwargs)
-                return str(cache_file)
-
-            with patch(
-                "tools.download_datasets.hf_hub_download",
-                side_effect=fake_hf_hub_download,
-            ):
-                result = downloader.download_artifact(
-                    artifact=artifact,
-                    root=root,
-                    endpoint="https://hf-mirror.com",
-                    force_download=False,
-                )
-
-            self.assertEqual(result, root / "test/data.bin")
-            self.assertTrue(result.is_symlink())
-            self.assertEqual(result.resolve(), cache_file.resolve())
-            self.assertEqual(result.read_bytes(), b"data")
-
-    def test_existing_symlink_is_refreshed_after_hub_download(self) -> None:
-        artifact = downloader.Artifact(
+    @staticmethod
+    def artifact(payload: bytes = b"data") -> downloader.Artifact:
+        return downloader.Artifact(
             name="TEST",
             repo_id="owner/repo",
             revision="deadbeef",
             filename="data.bin",
             output=Path("test/data.bin"),
+            size=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
         )
+
+    def test_endpoint_selection(self) -> None:
+        self.assertEqual(downloader.selected_endpoint("direct"), "https://huggingface.co")
+        self.assertEqual(downloader.selected_endpoint("mirror"), "https://hf-mirror.com")
+        with patch.dict(os.environ, {"HF_ENDPOINT": "https://example.invalid/"}, clear=False):
+            self.assertEqual(downloader.selected_endpoint(None), "https://example.invalid")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(downloader.selected_endpoint(None), "https://hf-mirror.com")
+
+    def test_artifact_url_is_pinned_to_revision(self) -> None:
+        artifact = downloader.Artifact(
+            name="TEST",
+            repo_id="owner/repo",
+            revision="deadbeef",
+            filename="nested/data file.bin",
+            output=Path("test/data.bin"),
+            size=10,
+            sha256="0" * 64,
+        )
+        self.assertEqual(
+            downloader.artifact_url(artifact, "https://hf-mirror.com"),
+            "https://hf-mirror.com/datasets/owner/repo/resolve/deadbeef/nested/data%20file.bin",
+        )
+
+    def test_download_lock_rejects_second_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            destination = Path(td) / "data.bin"
+            with downloader.download_lock(destination):
+                with self.assertRaisesRegex(RuntimeError, "already being downloaded"):
+                    with downloader.download_lock(destination):
+                        self.fail("second lock unexpectedly acquired")
+
+    def test_parse_final_headers_uses_last_redirect_response(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            headers = Path(td) / "headers"
+            headers.write_bytes(
+                b"HTTP/1.1 200 Connection established\r\n\r\n"
+                b"HTTP/2 302\r\nlocation: https://example.invalid/blob\r\n\r\n"
+                b"HTTP/2 206\r\ncontent-range: bytes 4-7/10\r\ncontent-length: 4\r\n\r\n"
+            )
+            status, parsed = downloader._parse_final_headers(headers)
+            self.assertEqual(status, 206)
+            self.assertEqual(parsed["content-range"], "bytes 4-7/10")
+
+    def test_curl_inherits_download_lock_fd(self) -> None:
+        class FakeProcess:
+            returncode = 0
+
+            def communicate(self) -> tuple[None, bytes]:
+                return None, b""
+
+            def poll(self) -> int:
+                return 0
+
+        with tempfile.TemporaryDirectory() as td:
+            part = Path(td) / "00000.part"
+            process = FakeProcess()
+            with patch("tools.download_datasets.subprocess.Popen", return_value=process) as popen:
+                downloader._curl_range(
+                    "https://example.invalid/data",
+                    0,
+                    3,
+                    part,
+                    threading.Event(),
+                    set(),
+                    threading.Lock(),
+                    123,
+                )
+
+            self.assertEqual(popen.call_args.kwargs["pass_fds"], (123,))
+
+    def test_invalid_range_response_is_rolled_back_and_retried(self) -> None:
+        payload = b"abcd"
+        with tempfile.TemporaryDirectory() as td:
+            part = Path(td) / "00000.part"
+            calls = 0
+
+            def fake_curl_range(
+                url: str,
+                start: int,
+                end: int,
+                part_path: Path,
+                stop_event: threading.Event,
+                active_processes: set[subprocess.Popen[bytes]],
+                active_lock: threading.Lock,
+                lock_fd: int,
+            ) -> tuple[int, bytes, int | None, str | None]:
+                del url, stop_event, active_processes, active_lock, lock_fd
+                nonlocal calls
+                calls += 1
+                with part_path.open("ab") as output:
+                    output.write(payload[start : end + 1])
+                if calls == 1:
+                    return 0, b"", 200, None
+                return 0, b"", 206, f"bytes {start}-{end}/{len(payload)}"
+
+            with patch("tools.download_datasets._curl_range", side_effect=fake_curl_range):
+                downloader._download_chunk(
+                    url="https://example.invalid/data",
+                    total_size=len(payload),
+                    part_path=part,
+                    start=0,
+                    end=3,
+                    retries=2,
+                    stop_event=threading.Event(),
+                    active_processes=set(),
+                    active_lock=threading.Lock(),
+                    lock_fd=0,
+                )
+
+            self.assertEqual(calls, 2)
+            self.assertEqual(part.read_bytes(), payload)
+
+    def test_interrupted_invalid_range_does_not_keep_unverified_bytes(self) -> None:
+        payload = b"abcd"
+        stop_event = threading.Event()
+        with tempfile.TemporaryDirectory() as td:
+            part = Path(td) / "00000.part"
+
+            def fake_curl_range(
+                url: str,
+                start: int,
+                end: int,
+                part_path: Path,
+                stop: threading.Event,
+                active_processes: set[subprocess.Popen[bytes]],
+                active_lock: threading.Lock,
+                lock_fd: int,
+            ) -> tuple[int, bytes, int | None, str | None]:
+                del url, active_processes, active_lock, lock_fd
+                with part_path.open("ab") as output:
+                    output.write(payload[start : end + 1])
+                stop.set()
+                return 0, b"", 200, None
+
+            with patch("tools.download_datasets._curl_range", side_effect=fake_curl_range):
+                downloader._download_chunk(
+                    url="https://example.invalid/data",
+                    total_size=len(payload),
+                    part_path=part,
+                    start=0,
+                    end=3,
+                    retries=0,
+                    stop_event=stop_event,
+                    active_processes=set(),
+                    active_lock=threading.Lock(),
+                    lock_fd=0,
+                )
+
+            self.assertEqual(part.read_bytes(), b"")
+
+    def test_unverified_tail_is_truncated_before_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            part = Path(td) / "00000.part"
+            part.write_bytes(b"abcdef")
+            downloader._write_verified_size(part, 3)
+            part.write_bytes(b"abcdefXYZ")
+
+            verified = downloader._normalize_part(part, 16)
+
+            self.assertEqual(verified, 3)
+            self.assertEqual(part.read_bytes(), b"abc")
+
+    def test_full_sized_unverified_chunk_is_not_trusted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            part = Path(td) / "00000.part"
+            part.write_bytes(b"abcd")
+
+            verified = downloader._normalize_part(part, 4)
+
+            self.assertEqual(verified, 0)
+            self.assertEqual(part.read_bytes(), b"")
+
+    def test_assemble_hashes_while_copying(self) -> None:
+        payload = b"abcdefgh"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            destination = root / "data.bin"
+            part_dir = root / "data.bin.parts"
+            part_dir.mkdir()
+            for index, data in enumerate((payload[:4], payload[4:])):
+                part = part_dir / f"{index:05d}.part"
+                part.write_bytes(data)
+                downloader._write_verified_size(part, len(data))
+
+            with patch("tools.download_datasets._sha256", side_effect=AssertionError("second pass SHA should not run")):
+                downloader._assemble(
+                    destination,
+                    part_dir,
+                    [(0, 0, 3), (1, 4, 7)],
+                    len(payload),
+                    hashlib.sha256(payload).hexdigest(),
+                )
+
+            self.assertEqual(destination.read_bytes(), payload)
+
+    def test_download_resumes_persistent_parts_and_assembles_file(self) -> None:
+        payload = b"abcdefghij"
+        artifact = self.artifact(payload)
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            old_cache = root / "cache/old.bin"
-            new_cache = root / "cache/new.bin"
-            old_cache.parent.mkdir(parents=True)
-            old_cache.write_bytes(b"old")
-            new_cache.write_bytes(b"new")
             destination = root / artifact.output
-            destination.parent.mkdir(parents=True)
-            destination.symlink_to(old_cache)
+            part_dir = destination.with_name(destination.name + ".parts")
+            url = downloader.artifact_url(artifact, "https://hf-mirror.com")
+            downloader._write_manifest(
+                part_dir,
+                url=url,
+                size=len(payload),
+                sha256=artifact.sha256,
+                chunk_size=4,
+                force=False,
+            )
+            part0 = part_dir / "00000.part"
+            part1 = part_dir / "00001.part"
+            part0.write_bytes(payload[:4])
+            part1.write_bytes(payload[4:6])
+            downloader._write_verified_size(part0, 4)
+            downloader._write_verified_size(part1, 2)
+            calls: list[tuple[int, int]] = []
 
-            with patch(
-                "tools.download_datasets.hf_hub_download",
-                return_value=str(new_cache),
-            ) as download:
+            def fake_curl_range(
+                url_arg: str,
+                start: int,
+                end: int,
+                part_path: Path,
+                stop_event: threading.Event,
+                active_processes: set[subprocess.Popen[bytes]],
+                active_lock: threading.Lock,
+                lock_fd: int,
+            ) -> tuple[int, bytes, int | None, str | None]:
+                del stop_event, active_processes, active_lock, lock_fd
+                self.assertEqual(url_arg, url)
+                calls.append((start, end))
+                with part_path.open("ab") as output:
+                    output.write(payload[start : end + 1])
+                return 0, b"", 206, f"bytes {start}-{end}/{len(payload)}"
+
+            with patch("tools.download_datasets._curl_range", side_effect=fake_curl_range):
                 result = downloader.download_artifact(
-                    artifact=artifact,
-                    root=root,
-                    endpoint=None,
+                    artifact,
+                    root,
+                    "https://hf-mirror.com",
+                    workers=2,
+                    chunk_size=4,
+                    retries=1,
                     force_download=False,
                 )
 
-            download.assert_called_once()
-            self.assertTrue(result.is_symlink())
-            self.assertEqual(result.resolve(), new_cache.resolve())
-            self.assertEqual(result.read_bytes(), b"new")
+            self.assertEqual(result, destination)
+            self.assertEqual(result.read_bytes(), payload)
+            self.assertFalse(part_dir.exists())
+            self.assertNotIn((0, 3), calls)
+            self.assertIn((6, 7), calls)
+            self.assertIn((8, 9), calls)
+
+    def test_complete_destination_requires_matching_sha256(self) -> None:
+        artifact = self.artifact(b"data")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            destination = root / artifact.output
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"DATA")
+            with self.assertRaisesRegex(RuntimeError, "failed integrity check"):
+                downloader.download_artifact(
+                    artifact,
+                    root,
+                    "https://hf-mirror.com",
+                    workers=2,
+                    chunk_size=2,
+                    retries=1,
+                    force_download=False,
+                )
+
+    def test_complete_destination_is_reused_without_network(self) -> None:
+        artifact = self.artifact(b"data")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            destination = root / artifact.output
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"data")
+            with patch("tools.download_datasets._curl_range") as download:
+                result = downloader.download_artifact(
+                    artifact,
+                    root,
+                    "https://hf-mirror.com",
+                    workers=2,
+                    chunk_size=2,
+                    retries=1,
+                    force_download=False,
+                )
+            self.assertEqual(result, destination)
+            download.assert_not_called()
+
+    def test_terminate_processes_stops_active_child(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        active = {process}
+        lock = threading.Lock()
+        downloader._terminate_processes(active, lock)
+        process.wait(timeout=2)
+        self.assertIsNotNone(process.returncode)
 
     def test_fairface_artifacts_merge_train_and_validation_into_one_pool(self) -> None:
         artifacts = downloader.DATASETS["fairface"]
@@ -117,41 +346,10 @@ class DownloaderTests(unittest.TestCase):
                 Path("fairface/part-00002.parquet"),
             ],
         )
+        self.assertEqual([artifact.size for artifact in artifacts], [250_030_031, 250_217_804, 63_189_799])
+        self.assertTrue(all(len(artifact.sha256) == 64 for artifact in artifacts))
         self.assertEqual(sum("/train-" in artifact.filename for artifact in artifacts), 2)
         self.assertEqual(sum("/validation-" in artifact.filename for artifact in artifacts), 1)
-
-    def test_regular_destination_is_not_replaced(self) -> None:
-        artifact = downloader.Artifact(
-            name="TEST",
-            repo_id="owner/repo",
-            revision="deadbeef",
-            filename="data.bin",
-            output=Path("test/data.bin"),
-        )
-
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            cache_file = root / "cache/data.bin"
-            cache_file.parent.mkdir(parents=True)
-            cache_file.write_bytes(b"new")
-            destination = root / artifact.output
-            destination.parent.mkdir(parents=True)
-            destination.write_bytes(b"old")
-
-            with patch(
-                "tools.download_datasets.hf_hub_download",
-                return_value=str(cache_file),
-            ) as download:
-                with self.assertRaisesRegex(RuntimeError, "refusing to replace non-symlink"):
-                    downloader.download_artifact(
-                        artifact=artifact,
-                        root=root,
-                        endpoint=None,
-                        force_download=False,
-                    )
-
-            download.assert_not_called()
-            self.assertEqual(destination.read_bytes(), b"old")
 
 
 class PostprocessTests(unittest.TestCase):

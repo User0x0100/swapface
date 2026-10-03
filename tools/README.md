@@ -2,7 +2,7 @@
 
 本目录包含当前训练数据准备使用的两个脚本：
 
-- `download_datasets.py`：从 Hugging Face 下载并固定到指定 revision，本地以符号链接组织到 `datasets/downloads/`。
+- `download_datasets.py`：从 Hugging Face 固定 revision 直接下载数据文件；使用并行 HTTP Range、持久分块和断点续传，默认针对大文件使用 24 路并发。
 - `postprocess_dataset.py`：将 ZIP 图片数据转换为统一 PNG，或将 FairFace 转换为按粗粒度人种分类的 ArcFace 112 source identity 数据。
 
 建议从项目根目录执行本文中的命令。
@@ -21,7 +21,7 @@ AMD ROCm：
 uv sync --group rocm
 ```
 
-FairFace 后处理依赖 `pyarrow`，已经包含在项目基础依赖中。
+FairFace 后处理依赖 `pyarrow`，已经包含在项目基础依赖中。下载脚本使用系统 `curl` 执行并行 HTTP Range；常见 Linux 训练镜像默认已包含 `curl`。
 
 ## 1. 下载数据集
 
@@ -91,7 +91,7 @@ uv run --no-sync python tools/download_datasets.py fairface \
   --root /workspace/datasets/downloads
 ```
 
-`--root` 是本地符号链接目录。实际文件仍由 Hugging Face Hub cache 管理，因此不会额外复制一份大文件。
+`--root` 是实际文件输出目录。下载过程中会在目标文件旁创建 `<filename>.parts/` 持久分块目录；每个 `.part` 另有 `.verified` sidecar 记录已经通过 `206 + Content-Range` 校验的前缀字节数。程序退出、Ctrl+C 或网络中断后重新执行相同命令，只复用这些已验证字节；SIGKILL 后孤儿 `curl` 额外写入但未经 Python 确认的尾部会在下次启动时先截掉。完整文件组装时同步计算 SHA-256，不额外再读一遍大文件；固定大小和 SHA-256 都通过后才原子替换为最终文件并删除分块目录。同一个目标文件同时只允许一个下载进程，重复启动会立即报错；活跃的 `curl` 会继承同一文件锁，因此即使 Python 父进程被 SIGTERM/SIGKILL，旧 `curl` 退出前新进程也不能写入同一分块。
 
 ### 指定 Hugging Face 源
 
@@ -109,7 +109,7 @@ uv run --no-sync python tools/download_datasets.py fairface \
   --source mirror
 ```
 
-不传 `--source` 时，脚本遵循当前 `HF_ENDPOINT`，否则使用 Hugging Face 官方默认值。
+不传 `--source` 时，若设置了 `HF_ENDPOINT` 则使用该地址，否则默认使用 `hf-mirror.com`。可显式传 `--source direct` 使用 Hugging Face 官方源。HTTP/HTTPS 代理继续遵循 `curl` 的标准环境变量。
 
 ### 强制重新下载
 
@@ -117,7 +117,7 @@ uv run --no-sync python tools/download_datasets.py fairface \
 uv run --no-sync python tools/download_datasets.py fairface --force
 ```
 
-`--force` 会将 `force_download=True` 传给 Hugging Face Hub。
+`--force` 会删除对应最终文件和该文件已有的 `.parts` 断点状态，然后从头下载。
 
 ### 只查看将要下载的文件
 
@@ -125,7 +125,7 @@ uv run --no-sync python tools/download_datasets.py fairface --force
 uv run --no-sync python tools/download_datasets.py fairface --list
 ```
 
-会打印 artifact 名、仓库、固定 revision、远端文件和本地映射路径，不执行下载。
+会打印 artifact 名、仓库、固定 revision、远端文件、本地路径、固定大小和 SHA-256，不执行下载。
 
 ## 2. ZIP 图片数据后处理
 
@@ -416,11 +416,14 @@ alignment = "arcface"
 
 ```text
 dataset                 lpff / ffhq / fairface / all
---root PATH             本地数据入口目录，默认 datasets/downloads
---source direct         Hugging Face 官方源
---source mirror         hf-mirror.com
---force                 强制重新下载
---list                  只列出 artifact，不下载
+--root PATH               实际输出目录，默认 datasets/downloads
+--source direct           Hugging Face 官方源
+--source mirror           hf-mirror.com
+--workers N               单文件并行 Range 数，默认 24
+--chunk-size-mib N        持久分块大小，默认 128 MiB
+--retries N               每个 Range 的失败重试次数；0 为持续重试
+--force                   丢弃最终文件/断点状态后重新下载
+--list                    只列出 artifact，不下载
 ```
 
 ### `postprocess_dataset.py`
