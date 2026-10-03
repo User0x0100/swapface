@@ -1325,6 +1325,7 @@ def main() -> None:
             "id_dim": 8,
             "coarse_resolution": 8,
             "coarse_latent_resolution": 4,
+            "coarse_bottleneck_dim": 8,
             "coarse_num_latent": 1,
             "coarse_base_ch": 2,
             "coarse_max_ch": 8,

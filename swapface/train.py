@@ -54,13 +54,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 18
+TRAINING_SEMANTICS_VERSION = 19
 
 COARSE_GENERATOR_CONFIG_KEYS = (
     "img_channels",
     "id_dim",
     "coarse_resolution",
     "coarse_latent_resolution",
+    "coarse_bottleneck_dim",
     "coarse_num_latent",
     "coarse_base_ch",
     "coarse_max_ch",

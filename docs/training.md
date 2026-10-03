@@ -271,6 +271,7 @@ stage = "hq"
 img_resolution = 512
 coarse_resolution = 128
 coarse_latent_resolution = 32
+coarse_bottleneck_dim = 256
 coarse_num_latent = 8
 coarse_base_ch = 64
 coarse_max_ch = 512
