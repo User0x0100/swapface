@@ -53,6 +53,8 @@ class IDEncoderProvider(Enum):
     BLENDFACE = IDEncoderProviderConfig(iresnet100, "blendface.pth")
     MS1MV3_ARCFACE_R50_FP16 = IDEncoderProviderConfig(iresnet50, "ms1mv3_arcface_r50_fp16.pth")
     MS1MV3_ARCFACE_R100_FP16 = IDEncoderProviderConfig(iresnet100, "ms1mv3_arcface_r100_fp16.pth")
+    GLINT360K_COSFACE_R50_FP16 = IDEncoderProviderConfig(iresnet50, "glint360k_r50_fp16.pth")
+    GLINT360K_COSFACE_R100_FP16_0_1 = IDEncoderProviderConfig(iresnet100, "glint360k_cosface_r100_fp16_0.1.pth")
     MS1MV2_TRANSFACE_S = IDEncoderProviderConfig(vit_s, "ms1mv2_model_TransFace_S.pt")
     MS1MV2_TRANSFACE_B = IDEncoderProviderConfig(vit_b, "ms1mv2_model_TransFace_B.pt")
     MS1MV2_TRANSFACE_L = IDEncoderProviderConfig(vit_l, "ms1mv2_model_TransFace_L.pt")
@@ -74,7 +76,7 @@ class IDEncoder(nn.Module):
     使用预训练的 IResNet 模型提取面部身份特征向量。
 
     Args:
-        provider: 模型提供者，支持 ArcFace BlendFace TransFace
+        provider: 模型提供者，支持 ArcFace、CosFace、BlendFace、TransFace 等身份编码器
 
     Example:
         >>> encoder = IDEncoder(IDEncoderProvider.BLENDFACE)
