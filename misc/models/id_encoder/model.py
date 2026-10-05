@@ -12,7 +12,7 @@ from ...models import MODEL_REPOSITORY_ID
 from .adaface import IR_101
 from .iresnet import iresnet50, iresnet100
 from .qcface_iresnet import qcface_iresnet100
-from .vit import vit_b, vit_l, vit_s
+from .vit import plsc_face_vit_b, vit_b, vit_l, vit_s
 
 ID_ENCODER_INPUT_SIZE = (112, 112)
 ID_ALIGNMENT_TEMPLATE = np.array(
@@ -55,6 +55,7 @@ class IDEncoderProvider(Enum):
     MS1MV3_ARCFACE_R100_FP16 = IDEncoderProviderConfig(iresnet100, "ms1mv3_arcface_r100_fp16.pth")
     GLINT360K_COSFACE_R50_FP16 = IDEncoderProviderConfig(iresnet50, "glint360k_r50_fp16.pth")
     GLINT360K_COSFACE_R100_FP16_0_1 = IDEncoderProviderConfig(iresnet100, "glint360k_cosface_r100_fp16_0.1.pth")
+    WF42M_COSFACE_FACEVIT_B_PFC03 = IDEncoderProviderConfig(plsc_face_vit_b, "wf42m_cosface_face_vit_b_pfc03.pth")
     MS1MV2_TRANSFACE_S = IDEncoderProviderConfig(vit_s, "ms1mv2_model_TransFace_S.pt")
     MS1MV2_TRANSFACE_B = IDEncoderProviderConfig(vit_b, "ms1mv2_model_TransFace_B.pt")
     MS1MV2_TRANSFACE_L = IDEncoderProviderConfig(vit_l, "ms1mv2_model_TransFace_L.pt")
@@ -67,7 +68,6 @@ class IDEncoderProvider(Enum):
         input_std=(0.2873, 0.2555, 0.2496),
     )
     GLINT360K_TOPOFR_R100 = IDEncoderProviderConfig(iresnet100, "glint360k_r100_topofr.pth")
-
 
 
 class IDEncoder(nn.Module):

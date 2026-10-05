@@ -484,3 +484,51 @@ datasets/fairface-arcface112/.failed.txt
 ```
 
 其中记录 RetinaFace 没检测到人脸的样本。实际最终数量等于 97,698 减去失败样本数。
+
+## 4. PLSC WebFace42M FaceViT-B -> PyTorch
+
+`convert_plsc_face_vit.py` converts the official PLSC
+`FaceViT_base_patch9_112_WebFace42M_CosFace_pfc03_droppath005_mask005`
+checkpoint into the PyTorch `state_dict` format used by `IDEncoder`.
+
+Official source checkpoint:
+
+```text
+https://plsc.bj.bcebos.com/models/face/v2.4/FaceViT_base_patch9_112_WebFace42M_CosFace_pfc03_droppath005_mask005_1n8c_dp_mp_fp16o1.pdparams
+SHA256: 2bb7c1a8f1aaf060eb23361aa5d8f16010dec45adc870d017070a2965f71d77b
+```
+
+The converter verifies this SHA-256 **before** calling `pickle.load`; any other
+file is rejected. This both pins the model provenance and prevents unpickling
+an arbitrary checkpoint.
+
+Run from the repository root:
+
+```bash
+uv run --no-sync python -m tools.convert_plsc_face_vit \
+  FaceViT_base_patch9_112_WebFace42M_CosFace_pfc03_droppath005_mask005_1n8c_dp_mp_fp16o1.pdparams \
+  wf42m_cosface_face_vit_b_pfc03.pth
+```
+
+Conversion rules:
+
+- Paddle `Linear.weight [in, out]` -> PyTorch `[out, in]` by transpose.
+- Convolution and LayerNorm tensors keep their layout.
+- BatchNorm `_mean` / `_variance` -> `running_mean` / `running_var`.
+- PyTorch `num_batches_tracked` buffers are initialized to zero.
+- The resulting state dict is loaded with `strict=True` before it is saved.
+
+The script prints the generated file's SHA-256 for the current serialization.
+Do not treat that output hash as a cross-version canonical identifier:
+`torch.save` container bytes may differ across PyTorch versions even when all
+tensor values are identical. The canonical provenance check is the source
+PLSC checkpoint SHA-256 above.
+
+The converted model is exposed as:
+
+```text
+IDEncoderProvider.WF42M_COSFACE_FACEVIT_B_PFC03
+```
+
+Its inference graph follows the PLSC FaceViT-B architecture and intentionally
+does not use TransFace's patch-SE weighting module.

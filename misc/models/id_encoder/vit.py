@@ -52,6 +52,23 @@ def vit_b():
     )
 
 
+def plsc_face_vit_b():
+    """PLSC FaceViT-B used by the WebFace42M CosFace PFC-0.3 model."""
+    return VisionTransformer(
+        img_size=112,
+        patch_size=9,
+        num_classes=512,
+        embed_dim=512,
+        depth=24,
+        num_heads=8,
+        drop_path_rate=0.05,
+        norm_layer="ln",
+        mask_ratio=0.05,
+        using_checkpoint=False,
+        use_patch_se=False,
+    )
+
+
 def _trunc_normal_(tensor, mean, std, a, b):
     # Cut & paste from PyTorch official master until it's in a few official releases - RW
     # Method based on https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
@@ -233,31 +250,30 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
-
-        with torch.amp.autocast(device_type="cuda"):
-            batch_size, num_token, embed_dim = x.shape
-            # qkv is [3,batch_size,num_heads,num_token, embed_dim//num_heads]
-            qkv = (
-                self
-                .qkv(x)
-                .reshape(
-                    batch_size,
-                    num_token,
-                    3,
-                    self.num_heads,
-                    embed_dim // self.num_heads,
-                )
-                .permute(2, 0, 3, 1, 4)
+        batch_size, num_token, embed_dim = x.shape
+        qkv = (
+            self
+            .qkv(x)
+            .reshape(
+                batch_size,
+                num_token,
+                3,
+                self.num_heads,
+                embed_dim // self.num_heads,
             )
-        with torch.amp.autocast(device_type="cuda", enabled=False):
-            q, k, v = qkv[0].float(), qkv[1].float(), qkv[2].float()
-            attn = (q @ k.transpose(-2, -1)) * self.scale
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = (attn @ v).transpose(1, 2).reshape(batch_size, num_token, embed_dim)
-        with torch.amp.autocast(device_type="cuda"):
-            x = self.proj(x)
-            x = self.proj_drop(x)
+            .permute(2, 0, 3, 1, 4)
+        )
+
+        # Keep attention-score accumulation and softmax in FP32 for numerical stability.
+        # Linear layers follow the caller's autocast context instead of forcing CUDA FP16
+        # internally, which also keeps torch.export/ONNX decomposition dtype-consistent.
+        q, k, v = qkv[0].float(), qkv[1].float(), qkv[2].float()
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(batch_size, num_token, embed_dim)
+        x = self.proj(x)
+        x = self.proj_drop(x)
         return x
 
 
@@ -307,8 +323,7 @@ class Block(nn.Module):
 
     def forward(self, x):
         x = x + self.drop_path(self.attn(self.norm1(x)))
-        with torch.amp.autocast(device_type="cuda"):
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
@@ -353,6 +368,7 @@ class VisionTransformer(nn.Module):
         norm_layer: str = "ln",
         mask_ratio=0.1,
         using_checkpoint=False,
+        use_patch_se: bool = True,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -370,6 +386,7 @@ class VisionTransformer(nn.Module):
             )
         self.mask_ratio = mask_ratio
         self.using_checkpoint = using_checkpoint
+        self.use_patch_se = use_patch_se
         num_patches = self.patch_embed.num_patches
         self.num_patches = num_patches
 
@@ -420,17 +437,19 @@ class VisionTransformer(nn.Module):
         # trunc_normal_(self.cls_token, std=.02)
         self.apply(self._init_weights)
 
-        ## SEModule FC
-        self.senet = nn.Sequential(
-            nn.Linear(
-                in_features=embed_dim * num_patches,
-                out_features=num_patches,
-                bias=False,
-            ),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_features=num_patches, out_features=num_patches, bias=False),
-            nn.Sigmoid(),
-        )
+        if use_patch_se:
+            self.senet = nn.Sequential(
+                nn.Linear(
+                    in_features=embed_dim * num_patches,
+                    out_features=num_patches,
+                    bias=False,
+                ),
+                nn.ReLU(inplace=True),
+                nn.Linear(in_features=num_patches, out_features=num_patches, bias=False),
+                nn.Sigmoid(),
+            )
+        else:
+            self.senet = None
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -500,13 +519,15 @@ class VisionTransformer(nn.Module):
             x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
             x = x_
 
-        orginal = x
-        out = torch.reshape(x, (B, self.num_patches * self.embed_dim))
-        out = self.senet(out)
-        out_softmax = out.softmax(dim=1)
-        out = torch.reshape(out, (B, self.num_patches, 1))
-        out = out * orginal
-        return torch.reshape(out, (B, self.num_patches * self.embed_dim)), out_softmax
+        flattened = torch.reshape(x, (B, self.num_patches * self.embed_dim))
+        if self.senet is None:
+            return flattened, None
+
+        patch_weight = self.senet(flattened)
+        patch_weight_softmax = patch_weight.softmax(dim=1)
+        patch_weight = torch.reshape(patch_weight, (B, self.num_patches, 1))
+        weighted = patch_weight * x
+        return torch.reshape(weighted, (B, self.num_patches * self.embed_dim)), patch_weight_softmax
 
     def forward(self, x):
         x, _ = self.forward_features(x)
