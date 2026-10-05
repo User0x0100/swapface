@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import torch
 
-from losses import DiscriminatorAdversarialLoss, make_blurred_l1_loss
+from losses import DiscriminatorAdversarialLoss, make_blurred_l1_loss, make_l1_loss
 from models.discriminator import Discriminator
 from models.networks import Generator
 from swapface.config import DEFAULT_GENERATOR_CONFIG, DEFAULT_LOSS_CONFIG, load_train_config, resolve_train_config
@@ -435,6 +435,19 @@ def _check_reconstruction_scope() -> None:
     print("PASS: reconstruction loss scope same/all")
 
 
+def _check_l1_loss() -> None:
+    prediction = torch.tensor(
+        [[[[1.0, -1.0], [-1.0, 1.0]]]],
+        requires_grad=True,
+    )
+    target = torch.zeros_like(prediction)
+    loss = make_l1_loss(weight=2.0)(prediction, target)
+    torch.testing.assert_close(loss, torch.tensor(2.0))
+    loss.backward()
+    assert prediction.grad is not None and torch.isfinite(prediction.grad).all()
+    print("PASS: reconstruction L1 uses direct pixel error without Gaussian blur")
+
+
 def _check_blurred_l1_loss() -> None:
     ratios = []
     for resolution in (128, 256, 512):
@@ -454,7 +467,7 @@ def _check_blurred_l1_loss() -> None:
     zero = torch.zeros_like(constant)
     constant_loss = make_blurred_l1_loss(weight=2.0, resolution=256)(constant, zero)
     torch.testing.assert_close(constant_loss, torch.tensor(0.5), atol=1e-6, rtol=0)
-    print(f"PASS: blurred L1 scales with resolution (128/256/512={ratios})")
+    print(f"PASS: blurred L1 helper retained (128/256/512={ratios})")
 
 
 def _check_step_boundary() -> None:
@@ -1075,6 +1088,7 @@ def _check_sample_gradient_maps() -> None:
 
 def main() -> None:
     _check_reconstruction_scope()
+    _check_l1_loss()
     _check_blurred_l1_loss()
     _check_global_discriminator()
     _check_r1_discriminator_path()

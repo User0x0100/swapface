@@ -23,7 +23,7 @@ from losses import (
     HRFFAFacialGeometryLoss,
     IdentityLoss,
     VGGPerceptualLoss,
-    make_blurred_l1_loss,
+    make_l1_loss,
     r1_reg_loss,
 )
 from misc.face_alignment import ffhq_to_arcface_112, make_ffhq_to_arcface_112_grid, transform_sampling_grid
@@ -54,7 +54,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 18
+TRAINING_SEMANTICS_VERSION = 19
 
 COARSE_GENERATOR_CONFIG_KEYS = (
     "img_channels",
@@ -566,9 +566,9 @@ class Trainer:
         self.coarse_identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.coarse_resolution, self.batch_size, self.device)
 
         if self.enable_coarse_l1_loss:
-            self.coarse_l1_loss = make_blurred_l1_loss(weight=float(coarse_l1_config["weight"]), resolution=self.coarse_resolution, reduction="none")
+            self.coarse_l1_loss = make_l1_loss(weight=float(coarse_l1_config["weight"]), reduction="none")
         if self.enable_hq_l1_loss:
-            self.hq_l1_loss = make_blurred_l1_loss(weight=float(hq_l1_config["weight"]), resolution=self.img_resolution, reduction="none")
+            self.hq_l1_loss = make_l1_loss(weight=float(hq_l1_config["weight"]), reduction="none")
 
         if self.enable_hq_gaze_loss:
             self.hq_gaze_loss = GazeLoss(
