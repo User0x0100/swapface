@@ -54,7 +54,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 19
+TRAINING_SEMANTICS_VERSION = 20
 
 COARSE_GENERATOR_CONFIG_KEYS = (
     "img_channels",
@@ -1221,8 +1221,10 @@ class Trainer:
                     if self.use_cosine_lr_d_coarse:
                         self.lr_scheduler_d_coarse.step()
 
-                # source identity teacher 只为 active stage 计算，并跨 G overflow retry 复用。
-                with torch.no_grad():
+                # source/reference 与 generated/fake identity teacher 必须使用同一 AMP 精度，
+                # 避免余弦损失两端落在不同数值空间；reference 无需梯度，但仍跟随训练 autocast。
+                # 只为 active stage 计算，并跨 G overflow retry 复用。
+                with torch.no_grad(), autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                     if self.hq_stage_active:
                         if self.reuse_generator_identity_for_hq_source:
                             hq_source_identity_embeddings = generator_identity_embeddings

@@ -962,6 +962,89 @@ def _check_generator_responsibility_boundary() -> None:
     assert {call.func.attr for call in train_source_teacher_calls} == {"hq_identity_embeddings_forward", "coarse_identity_embeddings_forward"}
     assert all(isinstance(call.args[0], ast.Name) and call.args[0].id == "source_identity_faces" for call in train_source_teacher_calls)
 
+    # Reference/source teacher 必须和 generated/fake teacher 共用训练 AMP 精度。
+    # no_grad 只冻结 reference 分支梯度，不能让它意外退回 FP32。
+    source_teacher_with = [
+        node
+        for node in ast.walk(train_tree)
+        if isinstance(node, ast.With)
+        and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Attribute)
+            and isinstance(item.context_expr.func.value, ast.Name)
+            and item.context_expr.func.value.id == "torch"
+            and item.context_expr.func.attr == "no_grad"
+            for item in node.items
+        )
+        and any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == "self"
+            and child.func.attr in {"hq_identity_embeddings_forward", "coarse_identity_embeddings_forward"}
+            for statement in node.body
+            for child in ast.walk(statement)
+        )
+    ]
+    assert len(source_teacher_with) == 1
+    source_teacher_contexts = source_teacher_with[0].items
+    source_teacher_autocast = [item.context_expr for item in source_teacher_contexts if isinstance(item.context_expr, ast.Call) and isinstance(item.context_expr.func, ast.Name) and item.context_expr.func.id == "autocast"]
+    assert len(source_teacher_autocast) == 1
+    autocast_call = source_teacher_autocast[0]
+    autocast_keywords = {item.arg: item.value for item in autocast_call.keywords}
+    assert isinstance(autocast_keywords["device_type"], ast.Constant) and autocast_keywords["device_type"].value == "cuda"
+    assert isinstance(autocast_keywords["dtype"], ast.Attribute) and isinstance(autocast_keywords["dtype"].value, ast.Name)
+    assert autocast_keywords["dtype"].value.id == "self" and autocast_keywords["dtype"].attr == "amp_dtype"
+    assert isinstance(autocast_keywords["enabled"], ast.Attribute) and isinstance(autocast_keywords["enabled"].value, ast.Name)
+    assert autocast_keywords["enabled"].value.id == "self" and autocast_keywords["enabled"].attr == "amp_enabled"
+
+    # generated/fake teacher 由 stage-loss 内部执行，因此锁定两个 stage-loss 调用本身
+    # 必须位于与 reference/source 相同参数的训练 autocast 作用域。
+    train_parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(train_tree):
+        for child in ast.iter_child_nodes(parent):
+            train_parents[child] = parent
+
+    def enclosing_training_autocast(node: ast.AST) -> ast.Call | None:
+        parent = train_parents.get(node)
+        while parent is not None:
+            if isinstance(parent, ast.With):
+                for item in parent.items:
+                    context = item.context_expr
+                    if isinstance(context, ast.Call) and isinstance(context.func, ast.Name) and context.func.id == "autocast":
+                        keywords = {keyword.arg: keyword.value for keyword in context.keywords}
+                        device_type = keywords.get("device_type")
+                        dtype = keywords.get("dtype")
+                        enabled = keywords.get("enabled")
+                        if (
+                            isinstance(device_type, ast.Constant)
+                            and device_type.value == "cuda"
+                            and isinstance(dtype, ast.Attribute)
+                            and isinstance(dtype.value, ast.Name)
+                            and dtype.value.id == "self"
+                            and dtype.attr == "amp_dtype"
+                            and isinstance(enabled, ast.Attribute)
+                            and isinstance(enabled.value, ast.Name)
+                            and enabled.value.id == "self"
+                            and enabled.attr == "amp_enabled"
+                        ):
+                            return context
+            parent = train_parents.get(parent)
+        return None
+
+    generated_stage_calls = [
+        node
+        for node in ast.walk(train_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and node.func.attr in {"_coarse_generator_stage_loss", "_hq_generator_stage_loss"}
+    ]
+    assert len(generated_stage_calls) == 2
+    assert {call.func.attr for call in generated_stage_calls} == {"_coarse_generator_stage_loss", "_hq_generator_stage_loss"}
+    assert all(enclosing_training_autocast(call) is not None for call in generated_stage_calls)
+
     reuse_assignments = []
     for node in ast.walk(train_tree):
         if not isinstance(node, ast.If):
