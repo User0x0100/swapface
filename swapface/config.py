@@ -109,7 +109,7 @@ DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
     "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
     "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
     "reconstruction": {"scope": "same"},
-    "l1": {"enable": True, "weight": 10.0},
+    "l1": {"enable": True, "weight": 10.0, "gaussian_blur": False},
     "vgg": {"enable": True, "weights": dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)},
 }
 DEFAULT_HQ_LOSS_CONFIG: dict[str, Any] = {
@@ -120,7 +120,7 @@ DEFAULT_HQ_LOSS_CONFIG: dict[str, Any] = {
     "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
     "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
     "reconstruction": {"scope": "same"},
-    "l1": {"enable": True, "weight": 10.0},
+    "l1": {"enable": True, "weight": 10.0, "gaussian_blur": False},
     "vgg": {"enable": True, "weights": dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)},
 }
 DEFAULT_LOSS_CONFIG: dict[str, Any] = {
@@ -369,6 +369,7 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
     l1 = _with_defaults(_table(loss, "l1", f"[{prefix}.l1]"), defaults["l1"], f"[{prefix}.l1]")
     l1["enable"] = _bool(l1["enable"], f"{prefix}.l1.enable")
     l1["weight"] = _float(l1["weight"], f"{prefix}.l1.weight", minimum=0.0)
+    l1["gaussian_blur"] = _bool(l1["gaussian_blur"], f"{prefix}.l1.gaussian_blur")
 
     vgg = _with_defaults(_table(loss, "vgg", f"[{prefix}.vgg]"), defaults["vgg"], f"[{prefix}.vgg]")
     vgg["enable"] = _bool(vgg["enable"], f"{prefix}.vgg.enable")

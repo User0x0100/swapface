@@ -126,10 +126,10 @@ def make_l1_loss(weight: float = 1.0, reduction: Reduction = "mean") -> LossFn:
 
 
 def _gaussian_blur_parameters(resolution: int) -> tuple[float, int]:
-    """按图像分辨率计算轻微 Gaussian blur：sigma 恒为边长的 1/256。"""
+    """按图像分辨率计算极轻 Gaussian blur：sigma 恒为边长的 1/384。"""
     if resolution <= 0:
         raise ValueError(f"resolution must be > 0, got {resolution}")
-    sigma = resolution / 256.0
+    sigma = resolution / 384.0
     radius = max(1, math.ceil(3.0 * sigma))
     return sigma, radius * 2 + 1
 
@@ -159,8 +159,8 @@ def _gaussian_blur(image: Tensor, kernel: Tensor) -> Tensor:
 def make_blurred_l1_loss(weight: float, resolution: int, reduction: Reduction = "mean") -> LossFn:
     """创建先做轻微 Gaussian blur、再计算 L1 的重建损失。
 
-    ``sigma = resolution / 256``，因此 128/256/512 分辨率分别使用
-    0.5/1.0/2.0 px sigma。kernel 覆盖约 ``±3 sigma``。
+    ``sigma = resolution / 384``，因此 128/256/512 分辨率分别使用
+    1/3、2/3、4/3 px sigma。kernel 覆盖约 ``±3 sigma``。
 
     对 prediction/target 使用同一个线性 Gaussian filter 后再相减，等价于
     先相减再滤波。这里采用后一种写法，将卷积开销减半。

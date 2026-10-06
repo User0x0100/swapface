@@ -80,9 +80,10 @@ weight = 10.0
 
 
 [loss.coarse.l1]
-# 直接对 prediction/target 计算逐像素 L1，不做 Gaussian blur。
+# false: 直接逐像素 L1；true: 先按当前分辨率做 Gaussian blur，再计算 L1。
 enable = true
 weight = 10.0
+gaussian_blur = false
 
 
 [loss.coarse.r1]
@@ -143,9 +144,10 @@ weight = 10.0
 
 
 [loss.hq.l1]
-# 直接对 prediction/target 计算逐像素 L1，不做 Gaussian blur。
+# false: 直接逐像素 L1；true: 先按当前分辨率做 Gaussian blur，再计算 L1。
 enable = true
 weight = 10.0
+gaussian_blur = false
 
 
 [loss.hq.r1]

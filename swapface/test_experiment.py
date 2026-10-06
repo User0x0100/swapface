@@ -53,7 +53,7 @@ def _check_train_config(root: Path) -> None:
         '[loss.coarse.reconstruction]\nscope = "same"\n'
         "[loss.coarse.gan]\nweight = 0.6\n"
         '[loss.coarse.identity]\nprovider = "BLENDFACE"\nweight = 7.0\n'
-        "[loss.coarse.l1]\nenable = true\nweight = 6.0\n"
+        "[loss.coarse.l1]\nenable = true\nweight = 6.0\ngaussian_blur = true\n"
         "[loss.coarse.r1]\nenable = true\ninterval = 8\ngamma = 5.0\n"
         "[loss.coarse.gaze]\nenable = true\nweight = 0.4\ndistribution_weight = 0.05\nconfidence_weighted = true\n"
         "[loss.coarse.hrffa]\nenable = true\npose_weight = 0.4\neye_weight = 0.8\nmouth_weight = 1.1\ncontour_weight = 1.2\ncontour_shape_weight = 0.3\noccluded_geometry_weight = 0.2\n"
@@ -61,7 +61,7 @@ def _check_train_config(root: Path) -> None:
         '[loss.hq.reconstruction]\nscope = "all"\n'
         "[loss.hq.gan]\nweight = 0.8\n"
         '[loss.hq.identity]\nprovider = "MS1MV3_ARCFACE_R50_FP16"\nweight = 9.0\n'
-        "[loss.hq.l1]\nenable = true\nweight = 7.0\n"
+        "[loss.hq.l1]\nenable = true\nweight = 7.0\ngaussian_blur = false\n"
         "[loss.hq.r1]\nenable = false\ninterval = 4\ngamma = 2.0\n"
         "[loss.hq.gaze]\nenable = true\nweight = 0.75\ndistribution_weight = 0.2\nconfidence_weighted = false\n"
         "[loss.hq.hrffa]\nenable = true\npose_weight = 0.5\neye_weight = 1.25\nmouth_weight = 1.5\ncontour_weight = 2.0\ncontour_shape_weight = 0.4\noccluded_geometry_weight = 0.1\n"
@@ -102,12 +102,12 @@ def _check_train_config(root: Path) -> None:
     assert resolved["loss"]["coarse"]["gan"] == {"weight": 0.6}
     assert resolved["loss"]["coarse"]["identity"] == {"provider": "BLENDFACE", "weight": 7.0}
     assert resolved["loss"]["coarse"]["reconstruction"] == {"scope": "same"}
-    assert resolved["loss"]["coarse"]["l1"] == {"enable": True, "weight": 6.0}
+    assert resolved["loss"]["coarse"]["l1"] == {"enable": True, "weight": 6.0, "gaussian_blur": True}
     assert resolved["loss"]["coarse"]["r1"] == {"enable": True, "interval": 8, "gamma": 5.0}
     assert resolved["loss"]["coarse"]["vgg"]["weights"] == {"relu2_2": 0.5}
     assert resolved["loss"]["hq"]["gan"] == {"weight": 0.8}
     assert resolved["loss"]["hq"]["identity"] == {"provider": "MS1MV3_ARCFACE_R50_FP16", "weight": 9.0}
-    assert resolved["loss"]["hq"]["l1"] == {"enable": True, "weight": 7.0}
+    assert resolved["loss"]["hq"]["l1"] == {"enable": True, "weight": 7.0, "gaussian_blur": False}
     assert resolved["loss"]["hq"]["r1"] == {"enable": False, "interval": 4, "gamma": 2.0}
     assert resolved["loss"]["hq"]["reconstruction"] == {"scope": "all"}
     assert resolved["data"]["augmentation"]["rotation_range"] == [-3.0, 3.0]
@@ -449,6 +449,18 @@ def _check_l1_loss() -> None:
 
 
 def _check_blurred_l1_loss() -> None:
+    from losses.functional import _gaussian_blur_parameters
+
+    expected_parameters = {
+        128: (128.0 / 384.0, 3),
+        256: (256.0 / 384.0, 5),
+        512: (512.0 / 384.0, 9),
+    }
+    for resolution, (expected_sigma, expected_kernel_size) in expected_parameters.items():
+        sigma, kernel_size = _gaussian_blur_parameters(resolution)
+        assert abs(sigma - expected_sigma) < 1e-12
+        assert kernel_size == expected_kernel_size
+
     ratios = []
     for resolution in (128, 256, 512):
         y, x = torch.meshgrid(torch.arange(resolution), torch.arange(resolution), indexing="ij")
@@ -900,6 +912,51 @@ def _check_generator_responsibility_boundary() -> None:
     assert {"_coarse_generator_stage_loss", "_update_discriminator_stage"}.issubset(guarded_calls("coarse_stage_active"))
 
     init_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer.__init__)))
+
+    def check_l1_mode_wiring(config_name: str, resolution_attr: str) -> None:
+        matches = []
+        for node in ast.walk(init_tree):
+            if not isinstance(node, ast.If):
+                continue
+            test = node.test
+            if not (
+                isinstance(test, ast.Call)
+                and isinstance(test.func, ast.Name)
+                and test.func.id == "bool"
+                and len(test.args) == 1
+                and isinstance(test.args[0], ast.Subscript)
+                and isinstance(test.args[0].value, ast.Name)
+                and test.args[0].value.id == config_name
+                and isinstance(test.args[0].slice, ast.Constant)
+                and test.args[0].slice.value == "gaussian_blur"
+            ):
+                continue
+            matches.append(node)
+        assert len(matches) == 1
+        branch = matches[0]
+
+        blurred_calls = [
+            child
+            for statement in branch.body
+            for child in ast.walk(statement)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id == "make_blurred_l1_loss"
+        ]
+        direct_calls = [
+            child
+            for statement in branch.orelse
+            for child in ast.walk(statement)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id == "make_l1_loss"
+        ]
+        assert len(blurred_calls) == 1 and len(direct_calls) == 1
+
+        blurred_keywords = {keyword.arg: keyword.value for keyword in blurred_calls[0].keywords}
+        resolution = blurred_keywords["resolution"]
+        assert isinstance(resolution, ast.Attribute) and isinstance(resolution.value, ast.Name)
+        assert resolution.value.id == "self" and resolution.attr == resolution_attr
+
+    check_l1_mode_wiring("coarse_l1_config", "coarse_resolution")
+    check_l1_mode_wiring("hq_l1_config", "img_resolution")
+
     channel_mismatch_pairs = set()
     for node in ast.walk(init_tree):
         if not isinstance(node, ast.Compare) or len(node.ops) != 1 or not isinstance(node.ops[0], ast.NotEq) or len(node.comparators) != 1:

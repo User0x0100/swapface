@@ -23,6 +23,7 @@ from losses import (
     HRFFAFacialGeometryLoss,
     IdentityLoss,
     VGGPerceptualLoss,
+    make_blurred_l1_loss,
     make_l1_loss,
     r1_reg_loss,
 )
@@ -566,9 +567,15 @@ class Trainer:
         self.coarse_identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.coarse_resolution, self.batch_size, self.device)
 
         if self.enable_coarse_l1_loss:
-            self.coarse_l1_loss = make_l1_loss(weight=float(coarse_l1_config["weight"]), reduction="none")
+            if bool(coarse_l1_config["gaussian_blur"]):
+                self.coarse_l1_loss = make_blurred_l1_loss(weight=float(coarse_l1_config["weight"]), resolution=self.coarse_resolution, reduction="none")
+            else:
+                self.coarse_l1_loss = make_l1_loss(weight=float(coarse_l1_config["weight"]), reduction="none")
         if self.enable_hq_l1_loss:
-            self.hq_l1_loss = make_l1_loss(weight=float(hq_l1_config["weight"]), reduction="none")
+            if bool(hq_l1_config["gaussian_blur"]):
+                self.hq_l1_loss = make_blurred_l1_loss(weight=float(hq_l1_config["weight"]), resolution=self.img_resolution, reduction="none")
+            else:
+                self.hq_l1_loss = make_l1_loss(weight=float(hq_l1_config["weight"]), reduction="none")
 
         if self.enable_hq_gaze_loss:
             self.hq_gaze_loss = GazeLoss(
