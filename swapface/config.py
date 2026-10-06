@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from misc.models.id_encoder import IDEncoderProvider
+from models.discriminator import INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION, DiscriminatorType
 
 from .dataloader_common import ImageDecoderBackend
 
@@ -53,6 +54,7 @@ DEFAULT_GENERATOR_CONFIG: dict[str, Any] = {
 
 DEFAULT_DISCRIMINATOR_CONFIG: dict[str, Any] = {
     "hq": {
+        "type": DiscriminatorType.FIR_MINIBATCH_STD.name,
         "img_resolution": 512,
         "img_channels": 3,
         "base_ch": 64,
@@ -60,6 +62,7 @@ DEFAULT_DISCRIMINATOR_CONFIG: dict[str, Any] = {
         "minibatch_std_group_size": 4,
     },
     "coarse": {
+        "type": DiscriminatorType.FIR_MINIBATCH_STD.name,
         "img_resolution": 128,
         "img_channels": 3,
         "base_ch": 64,
@@ -81,6 +84,7 @@ DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
 DEFAULT_GAN_LOSS_CONFIG = {"weight": 1.0}
 DEFAULT_IDENTITY_LOSS_CONFIG = {"provider": DEFAULT_IDENTITY_LOSS_PROVIDER.name, "weight": 10.0}
 DEFAULT_R1_LOSS_CONFIG = {"enable": True, "interval": 16, "gamma": 10.0}
+DEFAULT_WFM_LOSS_CONFIG = {"enable": False, "weights": {"0": 0.5, "1": 1.0, "2": 1.0, "3": 1.0}}
 DEFAULT_GAZE_LOSS_CONFIG = {"enable": False, "weight": 1.0, "distribution_weight": 0.1, "confidence_weighted": True}
 DEFAULT_HRFFA_LOSS_CONFIG = {
     "enable": False,
@@ -105,6 +109,7 @@ DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
     "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
     "identity": dict(DEFAULT_IDENTITY_LOSS_CONFIG),
     "r1": dict(DEFAULT_R1_LOSS_CONFIG),
+    "wfm": {"enable": DEFAULT_WFM_LOSS_CONFIG["enable"], "weights": dict(DEFAULT_WFM_LOSS_CONFIG["weights"])},
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
     "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
     "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
@@ -116,6 +121,7 @@ DEFAULT_HQ_LOSS_CONFIG: dict[str, Any] = {
     "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
     "identity": dict(DEFAULT_IDENTITY_LOSS_CONFIG),
     "r1": dict(DEFAULT_R1_LOSS_CONFIG),
+    "wfm": {"enable": DEFAULT_WFM_LOSS_CONFIG["enable"], "weights": dict(DEFAULT_WFM_LOSS_CONFIG["weights"])},
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
     "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
     "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
@@ -340,6 +346,22 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
     r1["interval"] = _int(r1["interval"], f"{prefix}.r1.interval", minimum=1)
     r1["gamma"] = _float(r1["gamma"], f"{prefix}.r1.gamma", minimum=0.0)
 
+    wfm = _with_defaults(_table(loss, "wfm", f"[{prefix}.wfm]"), defaults["wfm"], f"[{prefix}.wfm]")
+    wfm["enable"] = _bool(wfm["enable"], f"{prefix}.wfm.enable")
+    raw_wfm_weights = wfm["weights"]
+    if not isinstance(raw_wfm_weights, dict) or (wfm["enable"] and not raw_wfm_weights):
+        raise ValueError(f"[{prefix}.wfm.weights] 必须为非空表/对象")
+    normalized_wfm_weights: dict[str, float] = {}
+    for raw_index, raw_weight in raw_wfm_weights.items():
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{prefix}.wfm.weights 的层索引必须为非负整数，实际为 {raw_index!r}") from exc
+        if index < 0 or str(index) != str(raw_index):
+            raise ValueError(f"{prefix}.wfm.weights 的层索引必须为规范非负整数，实际为 {raw_index!r}")
+        normalized_wfm_weights[str(index)] = _float(raw_weight, f"{prefix}.wfm.weights.{index}", minimum=0.0)
+    wfm["weights"] = normalized_wfm_weights
+
     gaze = _with_defaults(_table(loss, "gaze", f"[{prefix}.gaze]"), defaults["gaze"], f"[{prefix}.gaze]")
     gaze["enable"] = _bool(gaze["enable"], f"{prefix}.gaze.enable")
     gaze["weight"] = _float(gaze["weight"], f"{prefix}.gaze.weight", minimum=0.0)
@@ -357,7 +379,7 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
     for key in ("weight", "brow_weight", "eye_weight", "nose_weight", "mouth_weight", "lower_face_weight", "asymmetry_weight"):
         facs[key] = _float(facs[key], f"{prefix}.facs.{key}", minimum=0.0)
 
-    result = {"gan": gan, "identity": identity, "r1": r1, "gaze": gaze, "hrffa": hrffa, "facs": facs}
+    result = {"gan": gan, "identity": identity, "r1": r1, "wfm": wfm, "gaze": gaze, "hrffa": hrffa, "facs": facs}
 
     reconstruction = _with_defaults(_table(loss, "reconstruction", f"[{prefix}.reconstruction]"), defaults["reconstruction"], f"[{prefix}.reconstruction]")
     scope = reconstruction["scope"]
@@ -438,6 +460,19 @@ def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _normalize_discriminator_type(value: object, name: str) -> DiscriminatorType:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} 必须为字符串，实际为 {type(value).__name__}")
+    try:
+        return DiscriminatorType[value]
+    except KeyError:
+        try:
+            return DiscriminatorType(value.lower())
+        except ValueError as exc:
+            supported = ", ".join(item.name for item in DiscriminatorType)
+            raise ValueError(f"{name}={value!r} 无效，可选：{supported}") from exc
+
+
 def _normalize_discriminator(config: dict[str, Any]) -> dict[str, Any]:
     discriminator = _table(config, "discriminator", "[discriminator]")
     unknown = set(discriminator) - set(DEFAULT_DISCRIMINATOR_CONFIG)
@@ -445,19 +480,40 @@ def _normalize_discriminator(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"[discriminator] 包含未知字段：{sorted(unknown)}")
 
     result: dict[str, Any] = {}
-    for stage, defaults in DEFAULT_DISCRIMINATOR_CONFIG.items():
-        stage_config = _with_defaults(
-            _table(discriminator, stage, f"[discriminator.{stage}]"),
-            defaults,
-            f"[discriminator.{stage}]",
-        )
-        for key in ("img_resolution", "img_channels", "base_ch", "max_ch", "minibatch_std_group_size"):
+    common_keys = {"type", "img_resolution", "img_channels", "base_ch", "max_ch"}
+    for stage, fir_defaults in DEFAULT_DISCRIMINATOR_CONFIG.items():
+        raw = _table(discriminator, stage, f"[discriminator.{stage}]")
+        discriminator_type = _normalize_discriminator_type(raw.get("type", fir_defaults["type"]), f"discriminator.{stage}.type")
+        allowed = common_keys | {"minibatch_std_group_size"}
+        unknown_stage = set(raw) - allowed
+        if unknown_stage:
+            raise ValueError(f"[discriminator.{stage}] 包含未知字段：{sorted(unknown_stage)}")
+
+        if discriminator_type is DiscriminatorType.FIR_MINIBATCH_STD:
+            defaults = dict(fir_defaults)
+            relevant = common_keys | {"minibatch_std_group_size"}
+        else:
+            defaults = {key: fir_defaults[key] for key in common_keys}
+            defaults["type"] = discriminator_type.name
+            relevant = common_keys
+
+        # 允许配置文件同时保留两类 D 的专属参数；切换 type 时只消费当前类型相关字段。
+        stage_config = defaults | {key: value for key, value in raw.items() if key in relevant}
+        stage_config["type"] = discriminator_type.name
+        for key in ("img_resolution", "img_channels", "base_ch", "max_ch"):
             stage_config[key] = _int(stage_config[key], f"discriminator.{stage}.{key}", minimum=1)
         if stage_config["max_ch"] < stage_config["base_ch"]:
             raise ValueError(f"discriminator.{stage}.max_ch 必须 >= discriminator.{stage}.base_ch")
         resolution = stage_config["img_resolution"]
         if resolution < 16 or resolution & (resolution - 1):
             raise ValueError(f"discriminator.{stage}.img_resolution 必须是 >=16 的 2 的整数次幂")
+
+        if discriminator_type is DiscriminatorType.FIR_MINIBATCH_STD:
+            stage_config["minibatch_std_group_size"] = _int(
+                stage_config["minibatch_std_group_size"],
+                f"discriminator.{stage}.minibatch_std_group_size",
+                minimum=1,
+            )
         result[stage] = stage_config
     return result
 
@@ -510,19 +566,32 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
 
     train = _normalize_train(config)
     discriminator = _normalize_discriminator(config)
+    loss = _normalize_loss(config)
     for stage, stage_config in discriminator.items():
-        group_size = stage_config["minibatch_std_group_size"]
-        if train["batch_size"] % group_size:
-            raise ValueError(
-                f"train.batch_size={train['batch_size']} 必须能被 discriminator.{stage}.minibatch_std_group_size={group_size} 整除"
-            )
+        discriminator_type = DiscriminatorType[stage_config["type"]]
+        if discriminator_type is DiscriminatorType.FIR_MINIBATCH_STD:
+            group_size = stage_config["minibatch_std_group_size"]
+            if train["batch_size"] % group_size:
+                raise ValueError(
+                    f"train.batch_size={train['batch_size']} 必须能被 discriminator.{stage}.minibatch_std_group_size={group_size} 整除"
+                )
+            feature_count = int(math.log2(stage_config["img_resolution"])) - 2
+        else:
+            feature_count = int(math.log2(stage_config["img_resolution"] // INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION))
+
+        if loss[stage]["wfm"]["enable"]:
+            indices = [int(index) for index in loss[stage]["wfm"]["weights"]]
+            if indices and max(indices) >= feature_count:
+                raise ValueError(
+                    f"loss.{stage}.wfm.weights 最大层索引={max(indices)} 超出 {discriminator_type.name} feature 数量={feature_count}"
+                )
 
     return {
         "train": train,
         "optimizer": _normalize_optimizer(config),
         "scheduler": _normalize_scheduler(config),
         "identity": _normalize_identity(config),
-        "loss": _normalize_loss(config),
+        "loss": loss,
         "data": _normalize_data(config),
         "generator": _normalize_generator(config),
         "discriminator": discriminator,

@@ -23,13 +23,14 @@ from losses import (
     HRFFAFacialGeometryLoss,
     IdentityLoss,
     VGGPerceptualLoss,
+    WeakFeatureMatchingLoss,
     make_blurred_l1_loss,
     make_l1_loss,
     r1_reg_loss,
 )
 from misc.face_alignment import ffhq_to_arcface_112, make_ffhq_to_arcface_112_grid, transform_sampling_grid
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
-from models.discriminator import Discriminator
+from models.discriminator import DiscriminatorType, build_discriminator
 from models.discriminator.upfirdn2d import initialize_upfirdn2d, is_rocm_gfx1100
 from models.networks import Generator
 
@@ -55,7 +56,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 20
+TRAINING_SEMANTICS_VERSION = 21
 
 COARSE_GENERATOR_CONFIG_KEYS = (
     "img_channels",
@@ -181,6 +182,13 @@ def _reduce_reconstruction_loss(rec_per_sample: Tensor, same_mask: Tensor, scope
     raise ValueError(f"reconstruction_scope 无效：{scope!r}")
 
 
+def _canonical_checkpoint_discriminator_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """把新增 type 字段前保存的当前 FIR D checkpoint 映射到新判别器配置协议。"""
+    result = dict(config)
+    result.setdefault("type", DiscriminatorType.FIR_MINIBATCH_STD.name)
+    return result
+
+
 def print_mapping(title: str, mapping: Mapping[Any, Any], indent: int = 0) -> None:
     print(f"{' ' * indent}{title}:")
     for key, value in mapping.items():
@@ -244,6 +252,8 @@ class Trainer:
         hq_identity_config = hq_loss_config["identity"]
         coarse_r1_config = coarse_loss_config["r1"]
         hq_r1_config = hq_loss_config["r1"]
+        coarse_wfm_config = coarse_loss_config["wfm"]
+        hq_wfm_config = hq_loss_config["wfm"]
         coarse_gaze_config = coarse_loss_config["gaze"]
         hq_gaze_config = hq_loss_config["gaze"]
         coarse_hrffa_config = coarse_loss_config["hrffa"]
@@ -272,6 +282,8 @@ class Trainer:
         self.enable_hq_r1_loss = self.hq_stage_active and bool(hq_r1_config["enable"])
         self.hq_r1_reg_step = int(hq_r1_config["interval"])
         self.hq_r1_gamma = float(hq_r1_config["gamma"])
+        self.enable_coarse_wfm_loss = self.coarse_stage_active and bool(coarse_wfm_config["enable"])
+        self.enable_hq_wfm_loss = self.hq_stage_active and bool(hq_wfm_config["enable"])
         self.enable_coarse_gaze_loss = self.coarse_stage_active and bool(coarse_gaze_config["enable"])
         self.enable_hq_gaze_loss = self.hq_stage_active and bool(hq_gaze_config["enable"])
         self.enable_coarse_hrffa_loss = self.coarse_stage_active and bool(coarse_hrffa_config["enable"])
@@ -366,8 +378,8 @@ class Trainer:
 
             self.img_resolution = int(net_g_cfg["img_resolution"])
             net_g = Generator(**net_g_cfg)
-            net_d = Discriminator(**net_d_cfg)
-            net_d_coarse = Discriminator(**net_d_coarse_cfg)
+            net_d = build_discriminator(net_d_cfg)
+            net_d_coarse = build_discriminator(net_d_coarse_cfg)
 
             if checkpoint_mode == "resume":
                 self._completed_step = checkpoint_step
@@ -391,10 +403,10 @@ class Trainer:
                 if saved_identity_encoders["hq_identity_loss"] != self.hq_identity_loss_provider.name:
                     raise ValueError("checkpoint HQ Identity Loss teacher 与当前配置不一致")
 
-                saved_net_d_cfg = dict(checkpoint["net_d"]["network_cfg"])
+                saved_net_d_cfg = _canonical_checkpoint_discriminator_config(checkpoint["net_d"]["network_cfg"])
                 if saved_net_d_cfg != net_d_cfg:
                     raise ValueError("checkpoint Discriminator 架构与当前配置不一致")
-                saved_net_d_coarse_cfg = dict(checkpoint["net_d_coarse"]["network_cfg"])
+                saved_net_d_coarse_cfg = _canonical_checkpoint_discriminator_config(checkpoint["net_d_coarse"]["network_cfg"])
                 if saved_net_d_coarse_cfg != net_d_coarse_cfg:
                     raise ValueError("checkpoint Coarse Discriminator 架构与当前配置不一致")
 
@@ -431,8 +443,8 @@ class Trainer:
                 raise ValueError("branch 必须提供父 checkpoint")
             self.img_resolution = int(net_g_cfg["img_resolution"])
             net_g = Generator(**net_g_cfg)
-            net_d = Discriminator(**net_d_cfg)
-            net_d_coarse = Discriminator(**net_d_coarse_cfg)
+            net_d = build_discriminator(net_d_cfg)
+            net_d_coarse = build_discriminator(net_d_coarse_cfg)
 
         d_resolution = int(net_d.network_cfg["img_resolution"])
         if d_resolution != self.img_resolution:
@@ -554,6 +566,10 @@ class Trainer:
             self.coarse_gan_loss = GeneratorAdversarialLoss(weight=float(coarse_gan_config["weight"]), reduction="mean").to(self.device)
         if self.hq_stage_active:
             self.hq_gan_loss = GeneratorAdversarialLoss(weight=float(hq_gan_config["weight"]), reduction="mean").to(self.device)
+        if self.enable_coarse_wfm_loss:
+            self.coarse_wfm_loss = WeakFeatureMatchingLoss(coarse_wfm_config["weights"]).to(self.device)
+        if self.enable_hq_wfm_loss:
+            self.hq_wfm_loss = WeakFeatureMatchingLoss(hq_wfm_config["weights"]).to(self.device)
 
         self.generator_id_encoder = IDEncoder(self.generator_id_encoder_provider).to(self.device).eval().requires_grad_(False)
         if self.hq_stage_active:
@@ -792,7 +808,7 @@ class Trainer:
         stage: Literal["hq", "coarse"],
         fake: Tensor,
         real: Tensor,
-        net: Discriminator,
+        net: torch.nn.Module,
         train_net: Any,
         *,
         r1_enabled: bool,
@@ -833,7 +849,7 @@ class Trainer:
         stage: Literal["hq", "coarse"],
         fake: Tensor,
         real: Tensor,
-        net: Discriminator,
+        net: torch.nn.Module,
         train_net: Any,
         optimizer: optim.Optimizer,
         scaler: GradScaler,
@@ -883,10 +899,20 @@ class Trainer:
         restore_grid: Tensor | None,
     ) -> Tensor:
         """计算 Coarse stage 的全部 Generator 训练目标。"""
-        coarse_score = self.train_d_coarse(coarse)
+        if self.enable_coarse_wfm_loss:
+            coarse_score, coarse_fake_feats = self.train_d_coarse(coarse, False, True)
+        else:
+            coarse_score = self.train_d_coarse(coarse)
         coarse_gan_loss = self.coarse_gan_loss(coarse_score)
         self.log("coarse_gan_loss", coarse_gan_loss)
         total = coarse_gan_loss
+
+        if self.enable_coarse_wfm_loss:
+            with torch.no_grad():
+                _, coarse_real_feats = self.train_d_coarse(coarse_resize_in, False, True)
+            coarse_wfm_loss = self.coarse_wfm_loss(coarse_fake_feats, coarse_real_feats)
+            self.log("coarse_wfm_loss", coarse_wfm_loss)
+            total = total + coarse_wfm_loss
 
         coarse_identity_embeddings = self.coarse_identity_embeddings_forward(self.prepare_identity_encoder_faces(coarse, theta_restore))
         coarse_id_loss = self.coarse_id_loss(coarse_identity_embeddings, source_identity_embeddings)
@@ -943,10 +969,20 @@ class Trainer:
         restore_grid: Tensor | None,
     ) -> Tensor:
         """计算 HQ stage 的全部 Generator 训练目标。"""
-        hq_score = self.train_d(fake)
+        if self.enable_hq_wfm_loss:
+            hq_score, hq_fake_feats = self.train_d(fake, False, True)
+        else:
+            hq_score = self.train_d(fake)
         hq_gan_loss = self.hq_gan_loss(hq_score)
         self.log("hq_gan_loss", hq_gan_loss)
         total = hq_gan_loss
+
+        if self.enable_hq_wfm_loss:
+            with torch.no_grad():
+                _, hq_real_feats = self.train_d(dst, False, True)
+            hq_wfm_loss = self.hq_wfm_loss(hq_fake_feats, hq_real_feats)
+            self.log("hq_wfm_loss", hq_wfm_loss)
+            total = total + hq_wfm_loss
 
         hq_identity_embeddings = self.hq_identity_embeddings_forward(self.prepare_identity_encoder_faces(fake, theta_restore))
         hq_id_loss = self.hq_id_loss(hq_identity_embeddings, source_identity_embeddings)
@@ -1444,10 +1480,10 @@ def _load_branch_checkpoint(
     hq_rebuild = branch_mode == "hq_rebuild"
     effective_reset_hq_discriminator = reset_hq_discriminator or hq_rebuild
 
-    if not effective_reset_hq_discriminator and dict(checkpoint["net_d"]["network_cfg"]) != resolved["discriminator"]["hq"]:
+    if not effective_reset_hq_discriminator and _canonical_checkpoint_discriminator_config(checkpoint["net_d"]["network_cfg"]) != resolved["discriminator"]["hq"]:
         raise ValueError("branch 继承 HQ Discriminator 时要求架构一致；如需新建请使用 --reset-hq-discriminator")
 
-    if not reset_coarse_discriminator and dict(checkpoint["net_d_coarse"]["network_cfg"]) != resolved["discriminator"]["coarse"]:
+    if not reset_coarse_discriminator and _canonical_checkpoint_discriminator_config(checkpoint["net_d_coarse"]["network_cfg"]) != resolved["discriminator"]["coarse"]:
         raise ValueError("branch 继承 Coarse Discriminator 时要求架构一致；如需新建请使用 --reset-coarse-discriminator")
 
     _branch_model_states(

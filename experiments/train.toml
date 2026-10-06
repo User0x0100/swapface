@@ -92,6 +92,17 @@ interval = 16
 gamma = 10.0
 
 
+[loss.coarse.wfm]
+# 判别器 encoder 中间特征的弱特征匹配；real 特征无梯度，fake 特征向 Generator 回传。
+enable = false
+
+[loss.coarse.wfm.weights]
+0 = 0.5
+1 = 1.0
+2 = 1.0
+3 = 1.0
+
+
 [loss.coarse.gaze]
 enable = true
 weight = 1.0
@@ -154,6 +165,17 @@ gaussian_blur = false
 enable = true
 interval = 16
 gamma = 10.0
+
+
+[loss.hq.wfm]
+# 判别器 encoder 中间特征的弱特征匹配。
+enable = false
+
+[loss.hq.wfm.weights]
+0 = 0.5
+1 = 1.0
+2 = 1.0
+3 = 1.0
 
 
 [loss.hq.gaze]
@@ -239,6 +261,8 @@ hq_max_ch = 128
 
 
 [discriminator.hq]
+# FIR_MINIBATCH_STD 或 INSTANCE_NORM_RESIDUAL。
+type = "FIR_MINIBATCH_STD"
 # HQ 单全局 Discriminator；FIR residual blocks 下采样到 4x4，使用 lazy R1 正则。
 img_resolution = 512
 img_channels = 3
@@ -247,6 +271,8 @@ max_ch = 512
 minibatch_std_group_size = 4
 
 [discriminator.coarse]
+# FIR_MINIBATCH_STD 或 INSTANCE_NORM_RESIDUAL。
+type = "FIR_MINIBATCH_STD"
 # Coarse 单全局 Discriminator；img_resolution 必须匹配 generator.coarse_resolution。
 img_resolution = 128
 img_channels = 3

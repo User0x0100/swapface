@@ -1,6 +1,7 @@
 from .adversarial import DiscriminatorAdversarialLoss, GeneratorAdversarialLoss
 from .color import LabStyleLoss
 from .facs import FACSConsistencyLoss
+from .feature_matching import WeakFeatureMatchingLoss
 from .functional import (
     make_bce_loss,
     make_bce_with_logits_loss,
@@ -33,6 +34,7 @@ __all__ = [
     "IdentityLoss",
     "LabStyleLoss",
     "VGGPerceptualLoss",
+    "WeakFeatureMatchingLoss",
     "get_supported_vgg_types",
     "get_vgg_layer_names",
     "make_bce_loss",

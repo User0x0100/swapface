@@ -12,8 +12,15 @@ from unittest.mock import patch
 
 import torch
 
-from losses import DiscriminatorAdversarialLoss, make_blurred_l1_loss, make_l1_loss
-from models.discriminator import Discriminator
+from losses import DiscriminatorAdversarialLoss, WeakFeatureMatchingLoss, make_blurred_l1_loss, make_l1_loss
+from models.discriminator import (
+    INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION,
+    Discriminator,
+    DiscriminatorType,
+    FIRMinibatchStdDiscriminator,
+    InstanceNormResidualDiscriminator,
+    build_discriminator,
+)
 from models.networks import Generator
 from swapface.config import DEFAULT_GENERATOR_CONFIG, DEFAULT_LOSS_CONFIG, load_train_config, resolve_train_config
 from swapface.contracts import CHECKPOINT_VERSION
@@ -79,7 +86,7 @@ def _check_train_config(root: Path) -> None:
     assert raw == original
     assert resolve_train_config(resolved) == resolved
     assert json.loads(json.dumps(resolved)) == resolved
-    for loss_name in ("gan", "identity", "r1", "gaze", "hrffa", "facs", "reconstruction", "l1", "vgg"):
+    for loss_name in ("gan", "identity", "r1", "wfm", "gaze", "hrffa", "facs", "reconstruction", "l1", "vgg"):
         assert DEFAULT_LOSS_CONFIG["coarse"][loss_name] is not DEFAULT_LOSS_CONFIG["hq"][loss_name]
     loaded = load_train_config(source)
     assert loaded == resolved
@@ -103,11 +110,13 @@ def _check_train_config(root: Path) -> None:
     assert resolved["loss"]["coarse"]["identity"] == {"provider": "BLENDFACE", "weight": 7.0}
     assert resolved["loss"]["coarse"]["reconstruction"] == {"scope": "same"}
     assert resolved["loss"]["coarse"]["l1"] == {"enable": True, "weight": 6.0, "gaussian_blur": True}
+    assert resolved["loss"]["coarse"]["wfm"] == {"enable": False, "weights": {"0": 0.5, "1": 1.0, "2": 1.0, "3": 1.0}}
     assert resolved["loss"]["coarse"]["r1"] == {"enable": True, "interval": 8, "gamma": 5.0}
     assert resolved["loss"]["coarse"]["vgg"]["weights"] == {"relu2_2": 0.5}
     assert resolved["loss"]["hq"]["gan"] == {"weight": 0.8}
     assert resolved["loss"]["hq"]["identity"] == {"provider": "MS1MV3_ARCFACE_R50_FP16", "weight": 9.0}
     assert resolved["loss"]["hq"]["l1"] == {"enable": True, "weight": 7.0, "gaussian_blur": False}
+    assert resolved["loss"]["hq"]["wfm"] == {"enable": False, "weights": {"0": 0.5, "1": 1.0, "2": 1.0, "3": 1.0}}
     assert resolved["loss"]["hq"]["r1"] == {"enable": False, "interval": 4, "gamma": 2.0}
     assert resolved["loss"]["hq"]["reconstruction"] == {"scope": "all"}
     assert resolved["data"]["augmentation"]["rotation_range"] == [-3.0, 3.0]
@@ -146,6 +155,7 @@ def _check_train_config(root: Path) -> None:
 
     assert resolved["discriminator"] == {
         "hq": {
+            "type": "FIR_MINIBATCH_STD",
             "img_resolution": 512,
             "img_channels": 3,
             "base_ch": 96,
@@ -153,6 +163,7 @@ def _check_train_config(root: Path) -> None:
             "minibatch_std_group_size": 4,
         },
         "coarse": {
+            "type": "FIR_MINIBATCH_STD",
             "img_resolution": 128,
             "img_channels": 3,
             "base_ch": 32,
@@ -160,6 +171,25 @@ def _check_train_config(root: Path) -> None:
             "minibatch_std_group_size": 4,
         },
     }
+
+    switched = copy.deepcopy(raw)
+    switched.setdefault("discriminator", {}).setdefault("coarse", {})["type"] = "INSTANCE_NORM_RESIDUAL"
+    switched["discriminator"]["coarse"]["minibatch_std_group_size"] = 4
+    switched_resolved = resolve_train_config(switched)
+    assert switched_resolved["discriminator"]["coarse"] == {
+        "type": "INSTANCE_NORM_RESIDUAL",
+        "img_resolution": 128,
+        "img_channels": 3,
+        "base_ch": 32,
+        "max_ch": 256,
+    }
+
+    wfm_enabled = copy.deepcopy(raw)
+    wfm_enabled.setdefault("loss", {}).setdefault("coarse", {})["wfm"] = {
+        "enable": True,
+        "weights": {"0": 0.5, "1": 1.0, "2": 1.0, "3": 1.0},
+    }
+    assert resolve_train_config(wfm_enabled)["loss"]["coarse"]["wfm"]["enable"] is True
 
     assert resolved["generator"]["coarse_num_latent"] == 7
     default_generator = copy.deepcopy(raw)
@@ -695,6 +725,68 @@ def _check_global_discriminator() -> None:
     print("PASS: global discriminator keeps anti-aliased deep encoder and minibatch std without spectral normalization")
 
 
+def _check_discriminator_types_and_wfm() -> None:
+    assert DiscriminatorType.FIR_MINIBATCH_STD.name == "FIR_MINIBATCH_STD"
+    assert DiscriminatorType.INSTANCE_NORM_RESIDUAL.name == "INSTANCE_NORM_RESIDUAL"
+
+    fir_cfg = {
+        "type": "FIR_MINIBATCH_STD",
+        "img_resolution": 32,
+        "img_channels": 3,
+        "base_ch": 8,
+        "max_ch": 32,
+        "minibatch_std_group_size": 2,
+    }
+    in_cfg = {
+        "type": "INSTANCE_NORM_RESIDUAL",
+        "img_resolution": 32,
+        "img_channels": 3,
+        "base_ch": 8,
+        "max_ch": 32,
+    }
+    fir = build_discriminator(fir_cfg)
+    old = build_discriminator(in_cfg)
+    assert isinstance(fir, FIRMinibatchStdDiscriminator)
+    assert isinstance(old, InstanceNormResidualDiscriminator)
+    assert fir.network_cfg == fir_cfg and old.network_cfg == in_cfg
+
+    for resolution, expected_blocks in ((128, 5), (256, 6), (512, 7)):
+        fixed = InstanceNormResidualDiscriminator(
+            img_resolution=resolution,
+            img_channels=3,
+            base_ch=8,
+            max_ch=32,
+        )
+        assert len(fixed.down_blocks) == expected_blocks
+        assert resolution // (2 ** len(fixed.down_blocks)) == fixed.MIN_RESOLUTION == INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION
+        assert "num_encoder" not in fixed.network_cfg
+    assert InstanceNormResidualDiscriminator.MIN_RESOLUTION == INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION == 4
+    assert len(old.down_blocks) == 3  # 32 -> 16 -> 8 -> 4
+    assert "num_encoder" not in old.network_cfg
+    from swapface.train import _canonical_checkpoint_discriminator_config
+
+    legacy_fir_cfg = dict(fir_cfg)
+    legacy_fir_cfg.pop("type")
+    assert _canonical_checkpoint_discriminator_config(legacy_fir_cfg) == fir_cfg
+
+    wfm = WeakFeatureMatchingLoss({0: 0.5, 1: 1.0})
+    for model in (fir, old):
+        fake = torch.randn(2, 3, 32, 32, requires_grad=True)
+        real = torch.randn(2, 3, 32, 32, requires_grad=True)
+        score, fake_feats = model(fake, return_feats=True)
+        with torch.no_grad():
+            _, real_feats = model(real, return_feats=True)
+        assert score.shape == (2, 1)
+        assert len(fake_feats) == len(real_feats) >= 2
+        loss = wfm(fake_feats, real_feats)
+        assert loss.ndim == 0 and torch.isfinite(loss)
+        loss.backward()
+        assert fake.grad is not None and torch.count_nonzero(fake.grad).item() > 0
+        assert real.grad is None
+
+    print("PASS: selectable FIR/InstanceNorm discriminators expose differentiable weak feature matching features")
+
+
 def _check_r1_discriminator_path() -> None:
     trainer = Trainer.__new__(Trainer)
     trainer._completed_step = 0
@@ -910,6 +1002,54 @@ def _check_generator_responsibility_boundary() -> None:
 
     assert {"train_hq", "_hq_generator_stage_loss", "_update_discriminator_stage"}.issubset(guarded_calls("hq_stage_active"))
     assert {"_coarse_generator_stage_loss", "_update_discriminator_stage"}.issubset(guarded_calls("coarse_stage_active"))
+
+    for method_name, d_attr, real_name, wfm_attr in (
+        ("_coarse_generator_stage_loss", "train_d_coarse", "coarse_resize_in", "coarse_wfm_loss"),
+        ("_hq_generator_stage_loss", "train_d", "dst", "hq_wfm_loss"),
+    ):
+        method_tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(Trainer, method_name))))
+        d_calls = [
+            node
+            for node in ast.walk(method_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr == d_attr
+        ]
+        assert len(d_calls) >= 3
+        feature_calls = [
+            call
+            for call in d_calls
+            if len(call.args) >= 3
+            and isinstance(call.args[1], ast.Constant)
+            and call.args[1].value is False
+            and isinstance(call.args[2], ast.Constant)
+            and call.args[2].value is True
+        ]
+        assert len(feature_calls) == 2
+        assert any(isinstance(call.args[0], ast.Name) and call.args[0].id == real_name for call in feature_calls)
+        assert any(
+            isinstance(node, ast.With)
+            and any(
+                isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Attribute)
+                and isinstance(item.context_expr.func.value, ast.Name)
+                and item.context_expr.func.value.id == "torch"
+                and item.context_expr.func.attr == "no_grad"
+                for item in node.items
+            )
+            and any(call is child for statement in node.body for child in ast.walk(statement) for call in feature_calls if isinstance(call.args[0], ast.Name) and call.args[0].id == real_name)
+            for node in ast.walk(method_tree)
+        )
+        assert any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr == wfm_attr
+            for node in ast.walk(method_tree)
+        )
 
     init_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer.__init__)))
 
@@ -1231,6 +1371,7 @@ def main() -> None:
     _check_l1_loss()
     _check_blurred_l1_loss()
     _check_global_discriminator()
+    _check_discriminator_types_and_wfm()
     _check_r1_discriminator_path()
     _check_generator_responsibility_boundary()
     _check_discriminator_training_state_split()
@@ -1261,8 +1402,8 @@ def main() -> None:
         "train": {"batch_size": 8, "stage": "joint"},
         "generator": dict(DEFAULT_GENERATOR_CONFIG),
         "discriminator": {
-            "hq": {"base_ch": 64},
-            "coarse": {"base_ch": 32},
+            "hq": {"type": "FIR_MINIBATCH_STD", "base_ch": 64},
+            "coarse": {"type": "FIR_MINIBATCH_STD", "base_ch": 32},
         },
         "identity": {"provider": "BLENDFACE"},
     }
