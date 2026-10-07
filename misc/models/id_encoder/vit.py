@@ -8,7 +8,39 @@ import torch
 from torch import nn
 
 
-def vit_l():
+def transface_s():
+    """Official TransFace-S backbone recipe used by MS1MV2/Glint360K checkpoints."""
+    return VisionTransformer(
+        img_size=112,
+        patch_size=9,
+        num_classes=512,
+        embed_dim=512,
+        depth=12,
+        num_heads=8,
+        drop_path_rate=0.05,
+        norm_layer="ln",
+        mask_ratio=0.0,
+    )
+
+
+def transface_b():
+    """Official TransFace-B backbone recipe used by MS1MV2/Glint360K checkpoints."""
+    return VisionTransformer(
+        img_size=112,
+        patch_size=9,
+        num_classes=512,
+        embed_dim=512,
+        depth=24,
+        num_heads=8,
+        drop_path_rate=0.05,
+        norm_layer="ln",
+        mask_ratio=0.05,
+        using_checkpoint=True,
+    )
+
+
+def transface_l():
+    """Official TransFace-L backbone recipe used by MS1MV2/Glint360K checkpoints."""
     return VisionTransformer(
         img_size=112,
         patch_size=9,
@@ -23,33 +55,17 @@ def vit_l():
     )
 
 
+# Backward-compatible aliases for existing imports.
 def vit_s():
-    return VisionTransformer(
-        img_size=112,
-        patch_size=9,
-        num_classes=512,
-        embed_dim=512,
-        depth=12,
-        num_heads=8,
-        drop_path_rate=0.1,
-        norm_layer="ln",
-        mask_ratio=0.1,
-    )
+    return transface_s()
 
 
 def vit_b():
-    return VisionTransformer(
-        img_size=112,
-        patch_size=9,
-        num_classes=512,
-        embed_dim=512,
-        depth=24,
-        num_heads=8,
-        drop_path_rate=0.1,
-        norm_layer="ln",
-        mask_ratio=0.1,
-        using_checkpoint=True,
-    )
+    return transface_b()
+
+
+def vit_l():
+    return transface_l()
 
 
 def plsc_face_vit_b():

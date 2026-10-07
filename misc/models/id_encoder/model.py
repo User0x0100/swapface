@@ -12,7 +12,7 @@ from ...models import MODEL_REPOSITORY_ID
 from .adaface import IR_101
 from .iresnet import iresnet50, iresnet100
 from .qcface_iresnet import qcface_iresnet100
-from .vit import plsc_face_vit_b, vit_b, vit_l, vit_s
+from .vit import plsc_face_vit_b, transface_b, transface_l, transface_s
 
 ID_ENCODER_INPUT_SIZE = (112, 112)
 ID_ALIGNMENT_TEMPLATE = np.array(
@@ -56,9 +56,12 @@ class IDEncoderProvider(Enum):
     GLINT360K_COSFACE_R50_FP16 = IDEncoderProviderConfig(iresnet50, "glint360k_r50_fp16.pth")
     GLINT360K_COSFACE_R100_FP16_0_1 = IDEncoderProviderConfig(iresnet100, "glint360k_cosface_r100_fp16_0.1.pth")
     WF42M_COSFACE_FACEVIT_B_PFC03 = IDEncoderProviderConfig(plsc_face_vit_b, "wf42m_cosface_face_vit_b_pfc03.pth")
-    MS1MV2_TRANSFACE_S = IDEncoderProviderConfig(vit_s, "ms1mv2_model_TransFace_S.pt")
-    MS1MV2_TRANSFACE_B = IDEncoderProviderConfig(vit_b, "ms1mv2_model_TransFace_B.pt")
-    MS1MV2_TRANSFACE_L = IDEncoderProviderConfig(vit_l, "ms1mv2_model_TransFace_L.pt")
+    MS1MV2_TRANSFACE_S = IDEncoderProviderConfig(transface_s, "ms1mv2_model_TransFace_S.pt")
+    MS1MV2_TRANSFACE_B = IDEncoderProviderConfig(transface_b, "ms1mv2_model_TransFace_B.pt")
+    MS1MV2_TRANSFACE_L = IDEncoderProviderConfig(transface_l, "ms1mv2_model_TransFace_L.pt")
+    GLINT360K_TRANSFACE_S = IDEncoderProviderConfig(transface_s, "glint360k_model_TransFace_S.pt")
+    GLINT360K_TRANSFACE_B = IDEncoderProviderConfig(transface_b, "glint360k_model_TransFace_B.pt")
+    GLINT360K_TRANSFACE_L = IDEncoderProviderConfig(transface_l, "glint360k_model_TransFace_L.pt")
     MS1MV2_ADAFACE_R100 = IDEncoderProviderConfig(IR_101, "adaface_ir101_ms1mv2.ckpt")
     MS1MV3_ADAFACE_R100 = IDEncoderProviderConfig(IR_101, "adaface_ir101_ms1mv3.ckpt")
     QCFACE_ARC_IR100 = IDEncoderProviderConfig(
