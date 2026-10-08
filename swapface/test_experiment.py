@@ -1350,20 +1350,48 @@ def _check_discriminator_training_state_split() -> None:
 
 
 def _check_sample_gradient_maps() -> None:
-    sample_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer._save_sample)))
-    self_calls = {node.func.attr for node in ast.walk(sample_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"}
-    assert {
-        "net_d_coarse",
+    stage_source = inspect.getsource(Trainer._sample_stage_grad_maps)
+    for token in (
         "coarse_gan_loss",
-        "coarse_identity_embeddings_forward",
+        "coarse_wfm_loss",
         "coarse_id_loss",
-        "net_d",
+        "coarse_gaze_loss",
+        "coarse_hrffa_loss",
+        "coarse_facs_loss",
+        "coarse_vgg_loss",
+        "coarse_l1_loss",
         "hq_gan_loss",
-        "hq_identity_embeddings_forward",
+        "hq_wfm_loss",
         "hq_id_loss",
-        "loss_grad_map",
-    }.issubset(self_calls)
-    print("PASS: sample visualization keeps Coarse/HQ discriminator and identity gradient maps")
+        "hq_gaze_loss",
+        "hq_hrffa_loss",
+        "hq_facs_loss",
+        "hq_vgg_loss",
+        "hq_l1_loss",
+        "enable_coarse_wfm_loss",
+        "enable_hq_wfm_loss",
+        "enable_coarse_gaze_loss",
+        "enable_hq_gaze_loss",
+        "enable_coarse_hrffa_loss",
+        "enable_hq_hrffa_loss",
+        "enable_coarse_facs_loss",
+        "enable_hq_facs_loss",
+        "enable_coarse_vgg_loss",
+        "enable_hq_vgg_loss",
+        "enable_coarse_l1_loss",
+        "enable_hq_l1_loss",
+    ):
+        assert token in stage_source
+    assert "enable_coarse_r1_loss" not in stage_source and "enable_hq_r1_loss" not in stage_source
+    assert "r1_reg_loss" not in stage_source
+    assert "loss_grad_map" in stage_source
+
+    sample_source = inspect.getsource(Trainer._save_sample)
+    assert "sample_same_mask" in sample_source and "same_mask_vis" in sample_source
+    for label in ("SOURCE / SRC", "TARGET / DST", "COARSE OUTPUT", "FINAL OUTPUT", "DST CANONICAL", "FINAL ID INPUT"):
+        assert label in sample_source
+    assert "_sample_row_bgr" in sample_source
+    print("PASS: sample visualization labels every row and renders every enabled Generator loss with the legacy gradient map")
 
 
 def main() -> None:

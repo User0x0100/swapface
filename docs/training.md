@@ -150,7 +150,7 @@ experiments/
 - `metadata.json`：只记录 run ID、状态、配置摘要和可选的 branch 父来源。
 - `latest.json`：很小的最新 checkpoint 指针，不复制大模型文件，适合本地文件系统和对象存储。
 - `checkpoints/`：完整训练状态。
-- `samples/`：与 completed step 对齐的训练可视化；基础图包含 src、dst、Coarse、HQ、canonical dst、HQ Identity 输入，之后仅附加 active stage 的判别器梯度图和 Identity 梯度图。
+- `samples/`：与 completed step 对齐的训练可视化；每一行最左侧标注该行含义。基础图包含 src、dst、Coarse、Final、canonical dst、Final Identity 输入；随后对 active stage 的 GAN/Identity 以及当前实际启用的 WFM/Gaze/HRFFA/FACS/VGG/L1 分别绘制原有 `loss_grad_map` 风格的梯度图。未启用的可选损失不占行，R1 不进入 sample 可视化。
 - `tensorboard/`：TensorBoard event 文件；一次 resume 可能新增 event 文件，这是正常现象。
 
 `experiments/*.toml` 可以进入 Git；`experiments/*/` 属于运行生成物，默认忽略。
