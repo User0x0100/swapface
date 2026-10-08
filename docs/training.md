@@ -150,7 +150,7 @@ experiments/
 - `metadata.json`：只记录 run ID、状态、配置摘要和可选的 branch 父来源。
 - `latest.json`：很小的最新 checkpoint 指针，不复制大模型文件，适合本地文件系统和对象存储。
 - `checkpoints/`：完整训练状态。
-- `samples/`：与 completed step 对齐的训练可视化；基础图包含 src、dst、Coarse、HQ、canonical dst、HQ Identity 输入，之后仅附加 active stage 的判别器梯度图和 Identity 梯度图。
+- `samples/`：与 completed step 对齐的训练可视化。保持完整训练 batch 与各 stage 的原始图像/梯度分辨率，不额外裁剪样本数量或降低热力图分辨率。每行带明确标签；基础图包含 source、target、Coarse、Final、canonical target，并分别显示 `COARSE ID INPUT` 与 `FINAL ID INPUT`。每个 active stage 会对所有已启用的 Generator loss 输出线性梯度热力图（TOTAL、GAN、WFM、Identity、L1、VGG、Gaze、HRFFA、FACS，按启用状态显示）。同一 stage 使用 `TOTAL` 与各 loss 的 `p99.5` 中最大值作为共享显示上限，0 到该上限保持严格线性，超过上限的极端值饱和；不使用 log/gamma 或逐图自归一化，每行同时标注 mean/RMS/max/共享 scale。随后输出各 loss 对 Generator 输出图像的梯度 cosine similarity：仅统计两个 loss 在该样本上都存在非零梯度的样本，再做 batch mean；每个单元格同时显示有效样本数 `n`，无共同有效样本显示 `N/A, n=0`。该矩阵描述 output-gradient conflict，不等同于 Generator 参数梯度冲突。R1 不进入 sample 可视化。
 - `tensorboard/`：TensorBoard event 文件；一次 resume 可能新增 event 文件，这是正常现象。
 
 `experiments/*.toml` 可以进入 Git；`experiments/*/` 属于运行生成物，默认忽略。
