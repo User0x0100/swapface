@@ -1,13 +1,11 @@
 import argparse
 import copy
-import math
 import signal
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
 import cv2
-import numpy as np
 import torch
 import torch.nn.functional as NF
 from torch import Tensor, optim
@@ -59,118 +57,6 @@ DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
 TRAINING_SEMANTICS_VERSION = 21
-SAMPLE_LABEL_WIDTH = 420
-SAMPLE_GRID_PADDING = 2
-SAMPLE_GRADIENT_SCALE_QUANTILE = 0.995
-
-
-def _sample_grid_bgr(images: Tensor, *, minus_one_to_one: bool) -> np.ndarray:
-    """把一批 RGB tensor 横向排成 uint8 BGR sample row。"""
-    images = images.detach().float()
-    if minus_one_to_one:
-        images = images.add(1.0).mul(0.5)
-    images = images.clamp(0.0, 1.0)
-    grid = make_grid(images, nrow=images.shape[0], padding=SAMPLE_GRID_PADDING)
-    grid = grid[[2, 1, 0], :, :].permute(1, 2, 0).mul(255.0)
-    return grid.to(device="cpu", dtype=torch.uint8).numpy()
-
-
-def _labeled_sample_row(images_bgr: np.ndarray, title: str, detail: str = "") -> np.ndarray:
-    """给 sample row 添加固定宽度 ASCII 标签栏，避免 OpenCV 字体的中文兼容问题。"""
-    height = images_bgr.shape[0]
-    label = np.full((height, SAMPLE_LABEL_WIDTH, 3), 20, dtype=np.uint8)
-    title_y = 20 if height < 64 else min(height // 2, 48)
-    cv2.putText(label, title, (16, title_y), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (240, 240, 240), 2, cv2.LINE_AA)
-    if detail:
-        detail_y = max(title_y + 14, min(height - 10, title_y + 30))
-        cv2.putText(label, detail, (16, detail_y), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (170, 170, 170), 1, cv2.LINE_AA)
-    return np.concatenate((label, images_bgr), axis=1)
-
-
-def _linear_gradient_heatmap(magnitude: Tensor, scale: Tensor, output_size: tuple[int, int]) -> Tensor:
-    """线性黑->红热力图；红通道强度严格正比于梯度幅值/共享尺度。"""
-    normalized = magnitude / scale.clamp_min(EPS)
-    normalized = normalized.clamp(0.0, 1.0)
-    if tuple(normalized.shape[-2:]) != output_size:
-        normalized = NF.interpolate(normalized, size=output_size, mode="bilinear", align_corners=False)
-    heatmap = torch.zeros((normalized.shape[0], 3, *output_size), device=normalized.device, dtype=normalized.dtype)
-    heatmap[:, 0:1] = normalized
-    return heatmap
-
-
-def _shared_gradient_scale(magnitudes: Mapping[str, Tensor]) -> Tensor:
-    """用各 loss 的 p99.5 上界构造共享线性显示尺度，避免单个异常像素支配整张图。"""
-    quantiles = [torch.quantile(magnitude.flatten(), SAMPLE_GRADIENT_SCALE_QUANTILE) for magnitude in magnitudes.values()]
-    return torch.stack(quantiles).amax().clamp_min(EPS)
-
-
-def _gradient_conflict_matrix(gradients: Mapping[str, Tensor]) -> tuple[list[str], Tensor, Tensor]:
-    """仅在两个 loss 都有有效输出梯度的样本上计算 cosine，并同时返回有效样本数。"""
-    names = list(gradients)
-    device = next(iter(gradients.values())).device
-    matrix = torch.full((len(names), len(names)), float("nan"), dtype=torch.float32, device=device)
-    counts = torch.zeros((len(names), len(names)), dtype=torch.int64, device=device)
-    flattened = {name: gradient.flatten(1) for name, gradient in gradients.items()}
-    norms = {name: torch.linalg.vector_norm(value, dim=1) for name, value in flattened.items()}
-
-    for row, row_name in enumerate(names):
-        row_valid = norms[row_name] > EPS
-        row_count = row_valid.sum()
-        counts[row, row] = row_count
-        if int(row_count) > 0:
-            matrix[row, row] = 1.0
-        for col in range(row + 1, len(names)):
-            col_name = names[col]
-            valid = row_valid & (norms[col_name] > EPS)
-            valid_count = valid.sum()
-            counts[row, col] = valid_count
-            counts[col, row] = valid_count
-            if int(valid_count) == 0:
-                continue
-            similarity = NF.cosine_similarity(flattened[row_name][valid], flattened[col_name][valid], dim=1, eps=EPS).mean()
-            matrix[row, col] = similarity
-            matrix[col, row] = similarity
-    return names, matrix.detach().cpu(), counts.detach().cpu()
-
-
-def _render_gradient_conflict_matrix(title: str, names: list[str], matrix: Tensor, counts: Tensor, width: int) -> np.ndarray:
-    """渲染 output-gradient cosine 与有效样本数；无共同有效梯度时显示 N/A。"""
-    cell = 64
-    top = 62
-    left = SAMPLE_LABEL_WIDTH + 92
-    height = top + len(names) * cell + 24
-    width = max(width, left + len(names) * cell + 20)
-    canvas = np.full((height, width, 3), 20, dtype=np.uint8)
-    cv2.putText(canvas, title, (16, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (240, 240, 240), 2, cv2.LINE_AA)
-    cv2.putText(canvas, "output-grad cosine: pairwise nonzero samples only; red=conflict, green=aligned", (16, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (170, 170, 170), 1, cv2.LINE_AA)
-
-    values = matrix.numpy()
-    valid_counts = counts.numpy()
-    for index, name in enumerate(names):
-        short = name[:8]
-        x = left + index * cell
-        y = top + index * cell
-        cv2.putText(canvas, short, (x + 3, top - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (205, 205, 205), 1, cv2.LINE_AA)
-        cv2.putText(canvas, short, (SAMPLE_LABEL_WIDTH + 6, y + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (205, 205, 205), 1, cv2.LINE_AA)
-        for col in range(len(names)):
-            value = float(values[index, col])
-            valid_count = int(valid_counts[index, col])
-            x0 = left + col * cell
-            if not math.isfinite(value):
-                cv2.rectangle(canvas, (x0, y), (x0 + cell - 2, y + cell - 2), (48, 48, 48), thickness=-1)
-                cv2.putText(canvas, "N/A", (x0 + 15, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 200, 200), 1, cv2.LINE_AA)
-                cv2.putText(canvas, "n=0", (x0 + 17, y + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.31, (160, 160, 160), 1, cv2.LINE_AA)
-                continue
-            amount = min(abs(value), 1.0)
-            if value >= 0.0:
-                color = (24, int(24 + 200 * amount), 24)
-            else:
-                color = (24, 24, int(24 + 220 * amount))
-            cv2.rectangle(canvas, (x0, y), (x0 + cell - 2, y + cell - 2), color, thickness=-1)
-            text_color = (245, 245, 245) if amount < 0.55 else (10, 10, 10)
-            cv2.putText(canvas, f"{value:+.2f}", (x0 + 8, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.36, text_color, 1, cv2.LINE_AA)
-            cv2.putText(canvas, f"n={valid_count}", (x0 + 14, y + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.31, text_color, 1, cv2.LINE_AA)
-    return canvas
 
 COARSE_GENERATOR_CONFIG_KEYS = (
     "img_channels",
@@ -1208,193 +1094,31 @@ class Trainer:
             temp_file.unlink(missing_ok=True)
             raise RuntimeError(f"保存检查点失败：{e}") from e
 
-    def _loss_gradient(self, loss: Tensor, x: Tensor) -> Tensor:
-        if not loss.requires_grad:
-            return torch.zeros(x.shape, dtype=torch.float32, device="cpu")
-        (grad,) = torch.autograd.grad(outputs=loss.sum(), inputs=x, retain_graph=False, create_graph=False, allow_unused=True)
-        if grad is None:
-            return torch.zeros(x.shape, dtype=torch.float32, device="cpu")
-        return grad.detach().float().cpu()
+    def loss_grad_map(self, loss: Tensor, x: Tensor) -> Tensor:
+        (grad,) = torch.autograd.grad(outputs=loss.sum(), inputs=x, retain_graph=False, create_graph=False)
 
-    def _sample_generator_loss_gradients(
-        self,
-        stage: Literal["coarse", "hq"],
-        generated: Tensor,
-        reconstruction_target: Tensor,
-        dst_canonical: Tensor,
-        theta_restore: Tensor,
-        same_mask: Tensor,
-        source_identity_embeddings: Tensor,
-        restore_grid: Tensor | None,
-    ) -> dict[str, Tensor]:
-        """计算 sample 可视化所需的每个已启用 Generator loss 对输出图像的真实加权梯度。"""
-        if stage == "coarse":
-            discriminator = self.net_d_coarse
-            gan_loss_fn = self.coarse_gan_loss
-            wfm_enabled = self.enable_coarse_wfm_loss
-            wfm_loss_fn = self.coarse_wfm_loss if wfm_enabled else None
-            identity_embeddings_forward = self.coarse_identity_embeddings_forward
-            identity_loss_fn = self.coarse_id_loss
-            gaze_enabled = self.enable_coarse_gaze_loss
-            gaze_loss_fn = self.coarse_gaze_loss_forward if gaze_enabled else None
-            hrffa_enabled = self.enable_coarse_hrffa_loss
-            hrffa_loss_fn = self.coarse_hrffa_loss if hrffa_enabled else None
-            facs_enabled = self.enable_coarse_facs_loss
-            facs_loss_fn = self.coarse_facs_loss if facs_enabled else None
-            vgg_enabled = self.enable_coarse_vgg_loss
-            vgg_loss_fn = self.coarse_vgg_loss_forward if vgg_enabled else None
-            l1_enabled = self.enable_coarse_l1_loss
-            l1_loss_fn = self.coarse_l1_loss if l1_enabled else None
-            reconstruction_scope = self.coarse_reconstruction_scope
-        else:
-            discriminator = self.net_d
-            gan_loss_fn = self.hq_gan_loss
-            wfm_enabled = self.enable_hq_wfm_loss
-            wfm_loss_fn = self.hq_wfm_loss if wfm_enabled else None
-            identity_embeddings_forward = self.hq_identity_embeddings_forward
-            identity_loss_fn = self.hq_id_loss
-            gaze_enabled = self.enable_hq_gaze_loss
-            gaze_loss_fn = self.hq_gaze_loss_forward if gaze_enabled else None
-            hrffa_enabled = self.enable_hq_hrffa_loss
-            hrffa_loss_fn = self.hq_hrffa_loss if hrffa_enabled else None
-            facs_enabled = self.enable_hq_facs_loss
-            facs_loss_fn = self.hq_facs_loss if facs_enabled else None
-            vgg_enabled = self.enable_hq_vgg_loss
-            vgg_loss_fn = self.hq_vgg_loss_forward if vgg_enabled else None
-            l1_enabled = self.enable_hq_l1_loss
-            l1_loss_fn = self.hq_l1_loss if l1_enabled else None
-            reconstruction_scope = self.hq_reconstruction_scope
+        h = grad.detach().float().abs().mean(dim=1, keepdim=True)  # [B, 1, H, W]
 
-        gradients: dict[str, Tensor] = {}
+        h = torch.log1p(h)
+        h = h / h.amax(dim=(2, 3), keepdim=True).clamp_min(EPS)
 
-        discriminator_training = discriminator.training
-        discriminator.eval()
-        try:
-            with torch.enable_grad(), autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                x = generated.detach().requires_grad_(True)
-                score = discriminator(x)
-                gradients["GAN"] = self._loss_gradient(gan_loss_fn(score), x)
+        h = h.mul(2.0).sub(1.0)  # [0,1] -> [-1,1]
+        h = h.expand(-1, 3, -1, -1).contiguous()
 
-            if wfm_enabled:
-                assert wfm_loss_fn is not None
-                with torch.enable_grad(), autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                    x = generated.detach().requires_grad_(True)
-                    _, fake_feats = discriminator(x, False, True)
-                    with torch.no_grad():
-                        _, real_feats = discriminator(reconstruction_target, False, True)
-                    gradients["WFM"] = self._loss_gradient(wfm_loss_fn(fake_feats, real_feats), x)
-        finally:
-            discriminator.train(discriminator_training)
+        return h
 
-        with torch.enable_grad(), autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-            x = generated.detach().requires_grad_(True)
-            generated_identity_embeddings = identity_embeddings_forward(self.prepare_identity_encoder_faces(x, theta_restore))
-            gradients["ID"] = self._loss_gradient(identity_loss_fn(generated_identity_embeddings, source_identity_embeddings.detach()), x)
-
-        geometry_enabled = gaze_enabled or hrffa_enabled or facs_enabled
-        if geometry_enabled and restore_grid is None:
-            raise RuntimeError(f"{stage} sample geometry gradient 需要 restore_grid")
-
-        def restored_input(x: Tensor) -> Tensor:
-            assert restore_grid is not None
-            with autocast(device_type="cuda", enabled=False):
-                if stage == "coarse":
-                    x = NF.interpolate(x.float(), size=restore_grid.shape[1:3], mode="bilinear", align_corners=False)
-                return NF.grid_sample(x.float(), restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
-
-        if gaze_enabled:
-            assert gaze_loss_fn is not None
-            with torch.enable_grad(), autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                x = generated.detach().requires_grad_(True)
-                loss = gaze_loss_fn(restored_input(x), dst_canonical)
-                gradients["GAZE"] = self._loss_gradient(loss, x)
-
-        if hrffa_enabled:
-            assert hrffa_loss_fn is not None
-            with torch.enable_grad(), autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                x = generated.detach().requires_grad_(True)
-                components = hrffa_loss_fn.forward_components(restored_input(x), dst_canonical)
-                loss = torch.stack(tuple(components.values())).sum()
-                gradients["HRFFA"] = self._loss_gradient(loss, x)
-
-        if facs_enabled:
-            assert facs_loss_fn is not None
-            with torch.enable_grad(), autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                x = generated.detach().requires_grad_(True)
-                components = facs_loss_fn.forward_components(restored_input(x), dst_canonical)
-                loss = torch.stack(tuple(components.values())).sum()
-                gradients["FACS"] = self._loss_gradient(loss, x)
-
-        if vgg_enabled:
-            assert vgg_loss_fn is not None
-            with torch.enable_grad(), autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                x = generated.detach().requires_grad_(True)
-                per_sample = vgg_loss_fn(x, reconstruction_target)
-                loss = _reduce_reconstruction_loss(per_sample, same_mask, reconstruction_scope)
-                gradients["VGG"] = self._loss_gradient(loss, x)
-
-        if l1_enabled:
-            assert l1_loss_fn is not None
-            with torch.enable_grad(), autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-                x = generated.detach().requires_grad_(True)
-                per_sample = l1_loss_fn(x, reconstruction_target).flatten(1).mean(dim=1)
-                loss = _reduce_reconstruction_loss(per_sample, same_mask, reconstruction_scope)
-                gradients["L1"] = self._loss_gradient(loss, x)
-
-        return gradients
-
-    @staticmethod
-    def _append_stage_gradient_visualization(
-        rows: list[np.ndarray],
-        stage: str,
-        gradients: Mapping[str, Tensor],
-        output_size: tuple[int, int],
-    ) -> None:
-        if not gradients:
-            return
-
-        gradient_iter = iter(gradients.values())
-        total_gradient = next(gradient_iter).clone()
-        for gradient in gradient_iter:
-            total_gradient.add_(gradient)
-        display_gradients = {"TOTAL": total_gradient, **gradients}
-        magnitudes = {name: gradient.abs().mean(dim=1, keepdim=True) for name, gradient in display_gradients.items()}
-        shared_scale = _shared_gradient_scale(magnitudes)
-        shared_scale_value = float(shared_scale)
-
-        for name, magnitude in magnitudes.items():
-            flat = magnitude.flatten()
-            mean_value = float(flat.mean().detach().cpu())
-            rms_value = float(flat.square().mean().sqrt().detach().cpu())
-            max_value = float(flat.amax().detach().cpu())
-            heatmap = _linear_gradient_heatmap(magnitude, shared_scale, output_size)
-            row = _sample_grid_bgr(heatmap, minus_one_to_one=False)
-            detail = f"mean={mean_value:.2e} rms={rms_value:.2e} max={max_value:.2e} p99.5-scale={shared_scale_value:.2e}"
-            rows.append(_labeled_sample_row(row, f"{stage} / {name} grad", detail))
-
-        names, conflict, conflict_counts = _gradient_conflict_matrix(gradients)
-        rows.append(_render_gradient_conflict_matrix(f"{stage} output-gradient conflict", names, conflict, conflict_counts, rows[0].shape[1]))
-
-    def _save_sample(
-        self,
-        sample_reference: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
-        current_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
-    ) -> None:
-        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces = (
-            tensor.to(self.device) for tensor in sample_reference
-        )
-        src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces = current_batch
-
+    def _save_sample(self, sample_reference: tuple[Tensor, Tensor, Tensor, Tensor, Tensor], current_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]) -> None:
+        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_src_identity_faces = (tensor.to(self.device) for tensor in sample_reference)
+        src, dst, dst_canonical, theta_restore, _same_mask, source_identity_faces = current_batch
         with torch.no_grad(), autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
-            reference_count = sample_src.shape[0]
-            dynamic_count = self.batch_size - reference_count
-            src_vis = torch.cat((sample_src, src[:dynamic_count]), dim=0)
-            dst_vis = torch.cat((sample_dst, dst[:dynamic_count]), dim=0)
-            dst_canonical_vis = torch.cat((sample_dst_canonical, dst_canonical[:dynamic_count]), dim=0)
-            theta_restore_vis = torch.cat((sample_theta_restore, theta_restore[:dynamic_count]), dim=0)
-            same_mask_vis = torch.cat((sample_same_mask, same_mask[:dynamic_count]), dim=0)
-            source_identity_faces_vis = torch.cat((sample_src_identity_faces, source_identity_faces[:dynamic_count]), dim=0)
+            half = sample_src.shape[0]
+            src_vis = torch.cat((sample_src, src[: self.batch_size - half]), dim=0)
+            dst_vis = torch.cat((sample_dst, dst[: self.batch_size - half]), dim=0)
 
+            dst_canonical_vis = torch.cat((sample_dst_canonical, dst_canonical[: self.batch_size - half]), dim=0)
+            theta_restore_vis = torch.cat((sample_theta_restore, theta_restore[: self.batch_size - half]), dim=0)
+
+            source_identity_faces_vis = torch.cat((sample_src_identity_faces, source_identity_faces[: self.batch_size - half]), dim=0)
             generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
             if self.hq_stage_active:
                 if self.reuse_generator_identity_for_hq_source:
@@ -1408,75 +1132,66 @@ class Trainer:
                     coarse_source_identity_embeddings_vis = hq_source_identity_embeddings_vis
                 else:
                     coarse_source_identity_embeddings_vis = self.coarse_identity_embeddings_forward(source_identity_faces_vis)
-
             fake_vis, coarse_vis = self.net_g_ema(dst_vis, generator_identity_embeddings_vis, return_coarse=True)
-            coarse_resize_in_vis = NF.interpolate(dst_vis, size=self.coarse_resolution, mode="bilinear", align_corners=False)
             coarse_display_vis = NF.interpolate(coarse_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
-            final_identity_encoder_input_vis = self.prepare_identity_encoder_faces(fake_vis, theta_restore_vis)
-            final_identity_encoder_input_display_vis = NF.interpolate(final_identity_encoder_input_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
+
+            # Identity Loss 编码器真正接收的图像；直接组合 restore + FFHQ->112，
+            # 避免先恢复到全分辨率再二次重采样。仅为 sample grid 显示再放大回训练分辨率。
+            identity_encoder_input_vis = self.prepare_identity_encoder_faces(fake_vis, theta_restore_vis)
+            identity_encoder_input_display_vis = NF.interpolate(identity_encoder_input_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
+
+            grid = [src_vis, dst_vis, coarse_display_vis, fake_vis, dst_canonical_vis, identity_encoder_input_display_vis]
+
             if self.coarse_stage_active:
-                coarse_identity_encoder_input_vis = self.prepare_identity_encoder_faces(coarse_vis, theta_restore_vis)
-                coarse_identity_encoder_input_display_vis = NF.interpolate(coarse_identity_encoder_input_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
+                # ========================= Coarse 判别器梯度图 =========================
+                # sample 可视化临时切到 eval，结束后恢复判别器原训练状态。
+                coarse_for_gan_grad = coarse_vis.detach().requires_grad_(True)
+                coarse_d_training = self.net_d_coarse.training
+                self.net_d_coarse.eval()
+                try:
+                    with torch.enable_grad():
+                        coarse_score_vis = self.net_d_coarse(coarse_for_gan_grad)
+                        coarse_gan_loss_vis = self.coarse_gan_loss(coarse_score_vis)
+                        coarse_gan_grad_map = self.loss_grad_map(coarse_gan_loss_vis, coarse_for_gan_grad)
+                finally:
+                    self.net_d_coarse.train(coarse_d_training)
+                grid.append(NF.interpolate(coarse_gan_grad_map, size=fake_vis.shape[2:], mode="bilinear", align_corners=False))
 
-            restore_grid_vis = None
-            if (
-                self.enable_hq_gaze_loss
-                or self.enable_hq_hrffa_loss
-                or self.enable_hq_facs_loss
-                or self.enable_coarse_gaze_loss
-                or self.enable_coarse_hrffa_loss
-                or self.enable_coarse_facs_loss
-            ):
-                with autocast(device_type="cuda", enabled=False):
-                    restore_grid_vis = NF.affine_grid(theta_restore_vis.float(), size=list(dst_vis.shape), align_corners=False)
+                # ========================= Coarse 身份损失梯度图 =========================
+                with torch.enable_grad():
+                    coarse_for_id_grad = coarse_vis.detach().requires_grad_(True)
+                    coarse_identity_embeddings_vis = self.coarse_identity_embeddings_forward(self.prepare_identity_encoder_faces(coarse_for_id_grad, theta_restore_vis))
+                    coarse_id_loss_vis = self.coarse_id_loss(coarse_identity_embeddings_vis, coarse_source_identity_embeddings_vis.detach())
+                    coarse_id_grad_map = self.loss_grad_map(coarse_id_loss_vis, coarse_for_id_grad)
+                grid.append(NF.interpolate(coarse_id_grad_map, size=fake_vis.shape[2:], mode="bilinear", align_corners=False))
 
-        rows = [
-            _labeled_sample_row(_sample_grid_bgr(src_vis, minus_one_to_one=True), "SOURCE ID"),
-            _labeled_sample_row(_sample_grid_bgr(dst_vis, minus_one_to_one=True), "TARGET / DST"),
-            _labeled_sample_row(_sample_grid_bgr(coarse_display_vis, minus_one_to_one=True), "COARSE OUTPUT"),
-            _labeled_sample_row(_sample_grid_bgr(fake_vis, minus_one_to_one=True), "FINAL OUTPUT"),
-            _labeled_sample_row(_sample_grid_bgr(dst_canonical_vis, minus_one_to_one=True), "DST CANONICAL"),
-        ]
-        if self.coarse_stage_active:
-            rows.append(_labeled_sample_row(_sample_grid_bgr(coarse_identity_encoder_input_display_vis, minus_one_to_one=True), "COARSE ID INPUT"))
-        if self.hq_stage_active:
-            rows.append(_labeled_sample_row(_sample_grid_bgr(final_identity_encoder_input_display_vis, minus_one_to_one=True), "FINAL ID INPUT"))
+            if self.hq_stage_active:
+                # ========================= HQ 判别器梯度图 =========================
+                fake_for_gan_grad = fake_vis.detach().requires_grad_(True)
+                hq_d_training = self.net_d.training
+                self.net_d.eval()
+                try:
+                    with torch.enable_grad():
+                        hq_score_vis = self.net_d(fake_for_gan_grad)
+                        gan_loss_vis = self.hq_gan_loss(hq_score_vis)
+                        gan_grad_map = self.loss_grad_map(gan_loss_vis, fake_for_gan_grad)
+                finally:
+                    self.net_d.train(hq_d_training)
+                grid.append(gan_grad_map)
 
-        if self.coarse_stage_active:
-            coarse_gradients = self._sample_generator_loss_gradients(
-                "coarse",
-                coarse_vis,
-                coarse_resize_in_vis,
-                dst_canonical_vis,
-                theta_restore_vis,
-                same_mask_vis,
-                coarse_source_identity_embeddings_vis,
-                restore_grid_vis,
-            )
-            self._append_stage_gradient_visualization(rows, "COARSE", coarse_gradients, tuple(coarse_vis.shape[-2:]))
-            del coarse_gradients
+                # ========================= HQ 身份损失梯度图 =========================
+                with torch.enable_grad():
+                    fake_for_id_grad = fake_vis.detach().requires_grad_(True)
+                    generated_identity_embeddings_vis = self.hq_identity_embeddings_forward(self.prepare_identity_encoder_faces(fake_for_id_grad, theta_restore_vis))
+                    id_loss_vis = self.hq_id_loss(generated_identity_embeddings_vis, hq_source_identity_embeddings_vis.detach())
+                    id_grad_map = self.loss_grad_map(id_loss_vis, fake_for_id_grad)
+                grid.append(id_grad_map)
 
-        if self.hq_stage_active:
-            hq_gradients = self._sample_generator_loss_gradients(
-                "hq",
-                fake_vis,
-                dst_vis,
-                dst_canonical_vis,
-                theta_restore_vis,
-                same_mask_vis,
-                hq_source_identity_embeddings_vis,
-                restore_grid_vis,
-            )
-            self._append_stage_gradient_visualization(rows, "HQ", hq_gradients, tuple(fake_vis.shape[-2:]))
-            del hq_gradients
-
-        width = max(row.shape[1] for row in rows)
-        padded_rows = [
-            np.pad(row, ((0, 0), (0, width - row.shape[1]), (0, 0)), constant_values=20) if row.shape[1] < width else row
-            for row in rows
-        ]
-        grid_cpu = np.concatenate(padded_rows, axis=0)
-
+            grid = torch.cat(grid, dim=0)
+            grid.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)
+            grid = make_grid(grid, nrow=self.batch_size)[[2, 1, 0], :, :]  # RGB → BGR
+            grid = grid.permute(1, 2, 0)  # CHW → HWC
+            grid_cpu = grid.to(device="cpu", dtype=torch.uint8).numpy()
         sample_file = self.run_paths.samples / f"step_{self.completed_step:09d}.png"
         if not cv2.imwrite(sample_file, grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
             raise OSError(f"保存训练 sample 失败：{sample_file}")
@@ -1484,12 +1199,9 @@ class Trainer:
     def train(self) -> None:
 
         net_coarse = self.train_coarse
-        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces = self.dataset.next()
-        reference_count = self.batch_size // 2
-        sample_reference = tuple(
-            tensor[:reference_count].detach().cpu()
-            for tensor in (sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces)
-        )
+        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, _, sample_src_identity_faces = self.dataset.next()
+        half = self.batch_size // 2
+        sample_reference = tuple(tensor[:half].detach().cpu() for tensor in (sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_src_identity_faces))
         with tqdm(total=None, initial=self.completed_step, mininterval=1.0, bar_format="{n_fmt:7} | 速度 {rate_fmt:3} | 训练时间 {elapsed}") as progress:
             while True:
                 if self._stop_requested:

@@ -31,8 +31,6 @@ from swapface.train import (
     _branch_generator_mode,
     _branch_model_states,
     _compile_training_callable,
-    _gradient_conflict_matrix,
-    _linear_gradient_heatmap,
     _load_branch_checkpoint,
     _load_run_config,
     _print_hq_rebuild_summary,
@@ -40,7 +38,6 @@ from swapface.train import (
     _require_training_config,
     _resolve_branch_start_step,
     _scaled_backward_step,
-    _shared_gradient_scale,
     _submodule_state_dict,
     _supports_compiled_bf16,
 )
@@ -1353,77 +1350,20 @@ def _check_discriminator_training_state_split() -> None:
 
 
 def _check_sample_gradient_maps() -> None:
-    magnitude = torch.tensor([[[[0.0, 0.25], [0.5, 1.0]]]])
-    heatmap = _linear_gradient_heatmap(magnitude, torch.tensor(1.0), (2, 2))
-    torch.testing.assert_close(heatmap[:, 0:1], magnitude)
-    torch.testing.assert_close(heatmap[:, 1:], torch.zeros_like(heatmap[:, 1:]))
-
-    gradients = {
-        "A": torch.tensor([[[[1.0, 0.0]]]]),
-        "B": torch.tensor([[[[-1.0, 0.0]]]]),
-        "C": torch.tensor([[[[0.0, 1.0]]]]),
-        "ZERO": torch.zeros(1, 1, 1, 2),
-    }
-    names, conflict, counts = _gradient_conflict_matrix(gradients)
-    assert names == ["A", "B", "C", "ZERO"]
-    torch.testing.assert_close(torch.diag(conflict)[:3], torch.ones(3))
-    assert torch.isnan(conflict[3, 3])
-    torch.testing.assert_close(conflict[0, 1], torch.tensor(-1.0))
-    torch.testing.assert_close(conflict[0, 2], torch.tensor(0.0))
-    torch.testing.assert_close(conflict[1, 2], torch.tensor(0.0))
-    assert torch.isnan(conflict[:3, 3]).all() and torch.isnan(conflict[3, :3]).all()
-    torch.testing.assert_close(counts[:3, :3], torch.ones((3, 3), dtype=torch.int64))
-    assert torch.equal(counts[3], torch.zeros(4, dtype=torch.int64))
-
-    # same-only reconstruction 的零梯度样本不能把有效样本的 cosine 人为拉向 0，且有效样本数必须可见。
-    masked_names, masked_conflict, masked_counts = _gradient_conflict_matrix(
-        {
-            "ID": torch.tensor([[[[1.0, 0.0]]], [[[1.0, 0.0]]]]),
-            "L1": torch.tensor([[[[1.0, 0.0]]], [[[0.0, 0.0]]]]),
-        }
-    )
-    assert masked_names == ["ID", "L1"]
-    torch.testing.assert_close(masked_conflict[0, 1], torch.tensor(1.0))
-    assert masked_counts.tolist() == [[2, 1], [1, 1]]
-
-    # 共享显示尺度使用各 loss 的 p99.5，而不是被单个极端像素支配。
-    mostly_one = torch.ones(1, 1, 1, 1000)
-    mostly_one[..., -1] = 1000.0
-    shared_scale = _shared_gradient_scale({"A": mostly_one, "B": torch.full_like(mostly_one, 0.5)})
-    assert 1.0 <= float(shared_scale) < 10.0
-
-    stage_source = inspect.getsource(Trainer._sample_generator_loss_gradients)
-    for token in (
+    sample_tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer._save_sample)))
+    self_calls = {node.func.attr for node in ast.walk(sample_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"}
+    assert {
+        "net_d_coarse",
         "coarse_gan_loss",
-        "coarse_wfm_loss",
+        "coarse_identity_embeddings_forward",
         "coarse_id_loss",
-        "coarse_gaze_loss",
-        "coarse_hrffa_loss",
-        "coarse_facs_loss",
-        "coarse_vgg_loss",
-        "coarse_l1_loss",
+        "net_d",
         "hq_gan_loss",
-        "hq_wfm_loss",
+        "hq_identity_embeddings_forward",
         "hq_id_loss",
-        "hq_gaze_loss",
-        "hq_hrffa_loss",
-        "hq_facs_loss",
-        "hq_vgg_loss",
-        "hq_l1_loss",
-    ):
-        assert token in stage_source
-    assert "r1" not in stage_source.lower()
-
-    sample_source = inspect.getsource(Trainer._save_sample)
-    assert "sample_same_mask" in sample_source and "same_mask_vis" in sample_source
-    assert "_append_stage_gradient_visualization" in sample_source
-    assert "self.batch_size - reference_count" in sample_source
-    assert "SAMPLE_MAX_IMAGES" not in sample_source and "SAMPLE_GRADIENT_MAX_RESOLUTION" not in sample_source
-    assert "tuple(coarse_vis.shape[-2:])" in sample_source and "tuple(fake_vis.shape[-2:])" in sample_source
-    assert "COARSE ID INPUT" in sample_source and "FINAL ID INPUT" in sample_source
-    assert 'if self.hq_stage_active:' in sample_source
-    assert "COARSE OUTPUT" in sample_source and "FINAL OUTPUT" in sample_source
-    print("PASS: sample visualization uses labeled linear gradient heatmaps, all enabled G losses, and cosine conflict matrices")
+        "loss_grad_map",
+    }.issubset(self_calls)
+    print("PASS: sample visualization keeps Coarse/HQ discriminator and identity gradient maps")
 
 
 def main() -> None:
