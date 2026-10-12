@@ -9,14 +9,14 @@ class AdaIN(nn.Module):
     def __init__(self, channels: int, w_dim: int) -> None:
         super().__init__()
 
-        self.norm = nn.InstanceNorm2d(channels, affine=False)
+        self.norm = nn.InstanceNorm2d(channels, affine=False, eps=1e-8)
         self.gamma_fc = nn.Linear(w_dim, channels)
         self.beta_fc = nn.Linear(w_dim, channels)
 
-        nn.init.zeros_(self.gamma_fc.weight)
+        nn.init.normal_(self.gamma_fc.weight, mean=0.0, std=0.01)
         nn.init.ones_(self.gamma_fc.bias)
 
-        nn.init.zeros_(self.beta_fc.weight)
+        nn.init.normal_(self.beta_fc.weight, mean=0.0, std=0.01)
         nn.init.zeros_(self.beta_fc.bias)
 
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
@@ -30,23 +30,25 @@ class IDInject(nn.Module):
     def __init__(self, channels: int, w_dim: int) -> None:
         super().__init__()
 
-        self.act = nn.SiLU()
+        self.act = nn.LeakyReLU(0.2)
 
         self.adain0 = AdaIN(channels, w_dim)
-        self.conv0 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.conv0 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, padding_mode="reflect")
 
         self.adain1 = AdaIN(channels, w_dim)
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, padding_mode="reflect")
 
-    def forward(self, x: Tensor, w: Tensor) -> Tensor:
+    def forward(self, x: Tensor, w: tuple[Tensor, Tensor]) -> Tensor:
+
+        w1, w2 = w
 
         residual = self.conv0(x)
-        residual = self.adain0(residual, w)
+        residual = self.adain0(residual, w1)
         residual = self.act(residual)
 
         residual = self.conv1(residual)
-        residual = self.adain1(residual, w)
-        residual = self.act(residual)
+        residual = self.adain1(residual, w2)
+        # residual = self.act(residual)
 
         return x + residual
 
@@ -55,9 +57,9 @@ class FromRGB(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__(
             nn.Conv2d(in_ch, out_ch // 2, kernel_size=7, stride=1, padding=3, padding_mode="reflect"),
-            nn.SiLU(),
+            nn.LeakyReLU(0.2),
             nn.Conv2d(out_ch // 2, out_ch, kernel_size=3, stride=1, padding=1),
-            nn.SiLU(),
+            nn.LeakyReLU(0.2),
         )
 
 
@@ -65,7 +67,7 @@ class ToRGB(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__(
             nn.Conv2d(in_ch, in_ch // 2, kernel_size=3, stride=1, padding=1),
-            nn.SiLU(),
+            nn.LeakyReLU(0.2),
             nn.Conv2d(in_ch // 2, out_ch, kernel_size=7, stride=1, padding=3, padding_mode="reflect"),
             nn.Tanh(),
         )
@@ -76,7 +78,7 @@ class UpSample(nn.Sequential):
         super().__init__(
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-            nn.SiLU(),
+            nn.LeakyReLU(0.2),
         )
 
 
@@ -84,7 +86,7 @@ class DownSample(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__(
             nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1),
-            nn.SiLU(),
+            nn.LeakyReLU(0.2),
         )
 
 
@@ -95,14 +97,14 @@ class WSpaceMap(nn.Module):
         self.shared_delta = nn.Sequential()
         for _ in range(num_share_layers - 1):
             self.shared_delta.append(nn.Linear(id_dim, id_dim))
-            self.shared_delta.append(nn.SiLU())
+            self.shared_delta.append(nn.LeakyReLU(0.2))
         self.shared_delta.append(nn.Linear(id_dim, id_dim))
 
         self.private_delta = nn.ModuleList()
         for _ in range(num):
             layers = nn.Sequential()
             for _ in range(num_w_p_layers):
-                layers.append(nn.SiLU())
+                layers.append(nn.LeakyReLU(0.2))
                 layers.append(nn.Linear(id_dim, id_dim))
             self.private_delta.append(layers)
 
@@ -111,14 +113,14 @@ class WSpaceMap(nn.Module):
 
         shared_output = self.shared_delta[-1]
         assert isinstance(shared_output, nn.Linear)
-        nn.init.zeros_(shared_output.weight)
+        nn.init.normal_(shared_output.weight, mean=0.0, std=0.005)
         nn.init.zeros_(shared_output.bias)
 
         for head in self.private_delta:
             assert isinstance(head, nn.Sequential)
             private_output = head[-1]
             assert isinstance(private_output, nn.Linear)
-            nn.init.zeros_(private_output.weight)
+            nn.init.normal_(private_output.weight, mean=0.0, std=0.005)
             nn.init.zeros_(private_output.bias)
 
     def forward(self, id_feat: Tensor) -> tuple[Tensor, ...]:
@@ -137,10 +139,10 @@ class LatentBlock(nn.Module):
 
     def forward(self, x: Tensor, w_space: tuple[Tensor, ...]) -> Tensor:
 
-        assert len(w_space) == len(self.layers), f"w_p_all length {len(w_space)} != layers length {len(self.layers)}"
+        assert len(w_space) == len(self.layers) * 2, f"w_p_all length {len(w_space)} != layers length {len(self.layers) * 2}"
 
-        for layer_index, layer in enumerate(self.layers):
-            x = layer(x, w_space[layer_index])
+        for i, layer in enumerate(self.layers):
+            x = layer(x, w_space[i * 2 : i * 2 + 2])
 
         return x
 
@@ -148,12 +150,12 @@ class LatentBlock(nn.Module):
 class Coarse(nn.Module):
     def __init__(
         self,
-        img_resolution: int = 512,
+        img_resolution: int = 128,
         img_channels: int = 3,
         latent_resolution: int = 32,
         num_latent: int = 6,
         base_ch: int = 64,
-        max_ch: int = 512,
+        max_ch: int = 256,
         id_dim: int = 512,
     ) -> None:
         super().__init__()
@@ -176,7 +178,7 @@ class Coarse(nn.Module):
 
         num_depth = int(math.log2(scale))
 
-        self.w_space_map = WSpaceMap(id_dim, num_latent)
+        self.w_space_map = WSpaceMap(id_dim, num_latent * 2)
         features = [min(max_ch, base_ch * (2**i)) for i in range(num_depth + 1)]
 
         self.from_rgb = FromRGB(img_channels, base_ch)
@@ -242,9 +244,9 @@ class HQRefiner(nn.Module):
             encoder.append(
                 nn.Sequential(
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.SiLU(),
+                    nn.LeakyReLU(0.2),
                     nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.SiLU(),
+                    nn.LeakyReLU(0.2),
                 )
             )
             in_ch = out_ch
@@ -252,9 +254,9 @@ class HQRefiner(nn.Module):
 
         self.bottleneck = nn.Sequential(
             nn.Conv2d(self.feature_channels[-2], self.feature_channels[-1], kernel_size=3, stride=1, padding=1),
-            nn.SiLU(),
+            nn.LeakyReLU(0.2),
             nn.Conv2d(self.feature_channels[-1], self.feature_channels[-1], kernel_size=3, stride=1, padding=1),
-            nn.SiLU(),
+            nn.LeakyReLU(0.2),
         )
 
         self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
@@ -266,9 +268,9 @@ class HQRefiner(nn.Module):
             decoder.append(
                 nn.Sequential(
                     nn.Conv2d(concat_ch, mid_ch, kernel_size=3, stride=1, padding=1),
-                    nn.SiLU(),
+                    nn.LeakyReLU(0.2),
                     nn.Conv2d(mid_ch, skip_ch, kernel_size=3, stride=1, padding=1),
-                    nn.SiLU(),
+                    nn.LeakyReLU(0.2),
                 )
             )
             decoder_ch = skip_ch
@@ -307,9 +309,9 @@ class Generator(nn.Module):
         id_dim: int = 512,
         coarse_resolution: int = 128,
         coarse_latent_resolution: int = 32,
-        coarse_num_latent: int = 8,
+        coarse_num_latent: int = 6,
         coarse_base_ch: int = 64,
-        coarse_max_ch: int = 512,
+        coarse_max_ch: int = 256,
         hq_bottleneck_resolution: int = 16,
         hq_base_ch: int = 8,
         hq_max_ch: int = 128,
@@ -373,14 +375,14 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 1
     network_cfg = {
-        "img_resolution": 256,
+        "img_resolution": 512,
         "img_channels": 3,
         "id_dim": 512,
         "coarse_resolution": 128,
         "coarse_latent_resolution": 32,
-        "coarse_num_latent": 8,
+        "coarse_num_latent": 6,
         "coarse_base_ch": 64,
-        "coarse_max_ch": 512,
+        "coarse_max_ch": 256,
         "hq_bottleneck_resolution": 16,
         "hq_base_ch": 8,
         "hq_max_ch": 128,

@@ -195,7 +195,8 @@ def _check_train_config(root: Path) -> None:
     default_generator = copy.deepcopy(raw)
     default_generator["generator"].pop("coarse_num_latent")
     default_generator_resolved = resolve_train_config(default_generator)
-    assert default_generator_resolved["generator"]["coarse_num_latent"] == 8
+    assert default_generator_resolved["generator"]["coarse_num_latent"] == 6
+    assert default_generator_resolved["generator"]["coarse_max_ch"] == 256
 
     invalid_batch = copy.deepcopy(raw)
     invalid_batch["train"]["batch_size"] = 10
