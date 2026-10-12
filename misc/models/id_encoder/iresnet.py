@@ -1,10 +1,10 @@
 import torch
 from torch import nn
 
-__all__ = ["iresnet18", "iresnet34", "iresnet50", "iresnet100", "iresnet200"]
+__all__ = ["iresnet18", "iresnet34", "iresnet50", "iresnet100", "iresnet200", "w600k_iresnet50"]
 
 
-def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
+def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1, bias=False):
     """3x3 convolution with padding"""
     return nn.Conv2d(
         in_planes,
@@ -13,14 +13,14 @@ def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
         stride=stride,
         padding=dilation,
         groups=groups,
-        bias=False,
+        bias=bias,
         dilation=dilation,
     )
 
 
-def conv1x1(in_planes, out_planes, stride=1):
+def conv1x1(in_planes, out_planes, stride=1, bias=False):
     """1x1 convolution"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=bias)
 
 
 class IBasicBlock(nn.Module):
@@ -35,6 +35,7 @@ class IBasicBlock(nn.Module):
         groups=1,
         base_width=64,
         dilation=1,
+        fused_bn=False,
     ):
         super().__init__()
         if groups != 1 or base_width != 64:
@@ -42,11 +43,11 @@ class IBasicBlock(nn.Module):
         if dilation > 1:
             raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
         self.bn1 = nn.BatchNorm2d(inplanes, eps=1e-05)
-        self.conv1 = conv3x3(inplanes, planes)
-        self.bn2 = nn.BatchNorm2d(planes, eps=1e-05)
+        self.conv1 = conv3x3(inplanes, planes, bias=fused_bn)
+        self.bn2 = nn.Identity() if fused_bn else nn.BatchNorm2d(planes, eps=1e-05)
         self.prelu = nn.PReLU(planes)
-        self.conv2 = conv3x3(planes, planes, stride)
-        self.bn3 = nn.BatchNorm2d(planes, eps=1e-05)
+        self.conv2 = conv3x3(planes, planes, stride, bias=fused_bn)
+        self.bn3 = nn.Identity() if fused_bn else nn.BatchNorm2d(planes, eps=1e-05)
         self.downsample = downsample
         self.stride = stride
 
@@ -76,24 +77,34 @@ class IResNet(nn.Module):
         width_per_group=64,
         replace_stride_with_dilation=None,
         fc_scale=7 * 7,
+        fused_bn=False,
     ):
         super().__init__()
         self.inplanes = 64
         self.dilation = 1
+        self.fused_bn = fused_bn
+        if fused_bn and zero_init_residual:
+            raise ValueError("zero_init_residual is unsupported for fused_bn")
         if replace_stride_with_dilation is None:
             replace_stride_with_dilation = [False, False, False]
         if len(replace_stride_with_dilation) != 3:
             raise ValueError(f'replace_stride_with_dilation should be None " "or a 3-element tuple, got {replace_stride_with_dilation}')
         self.groups = groups
         self.base_width = width_per_group
-        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(self.inplanes, eps=1e-05)
+        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=3, stride=1, padding=1, bias=fused_bn)
+        if not fused_bn:
+            self.bn1 = nn.BatchNorm2d(self.inplanes, eps=1e-05)
         self.prelu = nn.PReLU(self.inplanes)
         self.layer1 = self._make_layer(block, 64, layers[0], stride=2)
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
-        self.bn2 = nn.BatchNorm2d(512 * block.expansion, eps=1e-05)
+        # The folded checkpoint names its final 512-channel BN "bn1":
+        # the original stem BN no longer exists after fusion.
+        if fused_bn:
+            self.bn1 = nn.BatchNorm2d(512 * block.expansion, eps=1e-05)
+        else:
+            self.bn2 = nn.BatchNorm2d(512 * block.expansion, eps=1e-05)
         self.dropout = nn.Dropout(p=dropout, inplace=True)
         self.fc = nn.Linear(512 * block.expansion * fc_scale, num_features)
         self.features = nn.BatchNorm1d(num_features, eps=1e-05)
@@ -119,10 +130,13 @@ class IResNet(nn.Module):
             self.dilation *= stride
             stride = 1
         if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
-                nn.BatchNorm2d(planes * block.expansion, eps=1e-05),
-            )
+            if self.fused_bn:
+                downsample = conv1x1(self.inplanes, planes * block.expansion, stride, bias=True)
+            else:
+                downsample = nn.Sequential(
+                    conv1x1(self.inplanes, planes * block.expansion, stride),
+                    nn.BatchNorm2d(planes * block.expansion, eps=1e-05),
+                )
         layers = []
         layers.append(
             block(
@@ -133,6 +147,7 @@ class IResNet(nn.Module):
                 self.groups,
                 self.base_width,
                 previous_dilation,
+                self.fused_bn,
             )
         )
         self.inplanes = planes * block.expansion
@@ -144,6 +159,7 @@ class IResNet(nn.Module):
                     groups=self.groups,
                     base_width=self.base_width,
                     dilation=self.dilation,
+                    fused_bn=self.fused_bn,
                 )
             )
 
@@ -151,13 +167,14 @@ class IResNet(nn.Module):
 
     def forward(self, x):
         x = self.conv1(x)
-        x = self.bn1(x)
+        if not self.fused_bn:
+            x = self.bn1(x)
         x = self.prelu(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-        x = self.bn2(x)
+        x = self.bn1(x) if self.fused_bn else self.bn2(x)
         x = torch.flatten(x, 1)
         x = self.dropout(x)
         x = self.fc(x)
@@ -190,3 +207,15 @@ def iresnet100(pretrained=False, progress=True, **kwargs):
 
 def iresnet200(pretrained=False, progress=True, **kwargs):
     return _iresnet("iresnet200", IBasicBlock, [6, 26, 60, 6], pretrained, progress, **kwargs)
+
+
+def w600k_iresnet50():
+    """InsightFace IResNet50 with already-folded BN weights from buffalo_l.
+
+    The original pre-fusion topology is:
+    stem Conv-BN-PReLU; blocks BN-Conv-BN-PReLU-Conv-BN + skip.
+    The w600k ONNX/PyTorch checkpoint has folded Conv-adjacent BNs
+    into Conv weights/biases, while retaining block-input BNs and head BN.
+    Use this constructor only with the fused checkpoint.
+    """
+    return IResNet(IBasicBlock, [3, 4, 14, 3], fused_bn=True)

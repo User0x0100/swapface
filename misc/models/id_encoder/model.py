@@ -10,7 +10,7 @@ from torch import Tensor, nn
 
 from ...models import MODEL_REPOSITORY_ID
 from .adaface import IR_101
-from .iresnet import iresnet50, iresnet100
+from .iresnet import iresnet50, iresnet100, w600k_iresnet50
 from .qcface_iresnet import qcface_iresnet100
 from .vit import plsc_face_vit_b, transface_b, transface_l, transface_s
 
@@ -51,6 +51,7 @@ class IDEncoderProviderConfig:
 
 class IDEncoderProvider(Enum):
     BLENDFACE = IDEncoderProviderConfig(iresnet100, "blendface.pth")
+    WEBFACE600K_ARCFACE_R50 = IDEncoderProviderConfig(w600k_iresnet50, "w600k_r50.pth")
     MS1MV3_ARCFACE_R50_FP16 = IDEncoderProviderConfig(iresnet50, "ms1mv3_arcface_r50_fp16.pth")
     MS1MV3_ARCFACE_R100_FP16 = IDEncoderProviderConfig(iresnet100, "ms1mv3_arcface_r100_fp16.pth")
     GLINT360K_COSFACE_R50_FP16 = IDEncoderProviderConfig(iresnet50, "glint360k_r50_fp16.pth")

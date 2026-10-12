@@ -71,6 +71,21 @@ uv run python -m swapface.train \
 
 Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、R1、gaze、HRFFA、FACS、L1/VGG 与 reconstruction scope 均独立配置。`gan.weight` 只缩放对应阶段的 Generator adversarial loss；两个 Discriminator adversarial loss 固定权重 1.0。
 
+### WebFace600K ArcFace R50（InSwapper-128 身份编码器）
+
+身份编码器可选 `WEBFACE600K_ARCFACE_R50`。它从项目共用模型仓库 `leehx/model_hub` 加载 `w600k_r50.pth`（原始权重来自 `Icar/buffalo_l-torch`，与 InsightFace `buffalo_l/w600k_r50.onnx` 输出数值等价），复用项目原有 IResNet50 / IBasicBlock 的 `fused_bn=True` 结构（与普通非融合 R50 checkpoint 不可互换）。权重与其他身份编码器一样通过公共 `MODEL_REPOSITORY_ID` 下载到 Hugging Face Hub 缓存，不把模型文件加入 Git。
+
+```toml
+[identity]
+provider = "WEBFACE600K_ARCFACE_R50"  # Generator 的 source embedding
+
+[loss.coarse.identity]
+provider = "MS1MV3_ARCFACE_R50_FP16"  # Identity teacher 可独立选择
+```
+
+与其他 Provider 一样，输入必须是 ArcFace 112 对齐的 RGB、`[-1,1]`，输出是 L2 归一化的 512 维 embedding。`[loss.hq.identity].provider` 也可以独立选择该模型。对应 CLI 的 `id-encoder --provider WEBFACE600K_ARCFACE_R50` 可用于导出 ONNX。这里仅接入 **身份编码器**；InSwapper 换脸模型内部的 `emap` 投影矩阵不属于该编码器，不会用于本项目的生成器。InsightFace 的预训练权重有非商业研究用途限制，不因以 `.pth` 格式分发而获得商业使用授权。
+
+
 优化策略按训练实体分开配置：`[optimizer.generator]`、`[optimizer.hq_discriminator]`、`[optimizer.coarse_discriminator]` 分别设置 LR；对应的 `[scheduler.generator]`、`[scheduler.hq_discriminator]`、`[scheduler.coarse_discriminator]` 分别设置 `type / t_max / min_lr_ratio`。Adam 的 `betas=(0.0, 0.99)` 与 fused 实现仍固定在训练代码中。
 
 两个 Discriminator 的架构也完全独立：`[discriminator.hq].img_resolution` 必须等于 `generator.img_resolution`，`[discriminator.coarse].img_resolution` 必须等于 `generator.coarse_resolution`；两者的 `img_channels` 都必须等于 `generator.img_channels`。`base_ch` 与 `max_ch` 可以分别设置。两个阶段都使用单 Global Discriminator：Encoder 通过 residual block 与 FIR 抗混叠逐级下采样到 4x4，再经 MinibatchStd、3x3 Conv 和两层 Linear 输出每图一个 logit。判别器权重不使用 Spectral Normalization。
