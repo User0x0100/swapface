@@ -104,7 +104,7 @@ Generator、HQ Discriminator、Coarse Discriminator 分别拥有独立的 optimi
 - HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/R1、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
 - Discriminator：HQ 与 Coarse 各有一个单 Global 判别器，并分别维护自己的 D optimizer、scheduler、GradScaler 与 R1 enable/interval/gamma。Encoder 下采样使用 FIR 抗混叠，4x4 端使用 MinibatchStd。普通 D step 将 fake/real 合并为一次 forward，但在 MinibatchStd 处仍分开统计；lazy R1 step 只对 real 输入计算梯度惩罚，固定使用未编译的 FP32 判别器路径，并将 raw R1 乘以 interval 保持期望正则强度。joint 模式下两个 D 各自完成一次更新；某个 D 的 FP16 overflow 只重试该 D。
 
-Coarse 内部首先将真实 `dst` 双线性缩放到 `coarse_resolution`；训练时通过 `return_resize_in=True` 复用这一实际模型输入作为 Coarse Discriminator real，以及 L1/VGG reconstruction target，不在 Trainer 中重复 resize。Coarse/HQ 的 L1 reconstruction 直接对 prediction/target 计算逐像素 L1，不做 Gaussian blur；VGG 同样保持原始输入。make_blurred_l1_loss 仅作为可选 loss helper 保留，当前训练路径不使用。Coarse L1/VGG 由 `[loss.coarse.reconstruction].scope` 控制作用范围；默认 `same`，只对 self-reconstruction pair 生效。Coarse 的 target 属性监督则先将低分辨率输出双线性上采样到训练分辨率，再使用与 Final 相同的 `theta_restore` 恢复到 canonical 坐标系，与 `dst_canonical` 比较。
+Coarse 内部首先将真实 `dst` 双线性缩放到 `coarse_resolution`；训练时通过 `return_resize_in=True` 复用这一实际模型输入作为 Coarse Discriminator real，以及 L1/VGG reconstruction target，不在 Trainer 中重复 resize。Coarse/HQ 的 L1 reconstruction 由各自的 `[loss.coarse.l1].gaussian_blur`、`[loss.hq.l1].gaussian_blur` 控制：整数 `0`（默认）直接计算逐像素 L1；正整数 `N` 启用 Gaussian blur（`sigma = 当前阶段分辨率 / N`），例如 `384` 对应之前硬编码的模糊强度，`256` 则更强。开启时仅对 prediction-target 差分进行等价的滤波，不影响 VGG，VGG 始终使用原图。Coarse L1/VGG 由 `[loss.coarse.reconstruction].scope` 控制作用范围；默认 `same`，只对 self-reconstruction pair 生效。Coarse 的 target 属性监督则先将低分辨率输出双线性上采样到训练分辨率，再使用与 Final 相同的 `theta_restore` 恢复到 canonical 坐标系，与 `dst_canonical` 比较。
 
 ## 训练数据源
 

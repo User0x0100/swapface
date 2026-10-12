@@ -5,6 +5,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from losses.functional import _gaussian_blur_parameters
 from misc.models.id_encoder import IDEncoderProvider
 from models.discriminator import INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION, DiscriminatorType
 
@@ -114,7 +115,7 @@ DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
     "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
     "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
     "reconstruction": {"scope": "same"},
-    "l1": {"enable": True, "weight": 10.0, "gaussian_blur": False},
+    "l1": {"enable": True, "weight": 10.0, "gaussian_blur": 0},
     "vgg": {"enable": True, "weights": dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)},
 }
 DEFAULT_HQ_LOSS_CONFIG: dict[str, Any] = {
@@ -126,7 +127,7 @@ DEFAULT_HQ_LOSS_CONFIG: dict[str, Any] = {
     "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
     "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
     "reconstruction": {"scope": "same"},
-    "l1": {"enable": True, "weight": 10.0, "gaussian_blur": False},
+    "l1": {"enable": True, "weight": 10.0, "gaussian_blur": 0},
     "vgg": {"enable": True, "weights": dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)},
 }
 DEFAULT_LOSS_CONFIG: dict[str, Any] = {
@@ -391,7 +392,7 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
     l1 = _with_defaults(_table(loss, "l1", f"[{prefix}.l1]"), defaults["l1"], f"[{prefix}.l1]")
     l1["enable"] = _bool(l1["enable"], f"{prefix}.l1.enable")
     l1["weight"] = _float(l1["weight"], f"{prefix}.l1.weight", minimum=0.0)
-    l1["gaussian_blur"] = _bool(l1["gaussian_blur"], f"{prefix}.l1.gaussian_blur")
+    l1["gaussian_blur"] = _int(l1["gaussian_blur"], f"{prefix}.l1.gaussian_blur", minimum=0)
 
     vgg = _with_defaults(_table(loss, "vgg", f"[{prefix}.vgg]"), defaults["vgg"], f"[{prefix}.vgg]")
     vgg["enable"] = _bool(vgg["enable"], f"{prefix}.vgg.enable")
@@ -567,7 +568,19 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
     train = _normalize_train(config)
     discriminator = _normalize_discriminator(config)
     loss = _normalize_loss(config)
+    generator = _normalize_generator(config)
     for stage, stage_config in discriminator.items():
+        divisor = loss[stage]["l1"]["gaussian_blur"]
+        if divisor:
+            resolution_key = "coarse_resolution" if stage == "coarse" else "img_resolution"
+            resolution = generator[resolution_key]
+            try:
+                _gaussian_blur_parameters(resolution, divisor)
+            except ValueError as exc:
+                raise ValueError(
+                    f"loss.{stage}.l1.gaussian_blur={divisor} 无法用于 "
+                    f"generator.{resolution_key}={resolution}：{exc}"
+                ) from exc
         discriminator_type = DiscriminatorType[stage_config["type"]]
         if discriminator_type is DiscriminatorType.FIR_MINIBATCH_STD:
             group_size = stage_config["minibatch_std_group_size"]
@@ -593,7 +606,7 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
         "identity": _normalize_identity(config),
         "loss": loss,
         "data": _normalize_data(config),
-        "generator": _normalize_generator(config),
+        "generator": generator,
         "discriminator": discriminator,
     }
 

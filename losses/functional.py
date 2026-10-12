@@ -125,12 +125,18 @@ def make_l1_loss(weight: float = 1.0, reduction: Reduction = "mean") -> LossFn:
     return _make_weighted_loss(F.l1_loss, weight, reduction)
 
 
-def _gaussian_blur_parameters(resolution: int) -> tuple[float, int]:
-    """按图像分辨率计算极轻 Gaussian blur：sigma 恒为边长的 1/384。"""
+def _gaussian_blur_parameters(resolution: int, blur_divisor: int = 384) -> tuple[float, int]:
+    """Gaussian blur 的 sigma = resolution / blur_divisor；分母越小越模糊。"""
     if resolution <= 0:
         raise ValueError(f"resolution must be > 0, got {resolution}")
-    sigma = resolution / 384.0
+    if isinstance(blur_divisor, bool) or not isinstance(blur_divisor, int):
+        raise TypeError(f"blur_divisor must be an integer, got {type(blur_divisor).__name__}")
+    if blur_divisor <= 0:
+        raise ValueError(f"blur_divisor must be > 0, got {blur_divisor}")
+    sigma = resolution / blur_divisor
     radius = max(1, math.ceil(3.0 * sigma))
+    if radius >= resolution:
+        raise ValueError(f"Gaussian blur radius {radius} must be < resolution {resolution} for reflect padding")
     return sigma, radius * 2 + 1
 
 
@@ -156,16 +162,16 @@ def _gaussian_blur(image: Tensor, kernel: Tensor) -> Tensor:
     return F.conv2d(blurred, vertical, groups=channels)
 
 
-def make_blurred_l1_loss(weight: float, resolution: int, reduction: Reduction = "mean") -> LossFn:
-    """创建先做轻微 Gaussian blur、再计算 L1 的重建损失。
+def make_blurred_l1_loss(weight: float, resolution: int, reduction: Reduction = "mean", *, blur_divisor: int = 384) -> LossFn:
+    """创建 Gaussian blur 后的 L1 重建损失。
 
-    ``sigma = resolution / 384``，因此 128/256/512 分辨率分别使用
-    1/3、2/3、4/3 px sigma。kernel 覆盖约 ``±3 sigma``。
+    ``sigma = resolution / blur_divisor``，分母越小，模糊越强。
+    默认 384 保留现有 helper 的模糊强度；kernel 覆盖约 ``±3 sigma``。
 
     对 prediction/target 使用同一个线性 Gaussian filter 后再相减，等价于
     先相减再滤波。这里采用后一种写法，将卷积开销减半。
     """
-    sigma, kernel_size = _gaussian_blur_parameters(resolution)
+    sigma, kernel_size = _gaussian_blur_parameters(resolution, blur_divisor)
     kernel_cpu = _make_gaussian_kernel(sigma, kernel_size)
     cached_kernel = kernel_cpu
 

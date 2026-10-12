@@ -60,7 +60,7 @@ def _check_train_config(root: Path) -> None:
         '[loss.coarse.reconstruction]\nscope = "same"\n'
         "[loss.coarse.gan]\nweight = 0.6\n"
         '[loss.coarse.identity]\nprovider = "BLENDFACE"\nweight = 7.0\n'
-        "[loss.coarse.l1]\nenable = true\nweight = 6.0\ngaussian_blur = true\n"
+        "[loss.coarse.l1]\nenable = true\nweight = 6.0\ngaussian_blur = 384\n"
         "[loss.coarse.r1]\nenable = true\ninterval = 8\ngamma = 5.0\n"
         "[loss.coarse.gaze]\nenable = true\nweight = 0.4\ndistribution_weight = 0.05\nconfidence_weighted = true\n"
         "[loss.coarse.hrffa]\nenable = true\npose_weight = 0.4\neye_weight = 0.8\nmouth_weight = 1.1\ncontour_weight = 1.2\ncontour_shape_weight = 0.3\noccluded_geometry_weight = 0.2\n"
@@ -68,7 +68,7 @@ def _check_train_config(root: Path) -> None:
         '[loss.hq.reconstruction]\nscope = "all"\n'
         "[loss.hq.gan]\nweight = 0.8\n"
         '[loss.hq.identity]\nprovider = "MS1MV3_ARCFACE_R50_FP16"\nweight = 9.0\n'
-        "[loss.hq.l1]\nenable = true\nweight = 7.0\ngaussian_blur = false\n"
+        "[loss.hq.l1]\nenable = true\nweight = 7.0\ngaussian_blur = 0\n"
         "[loss.hq.r1]\nenable = false\ninterval = 4\ngamma = 2.0\n"
         "[loss.hq.gaze]\nenable = true\nweight = 0.75\ndistribution_weight = 0.2\nconfidence_weighted = false\n"
         "[loss.hq.hrffa]\nenable = true\npose_weight = 0.5\neye_weight = 1.25\nmouth_weight = 1.5\ncontour_weight = 2.0\ncontour_shape_weight = 0.4\noccluded_geometry_weight = 0.1\n"
@@ -109,13 +109,13 @@ def _check_train_config(root: Path) -> None:
     assert resolved["loss"]["coarse"]["gan"] == {"weight": 0.6}
     assert resolved["loss"]["coarse"]["identity"] == {"provider": "BLENDFACE", "weight": 7.0}
     assert resolved["loss"]["coarse"]["reconstruction"] == {"scope": "same"}
-    assert resolved["loss"]["coarse"]["l1"] == {"enable": True, "weight": 6.0, "gaussian_blur": True}
+    assert resolved["loss"]["coarse"]["l1"] == {"enable": True, "weight": 6.0, "gaussian_blur": 384}
     assert resolved["loss"]["coarse"]["wfm"] == {"enable": False, "weights": {"0": 0.5, "1": 1.0, "2": 1.0, "3": 1.0}}
     assert resolved["loss"]["coarse"]["r1"] == {"enable": True, "interval": 8, "gamma": 5.0}
     assert resolved["loss"]["coarse"]["vgg"]["weights"] == {"relu2_2": 0.5}
     assert resolved["loss"]["hq"]["gan"] == {"weight": 0.8}
     assert resolved["loss"]["hq"]["identity"] == {"provider": "MS1MV3_ARCFACE_R50_FP16", "weight": 9.0}
-    assert resolved["loss"]["hq"]["l1"] == {"enable": True, "weight": 7.0, "gaussian_blur": False}
+    assert resolved["loss"]["hq"]["l1"] == {"enable": True, "weight": 7.0, "gaussian_blur": 0}
     assert resolved["loss"]["hq"]["wfm"] == {"enable": False, "weights": {"0": 0.5, "1": 1.0, "2": 1.0, "3": 1.0}}
     assert resolved["loss"]["hq"]["r1"] == {"enable": False, "interval": 4, "gamma": 2.0}
     assert resolved["loss"]["hq"]["reconstruction"] == {"scope": "all"}
@@ -309,6 +309,38 @@ def _check_train_config(root: Path) -> None:
         else:
             raise AssertionError(f"配置错误接受了未知 {stage} reconstruction scope")
 
+    for stage in ("coarse", "hq"):
+        for bad_value in (True, False, 1.5, "384", -1):
+            invalid = copy.deepcopy(raw)
+            invalid["loss"][stage]["l1"]["gaussian_blur"] = bad_value
+            try:
+                resolve_train_config(invalid)
+            except (TypeError, ValueError) as error:
+                assert f"loss.{stage}.l1.gaussian_blur" in str(error)
+            else:
+                raise AssertionError(f"配置错误接受了 {stage}.l1.gaussian_blur={bad_value!r}")
+
+        for divisor in (0, 256, 384, 512):
+            valid = copy.deepcopy(raw)
+            valid["loss"][stage]["l1"]["gaussian_blur"] = divisor
+            assert resolve_train_config(valid)["loss"][stage]["l1"]["gaussian_blur"] == divisor
+
+        for divisor in (1, 2, 3):
+            invalid = copy.deepcopy(raw)
+            invalid["loss"][stage]["l1"]["gaussian_blur"] = divisor
+            try:
+                resolve_train_config(invalid)
+            except ValueError as error:
+                assert f"loss.{stage}.l1.gaussian_blur" in str(error)
+                resolution_key = "coarse_resolution" if stage == "coarse" else "img_resolution"
+                assert f"generator.{resolution_key}" in str(error)
+            else:
+                raise AssertionError(f"配置错误接受了 {stage}.l1.gaussian_blur={divisor}，运行时将触发 reflect padding 错误")
+
+        valid = copy.deepcopy(raw)
+        valid["loss"][stage]["l1"]["gaussian_blur"] = 4
+        assert resolve_train_config(valid)["loss"][stage]["l1"]["gaussian_blur"] == 4
+
     obsolete = copy.deepcopy(raw)
     obsolete["loss"]["gan"] = {"weight": 1.0}
     try:
@@ -483,14 +515,25 @@ def _check_blurred_l1_loss() -> None:
     from losses.functional import _gaussian_blur_parameters
 
     expected_parameters = {
-        128: (128.0 / 384.0, 3),
-        256: (256.0 / 384.0, 5),
-        512: (512.0 / 384.0, 9),
+        128: {384: (128.0 / 384.0, 3), 256: (128.0 / 256.0, 5)},
+        256: {384: (256.0 / 384.0, 5), 256: (256.0 / 256.0, 7)},
+        512: {384: (512.0 / 384.0, 9), 256: (512.0 / 256.0, 13)},
     }
-    for resolution, (expected_sigma, expected_kernel_size) in expected_parameters.items():
-        sigma, kernel_size = _gaussian_blur_parameters(resolution)
-        assert abs(sigma - expected_sigma) < 1e-12
-        assert kernel_size == expected_kernel_size
+    for resolution, divisors in expected_parameters.items():
+        for divisor, (expected_sigma, expected_kernel_size) in divisors.items():
+            sigma, kernel_size = _gaussian_blur_parameters(resolution, divisor)
+            assert abs(sigma - expected_sigma) < 1e-12
+            assert kernel_size == expected_kernel_size
+        # Historical helper default remains /384.
+        assert _gaussian_blur_parameters(resolution) == divisors[384]
+
+    for invalid_divisor in (0, -1, True, 384.0):
+        try:
+            _gaussian_blur_parameters(128, invalid_divisor)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(f"Invalid Gaussian blur divisor accepted: {invalid_divisor!r}")
 
     ratios = []
     for resolution in (128, 256, 512):
@@ -505,6 +548,18 @@ def _check_blurred_l1_loss() -> None:
         assert prediction.grad is not None and torch.isfinite(prediction.grad).all()
 
     assert ratios[0] > ratios[1] > ratios[2]
+
+    # Smaller positive divisor means a stronger blur for the same resolution.
+    checkerboard = torch.tensor([[[[-1.0, 1.0], [1.0, -1.0]]]]).repeat(1, 3, 128, 128).requires_grad_(True)
+    zeros = torch.zeros_like(checkerboard)
+    weaker = make_blurred_l1_loss(weight=1.0, resolution=256, blur_divisor=384)(checkerboard, zeros)
+    stronger = make_blurred_l1_loss(weight=1.0, resolution=256, blur_divisor=256)(checkerboard, zeros)
+    assert 0 <= stronger < weaker < checkerboard.abs().mean()
+
+    per_pixel = make_blurred_l1_loss(weight=1.0, resolution=256, reduction="none", blur_divisor=256)(checkerboard, zeros)
+    assert per_pixel.shape == checkerboard.shape
+    stronger.backward()
+    assert checkerboard.grad is not None and torch.isfinite(checkerboard.grad).all()
 
     constant = torch.full((2, 3, 256, 256), 0.25)
     zero = torch.zeros_like(constant)
@@ -1061,15 +1116,17 @@ def _check_generator_responsibility_boundary() -> None:
                 continue
             test = node.test
             if not (
-                isinstance(test, ast.Call)
-                and isinstance(test.func, ast.Name)
-                and test.func.id == "bool"
-                and len(test.args) == 1
-                and isinstance(test.args[0], ast.Subscript)
-                and isinstance(test.args[0].value, ast.Name)
-                and test.args[0].value.id == config_name
-                and isinstance(test.args[0].slice, ast.Constant)
-                and test.args[0].slice.value == "gaussian_blur"
+                isinstance(test, ast.Compare)
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.Gt)
+                and len(test.comparators) == 1
+                and isinstance(test.comparators[0], ast.Constant)
+                and test.comparators[0].value == 0
+                and isinstance(test.left, ast.Subscript)
+                and isinstance(test.left.value, ast.Name)
+                and test.left.value.id == config_name
+                and isinstance(test.left.slice, ast.Constant)
+                and test.left.slice.value == "gaussian_blur"
             ):
                 continue
             matches.append(node)
@@ -1094,6 +1151,10 @@ def _check_generator_responsibility_boundary() -> None:
         resolution = blurred_keywords["resolution"]
         assert isinstance(resolution, ast.Attribute) and isinstance(resolution.value, ast.Name)
         assert resolution.value.id == "self" and resolution.attr == resolution_attr
+        divisor = blurred_keywords["blur_divisor"]
+        assert isinstance(divisor, ast.Subscript) and isinstance(divisor.value, ast.Name)
+        assert divisor.value.id == config_name
+        assert isinstance(divisor.slice, ast.Constant) and divisor.slice.value == "gaussian_blur"
 
     check_l1_mode_wiring("coarse_l1_config", "coarse_resolution")
     check_l1_mode_wiring("hq_l1_config", "img_resolution")

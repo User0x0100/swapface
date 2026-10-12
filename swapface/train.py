@@ -597,13 +597,23 @@ class Trainer:
         self.coarse_identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.coarse_resolution, self.batch_size, self.device)
 
         if self.enable_coarse_l1_loss:
-            if bool(coarse_l1_config["gaussian_blur"]):
-                self.coarse_l1_loss = make_blurred_l1_loss(weight=float(coarse_l1_config["weight"]), resolution=self.coarse_resolution, reduction="none")
+            if coarse_l1_config["gaussian_blur"] > 0:
+                self.coarse_l1_loss = make_blurred_l1_loss(
+                    weight=float(coarse_l1_config["weight"]),
+                    resolution=self.coarse_resolution,
+                    reduction="none",
+                    blur_divisor=coarse_l1_config["gaussian_blur"],
+                )
             else:
                 self.coarse_l1_loss = make_l1_loss(weight=float(coarse_l1_config["weight"]), reduction="none")
         if self.enable_hq_l1_loss:
-            if bool(hq_l1_config["gaussian_blur"]):
-                self.hq_l1_loss = make_blurred_l1_loss(weight=float(hq_l1_config["weight"]), resolution=self.img_resolution, reduction="none")
+            if hq_l1_config["gaussian_blur"] > 0:
+                self.hq_l1_loss = make_blurred_l1_loss(
+                    weight=float(hq_l1_config["weight"]),
+                    resolution=self.img_resolution,
+                    reduction="none",
+                    blur_divisor=hq_l1_config["gaussian_blur"],
+                )
             else:
                 self.hq_l1_loss = make_l1_loss(weight=float(hq_l1_config["weight"]), reduction="none")
 

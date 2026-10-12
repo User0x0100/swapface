@@ -80,10 +80,10 @@ weight = 10.0
 
 
 [loss.coarse.l1]
-# false: 直接逐像素 L1；true: 先按当前分辨率做 Gaussian blur，再计算 L1。
+# 0: 直接逐像素 L1；正整数 N: Gaussian blur（sigma = 当前分辨率 / N），N 越小模糊越强；384 为旧强度。
 enable = true
 weight = 10.0
-gaussian_blur = false
+gaussian_blur = 0
 
 
 [loss.coarse.r1]
@@ -155,10 +155,10 @@ weight = 10.0
 
 
 [loss.hq.l1]
-# false: 直接逐像素 L1；true: 先按当前分辨率做 Gaussian blur，再计算 L1。
+# 0: 直接逐像素 L1；正整数 N: Gaussian blur（sigma = 当前分辨率 / N），N 越小模糊越强；384 为旧强度。
 enable = true
 weight = 10.0
-gaussian_blur = false
+gaussian_blur = 0
 
 
 [loss.hq.r1]
