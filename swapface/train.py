@@ -68,9 +68,32 @@ def _sample_row_bgr(images: Tensor, label: str, nrow: int) -> np.ndarray:
     grid = make_grid(images, nrow=nrow, padding=SAMPLE_GRID_PADDING)[[2, 1, 0], :, :]
     image = grid.permute(1, 2, 0).to(device="cpu", dtype=torch.uint8).numpy()
     label_panel = np.full((image.shape[0], SAMPLE_LABEL_WIDTH, 3), 20, dtype=np.uint8)
-    text_y = max(28, image.shape[0] // 2)
-    cv2.putText(label_panel, label, (14, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (235, 235, 235), 1, cv2.LINE_AA)
+    label_lines = label.splitlines()
+    line_height = 26
+    first_baseline = (image.shape[0] - (len(label_lines) - 1) * line_height) // 2 + 6
+    for index, line in enumerate(label_lines):
+        cv2.putText(label_panel, line, (14, first_baseline + index * line_height), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (235, 235, 235), 1, cv2.LINE_AA)
     return np.concatenate((label_panel, image), axis=1)
+
+
+def _format_sample_gradient_rows(
+    rows: list[tuple[str, Tensor]], gradient_strengths: list[Tensor]
+) -> list[tuple[str, Tensor]]:
+    """使用已加权 loss 对输出图像的梯度 RMS 标注当前 stage 内的相对强度。"""
+    if len(rows) != len(gradient_strengths):
+        raise ValueError("gradient row/strength count mismatch")
+    if not rows:
+        return []
+
+    strengths = torch.stack(gradient_strengths).cpu().tolist()
+    if not all(np.isfinite(value) and value >= 0 for value in strengths):
+        raise FloatingPointError("sample loss gradient RMS contains invalid values")
+    total_strength = sum(strengths)
+    return [
+        (f"{label}\nRMS {strength:.2e} ({(strength / total_strength * 100.0) if total_strength > 0 else 0.0:.1f}%)", image)
+        for (label, image), strength in zip(rows, strengths, strict=True)
+    ]
+
 
 COARSE_GENERATOR_CONFIG_KEYS = (
     "img_channels",
@@ -1118,10 +1141,13 @@ class Trainer:
             temp_file.unlink(missing_ok=True)
             raise RuntimeError(f"保存检查点失败：{e}") from e
 
-    def loss_grad_map(self, loss: Tensor, x: Tensor) -> Tensor:
+    def loss_grad_map(self, loss: Tensor, x: Tensor) -> tuple[Tensor, Tensor]:
+        """同一次 autograd 求导生成热力图与未归一化的输出梯度 RMS。"""
         (grad,) = torch.autograd.grad(outputs=loss.sum(), inputs=x, retain_graph=False, create_graph=False)
+        grad = grad.detach().float()
+        grad_rms = grad.square().mean().sqrt()
 
-        h = grad.detach().float().abs().mean(dim=1, keepdim=True)  # [B, 1, H, W]
+        h = grad.abs().mean(dim=1, keepdim=True)  # [B, 1, H, W]
 
         h = torch.log1p(h)
         h = h / h.amax(dim=(2, 3), keepdim=True).clamp_min(EPS)
@@ -1129,7 +1155,7 @@ class Trainer:
         h = h.mul(2.0).sub(1.0)  # [0,1] -> [-1,1]
         h = h.expand(-1, 3, -1, -1).contiguous()
 
-        return h
+        return h, grad_rms
 
     def _sample_stage_grad_maps(
         self,
@@ -1184,11 +1210,14 @@ class Trainer:
             reconstruction_scope = self.hq_reconstruction_scope
 
         rows: list[tuple[str, Tensor]] = []
+        gradient_strengths: list[Tensor] = []
 
-        def add_row(label: str, grad_map: Tensor) -> None:
+        def add_row(label: str, loss: Tensor, x: Tensor) -> None:
+            grad_map, grad_rms = self.loss_grad_map(loss, x)
             if tuple(grad_map.shape[-2:]) != display_size:
                 grad_map = NF.interpolate(grad_map, size=display_size, mode="bilinear", align_corners=False)
             rows.append((label, grad_map))
+            gradient_strengths.append(grad_rms)
 
         discriminator_training = discriminator.training
         discriminator.eval()
@@ -1196,7 +1225,7 @@ class Trainer:
             with torch.enable_grad():
                 x = generated.detach().requires_grad_(True)
                 score = discriminator(x)
-                add_row(f"{prefix} GAN GRAD", self.loss_grad_map(gan_loss_fn(score), x))
+                add_row(f"{prefix} GAN GRAD", gan_loss_fn(score), x)
 
             if wfm_enabled:
                 assert wfm_loss_fn is not None
@@ -1205,14 +1234,14 @@ class Trainer:
                     _, fake_features = discriminator(x, False, True)
                     with torch.no_grad():
                         _, real_features = discriminator(reconstruction_target, False, True)
-                    add_row(f"{prefix} WFM GRAD", self.loss_grad_map(wfm_loss_fn(fake_features, real_features), x))
+                    add_row(f"{prefix} WFM GRAD", wfm_loss_fn(fake_features, real_features), x)
         finally:
             discriminator.train(discriminator_training)
 
         with torch.enable_grad():
             x = generated.detach().requires_grad_(True)
             generated_identity_embeddings = identity_embeddings_forward(self.prepare_identity_encoder_faces(x, theta_restore))
-            add_row(f"{prefix} ID GRAD", self.loss_grad_map(identity_loss_fn(generated_identity_embeddings, source_identity_embeddings.detach()), x))
+            add_row(f"{prefix} ID GRAD", identity_loss_fn(generated_identity_embeddings, source_identity_embeddings.detach()), x)
 
         geometry_enabled = gaze_enabled or hrffa_enabled or facs_enabled
         if geometry_enabled and restore_grid is None:
@@ -1229,7 +1258,7 @@ class Trainer:
             assert gaze_loss_fn is not None
             with torch.enable_grad():
                 x = generated.detach().requires_grad_(True)
-                add_row(f"{prefix} GAZE GRAD", self.loss_grad_map(gaze_loss_fn(restored_input(x), dst_canonical), x))
+                add_row(f"{prefix} GAZE GRAD", gaze_loss_fn(restored_input(x), dst_canonical), x)
 
         if hrffa_enabled:
             assert hrffa_loss_fn is not None
@@ -1237,7 +1266,7 @@ class Trainer:
                 x = generated.detach().requires_grad_(True)
                 components = hrffa_loss_fn.forward_components(restored_input(x), dst_canonical)
                 loss = torch.stack(tuple(components.values())).sum()
-                add_row(f"{prefix} HRFFA GRAD", self.loss_grad_map(loss, x))
+                add_row(f"{prefix} HRFFA GRAD", loss, x)
 
         if facs_enabled:
             assert facs_loss_fn is not None
@@ -1245,7 +1274,7 @@ class Trainer:
                 x = generated.detach().requires_grad_(True)
                 components = facs_loss_fn.forward_components(restored_input(x), dst_canonical)
                 loss = torch.stack(tuple(components.values())).sum()
-                add_row(f"{prefix} FACS GRAD", self.loss_grad_map(loss, x))
+                add_row(f"{prefix} FACS GRAD", loss, x)
 
         if vgg_enabled:
             assert vgg_loss_fn is not None
@@ -1253,7 +1282,7 @@ class Trainer:
                 x = generated.detach().requires_grad_(True)
                 per_sample = vgg_loss_fn(x, reconstruction_target)
                 loss = _reduce_reconstruction_loss(per_sample, same_mask, reconstruction_scope)
-                add_row(f"{prefix} VGG GRAD", self.loss_grad_map(loss, x))
+                add_row(f"{prefix} VGG GRAD", loss, x)
 
         if l1_enabled:
             assert l1_loss_fn is not None
@@ -1261,9 +1290,10 @@ class Trainer:
                 x = generated.detach().requires_grad_(True)
                 per_sample = l1_loss_fn(x, reconstruction_target).flatten(1).mean(dim=1)
                 loss = _reduce_reconstruction_loss(per_sample, same_mask, reconstruction_scope)
-                add_row(f"{prefix} L1 GRAD", self.loss_grad_map(loss, x))
+                add_row(f"{prefix} L1 GRAD", loss, x)
 
-        return rows
+        # 每个 stage 独立计算相对份额；它不等于参数更新比例，梯度方向也可能抵消。
+        return _format_sample_gradient_rows(rows, gradient_strengths)
 
     def _save_sample(
         self,

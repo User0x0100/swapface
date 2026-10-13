@@ -34,6 +34,8 @@ from swapface.train import (
     _load_branch_checkpoint,
     _load_run_config,
     _print_hq_rebuild_summary,
+    _format_sample_gradient_rows,
+    _sample_row_bgr,
     _reduce_reconstruction_loss,
     _require_training_config,
     _resolve_branch_start_step,
@@ -1412,6 +1414,29 @@ def _check_discriminator_training_state_split() -> None:
 
 
 def _check_sample_gradient_maps() -> None:
+    # 梯度范数使用加权 loss 的原始输出梯度，而非热力图归一化后的强度。
+    x = torch.zeros(1, 3, 128, 128, requires_grad=True)
+    grad_map, rms = Trainer.loss_grad_map(Trainer.__new__(Trainer), 2.0 * x.sum(), x)
+    assert grad_map.shape == x.shape
+    assert torch.allclose(rms, torch.tensor(2.0))
+
+    sample_image = torch.zeros_like(x)
+    rows = [(f"COARSE {name} GRAD", sample_image) for name in ("GAN", "ID", "L1")]
+    result = _format_sample_gradient_rows(rows, [torch.tensor(x) for x in (2.0, 3.0, 5.0)])
+    assert [label.rsplit("(", 1)[1] for label, _ in result] == ["20.0%)", "30.0%)", "50.0%)"]
+    assert "RMS 2.00e+00" in result[0][0]
+    assert [label.rsplit("(", 1)[1] for label, _ in _format_sample_gradient_rows(rows[:2], [torch.tensor(0.0), torch.tensor(0.0)])] == ["0.0%)", "0.0%)"]
+    for invalid in (float("nan"), float("inf")):
+        try:
+            _format_sample_gradient_rows(rows[:1], [torch.tensor(invalid)])
+        except FloatingPointError:
+            pass
+        else:
+            raise AssertionError("invalid gradient RMS must be rejected")
+    labeled_image = _sample_row_bgr(sample_image, result[0][0], 1)
+    assert labeled_image.shape[1] > 300 and labeled_image.shape[2] == 3
+    assert (labeled_image[:, :300] != 20).any()
+
     stage_source = inspect.getsource(Trainer._sample_stage_grad_maps)
     for token in (
         "coarse_gan_loss",
@@ -1453,7 +1478,7 @@ def _check_sample_gradient_maps() -> None:
     for label in ("SOURCE / SRC", "TARGET / DST", "COARSE OUTPUT", "FINAL OUTPUT", "DST CANONICAL", "FINAL ID INPUT"):
         assert label in sample_source
     assert "_sample_row_bgr" in sample_source
-    print("PASS: sample visualization labels every row and renders every enabled Generator loss with the legacy gradient map")
+    print("PASS: sample visualization labels every enabled Generator loss with gradient heatmap, RMS and share")
 
 
 def main() -> None:
