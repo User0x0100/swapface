@@ -60,6 +60,10 @@ MAX_AMP_OVERFLOW_RETRIES = 16
 TRAINING_SEMANTICS_VERSION = 21
 SAMPLE_LABEL_WIDTH = 300
 SAMPLE_GRID_PADDING = 2
+# 默认保留原有逐损失亮度归一化；改为 "shared" 可直观比较同 stage 各梯度图的绝对强度。
+SAMPLE_GRADIENT_HEATMAP_SCALE: Literal["independent", "shared"] = "independent"
+# 合成梯度低于各项梯度范数总和的 20% 时，EFF 投影比例容易被抵消放大，显示 N/A。
+SAMPLE_MIN_RESULTANT_RATIO_FOR_EFFECT = 0.2
 
 
 def _sample_row_bgr(images: Tensor, label: str, nrow: int) -> np.ndarray:
@@ -77,22 +81,83 @@ def _sample_row_bgr(images: Tensor, label: str, nrow: int) -> np.ndarray:
 
 
 def _format_sample_gradient_rows(
-    rows: list[tuple[str, Tensor]], gradient_strengths: list[Tensor]
+    rows: list[tuple[str, Tensor]],
+    gradients: list[Tensor],
+    *,
+    heatmap_scale: Literal["independent", "shared"] = "independent",
 ) -> list[tuple[str, Tensor]]:
-    """使用已加权 loss 对输出图像的梯度 RMS 标注当前 stage 内的相对强度。"""
-    if len(rows) != len(gradient_strengths):
-        raise ValueError("gradient row/strength count mismatch")
+    """输出已加权 loss 的梯度强度、合成方向投影与 stage 抵消率。
+
+    指标在 Generator 输出图像空间计算，而非模型参数空间。热力图默认逐损失归一化；
+    shared 模式在当前 stage 的所有损失之间使用同一份逐样本亮度标尺。
+    """
+    if len(rows) != len(gradients):
+        raise ValueError("gradient row/count mismatch")
     if not rows:
         return []
+    if heatmap_scale not in ("independent", "shared"):
+        raise ValueError(f"unsupported gradient heatmap scale: {heatmap_scale}")
+    if any(grad.shape != gradients[0].shape for grad in gradients):
+        raise ValueError("gradient shapes mismatch")
 
-    strengths = torch.stack(gradient_strengths).cpu().tolist()
-    if not all(np.isfinite(value) and value >= 0 for value in strengths):
-        raise FloatingPointError("sample loss gradient RMS contains invalid values")
-    total_strength = sum(strengths)
-    return [
-        (f"{label}\nRMS {strength:.2e} ({(strength / total_strength * 100.0) if total_strength > 0 else 0.0:.1f}%)", image)
-        for (label, image), strength in zip(rows, strengths, strict=True)
-    ]
+    # 保留梯度直到所有启用的 loss 计算完成；不需要再次运行任何损失网络。
+    grads = [grad.detach().float() for grad in gradients]
+    norms = torch.stack([torch.linalg.vector_norm(grad) for grad in grads])
+    total_grad = grads[0].clone()
+    for grad in grads[1:]:
+        total_grad.add_(grad)
+    total_norm = torch.linalg.vector_norm(total_grad)
+    sum_norm = norms.sum()
+    values = torch.cat((norms, total_norm[None], sum_norm[None])).cpu().tolist()
+    if not all(np.isfinite(value) and value >= 0 for value in values):
+        raise FloatingPointError("sample loss gradient norms contain invalid values")
+
+    strength_denominator = sum_norm.clamp_min(torch.finfo(torch.float32).tiny)
+    strengths = norms / strength_denominator * 100.0
+    rms = norms / (grads[0].numel() ** 0.5)
+    # DIR 仅在总梯度近乎为 0 时无定义；EFF 则在高抵消率下提前隐藏，
+    # 避免方向仍可辨认但投影占比被很小的总梯度放大为极端百分比。
+    direction_defined = values[-1] > 0.0 and values[-2] > 1e-4 * values[-1]
+    effect_defined = direction_defined and values[-2] > SAMPLE_MIN_RESULTANT_RATIO_FOR_EFFECT * values[-1]
+    if direction_defined:
+        dots = torch.stack([torch.sum(grad * total_grad) for grad in grads])
+        alignments = dots / (norms * total_norm).clamp_min(torch.finfo(torch.float32).tiny)
+        effects = dots / total_norm.square() if effect_defined else torch.zeros_like(norms)
+    else:
+        alignments = torch.zeros_like(norms)
+        effects = torch.zeros_like(norms)
+
+    metrics = torch.stack((rms, strengths, alignments, effects), dim=1).cpu().tolist()
+    cancel_pct = min(100.0, max(0.0, (1.0 - values[-2] / values[-1]) * 100.0)) if values[-1] > 0 else None
+    if not all(all(np.isfinite(v) for v in metric) for metric in metrics):
+        raise FloatingPointError("sample loss gradient metrics contain invalid values")
+
+    # 归一化只影响显示亮度，不能参与梯度强度或方向的统计。
+    maps = [torch.log1p(heatmap.detach().float()) for _, heatmap in rows]
+    if heatmap_scale == "shared":
+        shared_max = maps[0].amax(dim=(2, 3), keepdim=True)
+        for heatmap in maps[1:]:
+            shared_max = torch.maximum(shared_max, heatmap.amax(dim=(2, 3), keepdim=True))
+    result: list[tuple[str, Tensor]] = []
+    for index, ((label, _), heatmap, (grad_rms, strength, alignment, effect)) in enumerate(zip(rows, maps, metrics, strict=True)):
+        if heatmap_scale == "independent":
+            max_value = heatmap.amax(dim=(2, 3), keepdim=True)
+        else:
+            max_value = shared_max
+        display_map = heatmap / max_value.clamp_min(EPS)
+        display_map = display_map.mul(2.0).sub(1.0).expand(-1, 3, -1, -1).contiguous()
+
+        direction_text = f"{alignment:+.2f}" if direction_defined and values[index] > 0 else "N/A"
+        effective_text = f"{effect * 100.0:+.1f}%" if effect_defined else "N/A"
+        label_lines = [label]
+        if index == 0:
+            label_lines.append(f"STAGE CANCEL {cancel_pct:.1f}%" if cancel_pct is not None else "STAGE CANCEL N/A")
+        label_lines.extend((
+            f"RMS {grad_rms:.2e}  STR {strength:.1f}%",
+            f"DIR {direction_text}  EFF {effective_text}",
+        ))
+        result.append(("\n".join(label_lines), display_map))
+    return result
 
 
 COARSE_GENERATOR_CONFIG_KEYS = (
@@ -1142,20 +1207,12 @@ class Trainer:
             raise RuntimeError(f"保存检查点失败：{e}") from e
 
     def loss_grad_map(self, loss: Tensor, x: Tensor) -> tuple[Tensor, Tensor]:
-        """同一次 autograd 求导生成热力图与未归一化的输出梯度 RMS。"""
+        """一次 autograd 获取原始图像梯度和未经归一化的梯度幅度图。"""
         (grad,) = torch.autograd.grad(outputs=loss.sum(), inputs=x, retain_graph=False, create_graph=False)
         grad = grad.detach().float()
-        grad_rms = grad.square().mean().sqrt()
-
-        h = grad.abs().mean(dim=1, keepdim=True)  # [B, 1, H, W]
-
-        h = torch.log1p(h)
-        h = h / h.amax(dim=(2, 3), keepdim=True).clamp_min(EPS)
-
-        h = h.mul(2.0).sub(1.0)  # [0,1] -> [-1,1]
-        h = h.expand(-1, 3, -1, -1).contiguous()
-
-        return h, grad_rms
+        # 对 RGB 通道取绝对梯度均值，后续按独立/共享标尺统一归一化。
+        heatmap = grad.abs().mean(dim=1, keepdim=True)
+        return heatmap, grad
 
     def _sample_stage_grad_maps(
         self,
@@ -1210,14 +1267,14 @@ class Trainer:
             reconstruction_scope = self.hq_reconstruction_scope
 
         rows: list[tuple[str, Tensor]] = []
-        gradient_strengths: list[Tensor] = []
+        gradients: list[Tensor] = []
 
         def add_row(label: str, loss: Tensor, x: Tensor) -> None:
-            grad_map, grad_rms = self.loss_grad_map(loss, x)
+            grad_map, grad = self.loss_grad_map(loss, x)
             if tuple(grad_map.shape[-2:]) != display_size:
                 grad_map = NF.interpolate(grad_map, size=display_size, mode="bilinear", align_corners=False)
             rows.append((label, grad_map))
-            gradient_strengths.append(grad_rms)
+            gradients.append(grad)
 
         discriminator_training = discriminator.training
         discriminator.eval()
@@ -1292,8 +1349,8 @@ class Trainer:
                 loss = _reduce_reconstruction_loss(per_sample, same_mask, reconstruction_scope)
                 add_row(f"{prefix} L1 GRAD", loss, x)
 
-        # 每个 stage 独立计算相对份额；它不等于参数更新比例，梯度方向也可能抵消。
-        return _format_sample_gradient_rows(rows, gradient_strengths)
+        # 每个 stage 独立计算输出梯度；不等于参数更新比例。
+        return _format_sample_gradient_rows(rows, gradients, heatmap_scale=SAMPLE_GRADIENT_HEATMAP_SCALE)
 
     def _save_sample(
         self,

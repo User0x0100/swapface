@@ -166,6 +166,15 @@ experiments/
 - `latest.json`：很小的最新 checkpoint 指针，不复制大模型文件，适合本地文件系统和对象存储。
 - `checkpoints/`：完整训练状态。
 - `samples/`：与 completed step 对齐的训练可视化；每一行最左侧标注该行含义。基础图包含 src、dst、Coarse、Final、canonical dst、Final Identity 输入；随后对 active stage 的 GAN/Identity 以及当前实际启用的 WFM/Gaze/HRFFA/FACS/VGG/L1 分别绘制原有 `loss_grad_map` 风格的梯度图。未启用的可选损失不占行，R1 不进入 sample 可视化。
+
+每个 active stage 在 EMA 输出图像上分别计算各项**已加权** Generator loss 的图像梯度 `g_i = dL_i / dx`，梯度只求导一次，标注以下量：
+
+- `RMS`：图像梯度的均方根幅度；`STR`：梯度 L2 范数占各损失范数之和的百分比。
+- `DIR`：单项梯度与合成梯度 `g = sum(g_i)` 的余弦相似度，取值 [-1, 1]。
+- `EFF`：`dot(g_i, g) / dot(g, g) * 100%`，表示沿合成梯度方向的有符号投影贡献。可以为负或大于 100%；当 `||g|| / sum(||g_i||) > 0.2` 时计算，其余高抵消率（80% 以上）场景显示 `N/A`，避免近零分母放大为不直观的极端百分比；仅在显示数值时各项之和为 100%。
+- `STAGE CANCEL`：`(1 - ||g|| / sum(||g_i||)) * 100%`，仅在该 stage 第一行梯度标签标注。当所有梯度为 0 时为 `N/A`；合成梯度小于各项范数之和的 0.01% 时，`DIR` 和 `EFF` 为 `N/A`，避免近乎完全抵消时分母过小。
+
+梯度图默认沿用**每项损失、每张图片独立归一化**的亮度表现；可将 `swapface/train.py` 中 `SAMPLE_GRADIENT_HEATMAP_SCALE` 改为 `"shared"`，让同一 stage 的不同损失对每张图使用共享亮度标尺。任何热力图归一化都不参与指标计算。上述指标位于**生成图像空间**，不等于生成器参数梯度、Adam 更新份额或实际训练每步的精确贡献；样本生成器采用 EMA 权重。
 - `tensorboard/`：TensorBoard event 文件；一次 resume 可能新增 event 文件，这是正常现象。
 
 `experiments/*.toml` 可以进入 Git；`experiments/*/` 属于运行生成物，默认忽略。

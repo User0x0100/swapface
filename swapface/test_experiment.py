@@ -31,14 +31,14 @@ from swapface.train import (
     _branch_generator_mode,
     _branch_model_states,
     _compile_training_callable,
+    _format_sample_gradient_rows,
     _load_branch_checkpoint,
     _load_run_config,
     _print_hq_rebuild_summary,
-    _format_sample_gradient_rows,
-    _sample_row_bgr,
     _reduce_reconstruction_loss,
     _require_training_config,
     _resolve_branch_start_step,
+    _sample_row_bgr,
     _scaled_backward_step,
     _submodule_state_dict,
     _supports_compiled_bf16,
@@ -1414,26 +1414,107 @@ def _check_discriminator_training_state_split() -> None:
 
 
 def _check_sample_gradient_maps() -> None:
-    # 梯度范数使用加权 loss 的原始输出梯度，而非热力图归一化后的强度。
+    # 加权输出图像梯度不被热力图归一化污染。
     x = torch.zeros(1, 3, 128, 128, requires_grad=True)
-    grad_map, rms = Trainer.loss_grad_map(Trainer.__new__(Trainer), 2.0 * x.sum(), x)
-    assert grad_map.shape == x.shape
-    assert torch.allclose(rms, torch.tensor(2.0))
+    grad_map, grad = Trainer.loss_grad_map(Trainer.__new__(Trainer), 2.0 * x.sum(), x)
+    assert grad_map.shape == (1, 1, 128, 128)
+    assert grad.shape == x.shape
+    assert torch.allclose(grad, torch.full_like(x, 2.0))
+    assert torch.allclose(grad_map, torch.full_like(grad_map, 2.0))
 
-    sample_image = torch.zeros_like(x)
-    rows = [(f"COARSE {name} GRAD", sample_image) for name in ("GAN", "ID", "L1")]
-    result = _format_sample_gradient_rows(rows, [torch.tensor(x) for x in (2.0, 3.0, 5.0)])
-    assert [label.rsplit("(", 1)[1] for label, _ in result] == ["20.0%)", "30.0%)", "50.0%)"]
-    assert "RMS 2.00e+00" in result[0][0]
-    assert [label.rsplit("(", 1)[1] for label, _ in _format_sample_gradient_rows(rows[:2], [torch.tensor(0.0), torch.tensor(0.0)])] == ["0.0%)", "0.0%)"]
+    # g_ID=(3,0), g_VGG=(-2,0), g_GAN=(0,1): total=(1,1)。
+    # 有效贡献依次是 150%、-100%、50%，而力度分别为 50%、33.3%、16.7%。
+    sample_map = torch.tensor([[[[1.0, 0.0]]]])
+    rows = [(f"COARSE {name} GRAD", sample_map) for name in ("ID", "VGG", "GAN")]
+    grads = [
+        torch.tensor([[[[3.0, 0.0]]]]),
+        torch.tensor([[[[-2.0, 0.0]]]]),
+        torch.tensor([[[[0.0, 1.0]]]]),
+    ]
+    result = _format_sample_gradient_rows(rows, grads)
+    assert "STR 50.0%" in result[0][0] and "EFF +150.0%" in result[0][0]
+    assert "STR 33.3%" in result[1][0] and "EFF -100.0%" in result[1][0]
+    assert "STR 16.7%" in result[2][0] and "EFF +50.0%" in result[2][0]
+    assert "DIR +0.71" in result[0][0] and "DIR -0.71" in result[1][0]
+    assert "STAGE CANCEL 76.4%" in result[0][0]
+    assert "STAGE CANCEL" not in result[1][0]
+
+    aligned = _format_sample_gradient_rows(rows[:2], [
+        torch.tensor([[[[2.0, 0.0]]]]),
+        torch.tensor([[[[3.0, 0.0]]]]),
+    ])
+    assert "STAGE CANCEL 0.0%" in aligned[0][0]
+    assert "EFF +40.0%" in aligned[0][0] and "EFF +60.0%" in aligned[1][0]
+    assert "DIR +1.00" in aligned[0][0]
+
+    opposed = _format_sample_gradient_rows(rows[:2], [
+        torch.tensor([[[[1.0, 0.0]]]]),
+        torch.tensor([[[[-1.0, 0.0]]]]),
+    ])
+    assert "STAGE CANCEL 100.0%" in opposed[0][0]
+    assert all("DIR N/A" in label and "EFF N/A" in label for label, _ in opposed)
+
+    almost_opposed = _format_sample_gradient_rows(
+        rows[:2],
+        [
+            torch.tensor([[[[1.0, 0.0]]]]),
+            torch.tensor([[[[-0.99999, 0.0]]]]),
+        ],
+    )
+    assert all("DIR N/A" in label and "EFF N/A" in label for label, _ in almost_opposed)
+
+    # 极高抵消率下，DIR 仍可明确指示方向，但 EFF 已失去直观解释价值。
+    high_cancel = _format_sample_gradient_rows(
+        rows[:2],
+        [
+            torch.tensor([[[[1.0, 0.0]]]]),
+            torch.tensor([[[[-0.9995, 0.0]]]]),
+        ],
+    )
+    assert "STAGE CANCEL 100.0%" in high_cancel[0][0]
+    assert "DIR +1.00" in high_cancel[0][0] and "DIR -1.00" in high_cancel[1][0]
+    assert all("EFF N/A" in label for label, _ in high_cancel)
+    # 88.9% 的抵消率也要抑制过大的投影数值；正常案例 (76.4%) 仍显示有符号占比。
+    large_cancel = _format_sample_gradient_rows(
+        rows[:2],
+        [
+            torch.tensor([[[[1.0, 0.0]]]]),
+            torch.tensor([[[[-0.8, 0.0]]]]),
+        ],
+    )
+    assert "STAGE CANCEL 88.9%" in large_cancel[0][0]
+    assert all("EFF N/A" in label for label, _ in large_cancel)
+
+    zeros = _format_sample_gradient_rows(rows[:2], [
+        torch.zeros(1, 1, 1, 2),
+        torch.zeros(1, 1, 1, 2),
+    ])
+    assert all("STR 0.0%" in label and "DIR N/A" in label for label, _ in zeros)
+    assert "STAGE CANCEL N/A" in zeros[0][0]
     for invalid in (float("nan"), float("inf")):
         try:
-            _format_sample_gradient_rows(rows[:1], [torch.tensor(invalid)])
+            _format_sample_gradient_rows(rows[:1], [torch.tensor([[[[invalid, 0.0]]]])])
         except FloatingPointError:
             pass
         else:
-            raise AssertionError("invalid gradient RMS must be rejected")
-    labeled_image = _sample_row_bgr(sample_image, result[0][0], 1)
+            raise AssertionError("non-finite gradient must be rejected")
+
+    scales = [(rows[0][0], sample_map), (rows[1][0], sample_map * 2)]
+    independent = _format_sample_gradient_rows(scales, grads[:2])
+    shared = _format_sample_gradient_rows(scales, grads[:2], heatmap_scale="shared")
+    assert torch.allclose(independent[0][1].amax(), torch.tensor(1.0))
+    assert torch.allclose(independent[1][1].amax(), torch.tensor(1.0))
+    assert shared[0][1].amax() < shared[1][1].amax()
+    assert shared[0][1].shape == (1, 3, 1, 2)
+    assert _format_sample_gradient_rows([], []) == []
+    try:
+        _format_sample_gradient_rows(rows[:1], grads[:2])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("mismatched gradient counts must be rejected")
+
+    labeled_image = _sample_row_bgr(torch.zeros(1, 3, 128, 128), result[0][0], 1)
     assert labeled_image.shape[1] > 300 and labeled_image.shape[2] == 3
     assert (labeled_image[:, :300] != 20).any()
 
@@ -1478,7 +1559,7 @@ def _check_sample_gradient_maps() -> None:
     for label in ("SOURCE / SRC", "TARGET / DST", "COARSE OUTPUT", "FINAL OUTPUT", "DST CANONICAL", "FINAL ID INPUT"):
         assert label in sample_source
     assert "_sample_row_bgr" in sample_source
-    print("PASS: sample visualization labels every enabled Generator loss with gradient heatmap, RMS and share")
+    print("PASS: sample gradients display intensity, alignment, effective contribution and cancellation")
 
 
 def main() -> None:
