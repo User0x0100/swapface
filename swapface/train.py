@@ -189,8 +189,7 @@ def _supports_compiled_bf16(device_id: int) -> bool:
 
 
 def _compile_training_callable(fn: Any) -> Any:
-    mode = "default" if torch.version.hip is not None else "max-autotune-no-cudagraphs"
-    return torch.compile(fn, fullgraph=True, dynamic=False, mode=mode)
+    return torch.compile(fn, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 
 def _ensure_finite_gradients(name: str, named_parameters: Iterable[tuple[str, Tensor]]) -> None:
