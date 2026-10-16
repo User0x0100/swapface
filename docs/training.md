@@ -114,7 +114,7 @@ gamma = 10.0
 
 只有 Coarse 可以选择 UNET，固定 128x128；Global/Spatial 都采用标准 Hinge Loss。默认模型 forward 输出 (global_logits, spatial_logits)，return_feats=True 的 Encoder 特征保留弱特征匹配接口；设置 forward(..., return_spatial=False) 时只返回 [B,1] Global logits，完全跳过 Decoder/Spatial Head（同时兼容 return_feats=True）。实际训练中 spatial_weight=0 会自动切换 Global-only 前向，包括常规 D/G step、Lazy R1 和 WFM 路径。显式设置 base_ch/max_ch 始终覆盖判别器默认通道配置。
 
-训练 TensorBoard 的 Loss/coarse_g_global_loss 和 Loss/coarse_g_spatial_loss 分别记录 Global GAN Loss 与已乘 spatial_weight 的 Spatial GAN Loss，二者之和为 Loss/coarse_gan_loss（Spatial 关闭时后者分量记录 0）；已有 Loss/coarse_d_global_loss、Loss/coarse_d_spatial_loss 保留，D 的总对抗损失使用相同 spatial_weight。样本梯度图将 Coarse GAN 拆为 GAN GLOBAL GRAD 和 GAN SPATIAL GRAD 两行，并在 TensorBoard 的 Grad/coarse_g_global_rms、Grad/coarse_g_spatial_rms 记录**对 Coarse 输出图像的梯度 RMS**（Spatial 已包含 spatial_weight），仅随 sample_save_every 计算，以避免每个训练 step 都额外计算两个分支的输入梯度；Spatial 关闭时不绘制 Spatial 梯度图，RMS 写为 0。
+训练 TensorBoard 的 Loss/coarse_g_global_loss 和 Loss/coarse_g_spatial_loss 分别记录 Global GAN Loss 与已乘 spatial_weight 的 Spatial GAN Loss，二者之和为 Loss/coarse_gan_loss（Spatial 关闭时后者分量记录 0）；已有 Loss/coarse_d_global_loss、Loss/coarse_d_spatial_loss 保留，D 的总对抗损失使用相同 spatial_weight。样本梯度图将 Coarse GAN 拆为 GAN GLOBAL GRAD 和 GAN SPATIAL GRAD 两行，仍在各行标签中显示图像梯度的 RMS、STR、DIR、EFF（Spatial 已包含 spatial_weight）；仅随 sample_save_every 计算，不再向 TensorBoard 写入梯度 RMS 指标。Spatial 关闭时不绘制 Spatial 梯度图。
 
 R1 日志另包含 coarse_r1_branch_spatial（0=Global，1=Spatial）。Spatial Head 的独立参数没有全局 R1 约束，因此采用随机分支 R1，不代表已经比较出最优 R1 方案；注意 Spatial 的均值 R1 并不惩罚每一个独立 logit 的 Jacobian。默认其他判别器的配置、loss 与 checkpoint 行为不改变。
 

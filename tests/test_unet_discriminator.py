@@ -1,6 +1,7 @@
 """U-Net discriminator integration tests (CPU-safe; no dataset needed)."""
 
 import copy
+import re
 import tomllib
 import unittest
 from pathlib import Path
@@ -238,18 +239,17 @@ def _check_unet_global_only_discriminator_skips_decoder() -> None:
 def _check_unet_sample_gradient_rms() -> None:
     model = UNetDiscriminator(base_ch=4, max_ch=16).eval()
 
-    class Writer:
-        def __init__(self):
-            self.values = {}
-
-        def add_scalar(self, tag, value, step):
-            self.values[tag] = (float(value), step)
+    def displayed_rms(label: str) -> str:
+        match = re.search(r"\bRMS ([0-9.eE+-]+)", label)
+        assert match is not None, f"样本梯度标签缺少 RMS：{label}"
+        return match.group(1)
 
     for spatial_weight in (0.25, 0.0):
         trainer, _ = _stub_generator_trainer(model, spatial_weight)
-        trainer.log_writer = Writer()
+        # No TensorBoard writer: sample gradients must not emit scalar metrics.
+        assert not hasattr(trainer, "log_writer")
         generated = torch.randn(2, 3, 128, 128)
-        # Model code running in actual sample generation is wrapped by no_grad.
+        # Actual sample rendering runs inside no_grad; the helper enables grads locally.
         with torch.no_grad():
             rows = trainer._sample_stage_grad_maps(
                 "coarse", generated, generated, None, None, None,
@@ -258,13 +258,8 @@ def _check_unet_sample_gradient_rms() -> None:
         assert rows[0][0].startswith("COARSE GAN GLOBAL GRAD")
         assert any(row[0].startswith("COARSE ID GRAD") for row in rows)
         assert len(rows) == (3 if spatial_weight else 2)
-        assert ("Grad/coarse_g_global_rms" in trainer.log_writer.values)
-        assert trainer.log_writer.values["Grad/coarse_g_global_rms"][1] == 1000
         if spatial_weight:
             assert rows[1][0].startswith("COARSE GAN SPATIAL GRAD")
-            assert trainer.log_writer.values["Grad/coarse_g_spatial_rms"][0] > 0
-        else:
-            assert trainer.log_writer.values["Grad/coarse_g_spatial_rms"] == (0.0, 1000)
 
         x = generated.detach().requires_grad_(True)
         logits = model(x, False, False, spatial_weight > 0.0)
@@ -272,13 +267,11 @@ def _check_unet_sample_gradient_rms() -> None:
         global_loss = loss_fn(logits[0] if isinstance(logits, tuple) else logits)
         (global_grad,) = torch.autograd.grad(global_loss, x, retain_graph=spatial_weight > 0)
         expected_global_rms = float(global_grad.square().mean().sqrt())
-        actual_global_rms = trainer.log_writer.values["Grad/coarse_g_global_rms"][0]
-        assert abs(expected_global_rms - actual_global_rms) < 1e-9
+        assert displayed_rms(rows[0][0]) == f"{expected_global_rms:.2e}"
         if spatial_weight:
             (spatial_grad,) = torch.autograd.grad(spatial_weight * loss_fn(logits[1]), x)
             expected_spatial_rms = float(spatial_grad.square().mean().sqrt())
-            actual_spatial_rms = trainer.log_writer.values["Grad/coarse_g_spatial_rms"][0]
-            assert abs(expected_spatial_rms - actual_spatial_rms) < 1e-9
+            assert displayed_rms(rows[1][0]) == f"{expected_spatial_rms:.2e}"
 
 
 class TestUNetDiscriminator(unittest.TestCase):

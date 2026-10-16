@@ -1376,16 +1376,12 @@ class Trainer:
         rows: list[tuple[str, Tensor]] = []
         gradients: list[Tensor] = []
 
-        def add_row(label: str, loss: Tensor, x: Tensor, *, metric_name: str | None = None) -> None:
+        def add_row(label: str, loss: Tensor, x: Tensor) -> None:
             grad_map, grad = self.loss_grad_map(loss, x)
             if tuple(grad_map.shape[-2:]) != display_size:
                 grad_map = NF.interpolate(grad_map, size=display_size, mode="bilinear", align_corners=False)
             rows.append((label, grad_map))
             gradients.append(grad)
-            if metric_name is not None:
-                # Sample cadence only: no additional per-training-step autograd cost.
-                rms = grad.square().mean().sqrt()
-                self.log_writer.add_scalar(f"Grad/{metric_name}", rms, self.completed_step)
 
         discriminator_training = discriminator.training
         discriminator.eval()
@@ -1394,10 +1390,7 @@ class Trainer:
                 with torch.enable_grad():
                     x = generated.detach().requires_grad_(True)
                     global_logits = discriminator(x, False, False, False)
-                    add_row(
-                        f"{prefix} GAN GLOBAL GRAD", gan_loss_fn(global_logits), x,
-                        metric_name="coarse_g_global_rms",
-                    )
+                    add_row(f"{prefix} GAN GLOBAL GRAD", gan_loss_fn(global_logits), x)
                 if self.coarse_spatial_gan_weight > 0.0:
                     with torch.enable_grad():
                         x = generated.detach().requires_grad_(True)
@@ -1405,10 +1398,7 @@ class Trainer:
                         add_row(
                             f"{prefix} GAN SPATIAL GRAD",
                             self.coarse_spatial_gan_weight * gan_loss_fn(spatial_logits), x,
-                            metric_name="coarse_g_spatial_rms",
                         )
-                else:
-                    self.log_writer.add_scalar("Grad/coarse_g_spatial_rms", 0.0, self.completed_step)
             else:
                 with torch.enable_grad():
                     x = generated.detach().requires_grad_(True)

@@ -1589,7 +1589,7 @@ def main() -> None:
     compile_target = object()
     with patch("swapface.train.torch.version.hip", "7.2.0"), patch("swapface.train.torch.compile", return_value=compile_target) as compile_mock:
         assert _compile_training_callable(object()) is compile_target
-        assert compile_mock.call_args.kwargs["mode"] == "default"
+        assert compile_mock.call_args.kwargs["mode"] == "max-autotune-no-cudagraphs"
     with patch("swapface.train.torch.version.hip", None), patch("swapface.train.torch.compile", return_value=compile_target) as compile_mock:
         assert _compile_training_callable(object()) is compile_target
         assert compile_mock.call_args.kwargs["mode"] == "max-autotune-no-cudagraphs"
