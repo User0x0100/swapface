@@ -72,6 +72,8 @@ scope = "same"
 
 [loss.coarse.gan]
 weight = 1.0
+# 仅当 discriminator.coarse.type = "UNET" 时允许配置：
+# spatial_weight = 0.25  # Decoder 空间对抗损失权重，默认 0.25
 
 
 [loss.coarse.identity]
@@ -271,9 +273,9 @@ max_ch = 512
 minibatch_std_group_size = 4
 
 [discriminator.coarse]
-# FIR_MINIBATCH_STD 或 INSTANCE_NORM_RESIDUAL。
+# FIR_MINIBATCH_STD、INSTANCE_NORM_RESIDUAL 或 UNET（Coarse 128x128）。
 type = "FIR_MINIBATCH_STD"
-# Coarse 单全局 Discriminator；img_resolution 必须匹配 generator.coarse_resolution。
+# UNET 时默认 base_ch=32/max_ch=256，其余类型保留各自默认值。
 img_resolution = 128
 img_channels = 3
 base_ch = 64

@@ -1,5 +1,6 @@
 import argparse
 import copy
+import random
 import signal
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -31,7 +32,7 @@ from losses import (
 )
 from misc.face_alignment import ffhq_to_arcface_112, make_ffhq_to_arcface_112_grid, transform_sampling_grid
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
-from models.discriminator import DiscriminatorType, build_discriminator
+from models.discriminator import DiscriminatorType, UNetDiscriminator, build_discriminator
 from models.discriminator.upfirdn2d import initialize_upfirdn2d, is_rocm_gfx1100
 from models.networks import Generator
 
@@ -350,6 +351,7 @@ class Trainer:
         hq_loss_config = loss_config["hq"]
         coarse_gan_config = coarse_loss_config["gan"]
         hq_gan_config = hq_loss_config["gan"]
+        self.coarse_spatial_gan_weight = float(coarse_gan_config.get("spatial_weight", 0.0))
         coarse_identity_config = coarse_loss_config["identity"]
         hq_identity_config = hq_loss_config["identity"]
         coarse_r1_config = coarse_loss_config["r1"]
@@ -915,6 +917,87 @@ class Trainer:
             return ffhq_to_arcface_112(faces, grid, padding_mode="reflection")
         return ffhq_to_arcface_112(faces, grid)
 
+    @staticmethod
+    def _unet_generator_gan_components(
+        logits: Tensor | tuple[Tensor, Tensor],
+        loss_fn: GeneratorAdversarialLoss,
+        spatial_weight: float,
+    ) -> tuple[Tensor, Tensor]:
+        """Return Global and weighted Spatial G losses; inactive Spatial is zero."""
+        global_logits = logits[0] if isinstance(logits, tuple) else logits
+        global_loss = loss_fn(global_logits)
+        if spatial_weight == 0.0:
+            return global_loss, global_loss.new_zeros(())
+        if not isinstance(logits, tuple):
+            raise ValueError("启用了 Spatial GAN loss，但判别器未返回 Spatial logits")
+        spatial_loss = loss_fn(logits[1]) * spatial_weight
+        return global_loss, spatial_loss
+
+    def _unet_discriminator_stage_loss(
+        self,
+        stage: Literal["hq", "coarse"],
+        fake: Tensor,
+        real: Tensor,
+        net: UNetDiscriminator,
+        train_net: Any,
+        *,
+        r1_enabled: bool,
+        r1_interval: int,
+        r1_gamma: float,
+    ) -> Tensor:
+        """U-Net Hinge: global + weighted spatial; lazy R1 selects one head.
+
+        Head selection is pseudorandom per step but stable across AMP overflow
+        retries and resume. Spatial R1 uses per-image mean logits rather than
+        sum logits to avoid a resolution-dependent gradient scale.
+        """
+        assert stage == "coarse"
+        spatial_weight = self.coarse_spatial_gan_weight
+        spatial_enabled = spatial_weight > 0.0
+        r1_step = r1_enabled and self.completed_step % r1_interval == 0
+
+        if r1_step:
+            with autocast(device_type="cuda", enabled=False):
+                fake_logits = net(fake.detach().float(), False, False, spatial_enabled)
+                real_img = real.detach().float().requires_grad_(True)
+                real_logits = net(real_img, False, False, spatial_enabled)
+                if spatial_enabled:
+                    fake_global, fake_spatial = fake_logits
+                    real_global, real_spatial = real_logits
+                    spatial_loss = self.d_loss(fake_spatial, real_spatial)
+                else:
+                    fake_global, real_global = fake_logits, real_logits
+                global_loss = self.d_loss(fake_global, real_global)
+                if not spatial_enabled:
+                    spatial_loss = global_loss.new_zeros(())
+                # Different choices across steps, fixed choice on retry/resume.
+                branch = random.Random(self.completed_step * 2654435761 + 0xA5A5).randrange(2) if spatial_enabled else 0
+                chosen_logits = real_global if branch == 0 else real_spatial.mean(dim=(2, 3))
+                r1_loss_raw = r1_reg_loss(chosen_logits, real_img, gamma=r1_gamma)
+                r1_loss = r1_loss_raw * r1_interval
+            self.log(f"{stage}_r1_branch_spatial", r1_loss_raw.new_tensor(float(branch)), force=True)
+            self.log(f"{stage}_r1_loss_raw", r1_loss_raw, force=True)
+            self.log(f"{stage}_r1_loss", r1_loss, force=True)
+        else:
+            with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
+                scores = train_net(torch.cat((fake.detach(), real.detach()), dim=0), True, False, spatial_enabled)
+                if spatial_enabled:
+                    global_scores, spatial_scores = scores
+                    fake_spatial, real_spatial = spatial_scores.chunk(2, dim=0)
+                    spatial_loss = self.d_loss(fake_spatial, real_spatial)
+                else:
+                    global_scores = scores
+                fake_global, real_global = global_scores.chunk(2, dim=0)
+                global_loss = self.d_loss(fake_global, real_global)
+                if not spatial_enabled:
+                    spatial_loss = global_loss.new_zeros(())
+
+        adversarial_loss = global_loss + spatial_weight * spatial_loss
+        self.log(f"{stage}_d_global_loss", global_loss)
+        self.log(f"{stage}_d_spatial_loss", spatial_loss)
+        self.log(f"{stage}_d_loss", adversarial_loss)
+        return adversarial_loss + r1_loss if r1_step else adversarial_loss
+
     def _discriminator_stage_loss(
         self,
         stage: Literal["hq", "coarse"],
@@ -927,7 +1010,12 @@ class Trainer:
         r1_interval: int,
         r1_gamma: float,
     ) -> Tensor:
-        """计算单个全局判别器阶段的 adversarial + lazy R1。"""
+        """计算当前判别器阶段的 adversarial + lazy R1。"""
+        if isinstance(net, UNetDiscriminator):
+            return self._unet_discriminator_stage_loss(
+                stage, fake, real, net, train_net,
+                r1_enabled=r1_enabled, r1_interval=r1_interval, r1_gamma=r1_gamma,
+            )
         r1_step = r1_enabled and self.completed_step % r1_interval == 0
         if r1_step:
             # R1 涉及输入梯度的二阶反传，固定走未编译的 FP32 D，避免 AMP/compile
@@ -1011,17 +1099,37 @@ class Trainer:
         restore_grid: Tensor | None,
     ) -> Tensor:
         """计算 Coarse stage 的全部 Generator 训练目标。"""
-        if self.enable_coarse_wfm_loss:
-            coarse_score, coarse_fake_feats = self.train_d_coarse(coarse, False, True)
+        unet_enabled = isinstance(self.net_d_coarse, UNetDiscriminator)
+        if unet_enabled:
+            coarse_result = self.train_d_coarse(
+                coarse, False, self.enable_coarse_wfm_loss, self.coarse_spatial_gan_weight > 0.0,
+            )
         else:
-            coarse_score = self.train_d_coarse(coarse)
-        coarse_gan_loss = self.coarse_gan_loss(coarse_score)
+            coarse_result = self.train_d_coarse(coarse, False, self.enable_coarse_wfm_loss)
+
+        if self.enable_coarse_wfm_loss:
+            coarse_score, coarse_fake_feats = coarse_result
+        else:
+            coarse_score = coarse_result
+        if unet_enabled:
+            global_loss, spatial_loss = self._unet_generator_gan_components(
+                coarse_score, self.coarse_gan_loss, self.coarse_spatial_gan_weight,
+            )
+            self.log("coarse_g_global_loss", global_loss)
+            self.log("coarse_g_spatial_loss", spatial_loss)
+            coarse_gan_loss = global_loss + spatial_loss
+        else:
+            coarse_gan_loss = self.coarse_gan_loss(coarse_score)
         self.log("coarse_gan_loss", coarse_gan_loss)
         total = coarse_gan_loss
 
         if self.enable_coarse_wfm_loss:
             with torch.no_grad():
-                _, coarse_real_feats = self.train_d_coarse(coarse_resize_in, False, True)
+                if unet_enabled:
+                    # WFM only uses encoder features; skip the decoder for real images.
+                    _, coarse_real_feats = self.train_d_coarse(coarse_resize_in, False, True, False)
+                else:
+                    _, coarse_real_feats = self.train_d_coarse(coarse_resize_in, False, True)
             coarse_wfm_loss = self.coarse_wfm_loss(coarse_fake_feats, coarse_real_feats)
             self.log("coarse_wfm_loss", coarse_wfm_loss)
             total = total + coarse_wfm_loss
@@ -1269,28 +1377,56 @@ class Trainer:
         rows: list[tuple[str, Tensor]] = []
         gradients: list[Tensor] = []
 
-        def add_row(label: str, loss: Tensor, x: Tensor) -> None:
+        def add_row(label: str, loss: Tensor, x: Tensor, *, metric_name: str | None = None) -> None:
             grad_map, grad = self.loss_grad_map(loss, x)
             if tuple(grad_map.shape[-2:]) != display_size:
                 grad_map = NF.interpolate(grad_map, size=display_size, mode="bilinear", align_corners=False)
             rows.append((label, grad_map))
             gradients.append(grad)
+            if metric_name is not None:
+                # Sample cadence only: no additional per-training-step autograd cost.
+                rms = grad.square().mean().sqrt()
+                self.log_writer.add_scalar(f"Grad/{metric_name}", rms, self.completed_step)
 
         discriminator_training = discriminator.training
         discriminator.eval()
         try:
-            with torch.enable_grad():
-                x = generated.detach().requires_grad_(True)
-                score = discriminator(x)
-                add_row(f"{prefix} GAN GRAD", gan_loss_fn(score), x)
+            if isinstance(discriminator, UNetDiscriminator):
+                with torch.enable_grad():
+                    x = generated.detach().requires_grad_(True)
+                    global_logits = discriminator(x, False, False, False)
+                    add_row(
+                        f"{prefix} GAN GLOBAL GRAD", gan_loss_fn(global_logits), x,
+                        metric_name="coarse_g_global_rms",
+                    )
+                if self.coarse_spatial_gan_weight > 0.0:
+                    with torch.enable_grad():
+                        x = generated.detach().requires_grad_(True)
+                        _, spatial_logits = discriminator(x)
+                        add_row(
+                            f"{prefix} GAN SPATIAL GRAD",
+                            self.coarse_spatial_gan_weight * gan_loss_fn(spatial_logits), x,
+                            metric_name="coarse_g_spatial_rms",
+                        )
+                else:
+                    self.log_writer.add_scalar("Grad/coarse_g_spatial_rms", 0.0, self.completed_step)
+            else:
+                with torch.enable_grad():
+                    x = generated.detach().requires_grad_(True)
+                    add_row(f"{prefix} GAN GRAD", gan_loss_fn(discriminator(x)), x)
 
             if wfm_enabled:
                 assert wfm_loss_fn is not None
                 with torch.enable_grad():
                     x = generated.detach().requires_grad_(True)
-                    _, fake_features = discriminator(x, False, True)
-                    with torch.no_grad():
-                        _, real_features = discriminator(reconstruction_target, False, True)
+                    if isinstance(discriminator, UNetDiscriminator):
+                        _, fake_features = discriminator(x, False, True, False)
+                        with torch.no_grad():
+                            _, real_features = discriminator(reconstruction_target, False, True, False)
+                    else:
+                        _, fake_features = discriminator(x, False, True)
+                        with torch.no_grad():
+                            _, real_features = discriminator(reconstruction_target, False, True)
                     add_row(f"{prefix} WFM GRAD", wfm_loss_fn(fake_features, real_features), x)
         finally:
             discriminator.train(discriminator_training)

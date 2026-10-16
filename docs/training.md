@@ -69,7 +69,7 @@ uv run python -m swapface.train \
 - `[[data.src]]` / `[[data.dst]]`：训练数据源；
 - `[generator]` / `[discriminator.hq]` / `[discriminator.coarse]`：Generator 与两个 Discriminator 的独立模型定义。
 
-Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、R1、gaze、HRFFA、FACS、L1/VGG 与 reconstruction scope 均独立配置。`gan.weight` 只缩放对应阶段的 Generator adversarial loss；两个 Discriminator adversarial loss 固定权重 1.0。
+Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、R1、gaze、HRFFA、FACS、L1/VGG 与 reconstruction scope 均独立配置。`gan.weight` 只缩放对应阶段的 Generator adversarial loss；两个全局判别器的 adversarial loss 固定权重 1.0；UNET 的 Global Head 仍为 1.0，Spatial Head 使用独立的 spatial_weight，同时作用于 D 与 G。
 
 ### WebFace600K ArcFace R50（InSwapper-128 身份编码器）
 
@@ -88,7 +88,35 @@ provider = "MS1MV3_ARCFACE_R50_FP16"  # Identity teacher 可独立选择
 
 优化策略按训练实体分开配置：`[optimizer.generator]`、`[optimizer.hq_discriminator]`、`[optimizer.coarse_discriminator]` 分别设置 LR；对应的 `[scheduler.generator]`、`[scheduler.hq_discriminator]`、`[scheduler.coarse_discriminator]` 分别设置 `type / t_max / min_lr_ratio`。Adam 的 `betas=(0.0, 0.99)` 与 fused 实现仍固定在训练代码中。
 
-两个 Discriminator 的架构也完全独立：`[discriminator.hq].img_resolution` 必须等于 `generator.img_resolution`，`[discriminator.coarse].img_resolution` 必须等于 `generator.coarse_resolution`；两者的 `img_channels` 都必须等于 `generator.img_channels`。`base_ch` 与 `max_ch` 可以分别设置。两个阶段都使用单 Global Discriminator：Encoder 通过 residual block 与 FIR 抗混叠逐级下采样到 4x4，再经 MinibatchStd、3x3 Conv 和两层 Linear 输出每图一个 logit。判别器权重不使用 Spectral Normalization。
+两个 Discriminator 的架构也完全独立：`[discriminator.hq].img_resolution` 必须等于 `generator.img_resolution`，`[discriminator.coarse].img_resolution` 必须等于 `generator.coarse_resolution`；两者的 `img_channels` 都必须等于 `generator.img_channels`。`base_ch` 与 `max_ch` 可以分别设置。默认的 FIR_MINIBATCH_STD 是单 Global Discriminator：Encoder 通过 residual block 与 FIR 抗混叠逐级下采样到 4x4，再经 MinibatchStd、3x3 Conv 和两层 Linear 输出每图一个 logit。INSTANCE_NORM_RESIDUAL 保留旧的全局残差判别器。新增 Coarse 专用 UNET（仅 128x128）：共享 Encoder 下采样到 8x8，Global Head 输出 [B,1]，带 Encoder Skip 的 Decoder 上采样至 128x128，Spatial Head 输出 [B,1,128,128]。UNET 用双线性上采样 + Conv 残差，不使用 ConvTranspose2d、Attention、CutMix、CR、GP、SN 或归一化层；其默认 base_ch=32、max_ch=256。
+
+### 可选 Coarse U-Net 判别器
+
+在新 run 配置中选择（已有 run 需 branch 并 reset Coarse Discriminator，不能原地 resume 改架构）：
+
+```toml
+[discriminator.coarse]
+type = "UNET"
+img_resolution = 128
+img_channels = 3
+base_ch = 32
+max_ch = 256
+
+[loss.coarse.gan]
+weight = 1.0
+spatial_weight = 0.25
+
+[loss.coarse.r1]
+enable = true
+interval = 16
+gamma = 10.0
+```
+
+只有 Coarse 可以选择 UNET，固定 128x128；Global/Spatial 都采用标准 Hinge Loss。默认模型 forward 输出 (global_logits, spatial_logits)，return_feats=True 的 Encoder 特征保留弱特征匹配接口；设置 forward(..., return_spatial=False) 时只返回 [B,1] Global logits，完全跳过 Decoder/Spatial Head（同时兼容 return_feats=True）。实际训练中 spatial_weight=0 会自动切换 Global-only 前向，包括常规 D/G step、Lazy R1 和 WFM 路径。显式设置 base_ch/max_ch 始终覆盖判别器默认通道配置。
+
+训练 TensorBoard 的 Loss/coarse_g_global_loss 和 Loss/coarse_g_spatial_loss 分别记录 Global GAN Loss 与已乘 spatial_weight 的 Spatial GAN Loss，二者之和为 Loss/coarse_gan_loss（Spatial 关闭时后者分量记录 0）；已有 Loss/coarse_d_global_loss、Loss/coarse_d_spatial_loss 保留，D 的总对抗损失使用相同 spatial_weight。样本梯度图将 Coarse GAN 拆为 GAN GLOBAL GRAD 和 GAN SPATIAL GRAD 两行，并在 TensorBoard 的 Grad/coarse_g_global_rms、Grad/coarse_g_spatial_rms 记录**对 Coarse 输出图像的梯度 RMS**（Spatial 已包含 spatial_weight），仅随 sample_save_every 计算，以避免每个训练 step 都额外计算两个分支的输入梯度；Spatial 关闭时不绘制 Spatial 梯度图，RMS 写为 0。
+
+R1 日志另包含 coarse_r1_branch_spatial（0=Global，1=Spatial）。Spatial Head 的独立参数没有全局 R1 约束，因此采用随机分支 R1，不代表已经比较出最优 R1 方案；注意 Spatial 的均值 R1 并不惩罚每一个独立 logit 的 Jacobian。默认其他判别器的配置、loss 与 checkpoint 行为不改变。
 
 ## Generator 梯度职责
 
@@ -102,7 +130,7 @@ Generator、HQ Discriminator、Coarse Discriminator 分别拥有独立的 optimi
 
 - Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、R1、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
 - HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/R1、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
-- Discriminator：HQ 与 Coarse 各有一个单 Global 判别器，并分别维护自己的 D optimizer、scheduler、GradScaler 与 R1 enable/interval/gamma。Encoder 下采样使用 FIR 抗混叠，4x4 端使用 MinibatchStd。普通 D step 将 fake/real 合并为一次 forward，但在 MinibatchStd 处仍分开统计；lazy R1 step 只对 real 输入计算梯度惩罚，固定使用未编译的 FP32 判别器路径，并将 raw R1 乘以 interval 保持期望正则强度。joint 模式下两个 D 各自完成一次更新；某个 D 的 FP16 overflow 只重试该 D。
+- Discriminator：HQ 与 Coarse 独立选择架构，并分别维护自己的 D optimizer、scheduler、GradScaler 与 R1 enable/interval/gamma。默认 FIR 判别器通过 FIR 抗混叠下采样到 4x4，使用 MinibatchStd；普通 D step 将 fake/real 合并为一次 forward，但 MinibatchStd 仍分开统计。Coarse UNET 使用同一 Encoder 的 Global/Spatial 双输出，分别计算 Hinge 并按 [loss.coarse.gan].spatial_weight（默认 0.25）加权；Generator 同样使用此权重。其 lazy R1 每次在 Global 与 Spatial 分支中伪随机选择一个，选中 Spatial 时先对 128x128 logits 逐样本求空间平均再计算 R1（不是完整空间 Jacobian 的惩罚）；随机选择仅依赖 completed_step，因此 overflow retry/resume 的选择稳定；spatial_weight=0 时只选 Global Head。与原版 GP 不同，R1 只基于 real 输入，在未编译的 FP32 判别器上计算，并将 raw R1 乘以 interval。joint 下两个 D 独立更新；一个 D 的 FP16 overflow 仅重试该 D。
 
 Coarse 内部首先将真实 `dst` 双线性缩放到 `coarse_resolution`；训练时通过 `return_resize_in=True` 复用这一实际模型输入作为 Coarse Discriminator real，以及 L1/VGG reconstruction target，不在 Trainer 中重复 resize。Coarse/HQ 的 L1 reconstruction 由各自的 `[loss.coarse.l1].gaussian_blur`、`[loss.hq.l1].gaussian_blur` 控制：整数 `0`（默认）直接计算逐像素 L1；正整数 `N` 启用 Gaussian blur（`sigma = 当前阶段分辨率 / N`），例如 `384` 对应之前硬编码的模糊强度，`256` 则更强。开启时仅对 prediction-target 差分进行等价的滤波，不影响 VGG，VGG 始终使用原图。Coarse L1/VGG 由 `[loss.coarse.reconstruction].scope` 控制作用范围；默认 `same`，只对 self-reconstruction pair 生效。Coarse 的 target 属性监督则先将低分辨率输出双线性上采样到训练分辨率，再使用与 Final 相同的 `theta_restore` 恢复到 canonical 坐标系，与 `dst_canonical` 比较。
 
@@ -259,7 +287,7 @@ uv run python -m swapface.train \
 
 需要两个 D 都重建时同时传入两个开关。Branch metadata 会分别记录 HQ/Coarse D 的 `inherit` / `reset`。HQ D 与 Coarse D 的架构分别由 `[discriminator.hq]` 和 `[discriminator.coarse]` 控制，因此可以只修改并 reset 其中一个；任何选择 inherit 的 D 都只要求自己的架构与父 checkpoint 保持一致。无论是否恢复 D，Branch 都不会继承 G/D optimizer、scheduler 或 GradScaler；step 默认继承父 checkpoint，也可以由 `--step` 指定。
 
-当前训练语义使用单 Global Discriminator：Encoder 直接下采样到 4x4，保留 FIR 抗混叠与 MinibatchStd，移除 SpectralNorm，并使用 real-only lazy R1。Resume 与 Branch 都只接受当前训练语义版本的 checkpoint，不提供旧训练结果迁移兼容。
+默认训练语义使用单 Global Discriminator：Encoder 下采样到 4x4，保留 FIR 抗混叠与 MinibatchStd，移除 SpectralNorm，并使用 real-only lazy R1。可选 Coarse UNET 使用本文前述双输出训练路径。Resume 与 Branch 都只接受当前训练语义版本的 checkpoint，不提供旧训练结果迁移兼容。
 
 ### HQ rebuild：继承 Coarse，用新分辨率从零训练 HQ
 

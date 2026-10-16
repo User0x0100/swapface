@@ -335,8 +335,11 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
         raise ValueError(f"[loss.{stage}] 包含未知字段：{sorted(unknown)}")
     prefix = f"loss.{stage}"
 
-    gan = _with_defaults(_table(loss, "gan", f"[{prefix}.gan]"), defaults["gan"], f"[{prefix}.gan]")
+    raw_gan = _table(loss, "gan", f"[{prefix}.gan]")
+    gan = _with_defaults({key: value for key, value in raw_gan.items() if key != "spatial_weight"}, defaults["gan"], f"[{prefix}.gan]")
     gan["weight"] = _float(gan["weight"], f"{prefix}.gan.weight", minimum=0.0)
+    if "spatial_weight" in raw_gan:
+        gan["spatial_weight"] = _float(raw_gan["spatial_weight"], f"{prefix}.gan.spatial_weight", minimum=0.0)
 
     identity = _with_defaults(_table(loss, "identity", f"[{prefix}.identity]"), defaults["identity"], f"[{prefix}.identity]")
     identity["provider"] = _provider(identity["provider"], f"{prefix}.identity.provider")
@@ -497,6 +500,11 @@ def _normalize_discriminator(config: dict[str, Any]) -> dict[str, Any]:
             defaults = {key: fir_defaults[key] for key in common_keys}
             defaults["type"] = discriminator_type.name
             relevant = common_keys
+            if discriminator_type is DiscriminatorType.UNET:
+                if stage != "coarse":
+                    raise ValueError("UNET 判别器仅用于 Coarse 阶段")
+                defaults["base_ch"] = 32
+                defaults["max_ch"] = 256
 
         # 允许配置文件同时保留两类 D 的专属参数；切换 type 时只消费当前类型相关字段。
         stage_config = defaults | {key: value for key, value in raw.items() if key in relevant}
@@ -582,6 +590,12 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
                     f"generator.{resolution_key}={resolution}：{exc}"
                 ) from exc
         discriminator_type = DiscriminatorType[stage_config["type"]]
+        if discriminator_type is DiscriminatorType.UNET:
+            if stage_config["img_resolution"] != 128 or generator["coarse_resolution"] != 128:
+                raise ValueError("UNET 判别器要求 Coarse 固定为 128x128")
+            loss[stage]["gan"].setdefault("spatial_weight", 0.25)
+        elif "spatial_weight" in loss[stage]["gan"]:
+            raise ValueError(f"loss.{stage}.gan.spatial_weight 仅适用于 UNET 判别器")
         if discriminator_type is DiscriminatorType.FIR_MINIBATCH_STD:
             group_size = stage_config["minibatch_std_group_size"]
             if train["batch_size"] % group_size:
@@ -589,6 +603,8 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
                     f"train.batch_size={train['batch_size']} 必须能被 discriminator.{stage}.minibatch_std_group_size={group_size} 整除"
                 )
             feature_count = int(math.log2(stage_config["img_resolution"])) - 2
+        elif discriminator_type is DiscriminatorType.UNET:
+            feature_count = 4
         else:
             feature_count = int(math.log2(stage_config["img_resolution"] // INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION))
 
