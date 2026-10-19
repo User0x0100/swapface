@@ -10,27 +10,25 @@ class AdaIN(nn.Module):
         super().__init__()
 
         self.norm = nn.InstanceNorm2d(channels, affine=False, eps=1e-8)
-        self.gamma_fc = nn.Linear(w_dim, channels)
-        self.beta_fc = nn.Linear(w_dim, channels)
+        # InSwapper-style affine modulation: one id_dim -> 2*C projection,
+        # first half gamma, second half beta. The scale/shift initialization
+        # preserves the project's previous near-identity AdaIN starting point.
+        self.linear = nn.Linear(w_dim, channels * 2)
+        nn.init.normal_(self.linear.weight, mean=0.0, std=0.01)
+        with torch.no_grad():
+            self.linear.bias[:channels].fill_(1.0)
+            self.linear.bias[channels:].zero_()
 
-        nn.init.normal_(self.gamma_fc.weight, mean=0.0, std=0.01)
-        nn.init.ones_(self.gamma_fc.bias)
-
-        nn.init.normal_(self.beta_fc.weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.beta_fc.bias)
-
-    def forward(self, x: Tensor, w: Tensor) -> Tensor:
-        gamma = self.gamma_fc(w)[:, :, None, None]
-        beta = self.beta_fc(w)[:, :, None, None]
-
-        return self.norm(x) * gamma + beta
+    def forward(self, x: Tensor, id_feat: Tensor) -> Tensor:
+        gamma, beta = self.linear(id_feat).chunk(2, dim=1)
+        return self.norm(x) * gamma[:, :, None, None] + beta[:, :, None, None]
 
 
 class IDInject(nn.Module):
     def __init__(self, channels: int, w_dim: int) -> None:
         super().__init__()
 
-        self.act = nn.LeakyReLU(0.2)
+        self.act = nn.ReLU()
 
         self.adain0 = AdaIN(channels, w_dim)
         self.conv0 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, padding_mode="reflect")
@@ -38,17 +36,13 @@ class IDInject(nn.Module):
         self.adain1 = AdaIN(channels, w_dim)
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, padding_mode="reflect")
 
-    def forward(self, x: Tensor, w: tuple[Tensor, Tensor]) -> Tensor:
-
-        w1, w2 = w
-
+    def forward(self, x: Tensor, id_feat: Tensor) -> Tensor:
         residual = self.conv0(x)
-        residual = self.adain0(residual, w1)
+        residual = self.adain0(residual, id_feat)
         residual = self.act(residual)
 
         residual = self.conv1(residual)
-        residual = self.adain1(residual, w2)
-        # residual = self.act(residual)
+        residual = self.adain1(residual, id_feat)
 
         return x + residual
 
@@ -90,60 +84,15 @@ class DownSample(nn.Sequential):
         )
 
 
-class WSpaceMap(nn.Module):
-    def __init__(self, id_dim: int, num: int, num_share_layers: int = 4, num_w_p_layers: int = 2) -> None:
-        super().__init__()
-
-        self.shared_delta = nn.Sequential()
-        for _ in range(num_share_layers - 1):
-            self.shared_delta.append(nn.Linear(id_dim, id_dim))
-            self.shared_delta.append(nn.LeakyReLU(0.2))
-        self.shared_delta.append(nn.Linear(id_dim, id_dim))
-
-        self.private_delta = nn.ModuleList()
-        for _ in range(num):
-            layers = nn.Sequential()
-            for _ in range(num_w_p_layers):
-                layers.append(nn.LeakyReLU(0.2))
-                layers.append(nn.Linear(id_dim, id_dim))
-            self.private_delta.append(layers)
-
-        self.num = num
-        self.id_dim = id_dim
-
-        shared_output = self.shared_delta[-1]
-        assert isinstance(shared_output, nn.Linear)
-        nn.init.normal_(shared_output.weight, mean=0.0, std=0.005)
-        nn.init.zeros_(shared_output.bias)
-
-        for head in self.private_delta:
-            assert isinstance(head, nn.Sequential)
-            private_output = head[-1]
-            assert isinstance(private_output, nn.Linear)
-            nn.init.normal_(private_output.weight, mean=0.0, std=0.005)
-            nn.init.zeros_(private_output.bias)
-
-    def forward(self, id_feat: Tensor) -> tuple[Tensor, ...]:
-        w = id_feat + self.shared_delta(id_feat)
-        outputs: list[Tensor] = []
-        for head in self.private_delta:
-            outputs.append(w + head(w))
-        return tuple(outputs)
-
-
 class LatentBlock(nn.Module):
     def __init__(self, channels: int, w_dim: int, num_layers: int) -> None:
         super().__init__()
 
         self.layers = nn.ModuleList([IDInject(channels, w_dim) for _ in range(num_layers)])
 
-    def forward(self, x: Tensor, w_space: tuple[Tensor, ...]) -> Tensor:
-
-        assert len(w_space) == len(self.layers) * 2, f"w_p_all length {len(w_space)} != layers length {len(self.layers) * 2}"
-
-        for i, layer in enumerate(self.layers):
-            x = layer(x, w_space[i * 2 : i * 2 + 2])
-
+    def forward(self, x: Tensor, id_feat: Tensor) -> Tensor:
+        for layer in self.layers:
+            x = layer(x, id_feat)
         return x
 
 
@@ -178,7 +127,6 @@ class Coarse(nn.Module):
 
         num_depth = int(math.log2(scale))
 
-        self.w_space_map = WSpaceMap(id_dim, num_latent * 2)
         features = [min(max_ch, base_ch * (2**i)) for i in range(num_depth + 1)]
 
         self.from_rgb = FromRGB(img_channels, base_ch)
@@ -188,13 +136,11 @@ class Coarse(nn.Module):
         self.to_rgb = ToRGB(base_ch, img_channels)
 
     def forward(self, x: Tensor, id_feat: Tensor, return_resize_in: bool = False) -> Tensor | tuple[Tensor, Tensor]:
-        w_space = self.w_space_map(id_feat)
-
         resize_in = F.interpolate(x, size=self.img_resolution, mode="bilinear", align_corners=False)
 
         feat = self.from_rgb(resize_in)
         encoder_feat = self.encoder(feat)
-        latent_feat = self.latent_space(encoder_feat, w_space)
+        latent_feat = self.latent_space(encoder_feat, id_feat)
         decoder_feat = self.decoder(latent_feat)
         output = self.to_rgb(decoder_feat)
 

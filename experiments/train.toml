@@ -247,8 +247,8 @@ same_prob = 0.2
 
 
 [generator]
-# 唯一 Generator：旧式强 ID 注入 Coarse + HQ Refiner。
-# Coarse/HQ 深度由分辨率边界自动推导，通道逐级翻倍并由 max_ch 截断。
+# Coarse 对齐 InSwapper 的直接 AdaIN 残差架构；HQ Refiner 保持独立。
+# 通道数量、Bottleneck 分辨率与残差块数量保持可配；输入输出统一 [-1,1]。
 img_resolution = 512
 img_channels = 3
 id_dim = 512
