@@ -76,7 +76,10 @@ class OcclusionAugmentor:
                     square = Image.new("RGBA", (asset_size, asset_size))
                     square.paste(rgba, ((asset_size - rgba.width) // 2, (asset_size - rgba.height) // 2))
                     images.append(torch.from_numpy(np.asarray(square, dtype=np.uint8).copy()).permute(2, 0, 1))
+            # 缓存预乘 Alpha 的 RGB：几何重采样时一起插值，避免透明区 RGB=0
+            # 造成半透明轮廓颜色二次衰减（黑边/暗边）。Alpha 通道本身不变。
             self.assets = torch.stack(images).to(device=device, dtype=torch.float16 if device.type == "cuda" else torch.float32).div_(255)
+            self.assets[:, :3].mul_(self.assets[:, 3:4])
 
     @torch.no_grad()
     def apply(self, dst: Tensor) -> tuple[Tensor, Tensor]:
@@ -107,8 +110,11 @@ class OcclusionAugmentor:
         if self.assets is not None:
             indices = torch.randint(self.assets.shape[0], (count,), device=dst.device)
             rgba = F.grid_sample(self.assets.index_select(0, indices).float(), grid, padding_mode="zeros", align_corners=False)
-            texture = rgba[:, :3].mul(2).sub(1).to(dst.dtype)
             alpha = rgba[:, 3:4].to(dst.dtype)
+            # 素材采用预乘 Alpha 的 [0,1] RGB。转换到 [-1,1] 后的预乘颜色
+            # 为 (2*RGBpremul - alpha)，因此无需再对纹理重复乘以 alpha。
+            premultiplied = rgba[:, :3].to(dst.dtype).mul(2).sub(alpha)
+            occluded = clean * (1 - alpha) + premultiplied
         else:
             # RandOcc：单一 GPU 网格上的不规则椭圆 + 随机颜色/低频纹理。
             x, y = grid[..., 0:1], grid[..., 1:2]
@@ -120,8 +126,7 @@ class OcclusionAugmentor:
             color = torch.rand((count, 3, 1, 1), device=dst.device, dtype=dst.dtype).mul(1.5).sub(0.75)
             noise = F.interpolate(torch.rand((count, 3, 8, 8), device=dst.device, dtype=dst.dtype), size=(height, width), mode="bilinear", align_corners=False)
             texture = (color + (noise - 0.5) * 0.35).clamp(-1, 1)
-
-        occluded = clean + alpha * (texture - clean)
+            occluded = clean + alpha * (texture - clean)
         result = dst.index_copy(0, selected, occluded)
 
         # OCC 只推理实际遮挡的干净目标，避免遮挡本身影响人脸可见区域判定。

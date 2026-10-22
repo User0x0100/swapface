@@ -13,7 +13,6 @@ from .occlusion import OcclusionAugmentor, gate_identity_gradient
 GEOMETRY = {key: value for key, value in DEFAULT_OCCLUSION_CONFIG.items() if key.endswith("_pct") or key.endswith("_deg")}
 
 
-
 def main() -> None:
     x = torch.randn((2, 3, 16, 16), requires_grad=True)
     mask = torch.ones((2, 1, 16, 16))
@@ -87,6 +86,33 @@ def main() -> None:
         unrotated = bounding_size(0)
         rotated = bounding_size(90)
         assert unrotated[0] < unrotated[1] and rotated[0] > rotated[1], (unrotated, rotated)
+
+    # 合成透明红色遮挡物，验证透明边界经过 bilinear 重采样后保持
+    # 预乘 Alpha 的红色，而不是出现 RGB * Alpha 的二次衰减黑边。
+    with tempfile.TemporaryDirectory() as tmp:
+        rgba = np.zeros((32, 32, 4), dtype=np.uint8)
+        rgba[:, :, 0] = 255
+        rgba[:, :14, 3] = 255
+        rgba[:, 31, 3] = 255  # 保留透明区，使边界在素材画布内部
+        Image.fromarray(rgba, "RGBA").save(Path(tmp) / "red.png")
+        overlay = OcclusionAugmentor(
+            1.0, tmp, torch.device("cpu"), visible_face,
+            size_range_pct=(100, 100),
+            center_x_range_pct=(0, 0),
+            center_y_range_pct=(0, 0),
+            rotation_range_deg=(0, 0),
+        )
+        cached = overlay.assets
+        assert cached is not None
+        assert bool((cached[:, :3] <= cached[:, 3:4]).all())
+        base = torch.full((1, 3, 100, 100), -1.0)
+        out, _ = overlay.apply(base)
+        grid = torch.nn.functional.affine_grid(torch.eye(2, 3)[None], base.shape, align_corners=False)
+        expected_alpha = torch.nn.functional.grid_sample(cached[:, 3:4], grid, align_corners=False)
+        # 红色通道从背景 -1 向纯红 +1 线性过渡，G/B 通道始终 -1。
+        torch.testing.assert_close(out[:, :1], expected_alpha * 2 - 1, atol=1e-5, rtol=0)
+        torch.testing.assert_close(out[:, 1:], base[:, 1:], atol=1e-5, rtol=0)
+        assert bool(((expected_alpha > 0.01) & (expected_alpha < 0.99)).any())
 
     # Trainer 的遮挡适配层不修改既有 DataLoader 六项契约。
     from .train import Trainer
