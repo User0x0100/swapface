@@ -414,11 +414,46 @@ uv run tensorboard --logdir experiments/runs
 
 当前 OCC checkpoint 在 `eval()` 模式下可能输出全零，因此跟随现有 `swapper.py` 使用训练模式并冻结参数、关闭梯度；模型内部 BatchNorm 仍依据选中样本的 batch 统计运行。**这并不是几何鲁棒性的完整实现**：Gaze/HRFFA/FACS 尚未增加遮挡置信度控制，建议结合模型梯度贡献与遮挡实验进行评估。OCC 需要在训练时额外执行一次小 batch 前向，当前未对吞吐做硬保证。
 
+### 已预处理的 NatOcc 遮挡素材（2026-10-23）
+
+已在 AMD 服务器将 [face-occlusion-generation](https://github.com/kennyvoo/face-occlusion-generation) 引用的第三方图像及掩码转为 **328 张独立 RGBA PNG**：COCO Objects 128 张、11k Hands 200 张（只使用与作者提供的 200 张手部 Mask 匹配的图片；没有把完整 11k Hands 当成可用遮挡素材）。每张图裁掉透明边界，保持长宽比，最长边不超过 512 像素。训练加载器会进一步缩放到 192×192、预载入 GPU，并执行批量仿射变换与 Alpha 合成。
+
+- **Hugging Face 私有 Dataset**：[`leehx/swapface-occluders`](https://huggingface.co/datasets/leehx/swapface-occluders)。需使用具有访问权限的账号认证；**训练进程不在线下载素材**，应在训练启动前离线准备。
+- **数据包**：`swapface-occluders-20261023.tar.gz`（90,361,739 字节，约 86.18 MiB）；解压后为 `swapface-occluders/rgba/*.png`，另有 `manifest.json`（来源、尺寸、单文件 SHA-256）、`preview.jpg` 与 `README.md`。
+- **数据包 SHA-256**：`dd42f5188943cdf068f5cbb4200fd378291127dbf43faf8d66ae2442680fc14a`。此哈希已与 AMD 生成包、Windows 本地包及 Hugging Face LFS 核对一致。
+- **Windows 本地备份**：`C:\Users\User0\Downloads\swapface-occluders-20261023.tar.gz`；**预处理服务器**：`/workspace/occlusion-prep-20261023/`（包含生成包和预处理产物）。路径是本次操作记录，未来重建的服务器不保证存在。
+- **授权边界**：底层 COCO/11k Hands 与上游生成项目涉及不同来源和使用条款；私有仓库仅作为访问受限的工作副本，不代表取得公开再分发或商业使用许可。不得直接转为公开仓库。
+
+在新训练服务器上先登录 Hugging Face（例如 `hf auth login`），再执行：
+
+```bash
+mkdir -p /workspace/datasets
+hf download leehx/swapface-occluders \
+  swapface-occluders-20261023.tar.gz \
+  --repo-type dataset \
+  --local-dir /workspace/datasets
+
+cd /workspace/datasets
+printf '%s  %s\n' \
+  'dd42f5188943cdf068f5cbb4200fd378291127dbf43faf8d66ae2442680fc14a' \
+  'swapface-occluders-20261023.tar.gz' | sha256sum -c -
+
+tar -xzf swapface-occluders-20261023.tar.gz
+find swapface-occluders/rgba -maxdepth 1 -type f -name '*.png' | wc -l
+# 预期 328
+```
+
+在当前 SwapFace 训练 TOML 中启用：
+
 ```toml
 [data.occlusion]
 prob = 0.2
-assets_dir = "/path/to/rgba-occluders"
+assets_dir = "/workspace/datasets/swapface-occluders/rgba"
 ```
+
+注意：`assets_dir` **只接受本地目录**，当前不递归扫描子目录；不要填 Hugging Face 仓库 ID 或 `.tar.gz` 路径。启用后需把 328 张素材预加载到 GPU（以 192×192 RGBA FP16 计，纹理本体约 92.25 MiB，另有临时张量与 OCC 模型开销）。关闭可删除 `[data.occlusion]` 或设置 `prob = 0.0`。
+
+### 从原始素材重新转换
 
 NatOcc 原始遮挡物若采用独立的图像目录与 PNG 掩码目录，应**离线转换一次**（训练时无需加载遮挡物 Mask 文件）：
 
