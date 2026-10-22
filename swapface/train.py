@@ -39,6 +39,7 @@ from models.networks import Generator
 from .config import load_train_config, resolve_train_config
 from .contracts import CHECKPOINT_VERSION
 from .dataloader import ImageDecoderBackend, TrainingDataLoader
+from .occlusion import OcclusionAugmentor, gate_identity_gradient
 from .experiment import (
     RunLock,
     RunPaths,
@@ -801,6 +802,15 @@ class Trainer:
             dst=dst,
             **dataloader_cfg,
         )
+        occlusion_cfg = data_config.get("occlusion", {})
+        self.occlusion: OcclusionAugmentor | None = None
+        if float(occlusion_cfg.get("prob", 0.0)) > 0.0:
+            # 遮挡模块内部按需管理 RGBA 素材和 OCC 模型；默认训练不创建该资源。
+            self.occlusion = OcclusionAugmentor(
+                probability=float(occlusion_cfg["prob"]),
+                assets_dir=str(occlusion_cfg["assets_dir"]),
+                device=self.device,
+            )
 
         # ========================= 编译模型 =========================
         # Coarse 始终需要前向；HQ/D/loss teacher 仅为 active stage 构建训练热路径。
@@ -1096,6 +1106,7 @@ class Trainer:
         same_mask: Tensor,
         source_identity_embeddings: Tensor,
         restore_grid: Tensor | None,
+        id_gate: Tensor | None,
     ) -> Tensor:
         """计算 Coarse stage 的全部 Generator 训练目标。"""
         unet_enabled = isinstance(self.net_d_coarse, UNetDiscriminator)
@@ -1133,7 +1144,8 @@ class Trainer:
             self.log("coarse_wfm_loss", coarse_wfm_loss)
             total = total + coarse_wfm_loss
 
-        coarse_identity_embeddings = self.coarse_identity_embeddings_forward(self.prepare_identity_encoder_faces(coarse, theta_restore))
+        coarse_id_gate = None if id_gate is None else NF.interpolate(id_gate, size=coarse.shape[-2:], mode="area")
+        coarse_identity_embeddings = self.coarse_identity_embeddings_forward(self.prepare_identity_encoder_faces(gate_identity_gradient(coarse, coarse_id_gate), theta_restore))
         coarse_id_loss = self.coarse_id_loss(coarse_identity_embeddings, source_identity_embeddings)
         self.log("coarse_id_loss", coarse_id_loss)
         total = total + coarse_id_loss
@@ -1186,6 +1198,7 @@ class Trainer:
         same_mask: Tensor,
         source_identity_embeddings: Tensor,
         restore_grid: Tensor | None,
+        id_gate: Tensor | None,
     ) -> Tensor:
         """计算 HQ stage 的全部 Generator 训练目标。"""
         if self.enable_hq_wfm_loss:
@@ -1203,7 +1216,7 @@ class Trainer:
             self.log("hq_wfm_loss", hq_wfm_loss)
             total = total + hq_wfm_loss
 
-        hq_identity_embeddings = self.hq_identity_embeddings_forward(self.prepare_identity_encoder_faces(fake, theta_restore))
+        hq_identity_embeddings = self.hq_identity_embeddings_forward(self.prepare_identity_encoder_faces(gate_identity_gradient(fake, id_gate), theta_restore))
         hq_id_loss = self.hq_id_loss(hq_identity_embeddings, source_identity_embeddings)
         self.log("hq_id_loss", hq_id_loss)
         total = total + hq_id_loss
@@ -1332,6 +1345,7 @@ class Trainer:
         source_identity_embeddings: Tensor,
         restore_grid: Tensor | None,
         display_size: tuple[int, int],
+        id_gate: Tensor | None,
     ) -> list[tuple[str, Tensor]]:
         """仅为当前启用的 Generator loss 生成旧版风格梯度图。R1 不参与。"""
         if stage == "coarse":
@@ -1422,7 +1436,8 @@ class Trainer:
 
         with torch.enable_grad():
             x = generated.detach().requires_grad_(True)
-            generated_identity_embeddings = identity_embeddings_forward(self.prepare_identity_encoder_faces(x, theta_restore))
+            stage_gate = None if id_gate is None else NF.interpolate(id_gate, size=x.shape[-2:], mode="area")
+            generated_identity_embeddings = identity_embeddings_forward(self.prepare_identity_encoder_faces(gate_identity_gradient(x, stage_gate), theta_restore))
             add_row(f"{prefix} ID GRAD", identity_loss_fn(generated_identity_embeddings, source_identity_embeddings.detach()), x)
 
         geometry_enabled = gaze_enabled or hrffa_enabled or facs_enabled
@@ -1481,6 +1496,8 @@ class Trainer:
         self,
         sample_reference: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
         current_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
+        sample_id_gate: Tensor | None = None,
+        current_id_gate: Tensor | None = None,
     ) -> None:
         sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces = (
             tensor.to(self.device) for tensor in sample_reference
@@ -1495,6 +1512,10 @@ class Trainer:
             theta_restore_vis = torch.cat((sample_theta_restore, theta_restore[:dynamic_count]), dim=0)
             same_mask_vis = torch.cat((sample_same_mask, same_mask[:dynamic_count]), dim=0)
             source_identity_faces_vis = torch.cat((sample_src_identity_faces, source_identity_faces[:dynamic_count]), dim=0)
+            id_gate_vis = (
+                torch.cat((sample_id_gate.to(self.device), current_id_gate[:dynamic_count]), dim=0)
+                if sample_id_gate is not None and current_id_gate is not None else None
+            )
 
             generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
             if self.hq_stage_active:
@@ -1549,6 +1570,7 @@ class Trainer:
                         coarse_source_identity_embeddings_vis,
                         restore_grid_vis,
                         tuple(fake_vis.shape[-2:]),
+                        id_gate_vis,
                     )
                 )
 
@@ -1564,6 +1586,7 @@ class Trainer:
                         hq_source_identity_embeddings_vis,
                         restore_grid_vis,
                         tuple(fake_vis.shape[-2:]),
+                        id_gate_vis,
                     )
                 )
 
@@ -1574,11 +1597,19 @@ class Trainer:
         if not cv2.imwrite(sample_file, grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
             raise OSError(f"保存训练 sample 失败：{sample_file}")
 
+    def _next_training_batch(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor | None]:
+        src, dst, canonical, theta_restore, same_mask, identity_faces = self.dataset.next()
+        if self.occlusion is None:
+            return src, dst, canonical, theta_restore, same_mask, identity_faces, None
+        dst, identity_gate = self.occlusion.apply(dst)
+        return src, dst, canonical, theta_restore, same_mask, identity_faces, identity_gate
+
     def train(self) -> None:
 
         net_coarse = self.train_coarse
-        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces = self.dataset.next()
+        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces, sample_id_gate = self._next_training_batch()
         half = self.batch_size // 2
+        sample_id_gate = sample_id_gate[:half].detach().cpu() if sample_id_gate is not None else None
         sample_reference = tuple(
             tensor[:half].detach().cpu()
             for tensor in (sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces)
@@ -1588,7 +1619,7 @@ class Trainer:
                 if self._stop_requested:
                     raise KeyboardInterrupt
 
-                src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces = self.dataset.next()
+                src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces, id_gate = self._next_training_batch()
                 self._step_in_progress = True
 
                 # ========================= 生成器前向 =========================
@@ -1696,6 +1727,7 @@ class Trainer:
                                 same_mask,
                                 coarse_source_identity_embeddings,
                                 restore_grid,
+                                id_gate,
                             )
                         if self.hq_stage_active:
                             hq_g_loss = self._hq_generator_stage_loss(
@@ -1706,6 +1738,7 @@ class Trainer:
                                 same_mask,
                                 hq_source_identity_embeddings,
                                 restore_grid,
+                                id_gate,
                             )
 
                         if self.train_stage == "joint":
@@ -1749,7 +1782,7 @@ class Trainer:
                     self.save_ckpt()
 
                 if self.completed_step % self.sample_save_every == 0:
-                    self._save_sample(sample_reference, (src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces))
+                    self._save_sample(sample_reference, (src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces), sample_id_gate, id_gate)
 
 
 def _load_run_config(paths: RunPaths) -> dict[str, Any]:

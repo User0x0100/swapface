@@ -338,3 +338,8 @@ alignment = "ffhq"
 path = "/path/to/occlusion_faces"
 adjustment = 1.0
 alignment = "ffhq"
+
+# 可选在线遮挡增强；不设置该段时完全禁用、也不加载 OCC 模型。
+# [data.occlusion]
+# prob = 0.2
+# assets_dir = "/path/to/rgba-occluders"  # PNG/WebP，透明背景；空字符串使用 RandOcc 程序化纹理

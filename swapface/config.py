@@ -529,7 +529,7 @@ def _normalize_discriminator(config: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_data(config: dict[str, Any]) -> dict[str, Any]:
     data = _table(config, "data", "[data]")
-    allowed = {"loader", "augmentation", "sampling", "src", "dst"}
+    allowed = {"loader", "augmentation", "sampling", "occlusion", "src", "dst"}
     unknown = set(data) - allowed
     if unknown:
         raise ValueError(f"[data] 包含未知字段：{sorted(unknown)}")
@@ -557,13 +557,23 @@ def _normalize_data(config: dict[str, Any]) -> dict[str, Any]:
     sampling = _with_defaults(_table(data, "sampling", "[data.sampling]"), DEFAULT_DATA_CONFIG["sampling"], "[data.sampling]")
     sampling["same_prob"] = _float(sampling["same_prob"], "data.sampling.same_prob", minimum=0.0, maximum=1.0)
 
-    return {
+    occlusion = None
+    if "occlusion" in data:
+        occlusion = _with_defaults(_table(data, "occlusion", "[data.occlusion]"), {"prob": 0.0, "assets_dir": ""}, "[data.occlusion]")
+        occlusion["prob"] = _float(occlusion["prob"], "data.occlusion.prob", minimum=0.0, maximum=1.0)
+        if not isinstance(occlusion["assets_dir"], str):
+            raise TypeError("data.occlusion.assets_dir 必须是字符串")
+
+    result = {
         "loader": loader,
         "augmentation": augmentation,
         "sampling": sampling,
         "src": _normalize_image_sources(data.get("src"), "data.src"),
         "dst": _normalize_image_sources(data.get("dst"), "data.dst"),
     }
+    if occlusion is not None:
+        result["occlusion"] = occlusion
+    return result
 
 
 def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:

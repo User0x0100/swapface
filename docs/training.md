@@ -405,3 +405,26 @@ uv run tensorboard --logdir experiments/runs
 ```
 
 恢复同一个 run 后，TensorBoard 目录可能出现多个 `events.out.tfevents.*`。它们仍属于同一逻辑 run；恢复时会设置 `purge_step`，让 TensorBoard 隐藏上次进程在最后 checkpoint 之后写出的失效 future steps，避免回滚恢复后出现重复曲线。
+
+## 在线遮挡增强（Phase 2）
+
+可选 `[data.occlusion]`：`prob` 为样本遮挡概率（0～1），`assets_dir` 为裁剪成透明 RGBA 的 PNG/WebP 遮挡素材目录；不设置目录或设为空字符串时，使用程序化随机纹理遮挡（RandOcc，**真实感弱于 NatOcc 手/物体素材**）。关闭时不加载 OCC 模型、不额外执行推理。素材在初始化时预加载到 GPU，训练循环内仅用批量仿射采样和 Alpha 合成。
+
+遮挡只施加于 `dst`，因此 Generator 输入、Discriminator real/fake、L1/VGG 的 real target 均同步包含遮挡；`src`、`source_identity_faces` 与几何教师使用的干净 `dst_canonical` 不变。新增 `ID` 专属可见区域梯度门控：针对本批被遮挡的样本，使用项目现有 `FaceMasker(mode="occlusion")` 对**遮挡前、已增强的 dst** 推理，并结合合成遮挡的 Alpha，只允许可见面部像素接收 ID 梯度。未遮挡样本不改变原有 ID 梯度。Coarse 门控缩放至对应输出分辨率。遮挡样本的 ID encoder 仍然观察生成的遮挡面部，梯度门控不等价于无损恢复身份特征。
+
+当前 OCC checkpoint 在 `eval()` 模式下可能输出全零，因此跟随现有 `swapper.py` 使用训练模式并冻结参数、关闭梯度；模型内部 BatchNorm 仍依据选中样本的 batch 统计运行。**这并不是几何鲁棒性的完整实现**：Gaze/HRFFA/FACS 尚未增加遮挡置信度控制，建议结合模型梯度贡献与遮挡实验进行评估。OCC 需要在训练时额外执行一次小 batch 前向，当前未对吞吐做硬保证。
+
+```toml
+[data.occlusion]
+prob = 0.2
+assets_dir = "/path/to/rgba-occluders"
+```
+
+NatOcc 原始遮挡物若采用独立的图像目录与 PNG 掩码目录，应**离线转换一次**（训练时无需加载遮挡物 Mask 文件）：
+
+```bash
+uv run --no-sync python tools/prepare_occluders.py \
+  --images /path/to/NatOcc/images \
+  --masks /path/to/NatOcc/masks \
+  --output /path/to/rgba-occluders
+```
