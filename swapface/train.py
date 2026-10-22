@@ -810,6 +810,10 @@ class Trainer:
                 probability=float(occlusion_cfg["prob"]),
                 assets_dir=str(occlusion_cfg["assets_dir"]),
                 device=self.device,
+                size_range_pct=occlusion_cfg["size_range_pct"],
+                center_x_range_pct=occlusion_cfg["center_x_range_pct"],
+                center_y_range_pct=occlusion_cfg["center_y_range_pct"],
+                rotation_range_deg=occlusion_cfg["rotation_range_deg"],
             )
 
         # ========================= 编译模型 =========================

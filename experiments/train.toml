@@ -343,5 +343,9 @@ alignment = "ffhq"
 # 已处理的 NatOcc 素材：Hugging Face 私有 Dataset leehx/swapface-occluders
 # 先按 docs/training.md 的步骤离线下载/解压；assets_dir 必须为本地 RGBA 图片目录。
 # [data.occlusion]
-# prob = 0.2
+# prob = 0.2                        # 每张图应用遮挡的概率，0~1（不是空间百分比）
 # assets_dir = "/workspace/datasets/swapface-occluders/rgba"  # 留空则使用程序化 RandOcc
+# size_range_pct = [40.0, 90.0]     # 遮挡物最长边占训练图像边长的百分比（允许 > 100%）
+# center_x_range_pct = [-15.0, 15.0] # 遮挡中心相对图像中心的水平偏移，单位为图像边长百分比
+# center_y_range_pct = [-15.0, 15.0] # 遮挡中心相对图像中心的垂直偏移，单位为图像边长百分比
+# rotation_range_deg = [-40.0, 40.0] # 遮挡物旋转角度范围，单位为度

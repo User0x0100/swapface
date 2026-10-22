@@ -25,11 +25,27 @@ def gate_identity_gradient(images: Tensor, mask: Tensor | None) -> Tensor:
 class OcclusionAugmentor:
     """在 Generator 前向前为目标人脸合成遮挡，并生成独立的身份梯度掩码。"""
 
-    def __init__(self, probability: float, assets_dir: str, device: torch.device, mask_model: Callable[[Tensor], Tensor] | None = None, asset_size: int = 192) -> None:
+    def __init__(
+        self,
+        probability: float,
+        assets_dir: str,
+        device: torch.device,
+        mask_model: Callable[[Tensor], Tensor] | None = None,
+        asset_size: int = 192,
+        *,
+        size_range_pct: tuple[float, float],
+        center_x_range_pct: tuple[float, float],
+        center_y_range_pct: tuple[float, float],
+        rotation_range_deg: tuple[float, float],
+    ) -> None:
         if not 0.0 < probability <= 1.0:
             raise ValueError("occlusion.prob 必须在 (0, 1] 内")
         self.probability = probability
         self.device = device
+        self.size_range_pct = tuple(size_range_pct)
+        self.center_x_range_pct = tuple(center_x_range_pct)
+        self.center_y_range_pct = tuple(center_y_range_pct)
+        self.rotation_range_deg = tuple(rotation_range_deg)
         if mask_model is None:
             from misc.models.face_mask import FaceMasker
 
@@ -53,7 +69,10 @@ class OcclusionAugmentor:
                     if bounds is None:
                         raise ValueError(f"遮挡素材完全透明：{path}")
                     rgba = rgba.crop(bounds)
-                    rgba.thumbnail((asset_size, asset_size), Image.Resampling.LANCZOS)
+                    # thumbnail() 只会缩小，不会放大小素材；会令实际覆盖率远小于配置值。
+                    # 将素材最长边统一映射到 asset_size，使 size_range_pct 有一致的几何含义。
+                    factor = asset_size / max(rgba.size)
+                    rgba = rgba.resize((max(1, round(rgba.width * factor)), max(1, round(rgba.height * factor))), Image.Resampling.LANCZOS)
                     square = Image.new("RGBA", (asset_size, asset_size))
                     square.paste(rgba, ((asset_size - rgba.width) // 2, (asset_size - rgba.height) // 2))
                     images.append(torch.from_numpy(np.asarray(square, dtype=np.uint8).copy()).permute(2, 0, 1))
@@ -70,11 +89,12 @@ class OcclusionAugmentor:
 
         clean = dst.index_select(0, selected)
         count = clean.shape[0]
-        # 图像在几何增强后已对齐至当前 dst 坐标系，随机位置限定于中央面部附近。
-        scale = torch.empty((count,), device=dst.device).uniform_(0.20, 0.50)
-        angle = torch.empty((count,), device=dst.device).uniform_(-0.7, 0.7)
-        cx = torch.empty((count,), device=dst.device).uniform_(-0.30, 0.30)
-        cy = torch.empty((count,), device=dst.device).uniform_(-0.30, 0.30)
+        # 素材画布长边相对于训练图像边长的百分比；中心偏移以图像中心为 0。
+        # affine_grid 的坐标范围为 [-1,1]，因此中心偏移百分比乘以 2/100。
+        scale = torch.empty((count,), device=dst.device).uniform_(*self.size_range_pct).mul_(0.01)
+        angle = torch.empty((count,), device=dst.device).uniform_(*self.rotation_range_deg).deg2rad_()
+        cx = torch.empty((count,), device=dst.device).uniform_(*self.center_x_range_pct).mul_(0.02)
+        cy = torch.empty((count,), device=dst.device).uniform_(*self.center_y_range_pct).mul_(0.02)
         c, s = angle.cos(), angle.sin()
         # 从目标像素归一化坐标映射到素材的 [-1,1] 区域。
         theta = torch.zeros((count, 2, 3), device=dst.device)

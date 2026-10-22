@@ -159,6 +159,15 @@ DEFAULT_DATA_CONFIG: dict[str, Any] = {
         "same_prob": 0.2,
     },
 }
+# 遮挡尺寸和位置均按训练图像边长的百分比配置，角度独立使用度数。
+DEFAULT_OCCLUSION_CONFIG: dict[str, Any] = {
+    "prob": 0.0,
+    "assets_dir": "",
+    "size_range_pct": [40.0, 90.0],
+    "center_x_range_pct": [-15.0, 15.0],
+    "center_y_range_pct": [-15.0, 15.0],
+    "rotation_range_deg": [-40.0, 40.0],
+}
 DATALOADER_RANGE_KEYS = ("rotation_range", "scale_factor_range", "tx_range", "ty_range")
 
 
@@ -559,10 +568,12 @@ def _normalize_data(config: dict[str, Any]) -> dict[str, Any]:
 
     occlusion = None
     if "occlusion" in data:
-        occlusion = _with_defaults(_table(data, "occlusion", "[data.occlusion]"), {"prob": 0.0, "assets_dir": ""}, "[data.occlusion]")
+        occlusion = _with_defaults(_table(data, "occlusion", "[data.occlusion]"), DEFAULT_OCCLUSION_CONFIG, "[data.occlusion]")
         occlusion["prob"] = _float(occlusion["prob"], "data.occlusion.prob", minimum=0.0, maximum=1.0)
         if not isinstance(occlusion["assets_dir"], str):
             raise TypeError("data.occlusion.assets_dir 必须是字符串")
+        for field in ("size_range_pct", "center_x_range_pct", "center_y_range_pct", "rotation_range_deg"):
+            occlusion[field] = _range(occlusion[field], f"data.occlusion.{field}", positive=field == "size_range_pct")
 
     result = {
         "loader": loader,
