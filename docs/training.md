@@ -83,7 +83,7 @@ provider = "WEBFACE600K_ARCFACE_R50"  # Generator 的 source embedding
 provider = "MS1MV3_ARCFACE_R50_FP16"  # Identity teacher 可独立选择
 ```
 
-与其他 Provider 一样，输入必须是 ArcFace 112 对齐的 RGB、`[-1,1]`，输出是 L2 归一化的 512 维 embedding。`[loss.hq.identity].provider` 也可以独立选择该模型。对应 CLI 的 `id-encoder --provider WEBFACE600K_ARCFACE_R50` 可用于导出 ONNX。这里仅接入 **身份编码器**；InSwapper 换脸模型内部的 `emap` 投影矩阵不属于该编码器，不会用于本项目的生成器。InsightFace 的预训练权重有非商业研究用途限制，不因以 `.pth` 格式分发而获得商业使用授权。
+与其他 Provider 一样，输入必须是 ArcFace 112 对齐的 RGB、`[-1,1]`，输出是 L2 归一化的 512 维 embedding。`[loss.hq.identity].provider` 也可以独立选择该模型。对应 CLI 的 `id-encoder --provider WEBFACE600K_ARCFACE_R50` 可用于导出 ONNX。这里仅接入 **身份编码器**；InSwapper 换脸模型内部的 `emap` 投影矩阵不属于该编码器，不会用于本项目的生成器。2026-10-23 已移除先前针对 WebFace600K 的临时 `emap` 投影及矩阵文件，当前始终使用骨干输出的原生 L2 归一化特征；历史使用该投影训练的 checkpoint 虽可能结构兼容，但源身份条件与 ID teacher 的特征语义已改变，不应直接将继续训练的指标与原实验视为同一训练条件。InsightFace 的预训练权重有非商业研究用途限制，不因以 `.pth` 格式分发而获得商业使用授权。
 
 
 优化策略按训练实体分开配置：`[optimizer.generator]`、`[optimizer.hq_discriminator]`、`[optimizer.coarse_discriminator]` 分别设置 LR；对应的 `[scheduler.generator]`、`[scheduler.hq_discriminator]`、`[scheduler.coarse_discriminator]` 分别设置 `type / t_max / min_lr_ratio`。Adam 的 `betas=(0.0, 0.99)` 与 fused 实现仍固定在训练代码中。

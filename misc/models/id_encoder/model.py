@@ -1,7 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -106,17 +105,6 @@ class IDEncoder(nn.Module):
         self.backbone.load_state_dict(state_dict)
         self.backbone.eval().requires_grad_(False)
 
-        # 仅 WebFace600K 使用 InSwapper128 的真实 buff2fs / emap。
-        # persistent=False：临时实验不修改训练 checkpoint 的模型状态协议。
-        if provider is IDEncoderProvider.WEBFACE600K_ARCFACE_R50:
-            emap_path = Path(__file__).with_name("inswapper_128_emap.npy")
-            emap = np.load(emap_path, allow_pickle=False)
-            if emap.shape != (512, 512) or emap.dtype != np.float32 or not np.isfinite(emap).all():
-                raise ValueError("InSwapper128 emap 必须是有限的 FP32 [512,512] 矩阵")
-            self.register_buffer("inswapper_emap", torch.from_numpy(emap.copy()), persistent=False)
-        else:
-            self.register_buffer("inswapper_emap", None, persistent=False)
-
     def forward(self, x: Tensor) -> Tensor:
         """前向传播
 
@@ -135,12 +123,6 @@ class IDEncoder(nn.Module):
             x = (x + 1.0) * 0.5
             x = (x - input_mean) / input_std
         features = self.backbone(x)
-        if self.inswapper_emap is not None:
-            # 官方 InSwapper: normed_embedding @ emap，再进行 L2。
-            # FP32 计算防止外层 BF16/FP16 autocast 降低特征投影精度。
-            with torch.autocast(device_type=features.device.type, enabled=False):
-                features = F.normalize(features.float(), p=2, dim=1)
-                return F.normalize(features @ self.inswapper_emap, p=2, dim=1)
         return F.normalize(features, p=2, dim=1)
 
 

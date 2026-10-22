@@ -72,9 +72,13 @@ class TestW600KIDEncoder(unittest.TestCase):
                 encoder = IDEncoder(provider)
             download.assert_called_once_with(repo_id="leehx/model_hub", filename="w600k_r50.pth")
             self.assertFalse(any(p.requires_grad for p in encoder.parameters()))
-            result = encoder(torch.randn(2, 3, 112, 112))
+            faces = torch.randn(2, 3, 112, 112)
+            result = encoder(faces)
             self.assertEqual(tuple(result.shape), (2, 512))
             torch.testing.assert_close(result.norm(dim=1), torch.ones(2))
+            # WebFace600K 输出原生骨干特征的 L2 归一化结果，不再执行 emap。
+            self.assertFalse(hasattr(encoder, "inswapper_emap"))
+            torch.testing.assert_close(result, torch.nn.functional.normalize(encoder.backbone(faces), p=2, dim=1))
 
     def test_strict_load_rejects_wrong_keys(self) -> None:
         with tempfile.TemporaryDirectory() as d:
