@@ -19,22 +19,67 @@ FFHQ_TO_ARCFACE_112_AFFINE_512 = (
 )
 
 
-def make_ffhq_to_arcface_112_grid(input_size: int, batch_size: int, device: torch.device) -> Tensor:
-    """预计算标准 FFHQ aligned 图像到 112x112 canonical 坐标系的采样网格。
+def ffhq_to_arcface_affine(input_size: int, output_size: int) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """FFHQ -> ArcFace-128 模板体系，始终以 128 标准五点坐标为基准。
 
-    该网格在固定训练分辨率、batch size 和 device 下完全不变，应在训练初始化阶段
-    构造一次并复用，避免在每个 iteration 重复创建 affine/theta/grid。
+    ArcFace-128 相对于 ArcFace-112 保持相同五点尺度，只在 x 上移动 8 像素，
+    而不是把 112 五点模板等比拉伸到 128。
     """
-    if input_size <= 0:
-        raise ValueError(f"input_size 必须为正数，实际为 {input_size}")
-    if batch_size <= 0:
-        raise ValueError(f"batch_size 必须为正数，实际为 {batch_size}")
+    if input_size <= 0 or output_size <= 0:
+        raise ValueError("input_size/output_size 必须为正数")
+    linear = (512.0 / input_size) * (output_size / 128.0)
+    offset = output_size / 128.0
+    a, b = FFHQ_TO_ARCFACE_112_AFFINE_512
+    return (
+        (a[0] * linear, a[1] * linear, (a[2] + 8.0) * offset),
+        (b[0] * linear, b[1] * linear, b[2] * offset),
+    )
 
+
+def _fixed_alignment_grid(affine: Tensor, input_size: int, output_size: int, batch_size: int) -> Tensor:
+    if batch_size <= 0:
+        raise ValueError("batch_size 必须为正数")
+    theta = affine_to_grid_theta(affine, (input_size, input_size), output_size, align_corners=False)
+    return F.affine_grid(theta.expand(batch_size, -1, -1), (batch_size, 3, output_size, output_size), align_corners=False)
+
+
+def make_ffhq_to_arcface_grid(input_size: int, output_size: int, batch_size: int, device: torch.device) -> Tensor:
+    """预计算 FFHQ -> ArcFace-128 模板体系的采样网格，用于 Generator 输入。"""
+    affine = torch.tensor(ffhq_to_arcface_affine(input_size, output_size), device=device, dtype=torch.float32)
+    return _fixed_alignment_grid(affine, input_size, output_size, batch_size)
+
+
+def make_ffhq_to_arcface_112_grid(input_size: int, batch_size: int, device: torch.device) -> Tensor:
+    """身份模型始终使用 ArcFace-112；不能复用生成模型的 ArcFace-128 映射。"""
+    if input_size <= 0:
+        raise ValueError("input_size 必须为正数")
     affine = torch.tensor(FFHQ_TO_ARCFACE_112_AFFINE_512, device=device, dtype=torch.float32)
-    affine[:, :2] *= 512.0 / float(input_size)
-    theta = affine_to_grid_theta(affine, (input_size, input_size), 112, align_corners=False)
-    theta = theta.expand(batch_size, -1, -1)
-    return F.affine_grid(theta, (batch_size, 3, 112, 112), align_corners=False)
+    affine[:, :2] *= 512.0 / input_size
+    return _fixed_alignment_grid(affine, input_size, 112, batch_size)
+
+
+def make_arcface112_to_arcface128_grid(input_size: int, output_size: int, batch_size: int, device: torch.device) -> Tensor:
+    """已按 112 模板对齐的 SRC -> 128 模板体系，保持 ID 输入分支不变。"""
+    if input_size <= 0 or output_size <= 0:
+        raise ValueError("input_size/output_size 必须为正数")
+    scale = (112.0 / input_size) * (output_size / 128.0)
+    affine = torch.tensor(
+        ((scale, 0.0, 8.0 * output_size / 128.0), (0.0, scale, 0.0)),
+        device=device, dtype=torch.float32,
+    )
+    return _fixed_alignment_grid(affine, input_size, output_size, batch_size)
+
+
+def make_arcface128_to_arcface112_grid(input_size: int, batch_size: int, device: torch.device) -> Tensor:
+    """ArcFace-128 模板 Generator 输出 -> ArcFace-112 身份 teacher 裁剪。"""
+    if input_size <= 0:
+        raise ValueError("input_size 必须为正数")
+    scale = 128.0 / input_size
+    affine = torch.tensor(
+        ((scale, 0.0, -8.0), (0.0, scale, 0.0)),
+        device=device, dtype=torch.float32,
+    )
+    return _fixed_alignment_grid(affine, input_size, 112, batch_size)
 
 
 def transform_sampling_grid(grid: Tensor, theta: Tensor) -> Tensor:
@@ -58,6 +103,13 @@ def transform_sampling_grid(grid: Tensor, theta: Tensor) -> Tensor:
         transformed = torch.bmm(flat_grid, theta[:, :, :2].transpose(1, 2))
         transformed.add_(theta[:, :, 2].unsqueeze(1))
         return transformed.reshape_as(grid)
+
+
+def arcface_to_identity_112(images: Tensor, grid: Tensor, theta_restore: Tensor | None = None) -> Tensor:
+    """128 模板生成图裁剪到 112 teacher；增强的逆变换合成一次采样。"""
+    if theta_restore is not None:
+        grid = transform_sampling_grid(grid, theta_restore)
+    return ffhq_to_arcface_112(images, grid, padding_mode="reflection" if theta_restore is not None else "border")
 
 
 def ffhq_to_arcface_112(images: Tensor, grid: Tensor, *, padding_mode: str = "border") -> Tensor:

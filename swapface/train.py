@@ -30,7 +30,7 @@ from losses import (
     make_l1_loss,
     r1_reg_loss,
 )
-from misc.face_alignment import ffhq_to_arcface_112, make_ffhq_to_arcface_112_grid, transform_sampling_grid
+from misc.face_alignment import arcface_to_identity_112, ffhq_to_arcface_112, make_arcface128_to_arcface112_grid, make_ffhq_to_arcface_112_grid, transform_sampling_grid
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
 from models.discriminator import DiscriminatorType, UNetDiscriminator, build_discriminator
 from models.discriminator.upfirdn2d import initialize_upfirdn2d, is_rocm_gfx1100
@@ -324,6 +324,7 @@ class Trainer:
         identity_config = config["identity"]
         loss_config = config["loss"]
         data_config = config["data"]
+        self.face_alignment = str(data_config.get("alignment", "ffhq"))
         net_g_cfg = dict(config["generator"])
         net_d_cfg = dict(config["discriminator"]["hq"])
         net_d_coarse_cfg = dict(config["discriminator"]["coarse"])
@@ -398,6 +399,7 @@ class Trainer:
         self.enable_hq_vgg_loss = self.hq_stage_active and bool(hq_vgg_config["enable"])
 
         dataloader_cfg = {**data_config["loader"], **data_config["augmentation"], **data_config["sampling"]}
+        dataloader_cfg["alignment"] = self.face_alignment
         dataloader_cfg["decoder_backend"] = ImageDecoderBackend(dataloader_cfg["decoder_backend"])
         src = [(str(entry["path"]), float(entry["adjustment"]), str(entry.get("alignment", "ffhq"))) for entry in data_config["src"]]
         dst = [(str(entry["path"]), float(entry["adjustment"])) for entry in data_config["dst"]]
@@ -475,6 +477,8 @@ class Trainer:
             saved_net_g_cfg = dict(checkpoint["net_g"]["network_cfg"])
             branch_mode: Literal["inherit", "hq_rebuild"] = "inherit"
             if checkpoint_mode == "resume":
+                if checkpoint.get("face_alignment", "ffhq") != self.face_alignment:
+                    raise ValueError("checkpoint 的人脸对齐标准与当前训练配置不一致")
                 if saved_net_g_cfg != net_g_cfg:
                     raise ValueError("checkpoint Generator 架构与当前配置不一致")
             else:
@@ -685,6 +689,9 @@ class Trainer:
         self.coarse_resolution = int(self.net_g.network_cfg["coarse_resolution"])
         self.identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.img_resolution, self.batch_size, self.device)
         self.coarse_identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.coarse_resolution, self.batch_size, self.device)
+        if self.face_alignment == "arcface":
+            self.arcface_identity_grid = make_arcface128_to_arcface112_grid(self.img_resolution, self.batch_size, self.device)
+            self.coarse_arcface_identity_grid = make_arcface128_to_arcface112_grid(self.coarse_resolution, self.batch_size, self.device)
 
         if self.enable_coarse_l1_loss:
             if coarse_l1_config["gaussian_blur"] > 0:
@@ -917,7 +924,16 @@ class Trainer:
             self.log_writer.add_scalar(f"Loss/{key}", value, self.completed_step)
 
     def prepare_identity_encoder_faces(self, faces: Tensor, theta_restore: Tensor | None = None) -> Tensor:
-        """将 full/coarse FFHQ aligned 人脸映射为身份编码器使用的 ArcFace 112 输入。"""
+        """将生成图映射到 112 身份编码器坐标系；与 Generator 对齐模式一致。"""
+        if self.face_alignment == "arcface":
+            spatial = tuple(faces.shape[-2:])
+            if spatial == (self.img_resolution, self.img_resolution):
+                grid = self.arcface_identity_grid
+            elif spatial == (self.coarse_resolution, self.coarse_resolution):
+                grid = self.coarse_arcface_identity_grid
+            else:
+                raise ValueError(f"身份编码器输入分辨率无效：{spatial}")
+            return arcface_to_identity_112(faces, grid, theta_restore)
         spatial = tuple(faces.shape[-2:])
         if spatial == (self.img_resolution, self.img_resolution):
             grid = self.identity_encoder_grid
@@ -1304,6 +1320,7 @@ class Trainer:
         state_dict = {
             "version": CHECKPOINT_VERSION,
             "step": completed_step,
+            "face_alignment": self.face_alignment,
             "run": {
                 "id": self.run_id,
                 "config_sha256": self.resolved_config_sha256,

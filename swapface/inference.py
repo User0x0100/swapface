@@ -36,7 +36,18 @@ def load_generator(checkpoint_path: str | Path) -> tuple[Generator, IDEncoderPro
         raise ValueError("checkpoint 缺少 step") from error
     if not isinstance(completed_step, int) or isinstance(completed_step, bool) or completed_step <= 0:
         raise ValueError(f"checkpoint.step 必须是正整数：{completed_step!r}")
+    face_alignment = checkpoint.get("face_alignment", "ffhq")
+    if face_alignment not in ("ffhq", "arcface"):
+        raise ValueError(f"checkpoint 人脸对齐标准无效：{face_alignment!r}")
+    model.face_alignment = face_alignment
     return model.eval(), provider, completed_step
+
+
+def get_arcface_alignment_template(output_size: int, device: torch.device) -> Tensor:
+    """ArcFace-128 五点模板线性缩放到 Generator 分辨率，不使用 112 模板。"""
+    if output_size <= 0:
+        raise ValueError("output_size 必须为正数")
+    return torch.as_tensor(get_alignment_template(128), device=device, dtype=torch.float32) * (output_size / 128.0)
 
 
 def get_ffhq_alignment_template(output_size: int, device: torch.device) -> Tensor:

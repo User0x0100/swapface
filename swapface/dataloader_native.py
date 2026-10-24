@@ -12,7 +12,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 
 from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, prepare_source_identity_faces, validate_range
-from misc.face_alignment import make_ffhq_to_arcface_112_grid
+from misc.face_alignment import make_arcface112_to_arcface128_grid, make_ffhq_to_arcface_112_grid, make_ffhq_to_arcface_grid
 
 
 class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool, bool, Tensor]]):
@@ -185,6 +185,7 @@ class _NativeTrainingDataLoader:
         scale_factor_range: FloatRange,
         tx_range: FloatRange,
         ty_range: FloatRange,
+        alignment: str = "ffhq",
     ) -> None:
         del num_threads, prefetch_queue_depth, decoder_backend, decoder_hw_load
         if batch_size <= 0:
@@ -203,6 +204,16 @@ class _NativeTrainingDataLoader:
         self.device = device
         self.img_resolution = img_resolution
         self.source_ffhq_grid = make_ffhq_to_arcface_112_grid(img_resolution, batch_size, device)
+        if alignment not in ("ffhq", "arcface"):
+            raise ValueError(f"无效的生成对齐标准：{alignment!r}")
+        self.generation_grid = (
+            make_ffhq_to_arcface_grid(img_resolution, img_resolution, batch_size, device)
+            if alignment == "arcface" else None
+        )
+        self.arcface_source_grid = (
+            make_arcface112_to_arcface128_grid(img_resolution, img_resolution, batch_size, device)
+            if alignment == "arcface" else None
+        )
         self.brightness = brightness
         self.contrast = contrast
         self.saturation = saturation
@@ -249,8 +260,12 @@ class _NativeTrainingDataLoader:
             dst = torch.where(dst_flip, dst.flip(-1), dst)
 
         dst = _color_twist(dst, self.brightness, self.contrast, self.saturation)
-        # semantic losses 使用与训练目标相同 flip/color、但尚未做几何仿射的 canonical reference。
+        # 在几何增强前统一生成坐标系，避免改变 theta_restore 的语义。
         dst_canonical = dst
+        if self.generation_grid is not None:
+            dst_canonical = F.grid_sample(
+                dst_canonical, self.generation_grid, mode="bilinear", padding_mode="border", align_corners=False
+            )
         theta_augment, theta_restore = make_affine_thetas(
             batch_size,
             self.img_resolution,
@@ -260,12 +275,21 @@ class _NativeTrainingDataLoader:
             self.ty_range,
             self.device,
         )
-        grid = F.affine_grid(theta_augment, dst.shape, align_corners=False)
-        dst = F.grid_sample(dst, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        grid = F.affine_grid(theta_augment, dst_canonical.shape, align_corners=False)
+        dst = F.grid_sample(dst_canonical, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
 
         src = src.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
         dst = dst.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
         dst_canonical = dst_canonical.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
         arcface_faces = arcface_faces.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
+        # Identity 始终从原始 source 对齐标准裁剪；不要从重采样的生成输入再次裁剪。
         source_identity_faces = prepare_source_identity_faces(src, arcface_faces, src_arcface_mask, self.source_ffhq_grid)
+        if self.generation_grid is not None:
+            aligned_src = F.grid_sample(
+                src, self.generation_grid, mode="bilinear", padding_mode="border", align_corners=False
+            )
+            aligned_arcface_src = F.grid_sample(
+                src, self.arcface_source_grid, mode="bilinear", padding_mode="border", align_corners=False
+            )
+            src = torch.where(src_arcface_mask[:, None, None, None], aligned_arcface_src, aligned_src)
         return src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces

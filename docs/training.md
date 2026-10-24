@@ -478,3 +478,23 @@ uv run --no-sync python tools/prepare_occluders.py \
   --masks /path/to/NatOcc/masks \
   --output /path/to/rgba-occluders
 ```
+
+
+### 生成对齐标准（FFHQ / ArcFace-128 模板体系）
+
+在 TOML 的 `[data]` 节添加 `alignment = "arcface"` 可启用全局 ArcFace-128 模板体系的生成坐标系（始终按 128 基准五点模板缩放，不是 112 模板等比缩放）。
+缺省或显式 `alignment = "ffhq"` 均保持旧 FFHQ 行为与配置哈希。
+
+- `alignment = "arcface"`：对 FFHQ 对齐数据采用固定五点模板拟合的仿射近似变换，
+  统一转换 Generator source、target、未几何增强的 canonical reference；
+  Discriminator、REC/VGG、语义损失与采样预览自然共享该坐标系。
+- `[[data.src]].alignment` 是独立的**原始数据池格式**，可为 `ffhq` 或 `arcface`；
+  当前 ArcFace 来源按 112 模板数据处理：生成输入必须使用 ArcFace112→ArcFace128 固定变换；身份分支仍保留原始 112 裁剪。
+- `[[data.dst]]` 目前仍要求原始文件为 FFHQ 对齐，模型输出规范通过全局模式选择，
+  不将已有 ArcFace 数据冒充 FFHQ 数据。
+- ArcFace 生成输出给身份 teacher 时使用 ArcFace128→112 固定裁剪。128 输出裁剪 x=[8,120)、y=[0,112)，而不是整图缩放到 112。
+- 固定 FFHQ→ArcFace 是基于现有 FFHQ 五点模板的**近似统一映射**，不是重新对每张图做关键点检测；
+  极端表情、姿态的精确五点对齐可能存在差异。
+- Generator 的对齐类型写入 checkpoint 与导出 ONNX 元数据。旧 checkpoint 未包含该字段视为 FFHQ；
+  严格 resume 禁止切换模式，切换应新建 run（可使用 branch）。
+- 切换对齐标准后的图像空间分布不同，不建议将新模型直接视作原 checkpoint 的无缝续训。

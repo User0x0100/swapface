@@ -538,7 +538,7 @@ def _normalize_discriminator(config: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_data(config: dict[str, Any]) -> dict[str, Any]:
     data = _table(config, "data", "[data]")
-    allowed = {"loader", "augmentation", "sampling", "occlusion", "src", "dst"}
+    allowed = {"alignment", "loader", "augmentation", "sampling", "occlusion", "src", "dst"}
     unknown = set(data) - allowed
     if unknown:
         raise ValueError(f"[data] 包含未知字段：{sorted(unknown)}")
@@ -575,6 +575,9 @@ def _normalize_data(config: dict[str, Any]) -> dict[str, Any]:
         for field in ("size_range_pct", "center_x_range_pct", "center_y_range_pct", "rotation_range_deg"):
             occlusion[field] = _range(occlusion[field], f"data.occlusion.{field}", positive=field == "size_range_pct")
 
+    alignment = data.get("alignment", "ffhq")
+    if alignment not in ("ffhq", "arcface"):
+        raise ValueError(f"data.alignment 必须为 ffhq 或 arcface，实际为 {alignment!r}")
     result = {
         "loader": loader,
         "augmentation": augmentation,
@@ -582,6 +585,9 @@ def _normalize_data(config: dict[str, Any]) -> dict[str, Any]:
         "src": _normalize_image_sources(data.get("src"), "data.src"),
         "dst": _normalize_image_sources(data.get("dst"), "data.dst"),
     }
+    # 旧 FFHQ run 的 canonical config/hash 不新增字段，保持严格 resume 兼容。
+    if alignment != "ffhq":
+        result["alignment"] = alignment
     if occlusion is not None:
         result["occlusion"] = occlusion
     return result

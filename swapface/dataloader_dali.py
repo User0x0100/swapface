@@ -37,13 +37,15 @@ from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 from numpy import ndarray
 from nvidia.dali import fn, pipeline_def
 from nvidia.dali.math import clamp
 from nvidia.dali.types import DALIDataType, DALIImageType, DALIInterpType
 
 from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, prepare_source_identity_faces, validate_range
-from misc.face_alignment import make_ffhq_to_arcface_112_grid
+from misc.face_alignment import ffhq_to_arcface_affine, make_arcface112_to_arcface128_grid, make_ffhq_to_arcface_112_grid, make_ffhq_to_arcface_grid
 
 
 class _RandomImagePairSource:
@@ -158,6 +160,7 @@ def create_dataloader_pipeline(
     scale_factor_range: FloatRange = (1.0 / 1.3, 1.25),
     tx_range: FloatRange = (-0.15, 0.15),
     ty_range: FloatRange = (-0.15, 0.15),
+    alignment: str = "ffhq",
 ):
     """构建训练用 DALI pipeline。
 
@@ -195,6 +198,8 @@ def create_dataloader_pipeline(
     """
     if img_resolution <= 0:
         raise ValueError(f"img_resolution 必须为正数，实际为 {img_resolution}")
+    if alignment not in ("ffhq", "arcface"):
+        raise ValueError(f"生成对齐标准无效：{alignment!r}")
     if reader_prefetch_queue_depth <= 0:
         raise ValueError(f"reader_prefetch_queue_depth 必须为正数，实际为 {reader_prefetch_queue_depth}")
     for name, value in (("brightness", brightness), ("contrast", contrast), ("saturation", saturation), ("flip_prob", flip_prob), ("same_prob", same_prob)):
@@ -239,6 +244,11 @@ def create_dataloader_pipeline(
         saturation=fn.random.uniform(range=(1.0 - saturation, 1.0 + saturation)),
     )
 
+    if alignment == "arcface":
+        # 固定 FFHQ->ArcFace 空间变换先于随机几何增强，canonical/restoration 坐标一致。
+        fixed_matrix = np.asarray(ffhq_to_arcface_affine(img_resolution, img_resolution), dtype=np.float32)
+        dst_image = fn.warp_affine(dst_image, fixed_matrix, device="gpu", inverse_map=False, fill_value=0.0)
+
     dst_canonical = _normalize_chw(dst_image)
     affine_matrix, theta_restore = _random_affine_matrices(img_resolution, rotation_range, scale_factor_range, tx_range, ty_range)
     dst_image = fn.warp_affine(dst_image, affine_matrix, device="gpu", inverse_map=False, fill_value=-1.0)
@@ -257,12 +267,23 @@ class _DALITrainingDataLoader:
         img_resolution: int,
         src: Sequence[ImageSource],
         dst: Sequence[ImageSource],
+        alignment: str = "ffhq",
         **config,
     ) -> None:
         import torch
         from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 
         self._source_ffhq_grid = make_ffhq_to_arcface_112_grid(img_resolution, batch_size, device)
+        if alignment not in ("ffhq", "arcface"):
+            raise ValueError(f"生成对齐标准无效：{alignment!r}")
+        self._generation_grid = (
+            make_ffhq_to_arcface_grid(img_resolution, img_resolution, batch_size, device)
+            if alignment == "arcface" else None
+        )
+        self._arcface_source_grid = (
+            make_arcface112_to_arcface128_grid(img_resolution, img_resolution, batch_size, device)
+            if alignment == "arcface" else None
+        )
         device_id = device.index if device.index is not None else torch.cuda.current_device()
         pipe = create_dataloader_pipeline(
             batch_size=batch_size,
@@ -270,6 +291,7 @@ class _DALITrainingDataLoader:
             img_resolution=img_resolution,
             src=src,
             dst=dst,
+            alignment=alignment,
             **config,
         )
         self._output_map = ["src", "dst", "dst_canonical", "theta_restore", "same_mask", "src_arcface_mask", "src_arcface_faces"]
@@ -283,4 +305,9 @@ class _DALITrainingDataLoader:
     def next(self):
         data = self._iterator.next()[0]
         identity = prepare_source_identity_faces(data["src"], data["src_arcface_faces"], data["src_arcface_mask"], self._source_ffhq_grid)
-        return data["src"], data["dst"], data["dst_canonical"], data["theta_restore"], data["same_mask"], identity
+        src = data["src"]
+        if self._generation_grid is not None:
+            aligned_src = F.grid_sample(src, self._generation_grid, mode="bilinear", padding_mode="border", align_corners=False)
+            aligned_arcface_src = F.grid_sample(src, self._arcface_source_grid, mode="bilinear", padding_mode="border", align_corners=False)
+            src = torch.where(data["src_arcface_mask"][:, None, None, None], aligned_arcface_src, aligned_src)
+        return src, data["dst"], data["dst_canonical"], data["theta_restore"], data["same_mask"], identity

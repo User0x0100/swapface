@@ -217,6 +217,10 @@ relu2_2 = 1.0
 relu3_4 = 1.0
 
 
+[data]
+# 生成器/判别器/空间监督共用对齐标准：ffhq（默认）或 arcface（FFHQ->ArcFace128 模板体系固定近似变换）。
+# alignment = "arcface"
+
 [data.loader]
 # 数据执行/解码后端参数。
 num_threads = 16

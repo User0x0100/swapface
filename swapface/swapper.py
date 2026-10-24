@@ -20,7 +20,7 @@ from misc.models.id_encoder import IDEncoder, IDEncoderProvider
 from misc.models.retinaface import RetinaFace, extract_landmarks
 
 from .contracts import ONNX_CONTRACT
-from .inference import get_ffhq_alignment_template, load_generator
+from .inference import get_arcface_alignment_template, get_ffhq_alignment_template, load_generator
 
 
 def _configure_swapper_runtime() -> None:
@@ -76,7 +76,10 @@ class SwapFace:
                 ]
             self.ort_session = ort.InferenceSession(str(model_path), providers=providers, sess_options=sess_options)
             metadata = self.ort_session.get_modelmeta().custom_metadata_map
-            for key, expected in (ONNX_CONTRACT | {"swapface.kind": "generator"}).items():
+            self.face_alignment = metadata.get("swapface.face_alignment")
+            if self.face_alignment not in ("ffhq", "arcface"):
+                raise ValueError(f"ONNX 对齐类型无效：{self.face_alignment!r}")
+            for key, expected in (ONNX_CONTRACT | {"swapface.face_alignment": self.face_alignment, "swapface.kind": "generator"}).items():
                 if metadata.get(key) != expected:
                     raise ValueError(f"ONNX 推理约定不匹配：{key}={metadata.get(key)!r}，请用当前 export.py 重新导出")
             try:
@@ -107,12 +110,17 @@ class SwapFace:
             net_g, self.id_encoder_provider, self.training_step = load_generator(model_path)
             self.img_resolution = net_g.network_cfg["img_resolution"]
             self.net_g = net_g.to(self.device).eval()
+            self.face_alignment = getattr(net_g, "face_alignment", "ffhq")
 
-        print(f"Loaded step={self.training_step}, provider={self.id_encoder_provider.name}, alignment=FFHQ")
+        print(f"Loaded step={self.training_step}, provider={self.id_encoder_provider.name}, alignment={self.face_alignment.upper()}")
         self.face_detector = RetinaFace(input_range=ImageInputRange.ZERO_TO_255).to(self.device).eval()
         self.id_encoder = IDEncoder(self.id_encoder_provider).to(self.device).eval()
         self.face_masker = FaceMasker(input_range=ImageInputRange.MINUS_ONE_TO_ONE, mode="occlusion").to(self.device)  # occ 模型在 eval 模式下无法正常推理
-        self.alignment_template = get_ffhq_alignment_template(self.img_resolution, self.device)
+        self.alignment_template = (
+            get_ffhq_alignment_template(self.img_resolution, self.device)
+            if self.face_alignment == "ffhq"
+            else get_arcface_alignment_template(self.img_resolution, self.device)
+        )
         self.identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.img_resolution, 1, self.device)
 
     @torch.inference_mode()
@@ -128,20 +136,23 @@ class SwapFace:
             print("Warning: 检测到多张面部，仅使用第一张")
 
         source_landmarks = extract_landmarks(detections)[:1]
-        raw_to_ffhq_theta = make_alignment_grid_theta(
+        raw_to_alignment_theta = make_alignment_grid_theta(
             source_landmarks,
             self.alignment_template,
             tuple(image.shape[-2:]),
             self.img_resolution,
         )
-        # 将 raw->FFHQ 与 FFHQ->ArcFace 合成一个采样网格，只对源图做一次 bilinear 重采样。
-        identity_grid = transform_sampling_grid(self.identity_encoder_grid, raw_to_ffhq_theta)
+        # FFHQ 模式复合一次原图->FFHQ->ArcFace 的采样；ArcFace 模式直接 112 对齐。
+        if self.face_alignment == "ffhq":
+            identity_grid = transform_sampling_grid(self.identity_encoder_grid, raw_to_alignment_theta)
+        else:
+            identity_grid = NF.affine_grid(raw_to_alignment_theta, (1, 3, 112, 112), align_corners=False)
         identity_faces = NF.grid_sample(normalized, identity_grid, mode="bilinear", padding_mode="border", align_corners=False)
         return self.id_encoder(identity_faces)
 
     @torch.inference_mode()
     def swap_faces(self, faces: Tensor, identity_embedding: Tensor) -> Tensor:
-        """输入 FFHQ 对齐的 RGB NCHW 人脸（[-1,1]），返回同布局的换脸结果。"""
+        """输入与 checkpoint 对齐模式一致的 RGB NCHW 人脸（[-1,1]）。"""
         if faces.ndim != 4 or tuple(faces.shape[1:]) != (3, self.img_resolution, self.img_resolution):
             raise ValueError(f"faces 必须为 [N,3,{self.img_resolution},{self.img_resolution}]")
         if tuple(identity_embedding.shape) != (1, 512):

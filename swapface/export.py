@@ -162,7 +162,7 @@ def export_swapface(
         (x, identity_embedding),
         output_dir=output_dir,
         file_prefix=f"{file_prefix}-{training_step}",
-        metadata=ONNX_CONTRACT | {"swapface.kind": "generator", "swapface.provider": provider.name, "swapface.layout": "NHWC" if nhwc else "NCHW", "swapface.step": str(training_step)},
+        metadata=ONNX_CONTRACT | {"swapface.face_alignment": getattr(model, "face_alignment", "ffhq"), "swapface.kind": "generator", "swapface.provider": provider.name, "swapface.layout": "NHWC" if nhwc else "NCHW", "swapface.step": str(training_step)},
         input_names=["faces", "identity"],
         output_name="swapped_faces",
         options=export_options,
