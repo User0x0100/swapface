@@ -87,6 +87,7 @@ weight = 10.0
 gaussian_blur = 0
 
 
+# 使用 UNET 时，无论 Coarse 还是 HQ，对应 R1 都强制禁用。
 [loss.coarse.r1]
 enable = true
 interval = 16
@@ -162,6 +163,7 @@ weight = 10.0
 gaussian_blur = 0
 
 
+# HQ 选择 UNET 时，此处 enable 也会被强制设为 false。
 [loss.hq.r1]
 enable = true
 interval = 16
@@ -266,9 +268,9 @@ hq_max_ch = 128
 
 
 [discriminator.hq]
-# FIR_MINIBATCH_STD 或 INSTANCE_NORM_RESIDUAL。
+# FIR_MINIBATCH_STD、INSTANCE_NORM_RESIDUAL 或 UNET。
 type = "FIR_MINIBATCH_STD"
-# HQ 单全局 Discriminator；FIR residual blocks 下采样到 4x4，使用 lazy R1 正则。
+# HQ 使用 UNET 时：max_ch/minibatch_std_group_size 无效，强制关闭 R1，输出全分辨率空间 Logit。
 img_resolution = 512
 img_channels = 3
 base_ch = 64
@@ -276,10 +278,12 @@ max_ch = 512
 minibatch_std_group_size = 4
 
 [discriminator.coarse]
-# FIR_MINIBATCH_STD、INSTANCE_NORM_RESIDUAL 或 UNET（Coarse 128x128）。
+# FIR_MINIBATCH_STD、INSTANCE_NORM_RESIDUAL 或 UNET。
 type = "FIR_MINIBATCH_STD"
-# UNET 采用 BasicSR UNetDiscriminatorSN：base_ch=64/max_ch=512（必须为 8 倍）。
-# UNET 可选 skip_connection = true；输出为 [B,1,128,128]。
+# UNET 采用 BasicSR UNetDiscriminatorSN：仅使用 base_ch（默认 64），自动按 1/2/4/8 倍扩展。
+# HQ 和 Coarse 的 UNET 都不读取 max_ch/minibatch_std_group_size，强制关闭 R1。
+# Coarse 的 img_resolution 必须等于 generator.coarse_resolution；HQ 必须等于 generator.img_resolution。
+# UNET 可选 skip_connection = true；输出为 [B,1,H,W]。
 img_resolution = 128
 img_channels = 3
 base_ch = 64

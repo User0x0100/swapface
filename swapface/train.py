@@ -957,7 +957,8 @@ class Trainer:
         r1_gamma: float,
     ) -> Tensor:
         """计算当前判别器阶段的 adversarial + lazy R1。"""
-        r1_step = r1_enabled and self.completed_step % r1_interval == 0
+        # 二次防护：UNetDiscriminatorSN 永远不执行 R1，即便调用方传入 enabled=True。
+        r1_step = r1_enabled and not isinstance(net, UNetDiscriminatorSN) and self.completed_step % r1_interval == 0
         if r1_step:
             # R1 涉及输入梯度的二阶反传，固定走未编译的 FP32 D，避免 AMP/compile
             # 改变梯度惩罚的数值路径。fake/real 分开前向也保持 MinibatchStd 统计隔离。
@@ -967,9 +968,7 @@ class Trainer:
                 fake_score = net(fake_img)
                 real_score = net(real_img)
                 adversarial_loss = self.d_loss(fake_score, real_score)
-                # 像素级 D 的 R1 对空间均值求梯度，避免随像素数平方放大。
-                r1_score = real_score.mean(dim=(2, 3)) if isinstance(net, UNetDiscriminatorSN) else real_score
-                r1_loss_raw = r1_reg_loss(r1_score, real_img, gamma=r1_gamma)
+                r1_loss_raw = r1_reg_loss(real_score, real_img, gamma=r1_gamma)
                 r1_loss = r1_loss_raw * r1_interval
             self.log(f"{stage}_r1_loss_raw", r1_loss_raw, force=True)
             self.log(f"{stage}_r1_loss", r1_loss, force=True)
