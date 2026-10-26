@@ -497,7 +497,7 @@ def _normalize_discriminator(config: dict[str, Any]) -> dict[str, Any]:
     for stage, fir_defaults in DEFAULT_DISCRIMINATOR_CONFIG.items():
         raw = _table(discriminator, stage, f"[discriminator.{stage}]")
         discriminator_type = _normalize_discriminator_type(raw.get("type", fir_defaults["type"]), f"discriminator.{stage}.type")
-        allowed = common_keys | {"minibatch_std_group_size"}
+        allowed = common_keys | {"minibatch_std_group_size", "skip_connection"}
         unknown_stage = set(raw) - allowed
         if unknown_stage:
             raise ValueError(f"[discriminator.{stage}] 包含未知字段：{sorted(unknown_stage)}")
@@ -512,8 +512,10 @@ def _normalize_discriminator(config: dict[str, Any]) -> dict[str, Any]:
             if discriminator_type is DiscriminatorType.UNET:
                 if stage != "coarse":
                     raise ValueError("UNET 判别器仅用于 Coarse 阶段")
-                defaults["base_ch"] = 32
-                defaults["max_ch"] = 256
+                defaults["base_ch"] = 64
+                defaults["max_ch"] = 512
+                defaults["skip_connection"] = True
+                relevant = common_keys | {"skip_connection"}
 
         # 允许配置文件同时保留两类 D 的专属参数；切换 type 时只消费当前类型相关字段。
         stage_config = defaults | {key: value for key, value in raw.items() if key in relevant}
@@ -522,6 +524,15 @@ def _normalize_discriminator(config: dict[str, Any]) -> dict[str, Any]:
             stage_config[key] = _int(stage_config[key], f"discriminator.{stage}.{key}", minimum=1)
         if stage_config["max_ch"] < stage_config["base_ch"]:
             raise ValueError(f"discriminator.{stage}.max_ch 必须 >= discriminator.{stage}.base_ch")
+        if discriminator_type is DiscriminatorType.UNET:
+            # BasicSR 的通道数固定按 1/2/4/8 倍扩展；未指定上限时自动推导。
+            if "max_ch" not in raw:
+                stage_config["max_ch"] = stage_config["base_ch"] * 8
+            stage_config["skip_connection"] = _bool(
+                stage_config["skip_connection"], f"discriminator.{stage}.skip_connection",
+            )
+            if stage_config["max_ch"] != 8 * stage_config["base_ch"]:
+                raise ValueError("UNET 的 max_ch 必须等于 8 * base_ch（BasicSR 固定通道倍数）")
         resolution = stage_config["img_resolution"]
         if resolution < 16 or resolution & (resolution - 1):
             raise ValueError(f"discriminator.{stage}.img_resolution 必须是 >=16 的 2 的整数次幂")
@@ -620,9 +631,8 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
         if discriminator_type is DiscriminatorType.UNET:
             if stage_config["img_resolution"] != 128 or generator["coarse_resolution"] != 128:
                 raise ValueError("UNET 判别器要求 Coarse 固定为 128x128")
-            loss[stage]["gan"].setdefault("spatial_weight", 0.25)
-        elif "spatial_weight" in loss[stage]["gan"]:
-            raise ValueError(f"loss.{stage}.gan.spatial_weight 仅适用于 UNET 判别器")
+        if "spatial_weight" in loss[stage]["gan"]:
+            raise ValueError(f"loss.{stage}.gan.spatial_weight 已删除：GAN 直接使用判别器的全分辨率输出")
         if discriminator_type is DiscriminatorType.FIR_MINIBATCH_STD:
             group_size = stage_config["minibatch_std_group_size"]
             if train["batch_size"] % group_size:

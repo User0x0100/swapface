@@ -1075,7 +1075,8 @@ def _check_generator_responsibility_boundary() -> None:
             and node.func.value.id == "self"
             and node.func.attr == d_attr
         ]
-        assert len(d_calls) >= 3
+        # GAN fake 调用 + no_grad 的真实特征调用；不再有双头 UNet 分支。
+        assert len(d_calls) >= 2
         feature_calls = [
             call
             for call in d_calls
@@ -1085,7 +1086,8 @@ def _check_generator_responsibility_boundary() -> None:
             and isinstance(call.args[2], ast.Constant)
             and call.args[2].value is True
         ]
-        assert len(feature_calls) == 2
+        # Coarse 的 fake 特征开关是动态布尔值；HQ 使用字面量 True。
+        assert len(feature_calls) == (1 if method_name.startswith("_coarse") else 2)
         assert any(isinstance(call.args[0], ast.Name) and call.args[0].id == real_name for call in feature_calls)
         assert any(
             isinstance(node, ast.With)

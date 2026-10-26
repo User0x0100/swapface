@@ -4,7 +4,7 @@ from typing import Any
 
 from torch import nn
 
-from .unet import UNetDiscriminator
+from .unet import UNetDiscriminatorSN
 
 from .network import (
     INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION,
@@ -27,7 +27,11 @@ def build_discriminator(config: Mapping[str, Any]) -> nn.Module:
     elif discriminator_type is DiscriminatorType.INSTANCE_NORM_RESIDUAL:
         model = InstanceNormResidualDiscriminator(**cfg)
     elif discriminator_type is DiscriminatorType.UNET:
-        model = UNetDiscriminator(**cfg)
+        model = UNetDiscriminatorSN(
+            num_in_ch=int(cfg["img_channels"]),
+            num_feat=int(cfg["base_ch"]),
+            skip_connection=bool(cfg["skip_connection"]),
+        )
     else:
         raise AssertionError(f"未处理的判别器类型：{discriminator_type}")
     model.network_cfg = dict(config)
@@ -43,6 +47,6 @@ __all__ = [
     "DiscriminatorType",
     "FIRMinibatchStdDiscriminator",
     "InstanceNormResidualDiscriminator",
-    "UNetDiscriminator",
+    "UNetDiscriminatorSN",
     "build_discriminator",
 ]

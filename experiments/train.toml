@@ -72,8 +72,7 @@ scope = "same"
 
 [loss.coarse.gan]
 weight = 1.0
-# 仅当 discriminator.coarse.type = "UNET" 时允许配置：
-# spatial_weight = 0.25  # Decoder 空间对抗损失权重，默认 0.25
+# UNET 使用 BasicSR 的单一像素级 Logit 图，不再区分 Global/Spatial 权重。
 
 
 [loss.coarse.identity]
@@ -279,7 +278,8 @@ minibatch_std_group_size = 4
 [discriminator.coarse]
 # FIR_MINIBATCH_STD、INSTANCE_NORM_RESIDUAL 或 UNET（Coarse 128x128）。
 type = "FIR_MINIBATCH_STD"
-# UNET 时默认 base_ch=32/max_ch=256，其余类型保留各自默认值。
+# UNET 采用 BasicSR UNetDiscriminatorSN：base_ch=64/max_ch=512（必须为 8 倍）。
+# UNET 可选 skip_connection = true；输出为 [B,1,128,128]。
 img_resolution = 128
 img_channels = 3
 base_ch = 64
