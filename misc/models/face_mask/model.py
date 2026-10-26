@@ -7,6 +7,8 @@ from torch.nn import functional as F
 
 from ...models import MODEL_REPOSITORY_ID, ImageInputRange
 
+FACE_PARSING_NUM_CLASSES = 19
+
 
 class FaceMasker(nn.Module):
     def __init__(
@@ -65,12 +67,11 @@ class FaceMasker(nn.Module):
             # https://github.com/yakhyo/face-parsing
             from .bisenet import BiSeNet
 
-            self.model = BiSeNet(n_classes=19)
+            self.model = BiSeNet(n_classes=FACE_PARSING_NUM_CLASSES)
             weight_path = hf_hub_download(repo_id=MODEL_REPOSITORY_ID, filename="79999_iter.pth")
             self.model.load_state_dict(torch.load(weight_path, map_location=torch.device("cpu"), weights_only=True))
 
-    def forward(self, images: Tensor) -> Tensor:
-
+    def _predict_scores(self, images: Tensor) -> Tensor:
         height, width = images.shape[-2:]
 
         if self.mode == "occlusion":
@@ -90,16 +91,22 @@ class FaceMasker(nn.Module):
         std = self.get_buffer("std")
         images = images.sub(mean).div(std)
 
-        mask = self.model(images)
-        mask: Tensor = F.interpolate(mask, (height, width), mode="bicubic")
+        scores: Tensor = self.model(images)
+        return F.interpolate(scores, (height, width), mode="bicubic")
 
+    def forward(self, images: Tensor) -> Tensor:
+        scores = self._predict_scores(images)
         if self.mode == "occlusion":
-            mask = (mask > 0).float()
-        else:
-            parsing = mask.argmax(dim=1)
-            mask = torch.isin(parsing, self.get_buffer("face_part_indices")).float().unsqueeze(1)
+            return (scores > 0).float()
+        parsing = scores.argmax(dim=1)
+        return torch.isin(parsing, self.get_buffer("face_part_indices")).float().unsqueeze(1)
 
-        return mask
+    @torch.no_grad()
+    def predict_labels(self, images: Tensor) -> Tensor:
+        """返回原始图像分辨率的 19 类解析标签 (B,H,W)，仅 parsing 模式可用。"""
+        if self.mode != "parsing":
+            raise ValueError("predict_labels 仅支持 parsing 模式")
+        return self._predict_scores(images).argmax(dim=1)
 
 
 if __name__ == "__main__":

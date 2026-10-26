@@ -109,14 +109,14 @@ def _check_train_config(root: Path) -> None:
     }
     assert resolved["identity"]["provider"] == raw["identity"]["provider"]
     assert resolved["loss"]["coarse"]["gan"] == {"weight": 0.6}
-    assert resolved["loss"]["coarse"]["identity"] == {"provider": "BLENDFACE", "weight": 7.0}
+    assert resolved["loss"]["coarse"]["identity"] == {"provider": "BLENDFACE", "weight": 7.0, "exclude_parsing_labels": []}
     assert resolved["loss"]["coarse"]["reconstruction"] == {"scope": "same"}
     assert resolved["loss"]["coarse"]["l1"] == {"enable": True, "weight": 6.0, "gaussian_blur": 384}
     assert resolved["loss"]["coarse"]["wfm"] == {"enable": False, "weights": {"0": 0.5, "1": 1.0, "2": 1.0, "3": 1.0}}
     assert resolved["loss"]["coarse"]["r1"] == {"enable": True, "interval": 8, "gamma": 5.0}
     assert resolved["loss"]["coarse"]["vgg"]["weights"] == {"relu2_2": 0.5}
     assert resolved["loss"]["hq"]["gan"] == {"weight": 0.8}
-    assert resolved["loss"]["hq"]["identity"] == {"provider": "MS1MV3_ARCFACE_R50_FP16", "weight": 9.0}
+    assert resolved["loss"]["hq"]["identity"] == {"provider": "MS1MV3_ARCFACE_R50_FP16", "weight": 9.0, "exclude_parsing_labels": []}
     assert resolved["loss"]["hq"]["l1"] == {"enable": True, "weight": 7.0, "gaussian_blur": 0}
     assert resolved["loss"]["hq"]["wfm"] == {"enable": False, "weights": {"0": 0.5, "1": 1.0, "2": 1.0, "3": 1.0}}
     assert resolved["loss"]["hq"]["r1"] == {"enable": False, "interval": 4, "gamma": 2.0}

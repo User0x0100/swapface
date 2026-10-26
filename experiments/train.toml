@@ -78,6 +78,9 @@ weight = 1.0
 [loss.coarse.identity]
 provider = "BLENDFACE"
 weight = 10.0
+# 可选：IDLoss 梯度排除的 BiSeNet/CelebAMask 类别编号。空数组表示关闭。
+# 4/5=左右眼，11=口腔内部，12/13=上下唇；例如 [4, 5, 12, 13]。
+exclude_parsing_labels = []
 
 
 [loss.coarse.l1]
@@ -154,6 +157,8 @@ weight = 1.0
 [loss.hq.identity]
 provider = "BLENDFACE"
 weight = 10.0
+# HQ 可独立于 Coarse 配置。仅过滤 IDLoss 梯度，不修改前向像素与其他 loss。
+exclude_parsing_labels = []
 
 
 [loss.hq.l1]

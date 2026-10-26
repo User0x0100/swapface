@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from losses.functional import _gaussian_blur_parameters
+from misc.models.face_mask import FACE_PARSING_NUM_CLASSES
 from misc.models.id_encoder import IDEncoderProvider
 from models.discriminator import INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION, DiscriminatorType
 
@@ -83,7 +84,7 @@ DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT: dict[str, float] = {
     "conv4_3": 2.5,
 }
 DEFAULT_GAN_LOSS_CONFIG = {"weight": 1.0}
-DEFAULT_IDENTITY_LOSS_CONFIG = {"provider": DEFAULT_IDENTITY_LOSS_PROVIDER.name, "weight": 10.0}
+DEFAULT_IDENTITY_LOSS_CONFIG = {"provider": DEFAULT_IDENTITY_LOSS_PROVIDER.name, "weight": 10.0, "exclude_parsing_labels": []}
 DEFAULT_R1_LOSS_CONFIG = {"enable": True, "interval": 16, "gamma": 10.0}
 DEFAULT_WFM_LOSS_CONFIG = {"enable": False, "weights": {"0": 0.5, "1": 1.0, "2": 1.0, "3": 1.0}}
 DEFAULT_GAZE_LOSS_CONFIG = {"enable": False, "weight": 1.0, "distribution_weight": 0.1, "confidence_weighted": True}
@@ -108,7 +109,7 @@ DEFAULT_FACS_LOSS_CONFIG = {
 }
 DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
     "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
-    "identity": dict(DEFAULT_IDENTITY_LOSS_CONFIG),
+    "identity": {**DEFAULT_IDENTITY_LOSS_CONFIG, "exclude_parsing_labels": []},
     "r1": dict(DEFAULT_R1_LOSS_CONFIG),
     "wfm": {"enable": DEFAULT_WFM_LOSS_CONFIG["enable"], "weights": dict(DEFAULT_WFM_LOSS_CONFIG["weights"])},
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
@@ -120,7 +121,7 @@ DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
 }
 DEFAULT_HQ_LOSS_CONFIG: dict[str, Any] = {
     "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
-    "identity": dict(DEFAULT_IDENTITY_LOSS_CONFIG),
+    "identity": {**DEFAULT_IDENTITY_LOSS_CONFIG, "exclude_parsing_labels": []},
     "r1": dict(DEFAULT_R1_LOSS_CONFIG),
     "wfm": {"enable": DEFAULT_WFM_LOSS_CONFIG["enable"], "weights": dict(DEFAULT_WFM_LOSS_CONFIG["weights"])},
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
@@ -353,6 +354,18 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
     identity = _with_defaults(_table(loss, "identity", f"[{prefix}.identity]"), defaults["identity"], f"[{prefix}.identity]")
     identity["provider"] = _provider(identity["provider"], f"{prefix}.identity.provider")
     identity["weight"] = _float(identity["weight"], f"{prefix}.identity.weight", minimum=0.0)
+    labels = identity["exclude_parsing_labels"]
+    if not isinstance(labels, list):
+        raise TypeError(f"{prefix}.identity.exclude_parsing_labels 必须为整数数组")
+    validated: list[int] = []
+    for index, label in enumerate(labels):
+        label = _int(label, f"{prefix}.identity.exclude_parsing_labels[{index}]", minimum=0)
+        if label >= FACE_PARSING_NUM_CLASSES:
+            raise ValueError(f"{prefix}.identity.exclude_parsing_labels[{index}] 超出 [0, {FACE_PARSING_NUM_CLASSES - 1}]")
+        if label in validated:
+            raise ValueError(f"{prefix}.identity.exclude_parsing_labels 不允许重复标签：{label}")
+        validated.append(label)
+    identity["exclude_parsing_labels"] = sorted(validated)
 
     r1 = _with_defaults(_table(loss, "r1", f"[{prefix}.r1]"), defaults["r1"], f"[{prefix}.r1]")
     r1["enable"] = _bool(r1["enable"], f"{prefix}.r1.enable")

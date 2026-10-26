@@ -71,6 +71,28 @@ uv run python -m swapface.train \
 
 Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、gaze、HRFFA、FACS、L1/VGG 与 reconstruction scope 均独立配置。`gan.weight` 只缩放对应阶段的 Generator adversarial loss，D 的 adversarial loss 固定权重 1.0。HQ 或 Coarse 选择 UNET 时，无论对应 `[loss.<stage>.r1].enable` 原始值如何都强制关闭 R1；其他判别器保留独立 R1 配置。
 
+### IDLoss 面部分割梯度过滤
+
+可在两个阶段的 `identity` 配置中独立指定 BiSeNet/CelebAMask-19 的排除类别：
+
+```toml
+[loss.coarse.identity]
+provider = "BLENDFACE"
+weight = 10.0
+exclude_parsing_labels = [4, 5, 12, 13]  # 左眼、右眼、上唇、下唇
+
+[loss.hq.identity]
+provider = "BLENDFACE"
+weight = 10.0
+exclude_parsing_labels = [4, 5, 11, 12, 13]  # 另外包含口腔内部
+```
+
+编号 4=左眼、5=右眼、11=口腔、12=上唇、13=下唇（CelebAMask-HQ 19 类定义）。支持 0～18 的不重复整数列表；`[]` 是默认值，不加载面部分割模型。开启后两个阶段共用项目已有的 `FaceMasker(mode="parsing")`，对每批尚未叠加在线遮挡的目标图像执行一次 FP32/no-grad 分割，输出与生成结果空间对齐的类别图；每阶段选择自己的排除类别，并与在线遮挡的 ID 门控相乘。Coarse 使用面积插值将门控缩小到其输出分辨率。新增 parsing teacher 不更新参数，结果不会回传到 teacher。
+
+`gate_identity_gradient` 保持输入像素及 IDLoss 标量值不变，但只允许未屏蔽像素向生成器回传 IDLoss 梯度；GAN、VGG、L1 与几何损失仍使用原始生成图像，不受影响。训练样本图中的 ID GRAD 使用同一门控，可以观察过滤效果。
+
+注意：被屏蔽区域的**直接图像梯度**归零，并不意味着训练后该区域的最终视觉结果绝对不变。卷积生成器的共享参数及其他 loss 仍可能间接改变该区域；分割错误、边缘过渡以及 Coarse 下采样同样会影响有效覆盖。使用非空列表需要额外下载 `79999_iter.pth`，并增加每个 batch 的一次分割前向计算；配置变更应使用新 run/branch，而不是修改已冻结 run 的 resume 配置。
+
 ### WebFace600K ArcFace R50（InSwapper-128 身份编码器）
 
 身份编码器可选 `WEBFACE600K_ARCFACE_R50`。它从项目共用模型仓库 `leehx/model_hub` 加载 `w600k_r50.pth`（原始权重来自 `Icar/buffalo_l-torch`，与 InsightFace `buffalo_l/w600k_r50.onnx` 输出数值等价），复用项目原有 IResNet50 / IBasicBlock 的 `fused_bn=True` 结构（与普通非融合 R50 checkpoint 不可互换）。权重与其他身份编码器一样通过公共 `MODEL_REPOSITORY_ID` 下载到 Hugging Face Hub 缓存，不把模型文件加入 Git。

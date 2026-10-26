@@ -1,3 +1,3 @@
-from .model import FaceMasker
+from .model import FACE_PARSING_NUM_CLASSES, FaceMasker
 
-__all__ = ["FaceMasker"]
+__all__ = ["FACE_PARSING_NUM_CLASSES", "FaceMasker"]

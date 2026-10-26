@@ -30,6 +30,7 @@ from losses import (
     r1_reg_loss,
 )
 from misc.face_alignment import arcface_to_identity_112, ffhq_to_arcface_112, make_arcface128_to_arcface112_grid, make_ffhq_to_arcface_112_grid, transform_sampling_grid
+from misc.models.face_mask import FaceMasker
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
 from models.discriminator import DiscriminatorType, UNetDiscriminatorSN, build_discriminator
 from models.discriminator.upfirdn2d import initialize_upfirdn2d, is_rocm_gfx1100
@@ -38,7 +39,6 @@ from models.networks import Generator
 from .config import load_train_config, resolve_train_config
 from .contracts import CHECKPOINT_VERSION
 from .dataloader import ImageDecoderBackend, TrainingDataLoader
-from .occlusion import OcclusionAugmentor, gate_identity_gradient
 from .experiment import (
     RunLock,
     RunPaths,
@@ -52,6 +52,7 @@ from .experiment import (
     update_metadata,
     write_latest,
 )
+from .occlusion import OcclusionAugmentor, gate_identity_gradient
 
 EPS = 1e-8
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -373,6 +374,8 @@ class Trainer:
         self.generator_id_encoder_provider = IDEncoderProvider[str(identity_config["provider"])]
         self.coarse_identity_loss_provider = IDEncoderProvider[str(coarse_identity_config["provider"])]
         self.hq_identity_loss_provider = IDEncoderProvider[str(hq_identity_config["provider"])]
+        self.coarse_excluded_parsing_labels = tuple(coarse_identity_config["exclude_parsing_labels"]) if self.coarse_stage_active else ()
+        self.hq_excluded_parsing_labels = tuple(hq_identity_config["exclude_parsing_labels"]) if self.hq_stage_active else ()
         self.reuse_generator_identity_for_coarse_source = self.coarse_stage_active and self.generator_id_encoder_provider is self.coarse_identity_loss_provider
         self.reuse_generator_identity_for_hq_source = self.hq_stage_active and self.generator_id_encoder_provider is self.hq_identity_loss_provider
         self.coarse_reconstruction_scope = coarse_reconstruction_scope
@@ -820,6 +823,17 @@ class Trainer:
                 center_y_range_pct=occlusion_cfg["center_y_range_pct"],
                 rotation_range_deg=occlusion_cfg["rotation_range_deg"],
             )
+
+        # 单个冻结 parsing teacher 同时服务 Coarse/HQ 的 ID 梯度过滤。
+        # 无标签时不加载模型或权重，默认训练路径保持原有开销。
+        self.face_parser: FaceMasker | None = None
+        if self.coarse_excluded_parsing_labels or self.hq_excluded_parsing_labels:
+            self.face_parser = FaceMasker(mode="parsing").to(self.device).eval().requires_grad_(False)
+        # 标签索引常驻设备，避免在每个训练 step 重复创建与传输。
+        self.parsing_exclusion_indices = tuple(
+            torch.tensor(indices, device=self.device, dtype=torch.long) if indices else None
+            for indices in (self.coarse_excluded_parsing_labels, self.hq_excluded_parsing_labels)
+        )
 
         # ========================= 编译模型 =========================
         # Coarse 始终需要前向；HQ/D/loss teacher 仅为 active stage 构建训练热路径。
@@ -1392,8 +1406,8 @@ class Trainer:
         self,
         sample_reference: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
         current_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
-        sample_id_gate: Tensor | None = None,
-        current_id_gate: Tensor | None = None,
+        sample_id_gate: tuple[Tensor | None, Tensor | None] = (None, None),
+        current_id_gate: tuple[Tensor | None, Tensor | None] = (None, None),
     ) -> None:
         sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces = (
             tensor.to(self.device) for tensor in sample_reference
@@ -1408,9 +1422,10 @@ class Trainer:
             theta_restore_vis = torch.cat((sample_theta_restore, theta_restore[:dynamic_count]), dim=0)
             same_mask_vis = torch.cat((sample_same_mask, same_mask[:dynamic_count]), dim=0)
             source_identity_faces_vis = torch.cat((sample_src_identity_faces, source_identity_faces[:dynamic_count]), dim=0)
-            id_gate_vis = (
-                torch.cat((sample_id_gate.to(self.device), current_id_gate[:dynamic_count]), dim=0)
-                if sample_id_gate is not None and current_id_gate is not None else None
+            id_gates_vis = tuple(
+                torch.cat((sample_gate.to(self.device), current_gate[:dynamic_count]), dim=0)
+                if sample_gate is not None and current_gate is not None else None
+                for sample_gate, current_gate in zip(sample_id_gate, current_id_gate, strict=True)
             )
 
             generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
@@ -1466,7 +1481,7 @@ class Trainer:
                         coarse_source_identity_embeddings_vis,
                         restore_grid_vis,
                         tuple(fake_vis.shape[-2:]),
-                        id_gate_vis,
+                        id_gates_vis[0],
                     )
                 )
 
@@ -1482,7 +1497,7 @@ class Trainer:
                         hq_source_identity_embeddings_vis,
                         restore_grid_vis,
                         tuple(fake_vis.shape[-2:]),
-                        id_gate_vis,
+                        id_gates_vis[1],
                     )
                 )
 
@@ -1493,19 +1508,37 @@ class Trainer:
         if not cv2.imwrite(sample_file, grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
             raise OSError(f"保存训练 sample 失败：{sample_file}")
 
-    def _next_training_batch(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor | None]:
+    def _next_training_batch(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, tuple[Tensor | None, Tensor | None]]:
         src, dst, canonical, theta_restore, same_mask, identity_faces = self.dataset.next()
-        if self.occlusion is None:
-            return src, dst, canonical, theta_restore, same_mask, identity_faces, None
-        dst, identity_gate = self.occlusion.apply(dst)
-        return src, dst, canonical, theta_restore, same_mask, identity_faces, identity_gate
+
+        # 在加入在线遮挡之前解析干净 dst，避免遮挡素材干扰标签分类。
+        labels = None
+        if self.face_parser is not None:
+            with torch.no_grad(), autocast(device_type="cuda", enabled=False):
+                labels = self.face_parser.predict_labels(dst.float())
+
+        occlusion_gate = None
+        if self.occlusion is not None:
+            dst, occlusion_gate = self.occlusion.apply(dst)
+
+        gates: list[Tensor | None] = []
+        for excluded_tensor in self.parsing_exclusion_indices:
+            gate = occlusion_gate
+            if excluded_tensor is not None:
+                assert labels is not None
+                # True 的区域可回传 ID 梯度；分割结果无梯度，不能反传给 parser。
+                keep = (~torch.isin(labels, excluded_tensor)).unsqueeze(1).to(dtype=dst.dtype)
+                gate = keep if gate is None else gate * keep
+            gates.append(gate)
+
+        return src, dst, canonical, theta_restore, same_mask, identity_faces, (gates[0], gates[1])
 
     def train(self) -> None:
 
         net_coarse = self.train_coarse
         sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces, sample_id_gate = self._next_training_batch()
         half = self.batch_size // 2
-        sample_id_gate = sample_id_gate[:half].detach().cpu() if sample_id_gate is not None else None
+        sample_id_gate = tuple(gate[:half].detach().cpu() if gate is not None else None for gate in sample_id_gate)
         sample_reference = tuple(
             tensor[:half].detach().cpu()
             for tensor in (sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces)
@@ -1623,7 +1656,7 @@ class Trainer:
                                 same_mask,
                                 coarse_source_identity_embeddings,
                                 restore_grid,
-                                id_gate,
+                                id_gate[0],
                             )
                         if self.hq_stage_active:
                             hq_g_loss = self._hq_generator_stage_loss(
@@ -1634,7 +1667,7 @@ class Trainer:
                                 same_mask,
                                 hq_source_identity_embeddings,
                                 restore_grid,
-                                id_gate,
+                                id_gate[1],
                             )
 
                         if self.train_stage == "joint":
