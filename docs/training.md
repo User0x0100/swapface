@@ -69,7 +69,7 @@ uv run python -m swapface.train \
 - `[[data.src]]` / `[[data.dst]]`：训练数据源；
 - `[generator]` / `[discriminator.hq]` / `[discriminator.coarse]`：Generator 与两个 Discriminator 的独立模型定义。
 
-Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、gaze、HRFFA、FACS、L1/VGG 与 reconstruction scope 均独立配置。`gan.weight` 只缩放对应阶段的 Generator adversarial loss，D 的 adversarial loss 固定权重 1.0。HQ 或 Coarse 选择 UNET 时，无论对应 `[loss.<stage>.r1].enable` 原始值如何都强制关闭 R1；其他判别器保留独立 R1 配置。
+Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、gaze、SMIRK（Pose/Expression/Jaw/Eyelid）、L1/VGG 与 reconstruction scope 均独立配置。`gan.weight` 只缩放对应阶段的 Generator adversarial loss，D 的 adversarial loss 固定权重 1.0。HQ 或 Coarse 选择 UNET 时，无论对应 `[loss.<stage>.r1].enable` 原始值如何都强制关闭 R1；其他判别器保留独立 R1 配置。
 
 ### IDLoss 面部分割梯度过滤
 
@@ -164,8 +164,8 @@ gamma = 10.0
 
 Generator、HQ Discriminator、Coarse Discriminator 分别拥有独立的 optimizer/scheduler/GradScaler。inactive Discriminator 保持在 CPU，不创建 optimizer/scaler/scheduler，也不占用训练 GPU 显存；inactive Generator stage 参数没有 gradient。EMA 只更新 active Generator stage。`hq` 模式下 HQ 输入仍使用冻结 Coarse 的输出；`joint` 模式下 HQ 输入使用 `coarse.detach()`，因此 Final/HQ losses 不会反向修改 Coarse。
 
-- Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、R1、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
-- HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/R1、gaze / HRFFA / FACS，以及 reconstruction scope 下的 L1/VGG；
+- Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、R1、gaze / SMIRK，以及 reconstruction scope 下的 L1/VGG；
+- HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/R1、gaze / SMIRK，以及 reconstruction scope 下的 L1/VGG；
 - Discriminator：HQ 与 Coarse 分别维护 D optimizer、scheduler 和 GradScaler。默认 FIR 判别器通过 FIR 抗混叠下采样到 4x4，使用 MinibatchStd；普通 D step 将 fake/real 合并为一次 forward，但 MinibatchStd 仍分开统计。任一阶段选择 UNET 时仅使用空间输出 `[B,1,H,W]` 计算 Hinge GAN，保留 encoder WFM 特征接口；SN 为其卷积提供约束，因此在配置解析与 D loss 执行层都强制跳过 R1。其他判别器的 lazy R1 仍只基于 real 输入，在未编译的 FP32 判别器上计算并乘以 interval。joint 下两个 D 独立更新；一个 D 的 FP16 overflow 仅重试该 D。
 
 Coarse 内部首先将真实 `dst` 双线性缩放到 `coarse_resolution`；训练时通过 `return_resize_in=True` 复用这一实际模型输入作为 Coarse Discriminator real，以及 L1/VGG reconstruction target，不在 Trainer 中重复 resize。Coarse/HQ 的 L1 reconstruction 由各自的 `[loss.coarse.l1].gaussian_blur`、`[loss.hq.l1].gaussian_blur` 控制：整数 `0`（默认）直接计算逐像素 L1；正整数 `N` 启用 Gaussian blur（`sigma = 当前阶段分辨率 / N`），例如 `384` 对应之前硬编码的模糊强度，`256` 则更强。开启时仅对 prediction-target 差分进行等价的滤波，不影响 VGG，VGG 始终使用原图。Coarse L1/VGG 由 `[loss.coarse.reconstruction].scope` 控制作用范围；默认 `same`，只对 self-reconstruction pair 生效。Coarse 的 target 属性监督则先将低分辨率输出双线性上采样到训练分辨率，再使用与 Final 相同的 `theta_restore` 恢复到 canonical 坐标系，与 `dst_canonical` 比较。
@@ -229,7 +229,7 @@ experiments/
 - `metadata.json`：只记录 run ID、状态、配置摘要和可选的 branch 父来源。
 - `latest.json`：很小的最新 checkpoint 指针，不复制大模型文件，适合本地文件系统和对象存储。
 - `checkpoints/`：完整训练状态。
-- `samples/`：与 completed step 对齐的训练可视化；每一行最左侧标注该行含义。基础图包含 src、dst、Coarse、Final、canonical dst、Final Identity 输入；随后对 active stage 的 GAN/Identity 以及当前实际启用的 WFM/Gaze/HRFFA/FACS/VGG/L1 分别绘制原有 `loss_grad_map` 风格的梯度图。未启用的可选损失不占行，R1 不进入 sample 可视化。
+- `samples/`：与 completed step 对齐的训练可视化；每一行最左侧标注该行含义。基础图包含 src、dst、Coarse、Final、canonical dst、Final Identity 输入；随后对 active stage 的 GAN/Identity 以及当前实际启用的 WFM/Gaze/SMIRK/VGG/L1 分别绘制原有 `loss_grad_map` 风格的梯度图。未启用的可选损失不占行，R1 不进入 sample 可视化。
 
 每个 active stage 在 EMA 输出图像上分别计算各项**已加权** Generator loss 的图像梯度 `g_i = dL_i / dx`，梯度只求导一次，标注以下量：
 
@@ -382,7 +382,7 @@ Branch 不检查 `training_config.semantics_version`，因为它不恢复父训�
 
 ### 可选严格校验训练精度
 
-`[train].precision` 必须显式配置，支持 `fp32`、`fp16`、`bf16`。FP16 使用 Generator、HQ Discriminator、Coarse Discriminator 三个独立 `GradScaler`；BF16 不使用 loss scaling。仿射恢复与 HRFFA 的数值敏感几何求解继续固定为 FP32。
+`[train].precision` 必须显式配置，支持 `fp32`、`fp16`、`bf16`。FP16 使用 Generator、HQ Discriminator、Coarse Discriminator 三个独立 `GradScaler`；BF16 不使用 loss scaling。仿射恢复与 SMIRK 编码器的损失计算固定为 FP32。
 
 FP16 中只有实际执行了 optimizer update 的阶段才推进对应 scheduler。D overflow 时当前 global step 不推进；D 已成功而 G overflow 时只重算并重试 G，直到 G 成功后才更新 EMA 和 `completed_step`。任一 active D stage 的 loss 或 `g_loss` 出现 NaN/Inf 时直接终止，避免把非有限值误当作可通过降低 loss scale 恢复的 overflow。BF16/FP32 在 backward 后、`optimizer.step()` 前额外检查参数梯度；若任一梯度出现 NaN/Inf，则报告首个异常参数并终止，避免污染模型参数和 optimizer state。FP16 的梯度 overflow 仍由 `GradScaler` 负责跳过 update 和动态调整 scale，不走该 fatal gradient guard。
 
@@ -448,7 +448,7 @@ uv run tensorboard --logdir experiments/runs
 
 遮挡只施加于 `dst`，因此 Generator 输入、Discriminator real/fake、L1/VGG 的 real target 均同步包含遮挡；`src`、`source_identity_faces` 与几何教师使用的干净 `dst_canonical` 不变。新增 `ID` 专属可见区域梯度门控：针对本批被遮挡的样本，使用项目现有 `FaceMasker(mode="occlusion")` 对**遮挡前、已增强的 dst** 推理，并结合合成遮挡的 Alpha，只允许可见面部像素接收 ID 梯度。未遮挡样本不改变原有 ID 梯度。Coarse 门控缩放至对应输出分辨率。遮挡样本的 ID encoder 仍然观察生成的遮挡面部，梯度门控不等价于无损恢复身份特征。
 
-当前 OCC checkpoint 在 `eval()` 模式下可能输出全零，因此跟随现有 `swapper.py` 使用训练模式并冻结参数、关闭梯度；模型内部 BatchNorm 仍依据选中样本的 batch 统计运行。**这并不是几何鲁棒性的完整实现**：Gaze/HRFFA/FACS 尚未增加遮挡置信度控制，建议结合模型梯度贡献与遮挡实验进行评估。OCC 需要在训练时额外执行一次小 batch 前向，当前未对吞吐做硬保证。
+当前 OCC checkpoint 在 `eval()` 模式下可能输出全零，因此跟随现有 `swapper.py` 使用训练模式并冻结参数、关闭梯度；模型内部 BatchNorm 仍依据选中样本的 batch 统计运行。**这并不是几何鲁棒性的完整实现**：Gaze 尚无独立的遮挡置信度控制；SMIRK 已按合成遮挡可见区域比例降权，但该比例并非教师估计置信度，无法可靠识别自然遮挡及极端姿态的估计错误。建议结合模型梯度贡献与遮挡实验评估。OCC 需要在训练时额外执行一次小 batch 前向，当前未对吞吐做硬保证。
 
 ### 已预处理的 NatOcc 遮挡素材（2026-10-23）
 
@@ -534,3 +534,14 @@ uv run --no-sync python tools/prepare_occluders.py \
 - Generator 的对齐类型写入 checkpoint 与导出 ONNX 元数据。旧 checkpoint 未包含该字段视为 FFHQ；
   严格 resume 禁止切换模式，切换应新建 run（可使用 branch）。
 - 切换对齐标准后的图像空间分布不同，不建议将新模型直接视作原 checkpoint 的无缝续训。
+
+
+### SMIRK 面部动态监督
+
+`[loss.coarse.smirk]`、`[loss.hq.smirk]` 独立配置 `enable`、`pose_weight`、`expression_weight`、`jaw_weight`、`eyelid_weight`。对应项使用官方 SMIRK Encoder（不需要 FLAME、PyTorch3D 或生成器），分别对比 Target 与生成图像的 FLAME 轴角姿态所构成的旋转矩阵、50 维 Expression、3 维 Jaw 和 2 维 Eyelid 输出；冻结教师权重、Target 无梯度、生成侧保留反向梯度。监督在恢复至 Target canonical 朝向的图像上计算，SMIRK 输入使用 RGB [0,1]、224×224、FP32，独立于训练 AMP 精度。Coarse/HQ 共用同一教师实例。
+
+SMIRK 监督实现保证：生成分支的 Jaw/Eyelid 物理输出沿用官方的 clamp/ReLU 前向范围，但通过 Straight-Through 估计避免越界时的零梯度；Pose 旋转矩阵与损失归约均强制 FP32，不受外层 FP16/BF16 Autocast 影响。Joint 模式对每个 Batch 的 Target 只运行一次 SMIRK Encoder，并复用于 Coarse/HQ 及 Generator overflow 重试。Target 教师输出中存在 NaN/Inf 的样本被逐样本排除，同时记录 `coarse_smirk_valid_fraction` / `hq_smirk_valid_fraction`。该指标**只说明数值有限**，不是预训练 SMIRK 的姿态/表情置信度。
+
+若启用在线遮挡增强，SMIRK 监督按该增强提供的原始可见区域比例降低权重，不与 IDLoss 的语义分割过滤掩码混用；但这只能降低**合成遮挡**造成的异常监督，并不能可靠识别天然遮挡。当前输入是 FFHQ/ArcFace canonical 图像直接缩放为 224×224；SMIRK 原始训练还有基于面部关键点的裁剪及尺度增强，因此**输入分布是否匹配实际目标数据**仍需用真实样本检验，不应未经标定就引入固定的中心裁剪/放大参数。缺少额外嘴唇关键点教师时，不把 SMIRK Jaw 虚称为 MouthState：完整唇形、露齿与左右嘴角状态目前仍无独立损失。
+
+仅在启用 SMIRK 的阶段初始化时，从 Hugging Face `Skywork/SkyReels-A1` 的 `extra_models/smirk/SMIRK_em1.pt` 自动下载官方预训练权重，复用其他教师模型相同的 `hf_hub_download()` 本地缓存机制（遵循 `HF_HOME`）；不需要配置文件路径，也不需要额外下载脚本。项目公共仓库 `leehx/model_hub` 当前未收录此权重，因此采用经 SHA-256 与 SMIRK 官方 Google Drive 权重逐字节验证的公开镜像，固定 commit revision `6cee256d5ea38dbbe87ff026566c95b6401d3124` 和文件 SHA-256 `26b234e3cc31a5de226bcba4321bb5d7343a2ad48234c028b57a1c2f8c2d22d0`。下载失败、摘要不匹配或 state_dict 不完整时直接报错，拒绝随机教师。阶段日志包含 `coarse_smirk_{pose,expression,jaw,eyelid}_loss` 和 HQ 对应项，样本梯度图包含整体 SMIRK 梯度。眼球方向仍由独立 Gaze Loss 监督；SMIRK Jaw 不等于嘴唇几何。旧训练配置里的两个废弃损失表不再接受，也不提供兼容映射。

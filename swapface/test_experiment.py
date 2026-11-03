@@ -65,7 +65,7 @@ def _check_train_config(root: Path) -> None:
         "[loss.coarse.l1]\nenable = true\nweight = 6.0\ngaussian_blur = 384\n"
         "[loss.coarse.r1]\nenable = true\ninterval = 8\ngamma = 5.0\n"
         "[loss.coarse.gaze]\nenable = true\nweight = 0.4\ndistribution_weight = 0.05\nconfidence_weighted = true\n"
-        "[loss.coarse.hrffa]\nenable = true\npose_weight = 0.4\neye_weight = 0.8\nmouth_weight = 1.1\ncontour_weight = 1.2\ncontour_shape_weight = 0.3\noccluded_geometry_weight = 0.2\n"
+        "[loss.coarse.smirk]\nenable = true\npose_weight = 0.4\nexpression_weight = 0.8\njaw_weight = 1.1\neyelid_weight = 1.2\n"
         "[loss.coarse.vgg.weights]\nrelu2_2 = 0.5\n"
         '[loss.hq.reconstruction]\nscope = "all"\n'
         "[loss.hq.gan]\nweight = 0.8\n"
@@ -73,8 +73,7 @@ def _check_train_config(root: Path) -> None:
         "[loss.hq.l1]\nenable = true\nweight = 7.0\ngaussian_blur = 0\n"
         "[loss.hq.r1]\nenable = false\ninterval = 4\ngamma = 2.0\n"
         "[loss.hq.gaze]\nenable = true\nweight = 0.75\ndistribution_weight = 0.2\nconfidence_weighted = false\n"
-        "[loss.hq.hrffa]\nenable = true\npose_weight = 0.5\neye_weight = 1.25\nmouth_weight = 1.5\ncontour_weight = 2.0\ncontour_shape_weight = 0.4\noccluded_geometry_weight = 0.1\n"
-        "[loss.hq.facs]\nenable = true\nweight = 0.8\nbrow_weight = 1.1\neye_weight = 1.2\nnose_weight = 0.9\nmouth_weight = 1.3\nlower_face_weight = 0.7\nasymmetry_weight = 1.4\n"
+        "[loss.hq.smirk]\nenable = true\npose_weight = 0.4\nexpression_weight = 0.8\njaw_weight = 1.1\neyelid_weight = 1.2\n"
         "[data.augmentation]\nrotation_range = [-3, 3]\n"
         "[data.sampling]\nsame_prob = 0.25\n"
         '[[data.src]]\npath = "source"\nadjustment = 1\n'
@@ -88,7 +87,7 @@ def _check_train_config(root: Path) -> None:
     assert raw == original
     assert resolve_train_config(resolved) == resolved
     assert json.loads(json.dumps(resolved)) == resolved
-    for loss_name in ("gan", "identity", "r1", "wfm", "gaze", "hrffa", "facs", "reconstruction", "l1", "vgg"):
+    for loss_name in ("gan", "identity", "r1", "wfm", "gaze", "smirk", "reconstruction", "l1", "vgg"):
         assert DEFAULT_LOSS_CONFIG["coarse"][loss_name] is not DEFAULT_LOSS_CONFIG["hq"][loss_name]
     loaded = load_train_config(source)
     assert loaded == resolved
@@ -125,33 +124,13 @@ def _check_train_config(root: Path) -> None:
     assert abs(resolved["data"]["sampling"]["same_prob"] - 0.25) < 1e-12
     assert resolved["loss"]["coarse"]["gaze"] == {"enable": True, "weight": 0.4, "distribution_weight": 0.05, "confidence_weighted": True}
     assert resolved["loss"]["hq"]["gaze"] == {"enable": True, "weight": 0.75, "distribution_weight": 0.2, "confidence_weighted": False}
-    assert resolved["loss"]["coarse"]["hrffa"] == {
-        "enable": True,
-        "pose_weight": 0.4,
-        "eye_weight": 0.8,
-        "mouth_weight": 1.1,
-        "contour_weight": 1.2,
-        "contour_shape_weight": 0.3,
-        "occluded_geometry_weight": 0.2,
+    assert resolved["loss"]["coarse"]["smirk"] == {
+        "enable": True, "pose_weight": 0.4,
+        "expression_weight": 0.8, "jaw_weight": 1.1, "eyelid_weight": 1.2,
     }
-    assert resolved["loss"]["hq"]["hrffa"] == {
-        "enable": True,
-        "pose_weight": 0.5,
-        "eye_weight": 1.25,
-        "mouth_weight": 1.5,
-        "contour_weight": 2.0,
-        "contour_shape_weight": 0.4,
-        "occluded_geometry_weight": 0.1,
-    }
-    assert resolved["loss"]["hq"]["facs"] == {
-        "enable": True,
-        "weight": 0.8,
-        "brow_weight": 1.1,
-        "eye_weight": 1.2,
-        "nose_weight": 0.9,
-        "mouth_weight": 1.3,
-        "lower_face_weight": 0.7,
-        "asymmetry_weight": 1.4,
+    assert resolved["loss"]["hq"]["smirk"] == {
+        "enable": True, "pose_weight": 0.4,
+        "expression_weight": 0.8, "jaw_weight": 1.1, "eyelid_weight": 1.2,
     }
     assert resolved["data"]["src"][0]["adjustment"] == 1 and resolved["data"]["dst"][0]["adjustment"] == -1
 
@@ -457,15 +436,15 @@ def _check_train_config(root: Path) -> None:
     else:
         raise AssertionError("配置错误接受了负数 r1.gamma")
 
-    for key, value in (("pose_weight", float("nan")), ("eye_weight", float("inf")), ("occluded_geometry_weight", float("nan"))):
+    for key, value in (("pose_weight", float("nan")), ("expression_weight", float("inf")), ("eyelid_weight", float("nan"))):
         invalid = copy.deepcopy(raw)
-        invalid["loss"]["hq"]["hrffa"][key] = value
+        invalid["loss"]["hq"]["smirk"][key] = value
         try:
             resolve_train_config(invalid)
         except ValueError as error:
             assert "有限" in str(error)
         else:
-            raise AssertionError(f"配置错误接受了 HRFFA 非有限数值：{key}={value}")
+            raise AssertionError(f"配置错误接受了 SMIRK 非有限数值：{key}={value}")
 
     # 旧顶层 identity/dataloader/src/dst 协议必须直接拒绝，不提供 alias。
     for obsolete_top_level in (
@@ -1203,8 +1182,8 @@ def _check_generator_responsibility_boundary() -> None:
                 owners.add(owner.attr)
         return owners
 
-    assert forward_component_owners(Trainer._coarse_generator_stage_loss) == {"coarse_hrffa_loss", "coarse_facs_loss"}
-    assert forward_component_owners(Trainer._hq_generator_stage_loss) == {"hq_hrffa_loss", "hq_facs_loss"}
+    assert forward_component_owners(Trainer._coarse_generator_stage_loss) == {"coarse_smirk_loss"}
+    assert forward_component_owners(Trainer._hq_generator_stage_loss) == {"hq_smirk_loss"}
 
     affine_grid_calls = [node for node in ast.walk(train_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "affine_grid"]
     assert len(affine_grid_calls) == 1
@@ -1526,26 +1505,22 @@ def _check_sample_gradient_maps() -> None:
         "coarse_wfm_loss",
         "coarse_id_loss",
         "coarse_gaze_loss",
-        "coarse_hrffa_loss",
-        "coarse_facs_loss",
+        "coarse_smirk_loss",
         "coarse_vgg_loss",
         "coarse_l1_loss",
         "hq_gan_loss",
         "hq_wfm_loss",
         "hq_id_loss",
         "hq_gaze_loss",
-        "hq_hrffa_loss",
-        "hq_facs_loss",
+        "hq_smirk_loss",
         "hq_vgg_loss",
         "hq_l1_loss",
         "enable_coarse_wfm_loss",
         "enable_hq_wfm_loss",
         "enable_coarse_gaze_loss",
         "enable_hq_gaze_loss",
-        "enable_coarse_hrffa_loss",
-        "enable_hq_hrffa_loss",
-        "enable_coarse_facs_loss",
-        "enable_hq_facs_loss",
+        "enable_coarse_smirk_loss",
+        "enable_hq_smirk_loss",
         "enable_coarse_vgg_loss",
         "enable_hq_vgg_loss",
         "enable_coarse_l1_loss",

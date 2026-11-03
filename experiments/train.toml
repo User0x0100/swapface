@@ -115,25 +115,13 @@ distribution_weight = 0.1
 confidence_weighted = true
 
 
-[loss.coarse.hrffa]
+[loss.coarse.smirk]
+# SMIRK 官方预训练权重由 Hugging Face Hub 自动下载并缓存，文件版本与 SHA 固定。
 enable = true
 pose_weight = 1.0
-eye_weight = 1.0
-mouth_weight = 1.0
-contour_weight = 1.0
-contour_shape_weight = 0.5
-occluded_geometry_weight = 0.25
-
-
-[loss.coarse.facs]
-enable = true
-weight = 1.0
-brow_weight = 1.0
-eye_weight = 1.0
-nose_weight = 1.0
-mouth_weight = 1.0
-lower_face_weight = 1.0
-asymmetry_weight = 1.0
+expression_weight = 1.0
+jaw_weight = 1.0
+eyelid_weight = 1.0
 
 
 [loss.coarse.vgg]
@@ -193,25 +181,13 @@ distribution_weight = 0.1
 confidence_weighted = true
 
 
-[loss.hq.hrffa]
+[loss.hq.smirk]
+# SMIRK 官方预训练权重由 Hugging Face Hub 自动下载并缓存，文件版本与 SHA 固定。
 enable = true
 pose_weight = 1.0
-eye_weight = 1.0
-mouth_weight = 1.0
-contour_weight = 1.0
-contour_shape_weight = 0.5
-occluded_geometry_weight = 0.25
-
-
-[loss.hq.facs]
-enable = true
-weight = 1.0
-brow_weight = 1.0
-eye_weight = 1.0
-nose_weight = 1.0
-mouth_weight = 1.0
-lower_face_weight = 1.0
-asymmetry_weight = 1.0
+expression_weight = 1.0
+jaw_weight = 1.0
+eyelid_weight = 1.0
 
 
 [loss.hq.vgg]

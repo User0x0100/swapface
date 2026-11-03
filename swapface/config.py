@@ -88,24 +88,12 @@ DEFAULT_IDENTITY_LOSS_CONFIG = {"provider": DEFAULT_IDENTITY_LOSS_PROVIDER.name,
 DEFAULT_R1_LOSS_CONFIG = {"enable": True, "interval": 16, "gamma": 10.0}
 DEFAULT_WFM_LOSS_CONFIG = {"enable": False, "weights": {"0": 0.5, "1": 1.0, "2": 1.0, "3": 1.0}}
 DEFAULT_GAZE_LOSS_CONFIG = {"enable": False, "weight": 1.0, "distribution_weight": 0.1, "confidence_weighted": True}
-DEFAULT_HRFFA_LOSS_CONFIG = {
+DEFAULT_SMIRK_LOSS_CONFIG = {
     "enable": False,
     "pose_weight": 1.0,
-    "eye_weight": 1.0,
-    "mouth_weight": 1.0,
-    "contour_weight": 1.0,
-    "contour_shape_weight": 0.5,
-    "occluded_geometry_weight": 0.25,
-}
-DEFAULT_FACS_LOSS_CONFIG = {
-    "enable": False,
-    "weight": 1.0,
-    "brow_weight": 1.0,
-    "eye_weight": 1.0,
-    "nose_weight": 1.0,
-    "mouth_weight": 1.0,
-    "lower_face_weight": 1.0,
-    "asymmetry_weight": 1.0,
+    "expression_weight": 1.0,
+    "jaw_weight": 1.0,
+    "eyelid_weight": 1.0,
 }
 DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
     "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
@@ -113,8 +101,7 @@ DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
     "r1": dict(DEFAULT_R1_LOSS_CONFIG),
     "wfm": {"enable": DEFAULT_WFM_LOSS_CONFIG["enable"], "weights": dict(DEFAULT_WFM_LOSS_CONFIG["weights"])},
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
-    "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
-    "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
+    "smirk": dict(DEFAULT_SMIRK_LOSS_CONFIG),
     "reconstruction": {"scope": "same"},
     "l1": {"enable": True, "weight": 10.0, "gaussian_blur": 0},
     "vgg": {"enable": True, "weights": dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)},
@@ -125,8 +112,7 @@ DEFAULT_HQ_LOSS_CONFIG: dict[str, Any] = {
     "r1": dict(DEFAULT_R1_LOSS_CONFIG),
     "wfm": {"enable": DEFAULT_WFM_LOSS_CONFIG["enable"], "weights": dict(DEFAULT_WFM_LOSS_CONFIG["weights"])},
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
-    "hrffa": dict(DEFAULT_HRFFA_LOSS_CONFIG),
-    "facs": dict(DEFAULT_FACS_LOSS_CONFIG),
+    "smirk": dict(DEFAULT_SMIRK_LOSS_CONFIG),
     "reconstruction": {"scope": "same"},
     "l1": {"enable": True, "weight": 10.0, "gaussian_blur": 0},
     "vgg": {"enable": True, "weights": dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)},
@@ -394,18 +380,12 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
     gaze["distribution_weight"] = _float(gaze["distribution_weight"], f"{prefix}.gaze.distribution_weight", minimum=0.0)
     gaze["confidence_weighted"] = _bool(gaze["confidence_weighted"], f"{prefix}.gaze.confidence_weighted")
 
-    hrffa = _with_defaults(_table(loss, "hrffa", f"[{prefix}.hrffa]"), defaults["hrffa"], f"[{prefix}.hrffa]")
-    hrffa["enable"] = _bool(hrffa["enable"], f"{prefix}.hrffa.enable")
-    for key in ("pose_weight", "eye_weight", "mouth_weight", "contour_weight", "contour_shape_weight"):
-        hrffa[key] = _float(hrffa[key], f"{prefix}.hrffa.{key}", minimum=0.0)
-    hrffa["occluded_geometry_weight"] = _float(hrffa["occluded_geometry_weight"], f"{prefix}.hrffa.occluded_geometry_weight", minimum=0.0, maximum=1.0)
+    smirk = _with_defaults(_table(loss, "smirk", f"[{prefix}.smirk]"), defaults["smirk"], f"[{prefix}.smirk]")
+    smirk["enable"] = _bool(smirk["enable"], f"{prefix}.smirk.enable")
+    for key in ("pose_weight", "expression_weight", "jaw_weight", "eyelid_weight"):
+        smirk[key] = _float(smirk[key], f"{prefix}.smirk.{key}", minimum=0.0)
 
-    facs = _with_defaults(_table(loss, "facs", f"[{prefix}.facs]"), defaults["facs"], f"[{prefix}.facs]")
-    facs["enable"] = _bool(facs["enable"], f"{prefix}.facs.enable")
-    for key in ("weight", "brow_weight", "eye_weight", "nose_weight", "mouth_weight", "lower_face_weight", "asymmetry_weight"):
-        facs[key] = _float(facs[key], f"{prefix}.facs.{key}", minimum=0.0)
-
-    result = {"gan": gan, "identity": identity, "r1": r1, "wfm": wfm, "gaze": gaze, "hrffa": hrffa, "facs": facs}
+    result = {"gan": gan, "identity": identity, "r1": r1, "wfm": wfm, "gaze": gaze, "smirk": smirk}
 
     reconstruction = _with_defaults(_table(loss, "reconstruction", f"[{prefix}.reconstruction]"), defaults["reconstruction"], f"[{prefix}.reconstruction]")
     scope = reconstruction["scope"]

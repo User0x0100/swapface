@@ -1,6 +1,5 @@
 from .adversarial import DiscriminatorAdversarialLoss, GeneratorAdversarialLoss
 from .color import LabStyleLoss
-from .facs import FACSConsistencyLoss
 from .feature_matching import WeakFeatureMatchingLoss
 from .functional import (
     make_bce_loss,
@@ -13,12 +12,12 @@ from .functional import (
     r1_reg_loss,
 )
 from .gaze import GazeLoss
-from .hrffa import HRFFAFacialGeometryLoss
 from .identity import IdentityLoss, IFSRLoss
 from .perceptual import (
     DINOv2PerceptualLoss,
     VGGPerceptualLoss,
 )
+from .smirk import SMIRKMotionLoss
 from .structural import DSSIMLoss
 from .vgg import get_supported_vgg_types, get_vgg_layer_names
 
@@ -26,13 +25,12 @@ __all__ = [
     "DINOv2PerceptualLoss",
     "DSSIMLoss",
     "DiscriminatorAdversarialLoss",
-    "FACSConsistencyLoss",
     "GazeLoss",
     "GeneratorAdversarialLoss",
-    "HRFFAFacialGeometryLoss",
     "IFSRLoss",
     "IdentityLoss",
     "LabStyleLoss",
+    "SMIRKMotionLoss",
     "VGGPerceptualLoss",
     "WeakFeatureMatchingLoss",
     "get_supported_vgg_types",

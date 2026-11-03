@@ -104,9 +104,11 @@ class TestIdentityParsingGradient(unittest.TestCase):
         trainer.hq_excluded_parsing_labels = (11,)
         trainer.parsing_exclusion_indices = (torch.tensor([4, 12]), torch.tensor([11]))
 
-        _, augmented_dst, _, _, _, _, (coarse_gate, hq_gate) = trainer._next_training_batch()
+        _, augmented_dst, _, _, _, _, (coarse_gate, hq_gate), smirk_weights = trainer._next_training_batch()
         assert torch.allclose(parser.last_input, dst)
         assert torch.allclose(augmented_dst, dst + 0.1)
+        assert torch.allclose(smirk_weights, occlusion_gate.flatten(1).mean(dim=1))
+        assert not torch.allclose(smirk_weights, coarse_gate.flatten(1).mean(dim=1))  # independent of ID parsing
         assert not coarse_gate.requires_grad and not hq_gate.requires_grad
         assert coarse_gate[:, :, :4, :].count_nonzero() == 0
         assert torch.allclose(coarse_gate[:, :, 4:, :], torch.full_like(coarse_gate[:, :, 4:, :], 0.25))
@@ -146,8 +148,7 @@ class TestIdentityParsingGradient(unittest.TestCase):
         trainer.hq_id_loss = lambda generated, reference: generated.sum()
         trainer.enable_coarse_wfm_loss = trainer.enable_hq_wfm_loss = False
         trainer.enable_coarse_gaze_loss = trainer.enable_hq_gaze_loss = False
-        trainer.enable_coarse_hrffa_loss = trainer.enable_hq_hrffa_loss = False
-        trainer.enable_coarse_facs_loss = trainer.enable_hq_facs_loss = False
+        trainer.enable_coarse_smirk_loss = trainer.enable_hq_smirk_loss = False
         trainer.enable_coarse_vgg_loss = trainer.enable_hq_vgg_loss = False
         trainer.enable_coarse_l1_loss = trainer.enable_hq_l1_loss = False
         trainer.log = lambda *args, **kwargs: None
@@ -181,7 +182,8 @@ class TestIdentityParsingGradient(unittest.TestCase):
         trainer.coarse_excluded_parsing_labels = ()
         trainer.hq_excluded_parsing_labels = ()
         trainer.parsing_exclusion_indices = (None, None)
-        assert trainer._next_training_batch()[-1] == (None, None)
+        assert trainer._next_training_batch()[-2] == (None, None)
+        assert trainer._next_training_batch()[-1] is None
 
 
 if __name__ == "__main__":

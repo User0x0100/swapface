@@ -18,11 +18,10 @@ from tqdm import tqdm
 
 from losses import (
     DiscriminatorAdversarialLoss,
-    FACSConsistencyLoss,
     GazeLoss,
     GeneratorAdversarialLoss,
-    HRFFAFacialGeometryLoss,
     IdentityLoss,
+    SMIRKMotionLoss,
     VGGPerceptualLoss,
     WeakFeatureMatchingLoss,
     make_blurred_l1_loss,
@@ -33,7 +32,7 @@ from misc.face_alignment import arcface_to_identity_112, ffhq_to_arcface_112, ma
 from misc.models.face_mask import FaceMasker
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
 from models.discriminator import DiscriminatorType, UNetDiscriminatorSN, build_discriminator
-from models.discriminator.upfirdn2d import initialize_upfirdn2d, is_rocm_gfx1100
+from models.discriminator.upfirdn2d import initialize_upfirdn2d
 from models.networks import Generator
 
 from .config import load_train_config, resolve_train_config
@@ -59,7 +58,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 21
+TRAINING_SEMANTICS_VERSION = 22
 SAMPLE_LABEL_WIDTH = 300
 SAMPLE_GRID_PADDING = 2
 # 默认保留原有逐损失亮度归一化；改为 "shared" 可直观比较同 stage 各梯度图的绝对强度。
@@ -360,10 +359,8 @@ class Trainer:
         hq_wfm_config = hq_loss_config["wfm"]
         coarse_gaze_config = coarse_loss_config["gaze"]
         hq_gaze_config = hq_loss_config["gaze"]
-        coarse_hrffa_config = coarse_loss_config["hrffa"]
-        hq_hrffa_config = hq_loss_config["hrffa"]
-        coarse_facs_config = coarse_loss_config["facs"]
-        hq_facs_config = hq_loss_config["facs"]
+        coarse_smirk_config = coarse_loss_config["smirk"]
+        hq_smirk_config = hq_loss_config["smirk"]
         coarse_reconstruction_scope = str(coarse_loss_config["reconstruction"]["scope"])
         hq_reconstruction_scope = str(hq_loss_config["reconstruction"]["scope"])
         coarse_l1_config = coarse_loss_config["l1"]
@@ -392,10 +389,8 @@ class Trainer:
         self.enable_hq_wfm_loss = self.hq_stage_active and bool(hq_wfm_config["enable"])
         self.enable_coarse_gaze_loss = self.coarse_stage_active and bool(coarse_gaze_config["enable"])
         self.enable_hq_gaze_loss = self.hq_stage_active and bool(hq_gaze_config["enable"])
-        self.enable_coarse_hrffa_loss = self.coarse_stage_active and bool(coarse_hrffa_config["enable"])
-        self.enable_hq_hrffa_loss = self.hq_stage_active and bool(hq_hrffa_config["enable"])
-        self.enable_coarse_facs_loss = self.coarse_stage_active and bool(coarse_facs_config["enable"])
-        self.enable_hq_facs_loss = self.hq_stage_active and bool(hq_facs_config["enable"])
+        self.enable_coarse_smirk_loss = self.coarse_stage_active and bool(coarse_smirk_config["enable"])
+        self.enable_hq_smirk_loss = self.hq_stage_active and bool(hq_smirk_config["enable"])
         self.enable_coarse_vgg_loss = self.coarse_stage_active and bool(coarse_vgg_config["enable"])
         self.enable_hq_vgg_loss = self.hq_stage_active and bool(hq_vgg_config["enable"])
 
@@ -734,57 +729,21 @@ class Trainer:
         if self.enable_coarse_gaze_loss:
             self.coarse_gaze_loss.to(self.device)
 
-        if self.enable_hq_hrffa_loss:
-            self.hq_hrffa_loss = HRFFAFacialGeometryLoss(
-                pose_weight=float(hq_hrffa_config["pose_weight"]),
-                eye_weight=float(hq_hrffa_config["eye_weight"]),
-                mouth_weight=float(hq_hrffa_config["mouth_weight"]),
-                contour_weight=float(hq_hrffa_config["contour_weight"]),
-                contour_shape_weight=float(hq_hrffa_config["contour_shape_weight"]),
-                occluded_geometry_weight=float(hq_hrffa_config["occluded_geometry_weight"]),
-            )
-        if self.enable_coarse_hrffa_loss:
-            self.coarse_hrffa_loss = HRFFAFacialGeometryLoss(
-                pose_weight=float(coarse_hrffa_config["pose_weight"]),
-                eye_weight=float(coarse_hrffa_config["eye_weight"]),
-                mouth_weight=float(coarse_hrffa_config["mouth_weight"]),
-                contour_weight=float(coarse_hrffa_config["contour_weight"]),
-                contour_shape_weight=float(coarse_hrffa_config["contour_shape_weight"]),
-                occluded_geometry_weight=float(coarse_hrffa_config["occluded_geometry_weight"]),
-            )
-            if self.enable_hq_hrffa_loss:
-                self.coarse_hrffa_loss.hrffa = self.hq_hrffa_loss.hrffa
-        if self.enable_hq_hrffa_loss:
-            self.hq_hrffa_loss.to(self.device)
-        if self.enable_coarse_hrffa_loss:
-            self.coarse_hrffa_loss.to(self.device)
-
-        if self.enable_hq_facs_loss:
-            self.hq_facs_loss = FACSConsistencyLoss(
-                weight=float(hq_facs_config["weight"]),
-                brow_weight=float(hq_facs_config["brow_weight"]),
-                eye_weight=float(hq_facs_config["eye_weight"]),
-                nose_weight=float(hq_facs_config["nose_weight"]),
-                mouth_weight=float(hq_facs_config["mouth_weight"]),
-                lower_face_weight=float(hq_facs_config["lower_face_weight"]),
-                asymmetry_weight=float(hq_facs_config["asymmetry_weight"]),
-            )
-        if self.enable_coarse_facs_loss:
-            self.coarse_facs_loss = FACSConsistencyLoss(
-                weight=float(coarse_facs_config["weight"]),
-                brow_weight=float(coarse_facs_config["brow_weight"]),
-                eye_weight=float(coarse_facs_config["eye_weight"]),
-                nose_weight=float(coarse_facs_config["nose_weight"]),
-                mouth_weight=float(coarse_facs_config["mouth_weight"]),
-                lower_face_weight=float(coarse_facs_config["lower_face_weight"]),
-                asymmetry_weight=float(coarse_facs_config["asymmetry_weight"]),
-            )
-            if self.enable_hq_facs_loss:
-                self.coarse_facs_loss.au_model = self.hq_facs_loss.au_model
-        if self.enable_hq_facs_loss:
-            self.hq_facs_loss.to(self.device)
-        if self.enable_coarse_facs_loss:
-            self.coarse_facs_loss.to(self.device)
+        if self.enable_hq_smirk_loss:
+            self.hq_smirk_loss = SMIRKMotionLoss(
+                pose_weight=float(hq_smirk_config["pose_weight"]),
+                expression_weight=float(hq_smirk_config["expression_weight"]),
+                jaw_weight=float(hq_smirk_config["jaw_weight"]),
+                eyelid_weight=float(hq_smirk_config["eyelid_weight"]),
+            ).to(self.device)
+        if self.enable_coarse_smirk_loss:
+            self.coarse_smirk_loss = SMIRKMotionLoss(
+                encoder=self.hq_smirk_loss.encoder if self.enable_hq_smirk_loss else None,
+                pose_weight=float(coarse_smirk_config["pose_weight"]),
+                expression_weight=float(coarse_smirk_config["expression_weight"]),
+                jaw_weight=float(coarse_smirk_config["jaw_weight"]),
+                eyelid_weight=float(coarse_smirk_config["eyelid_weight"]),
+            ).to(self.device)
 
         if self.enable_hq_vgg_loss:
             self.hq_vgg_loss = VGGPerceptualLoss(layer_weights=hq_vgg_config["weights"], reduction="none").to(self.device)
@@ -857,19 +816,8 @@ class Trainer:
                 self.hq_gaze_loss_forward = _compile_training_callable(self.hq_gaze_loss)
             if self.enable_coarse_gaze_loss:
                 self.coarse_gaze_loss_forward = _compile_training_callable(self.coarse_gaze_loss)
-            if self.enable_hq_hrffa_loss or self.enable_coarse_hrffa_loss:
-                hrffa_loss = self.hq_hrffa_loss if self.enable_hq_hrffa_loss else self.coarse_hrffa_loss
-                hrffa_loss.hrffa.network = _compile_training_callable(hrffa_loss.hrffa.network)
-            if self.enable_hq_facs_loss or self.enable_coarse_facs_loss:
-                if is_rocm_gfx1100(device_id):
-                    print("警告：gfx1100 上 FACS/OpenGraphAU 保持 eager，避免 compiled 混合精度数值错误")
-                else:
-                    facs_loss = self.hq_facs_loss if self.enable_hq_facs_loss else self.coarse_facs_loss
-                    compiled_au_model = _compile_training_callable(facs_loss.au_model)
-                    if self.enable_hq_facs_loss:
-                        self.hq_facs_loss.au_model = compiled_au_model
-                    if self.enable_coarse_facs_loss:
-                        self.coarse_facs_loss.au_model = compiled_au_model
+            # SMIRK teacher stays in eager mode: small MobileNet backbones and
+            # frozen BN have a reliable gradient path without compile specialization.
             if self.enable_hq_vgg_loss:
                 self.hq_vgg_loss_forward = _compile_training_callable(self.hq_vgg_loss)
             if self.enable_coarse_vgg_loss:
@@ -1044,6 +992,15 @@ class Trainer:
             if overflow_retries >= MAX_AMP_OVERFLOW_RETRIES:
                 raise FloatingPointError(f"{stage} Discriminator 连续 {MAX_AMP_OVERFLOW_RETRIES} 次 FP16 gradient overflow，停止训练")
 
+    def _prepare_smirk_references(self, reference: Tensor) -> tuple[dict[str, Tensor] | None, dict[str, Tensor] | None]:
+        """Evaluate each distinct SMIRK target teacher once for a training/preview batch."""
+        hq_features = self.hq_smirk_loss.encode_reference(reference) if self.enable_hq_smirk_loss else None
+        if not self.enable_coarse_smirk_loss:
+            return None, hq_features
+        if hq_features is not None and self.coarse_smirk_loss.encoder is self.hq_smirk_loss.encoder:
+            return hq_features, hq_features
+        return self.coarse_smirk_loss.encode_reference(reference), hq_features
+
     def _coarse_generator_stage_loss(
         self,
         coarse: Tensor,
@@ -1054,6 +1011,8 @@ class Trainer:
         source_identity_embeddings: Tensor,
         restore_grid: Tensor | None,
         id_gate: Tensor | None,
+        smirk_reference: dict[str, Tensor] | None = None,
+        smirk_sample_weights: Tensor | None = None,
     ) -> Tensor:
         """计算 Coarse stage 的全部 Generator 训练目标。"""
         coarse_result = self.train_d_coarse(coarse, False, self.enable_coarse_wfm_loss)
@@ -1078,7 +1037,7 @@ class Trainer:
         self.log("coarse_id_loss", coarse_id_loss)
         total = total + coarse_id_loss
 
-        geometry_enabled = self.enable_coarse_gaze_loss or self.enable_coarse_hrffa_loss or self.enable_coarse_facs_loss
+        geometry_enabled = self.enable_coarse_gaze_loss or self.enable_coarse_smirk_loss
         if geometry_enabled:
             if restore_grid is None:
                 raise RuntimeError("Coarse geometry loss 需要 restore_grid")
@@ -1091,17 +1050,14 @@ class Trainer:
                 self.log("coarse_gaze_loss", coarse_gaze_loss)
                 total = total + coarse_gaze_loss
 
-            if self.enable_coarse_hrffa_loss:
-                coarse_hrffa_components = self.coarse_hrffa_loss.forward_components(coarse_restored, dst_canonical)
-                for name, component in coarse_hrffa_components.items():
-                    self.log(f"coarse_hrffa_{name}_loss", component)
-                total = total + torch.stack(tuple(coarse_hrffa_components.values())).sum()
-
-            if self.enable_coarse_facs_loss:
-                coarse_facs_components = self.coarse_facs_loss.forward_components(coarse_restored, dst_canonical)
-                for name, component in coarse_facs_components.items():
-                    self.log(f"coarse_facs_{name}_loss", component)
-                total = total + torch.stack(tuple(coarse_facs_components.values())).sum()
+            if self.enable_coarse_smirk_loss:
+                coarse_smirk_components = self.coarse_smirk_loss.forward_components(
+                    coarse_restored, dst_canonical, reference_features=smirk_reference, sample_weights=smirk_sample_weights
+                )
+                for name, component in coarse_smirk_components.items():
+                    self.log(f"coarse_smirk_{name}_loss", component)
+                if coarse_smirk_components:
+                    total = total + torch.stack(tuple(coarse_smirk_components.values())).sum()
 
         if self.enable_coarse_vgg_loss:
             coarse_vgg_per_sample = self.coarse_vgg_loss_forward(coarse, coarse_resize_in)
@@ -1127,6 +1083,8 @@ class Trainer:
         source_identity_embeddings: Tensor,
         restore_grid: Tensor | None,
         id_gate: Tensor | None,
+        smirk_reference: dict[str, Tensor] | None = None,
+        smirk_sample_weights: Tensor | None = None,
     ) -> Tensor:
         """计算 HQ stage 的全部 Generator 训练目标。"""
         if self.enable_hq_wfm_loss:
@@ -1149,7 +1107,7 @@ class Trainer:
         self.log("hq_id_loss", hq_id_loss)
         total = total + hq_id_loss
 
-        geometry_enabled = self.enable_hq_gaze_loss or self.enable_hq_hrffa_loss or self.enable_hq_facs_loss
+        geometry_enabled = self.enable_hq_gaze_loss or self.enable_hq_smirk_loss
         if geometry_enabled:
             if restore_grid is None:
                 raise RuntimeError("HQ geometry loss 需要 restore_grid")
@@ -1161,17 +1119,14 @@ class Trainer:
                 self.log("hq_gaze_loss", hq_gaze_loss)
                 total = total + hq_gaze_loss
 
-            if self.enable_hq_hrffa_loss:
-                hq_hrffa_components = self.hq_hrffa_loss.forward_components(fake_restored, dst_canonical)
-                for name, component in hq_hrffa_components.items():
-                    self.log(f"hq_hrffa_{name}_loss", component)
-                total = total + torch.stack(tuple(hq_hrffa_components.values())).sum()
-
-            if self.enable_hq_facs_loss:
-                hq_facs_components = self.hq_facs_loss.forward_components(fake_restored, dst_canonical)
-                for name, component in hq_facs_components.items():
-                    self.log(f"hq_facs_{name}_loss", component)
-                total = total + torch.stack(tuple(hq_facs_components.values())).sum()
+            if self.enable_hq_smirk_loss:
+                hq_smirk_components = self.hq_smirk_loss.forward_components(
+                    fake_restored, dst_canonical, reference_features=smirk_reference, sample_weights=smirk_sample_weights
+                )
+                for name, component in hq_smirk_components.items():
+                    self.log(f"hq_smirk_{name}_loss", component)
+                if hq_smirk_components:
+                    total = total + torch.stack(tuple(hq_smirk_components.values())).sum()
 
         if self.enable_hq_vgg_loss:
             hq_vgg_per_sample = self.hq_vgg_loss_forward(fake, dst)
@@ -1275,6 +1230,8 @@ class Trainer:
         restore_grid: Tensor | None,
         display_size: tuple[int, int],
         id_gate: Tensor | None,
+        smirk_reference: dict[str, Tensor] | None = None,
+        smirk_sample_weights: Tensor | None = None,
     ) -> list[tuple[str, Tensor]]:
         """仅为当前启用的 Generator loss 生成旧版风格梯度图。R1 不参与。"""
         if stage == "coarse":
@@ -1287,10 +1244,8 @@ class Trainer:
             wfm_loss_fn = self.coarse_wfm_loss if wfm_enabled else None
             gaze_enabled = self.enable_coarse_gaze_loss
             gaze_loss_fn = self.coarse_gaze_loss_forward if gaze_enabled else None
-            hrffa_enabled = self.enable_coarse_hrffa_loss
-            hrffa_loss_fn = self.coarse_hrffa_loss if hrffa_enabled else None
-            facs_enabled = self.enable_coarse_facs_loss
-            facs_loss_fn = self.coarse_facs_loss if facs_enabled else None
+            smirk_enabled = self.enable_coarse_smirk_loss
+            smirk_loss_fn = self.coarse_smirk_loss if smirk_enabled else None
             vgg_enabled = self.enable_coarse_vgg_loss
             vgg_loss_fn = self.coarse_vgg_loss_forward if vgg_enabled else None
             l1_enabled = self.enable_coarse_l1_loss
@@ -1306,10 +1261,8 @@ class Trainer:
             wfm_loss_fn = self.hq_wfm_loss if wfm_enabled else None
             gaze_enabled = self.enable_hq_gaze_loss
             gaze_loss_fn = self.hq_gaze_loss_forward if gaze_enabled else None
-            hrffa_enabled = self.enable_hq_hrffa_loss
-            hrffa_loss_fn = self.hq_hrffa_loss if hrffa_enabled else None
-            facs_enabled = self.enable_hq_facs_loss
-            facs_loss_fn = self.hq_facs_loss if facs_enabled else None
+            smirk_enabled = self.enable_hq_smirk_loss
+            smirk_loss_fn = self.hq_smirk_loss if smirk_enabled else None
             vgg_enabled = self.enable_hq_vgg_loss
             vgg_loss_fn = self.hq_vgg_loss_forward if vgg_enabled else None
             l1_enabled = self.enable_hq_l1_loss
@@ -1350,7 +1303,7 @@ class Trainer:
             generated_identity_embeddings = identity_embeddings_forward(self.prepare_identity_encoder_faces(gate_identity_gradient(x, stage_gate), theta_restore))
             add_row(f"{prefix} ID GRAD", identity_loss_fn(generated_identity_embeddings, source_identity_embeddings.detach()), x)
 
-        geometry_enabled = gaze_enabled or hrffa_enabled or facs_enabled
+        geometry_enabled = gaze_enabled or smirk_enabled
         if geometry_enabled and restore_grid is None:
             raise RuntimeError(f"{stage} sample geometry gradient 需要 restore_grid")
 
@@ -1367,21 +1320,15 @@ class Trainer:
                 x = generated.detach().requires_grad_(True)
                 add_row(f"{prefix} GAZE GRAD", gaze_loss_fn(restored_input(x), dst_canonical), x)
 
-        if hrffa_enabled:
-            assert hrffa_loss_fn is not None
+        if smirk_enabled:
+            assert smirk_loss_fn is not None
             with torch.enable_grad():
                 x = generated.detach().requires_grad_(True)
-                components = hrffa_loss_fn.forward_components(restored_input(x), dst_canonical)
-                loss = torch.stack(tuple(components.values())).sum()
-                add_row(f"{prefix} HRFFA GRAD", loss, x)
-
-        if facs_enabled:
-            assert facs_loss_fn is not None
-            with torch.enable_grad():
-                x = generated.detach().requires_grad_(True)
-                components = facs_loss_fn.forward_components(restored_input(x), dst_canonical)
-                loss = torch.stack(tuple(components.values())).sum()
-                add_row(f"{prefix} FACS GRAD", loss, x)
+                components = smirk_loss_fn.forward_components(
+                    restored_input(x), dst_canonical, reference_features=smirk_reference, sample_weights=smirk_sample_weights
+                )
+                if components:
+                    add_row(f"{prefix} SMIRK GRAD", torch.stack(tuple(components.values())).sum(), x)
 
         if vgg_enabled:
             assert vgg_loss_fn is not None
@@ -1408,6 +1355,8 @@ class Trainer:
         current_batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
         sample_id_gate: tuple[Tensor | None, Tensor | None] = (None, None),
         current_id_gate: tuple[Tensor | None, Tensor | None] = (None, None),
+        sample_smirk_weights: Tensor | None = None,
+        current_smirk_weights: Tensor | None = None,
     ) -> None:
         sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces = (
             tensor.to(self.device) for tensor in sample_reference
@@ -1426,6 +1375,11 @@ class Trainer:
                 torch.cat((sample_gate.to(self.device), current_gate[:dynamic_count]), dim=0)
                 if sample_gate is not None and current_gate is not None else None
                 for sample_gate, current_gate in zip(sample_id_gate, current_id_gate, strict=True)
+            )
+
+            smirk_weights_vis = (
+                torch.cat((sample_smirk_weights.to(self.device), current_smirk_weights[:dynamic_count]), dim=0)
+                if sample_smirk_weights is not None and current_smirk_weights is not None else None
             )
 
             generator_identity_embeddings_vis = self.generator_id_encoder_forward(source_identity_faces_vis)
@@ -1451,14 +1405,14 @@ class Trainer:
             restore_grid_vis = None
             if (
                 self.enable_hq_gaze_loss
-                or self.enable_hq_hrffa_loss
-                or self.enable_hq_facs_loss
+                or self.enable_hq_smirk_loss
                 or self.enable_coarse_gaze_loss
-                or self.enable_coarse_hrffa_loss
-                or self.enable_coarse_facs_loss
+                or self.enable_coarse_smirk_loss
             ):
                 with autocast(device_type="cuda", enabled=False):
                     restore_grid_vis = NF.affine_grid(theta_restore_vis.float(), size=list(dst_vis.shape), align_corners=False)
+
+            coarse_smirk_reference_vis, hq_smirk_reference_vis = self._prepare_smirk_references(dst_canonical_vis)
 
             rows: list[tuple[str, Tensor]] = [
                 ("SOURCE / SRC", src_vis),
@@ -1482,6 +1436,8 @@ class Trainer:
                         restore_grid_vis,
                         tuple(fake_vis.shape[-2:]),
                         id_gates_vis[0],
+                        coarse_smirk_reference_vis,
+                        smirk_weights_vis,
                     )
                 )
 
@@ -1498,6 +1454,8 @@ class Trainer:
                         restore_grid_vis,
                         tuple(fake_vis.shape[-2:]),
                         id_gates_vis[1],
+                        hq_smirk_reference_vis,
+                        smirk_weights_vis,
                     )
                 )
 
@@ -1508,7 +1466,7 @@ class Trainer:
         if not cv2.imwrite(sample_file, grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
             raise OSError(f"保存训练 sample 失败：{sample_file}")
 
-    def _next_training_batch(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, tuple[Tensor | None, Tensor | None]]:
+    def _next_training_batch(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, tuple[Tensor | None, Tensor | None], Tensor | None]:
         src, dst, canonical, theta_restore, same_mask, identity_faces = self.dataset.next()
 
         # 在加入在线遮挡之前解析干净 dst，避免遮挡素材干扰标签分类。
@@ -1521,6 +1479,14 @@ class Trainer:
         if self.occlusion is not None:
             dst, occlusion_gate = self.occlusion.apply(dst)
 
+        # Use the original augmentation/OCC visibility, not the ID-gradient
+        # gate after optional semantic parsing exclusions. Otherwise enabling
+        # an ID parsing label would accidentally suppress SMIRK supervision.
+        smirk_sample_weights = (
+            occlusion_gate.detach().float().flatten(1).mean(dim=1).clamp(0, 1)
+            if occlusion_gate is not None else None
+        )
+
         gates: list[Tensor | None] = []
         for excluded_tensor in self.parsing_exclusion_indices:
             gate = occlusion_gate
@@ -1531,14 +1497,15 @@ class Trainer:
                 gate = keep if gate is None else gate * keep
             gates.append(gate)
 
-        return src, dst, canonical, theta_restore, same_mask, identity_faces, (gates[0], gates[1])
+        return src, dst, canonical, theta_restore, same_mask, identity_faces, (gates[0], gates[1]), smirk_sample_weights
 
     def train(self) -> None:
 
         net_coarse = self.train_coarse
-        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces, sample_id_gate = self._next_training_batch()
+        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces, sample_id_gate, sample_smirk_weights = self._next_training_batch()
         half = self.batch_size // 2
         sample_id_gate = tuple(gate[:half].detach().cpu() if gate is not None else None for gate in sample_id_gate)
+        sample_smirk_weights = sample_smirk_weights[:half].detach().cpu() if sample_smirk_weights is not None else None
         sample_reference = tuple(
             tensor[:half].detach().cpu()
             for tensor in (sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces)
@@ -1548,7 +1515,7 @@ class Trainer:
                 if self._stop_requested:
                     raise KeyboardInterrupt
 
-                src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces, id_gate = self._next_training_batch()
+                src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces, id_gate, smirk_sample_weights = self._next_training_batch()
                 self._step_in_progress = True
 
                 # ========================= 生成器前向 =========================
@@ -1622,6 +1589,16 @@ class Trainer:
                         else:
                             coarse_source_identity_embeddings = self.coarse_identity_embeddings_forward(source_identity_faces)
 
+                coarse_smirk_reference, hq_smirk_reference = self._prepare_smirk_references(dst_canonical)
+                # Report the finite-prediction coverage. SMIRK does not expose
+                # a calibrated confidence estimate for extreme poses.
+                if hq_smirk_reference is not None:
+                    self.log("hq_smirk_valid_fraction", hq_smirk_reference["valid"].float().mean())
+                if coarse_smirk_reference is not None:
+                    self.log("coarse_smirk_valid_fraction", coarse_smirk_reference["valid"].float().mean())
+                if smirk_sample_weights is not None and (coarse_smirk_reference is not None or hq_smirk_reference is not None):
+                    self.log("smirk_occlusion_weight_mean", smirk_sample_weights.float().mean())
+
                 # ========================= 训练生成器 =========================
                 self.net_d.requires_grad_(False)
                 self.net_d_coarse.requires_grad_(False)
@@ -1643,7 +1620,7 @@ class Trainer:
 
                     with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                         restore_grid = None
-                        if self.enable_hq_gaze_loss or self.enable_hq_hrffa_loss or self.enable_hq_facs_loss or self.enable_coarse_gaze_loss or self.enable_coarse_hrffa_loss or self.enable_coarse_facs_loss:
+                        if self.enable_hq_gaze_loss or self.enable_coarse_gaze_loss or self.enable_hq_smirk_loss or self.enable_coarse_smirk_loss:
                             with autocast(device_type="cuda", enabled=False):
                                 restore_grid = NF.affine_grid(theta_restore.float(), size=list(dst.shape), align_corners=False)
 
@@ -1657,6 +1634,8 @@ class Trainer:
                                 coarse_source_identity_embeddings,
                                 restore_grid,
                                 id_gate[0],
+                                coarse_smirk_reference,
+                                smirk_sample_weights,
                             )
                         if self.hq_stage_active:
                             hq_g_loss = self._hq_generator_stage_loss(
@@ -1668,6 +1647,8 @@ class Trainer:
                                 hq_source_identity_embeddings,
                                 restore_grid,
                                 id_gate[1],
+                                hq_smirk_reference,
+                                smirk_sample_weights,
                             )
 
                         if self.train_stage == "joint":
@@ -1711,7 +1692,10 @@ class Trainer:
                     self.save_ckpt()
 
                 if self.completed_step % self.sample_save_every == 0:
-                    self._save_sample(sample_reference, (src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces), sample_id_gate, id_gate)
+                    self._save_sample(
+                        sample_reference, (src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces),
+                        sample_id_gate, id_gate, sample_smirk_weights, smirk_sample_weights,
+                    )
 
 
 def _load_run_config(paths: RunPaths) -> dict[str, Any]:

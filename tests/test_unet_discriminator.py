@@ -30,8 +30,7 @@ def _stub_trainer(model: UNetDiscriminatorSN) -> tuple[Trainer, dict[str, float]
     trainer.amp_dtype = None
     trainer.enable_coarse_wfm_loss = False
     trainer.enable_coarse_gaze_loss = False
-    trainer.enable_coarse_hrffa_loss = False
-    trainer.enable_coarse_facs_loss = False
+    trainer.enable_coarse_smirk_loss = False
     trainer.enable_coarse_vgg_loss = False
     trainer.enable_coarse_l1_loss = False
     trainer.coarse_reconstruction_scope = "all"
@@ -228,8 +227,7 @@ class TestUNetDiscriminatorSN(unittest.TestCase):
         trainer.hq_id_loss = lambda a, b: (a - b).square().mean() * 0
         trainer.hq_reconstruction_scope = "all"
         trainer.enable_hq_gaze_loss = False
-        trainer.enable_hq_hrffa_loss = False
-        trainer.enable_hq_facs_loss = False
+        trainer.enable_hq_smirk_loss = False
         trainer.enable_hq_vgg_loss = False
         trainer.enable_hq_l1_loss = False
         trainer.enable_hq_wfm_loss = True

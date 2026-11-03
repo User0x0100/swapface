@@ -1016,6 +1016,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "scipy" },
     { name = "tensorboard" },
+    { name = "timm" },
     { name = "torchinfo" },
     { name = "tqdm" },
 ]
@@ -1052,6 +1053,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=25.0.1" },
     { name = "scipy" },
     { name = "tensorboard" },
+    { name = "timm", specifier = ">=1.0.0" },
     { name = "torchinfo" },
     { name = "tqdm" },
 ]

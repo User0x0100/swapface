@@ -409,7 +409,7 @@ identity/video 数据：
 | Weak Feature Matching | yes | yes | yes |
 | L1 reconstruction | **no** | yes | yes |
 | VGG reconstruction | **no** | yes | yes |
-| Gaze/HRFFA/FACS | baseline 中先只做评测 | baseline 中先只做评测 | baseline 中先只做评测 |
+| Gaze/SMIRK | baseline 中先只做评测 | baseline 中先只做评测 | baseline 中先只做评测 |
 
 ### 7.1 Identity loss
 
@@ -466,8 +466,7 @@ EMA = current implementation
 以下全部作为后续 ablation：
 
 - Gaze loss；
-- HRFFA；
-- FACS；
+- SMIRK；
 - affine equivariance double-forward loss；
 - mask BCE；
 - temporal loss；
@@ -550,10 +549,10 @@ cos(E_eval(fake), E_eval(source))
 
 利用项目已有模型建立独立指标：
 
-- pose：HRFFA / SynergyNet；
+- pose：SMIRK / SynergyNet；
 - gaze：L2CS；
-- expression：FACS；
-- landmark/contour：HRFFA / FAN。
+- expression：SMIRK；
+- landmark/contour：FAN。
 
 比较：
 
