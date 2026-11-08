@@ -139,7 +139,12 @@ def export_swapface(
     export_options: OnnxExportOptions | None = None,
     export_dir: str | os.PathLike | None = None,
 ) -> tuple[Path, IDEncoderProvider]:
-    target_device = torch.device(device)
+    # ONNX export of the StyleGAN2 FIR resampling path must happen on CPU:
+    # torch.export.export(strict=True) captures the fused CUDA op before the
+    # ONNX-only decomposition branch can run.
+    target_device = torch.device("cpu")
+    if torch.device(device).type != "cpu":
+        print("Generator ONNX 导出固定在 CPU 执行；--device 仅对 IDEncoder 导出生效。")
 
     if batch_size <= 0:
         raise ValueError("batch_size 必须为正数")
@@ -225,7 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     def add_common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--batch-size", type=int, default=1, metavar="N", help="导出时的 batch size")
         p.add_argument("--nchw", action="store_true", help="使用 NCHW 布局（默认 NHWC）")
-        p.add_argument("--device", default="cuda", help="推理设备，如 cuda / cuda:1 / cpu")
+        p.add_argument("--device", default="cuda", help="IDEncoder 导出设备（Generator 导出固定使用 CPU）")
         p.add_argument("--output-dir", default="onnx_export", help="ONNX 文件输出目录")
         p.add_argument("--file-prefix", default="swapface", help="ONNX 文件名")
         p.add_argument("--optimize", action="store_true", help="启用 torch.onnx.export 图优化；SwapFace 默认关闭")

@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .stylegan2 import Generator as StyleGAN2Generator
+
 
 class AdaIN(nn.Module):
     def __init__(self, channels: int, w_dim: int) -> None:
@@ -149,6 +151,39 @@ class Coarse(nn.Module):
         return output
 
 
+class StyleGAN2Coarse(nn.Module):
+    """Adapt the StyleGAN2 generator to the existing Coarse training interface."""
+
+    def __init__(
+        self,
+        img_resolution: int = 128,
+        img_channels: int = 3,
+        id_dim: int = 512,
+        w_dim: int = 512,
+        mapping_layers: int = 8,
+        channel_multiplier: int = 1,
+    ) -> None:
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.generator = StyleGAN2Generator(
+            img_resolution=img_resolution,
+            img_channels=img_channels,
+            id_dim=id_dim,
+            w_dim=w_dim,
+            mapping_layers=mapping_layers,
+            channel_multiplier=channel_multiplier,
+        )
+
+    def forward(self, x: Tensor, id_feat: Tensor, return_resize_in: bool = False) -> Tensor | tuple[Tensor, Tensor]:
+        resize_in = F.interpolate(x, size=self.img_resolution, mode="bilinear", align_corners=False)
+        # The original Coarse output is tanh-bounded; training losses and HQ
+        # assume the same normalized RGB range for both implementations.
+        output = torch.tanh(self.generator(resize_in, id_feat))
+        if return_resize_in:
+            return output, resize_in
+        return output
+
+
 class HQRefiner(nn.Module):
     def __init__(
         self,
@@ -258,6 +293,10 @@ class Generator(nn.Module):
         coarse_num_latent: int = 6,
         coarse_base_ch: int = 64,
         coarse_max_ch: int = 256,
+        coarse_type: str | None = None,
+        coarse_w_dim: int = 512,
+        coarse_mapping_layers: int = 8,
+        coarse_channel_multiplier: int = 1,
         hq_bottleneck_resolution: int = 16,
         hq_base_ch: int = 8,
         hq_max_ch: int = 128,
@@ -277,20 +316,41 @@ class Generator(nn.Module):
             "hq_base_ch": hq_base_ch,
             "hq_max_ch": hq_max_ch,
         }
+        # Old configurations retain their original network_cfg representation;
+        # new options are recorded only when the caller opts into the schema.
+        if coarse_type is not None:
+            self.network_cfg.update({
+                "coarse_type": coarse_type,
+                "coarse_w_dim": coarse_w_dim,
+                "coarse_mapping_layers": coarse_mapping_layers,
+                "coarse_channel_multiplier": coarse_channel_multiplier,
+            })
         self.img_resolution = img_resolution
         self.img_channels = img_channels
         self.id_dim = id_dim
         self.coarse_resolution = coarse_resolution
 
-        self.coarse = Coarse(
-            img_resolution=coarse_resolution,
-            img_channels=img_channels,
-            latent_resolution=coarse_latent_resolution,
-            num_latent=coarse_num_latent,
-            base_ch=coarse_base_ch,
-            max_ch=coarse_max_ch,
-            id_dim=id_dim,
-        )
+        if coarse_type is None or coarse_type == "inswapper":
+            self.coarse = Coarse(
+                img_resolution=coarse_resolution,
+                img_channels=img_channels,
+                latent_resolution=coarse_latent_resolution,
+                num_latent=coarse_num_latent,
+                base_ch=coarse_base_ch,
+                max_ch=coarse_max_ch,
+                id_dim=id_dim,
+            )
+        elif coarse_type == "stylegan2":
+            self.coarse = StyleGAN2Coarse(
+                img_resolution=coarse_resolution,
+                img_channels=img_channels,
+                id_dim=id_dim,
+                w_dim=coarse_w_dim,
+                mapping_layers=coarse_mapping_layers,
+                channel_multiplier=coarse_channel_multiplier,
+            )
+        else:
+            raise ValueError(f"unknown coarse_type: {coarse_type!r}")
         self.hq = HQRefiner(
             img_resolution=img_resolution,
             img_channels=img_channels,

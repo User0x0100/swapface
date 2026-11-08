@@ -39,6 +39,8 @@ ROCm 环境完成同步后，运行训练命令使用 `uv run --no-sync ...`（�
 uv run python -m swapface.train
 ```
 
+`experiments/train.toml` 在同一个文件中提供两组完整的 `[generator]` 示例：InSwapper 默认启用，StyleGAN2 整块注释。切换架构时，注释当前整块，再取消注释另一块；不能同时启用两个同名 TOML 表。
+
 显式指定配置：
 
 ```bash
@@ -153,6 +155,28 @@ gamma = 10.0
 ```
 
 上述片段仅展示需要关注的字段，**不要把 `[generator]` 覆盖成只有一个键的表**；应在现有完整 TOML 中修改 `generator.coarse_resolution` 和判别器分辨率。两个阶段可以独立选择 UNET，不需要同时启用。UNET 不再有 `max_ch` 参数；从 FIR 配置切换时即使保留 `max_ch`，也不会参与 UNET 模型构造或存入其 canonical config。`minibatch_std_group_size` 同样不参与 UNET。判别器没有固定的 128 分辨率限制；目前项目配置统一要求分辨率为不小于 16 的 2 的整数次幂，同时生成器还要求 Coarse 分辨率与其 latent resolution 满足整数 2 的幂倍率关系；HQ 的 img_resolution 必须与 generator.img_resolution 相等。UNET 内部三层 stride-2 下采样要求宽高都能被 8 整除。训练对抗损失直接对每像素 logits 应用 Hinge 后取均值；`return_feats=True` 返回四层 encoder 特征供 WFM 使用。每个启用 UNET 的阶段只绘制一行对应的 GAN GRAD，UNET 无 Global/Spatial 双头权重或 R1 日志。
+
+### 可选 StyleGAN2 Coarse
+
+现有 `models/networks.py::Generator` 可通过 `[generator].coarse_type` 选择 Coarse 实现。省略该字段时仍使用原 `inswapper`（AdaIN/IDInject），并保持历史 run 的 canonical 配置与哈希不变。启用新架构示例：
+
+```toml
+[generator]
+img_resolution = 512
+coarse_resolution = 128
+coarse_type = "stylegan2"
+coarse_w_dim = 512
+coarse_mapping_layers = 8
+coarse_channel_multiplier = 1
+```
+
+`stylegan2` 使用 `models/stylegan2.py` 的条件生成器（Target Encoder + 每层 ModulatedConv），`coarse_w_dim`、`coarse_mapping_layers`、`coarse_channel_multiplier` 控制新架构。原 Coarse 的 `coarse_latent_resolution`、`coarse_num_latent`、`coarse_base_ch`、`coarse_max_ch` 不影响 StyleGAN2。`coarse_resolution` 必须为 4～1024 的 2 的整数次幂，且不超过 HQ 输出分辨率。
+
+两种 Coarse 共用 `coarse(target, identity, return_resize_in=True)` 接口：输入自动双线性缩放，输出为 `[B,3,coarse_resolution,coarse_resolution]`，经 `tanh` 限制在 `[-1,1]`，HQRefiner 与 Coarse 损失路径不变。StyleGAN2 的注入增益初始为 0；训练初期 Target Encoder 的梯度需经注入增益逐步建立。
+
+**检查点隔离**：不同 Coarse 架构的权重不可互换。`resume`/继承 Coarse 的 `branch` 必须保持同一架构；HQ rebuild 只允许修改 HQ 配置，不允许把 InSwapper Coarse 的权重当成 StyleGAN2 权重。旧检查点缺少 `coarse_type` 时按原 InSwapper 解释。
+
+**ONNX 导出**：Generator 统一在 CPU 上执行 PyTorch strict export，`upfirdn2d` 展开为标准 ONNX 算子，不需要自定义 runtime 插件；`--device` 仅决定 IDEncoder 的导出设备。导出的 ONNX 仍需在目标 TensorRT 版本中独立验证 Engine 构建和性能。
 
 ## Generator 梯度职责
 

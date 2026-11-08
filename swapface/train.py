@@ -169,6 +169,10 @@ COARSE_GENERATOR_CONFIG_KEYS = (
     "coarse_num_latent",
     "coarse_base_ch",
     "coarse_max_ch",
+    "coarse_type",
+    "coarse_w_dim",
+    "coarse_mapping_layers",
+    "coarse_channel_multiplier",
 )
 
 
@@ -470,12 +474,12 @@ class Trainer:
             print_mapping("net_g", checkpoint["net_g"]["network_cfg"])
             print_mapping("net_d", checkpoint["net_d"]["network_cfg"])
 
-            saved_net_g_cfg = dict(checkpoint["net_g"]["network_cfg"])
+            saved_net_g_cfg = _canonical_generator_config(checkpoint["net_g"]["network_cfg"])
             branch_mode: Literal["inherit", "hq_rebuild"] = "inherit"
             if checkpoint_mode == "resume":
                 if checkpoint.get("face_alignment", "ffhq") != self.face_alignment:
                     raise ValueError("checkpoint 的人脸对齐标准与当前训练配置不一致")
-                if saved_net_g_cfg != net_g_cfg:
+                if saved_net_g_cfg != _canonical_generator_config(net_g_cfg):
                     raise ValueError("checkpoint Generator 架构与当前配置不一致")
             else:
                 branch_mode = _branch_generator_mode(checkpoint, config)
@@ -1706,15 +1710,32 @@ def _load_run_config(paths: RunPaths) -> dict[str, Any]:
     return resolved
 
 
+def _canonical_generator_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Compare effective Coarse architectures without changing persisted run hashes."""
+    from .config import DEFAULT_GENERATOR_CONFIG, STYLEGAN2_COARSE_CONFIG_DEFAULTS
+
+    canonical = {**STYLEGAN2_COARSE_CONFIG_DEFAULTS, **config}
+    if canonical["coarse_type"] == "stylegan2":
+        # Legacy InSwapper knobs do not affect the StyleGAN2 weights.
+        for key in ("coarse_latent_resolution", "coarse_num_latent", "coarse_base_ch", "coarse_max_ch"):
+            canonical[key] = DEFAULT_GENERATOR_CONFIG[key]
+    else:
+        # StyleGAN2-only options do not affect the legacy Coarse weights.
+        for key in ("coarse_w_dim", "coarse_mapping_layers", "coarse_channel_multiplier"):
+            canonical[key] = STYLEGAN2_COARSE_CONFIG_DEFAULTS[key]
+    return canonical
+
+
 def _coarse_generator_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """提取决定 Coarse 参数结构与 identity 输入空间的 Generator 配置。"""
-    return {key: config[key] for key in COARSE_GENERATOR_CONFIG_KEYS}
+    canonical = _canonical_generator_config(config)
+    return {key: canonical[key] for key in COARSE_GENERATOR_CONFIG_KEYS}
 
 
 def _branch_generator_mode(checkpoint: Mapping[str, Any], resolved: Mapping[str, Any]) -> Literal["inherit", "hq_rebuild"]:
     """决定 branch 是完整继承 Generator，还是仅继承 Coarse 并重建 HQ。"""
-    parent_generator = dict(checkpoint["net_g"]["network_cfg"])
-    current_generator = dict(resolved["generator"])
+    parent_generator = _canonical_generator_config(checkpoint["net_g"]["network_cfg"])
+    current_generator = _canonical_generator_config(resolved["generator"])
     hq_only = resolved["train"]["stage"] == "hq"
 
     if hq_only:

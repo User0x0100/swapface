@@ -421,8 +421,21 @@ def _normalize_loss(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+STYLEGAN2_COARSE_CONFIG_DEFAULTS: dict[str, Any] = {
+    "coarse_type": "inswapper",
+    "coarse_w_dim": 512,
+    "coarse_mapping_layers": 8,
+    "coarse_channel_multiplier": 1,
+}
+
+
 def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
-    result = _with_defaults(_table(config, "generator", "[generator]"), DEFAULT_GENERATOR_CONFIG, "[generator]")
+    raw = _table(config, "generator", "[generator]")
+    # Preserve existing frozen run configs/hashes when no new Coarse options
+    # were selected. An explicit option enables the extended canonical schema.
+    extended = bool(set(raw) & set(STYLEGAN2_COARSE_CONFIG_DEFAULTS))
+    defaults = DEFAULT_GENERATOR_CONFIG | (STYLEGAN2_COARSE_CONFIG_DEFAULTS if extended else {})
+    result = _with_defaults(raw, defaults, "[generator]")
 
     integer_keys = (
         "img_resolution",
@@ -439,18 +452,28 @@ def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
     )
     for key in integer_keys:
         result[key] = _int(result[key], f"generator.{key}", minimum=1)
+    if extended:
+        for key in ("coarse_w_dim", "coarse_mapping_layers", "coarse_channel_multiplier"):
+            result[key] = _int(result[key], f"generator.{key}", minimum=1)
 
+    coarse_type = result.get("coarse_type", "inswapper")
+    if not isinstance(coarse_type, str) or coarse_type not in {"inswapper", "stylegan2"}:
+        raise ValueError("generator.coarse_type 仅支持 inswapper 或 stylegan2")
     if result["coarse_resolution"] > result["img_resolution"]:
         raise ValueError("generator.coarse_resolution 不能大于 generator.img_resolution")
-    if result["coarse_max_ch"] < result["coarse_base_ch"]:
+    if coarse_type == "inswapper" and result["coarse_max_ch"] < result["coarse_base_ch"]:
         raise ValueError("generator.coarse_max_ch 必须 >= generator.coarse_base_ch")
+    if coarse_type == "stylegan2":
+        resolution = result["coarse_resolution"]
+        if resolution < 4 or resolution > 1024 or resolution & (resolution - 1):
+            raise ValueError("generator.coarse_resolution 使用 stylegan2 时必须是 [4, 1024] 内的 2 的整数次幂")
     if result["hq_max_ch"] < result["hq_base_ch"]:
         raise ValueError("generator.hq_max_ch 必须 >= generator.hq_base_ch")
 
-    for resolution_key, latent_key in (
-        ("coarse_resolution", "coarse_latent_resolution"),
-        ("img_resolution", "hq_bottleneck_resolution"),
-    ):
+    dimension_pairs = [("img_resolution", "hq_bottleneck_resolution")]
+    if coarse_type == "inswapper":
+        dimension_pairs.append(("coarse_resolution", "coarse_latent_resolution"))
+    for resolution_key, latent_key in dimension_pairs:
         resolution = result[resolution_key]
         latent = result[latent_key]
         if resolution < latent or resolution % latent != 0:
