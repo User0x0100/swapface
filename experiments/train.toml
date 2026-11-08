@@ -79,6 +79,10 @@ weight = 1.0
 [loss.coarse.identity]
 provider = "BLENDFACE"
 weight = 10.0
+# 逐样本身份相似度软下限；达到 0.70 后 IDLoss 梯度归零。
+# 0.70 是待校准的实验值，不同身份编码器需单独校准；注释这两项可恢复原 IDLoss。
+min_similarity = 0.70
+transition_width = 0.03
 # 可选：IDLoss 梯度排除的 BiSeNet/CelebAMask 类别编号。空数组表示关闭。
 # 4/5=左右眼，11=口腔内部，12/13=上下唇；例如 [4, 5, 12, 13]。
 exclude_parsing_labels = []
@@ -146,6 +150,9 @@ weight = 1.0
 [loss.hq.identity]
 provider = "BLENDFACE"
 weight = 10.0
+# HQ 独立控制身份门槛；真实训练时应按所选 teacher 的相似度分布校准。
+min_similarity = 0.70
+transition_width = 0.03
 # HQ 可独立于 Coarse 配置。仅过滤 IDLoss 梯度，不修改前向像素与其他 loss。
 exclude_parsing_labels = []
 

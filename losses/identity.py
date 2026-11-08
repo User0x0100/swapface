@@ -1,11 +1,17 @@
+import math
 from collections.abc import Mapping
 
+import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
 
 from .functional import Reduction, _reduce_loss
+
+# FP32 cosine similarity has ~1e-7 resolution around 1.0. Narrower margins
+# are not meaningful and can underflow in the quadratic torch.where branch.
+MIN_IDENTITY_TRANSITION_WIDTH = 1e-6
 
 
 class IdentityLoss(nn.Module):
@@ -19,16 +25,26 @@ class IdentityLoss(nn.Module):
         provider: IDEncoderProvider = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16,
         weight: float = 1.0,
         reduction: Reduction = "mean",
+        min_similarity: float | None = None,
+        transition_width: float = 0.03,
     ) -> None:
         """初始化身份损失。
 
         参数:
             provider: 身份编码器模型配置。
             weight: 最终身份损失权重。
-            reduction: 输出聚合方式。"""
+            reduction: 输出聚合方式。
+            min_similarity: 逐样本最低余弦相似度；None 保持原始余弦距离损失。
+            transition_width: 超出相似度门槛时的平滑过渡宽度。"""
         super().__init__()
+        if min_similarity is not None and (not math.isfinite(min_similarity) or not -1.0 <= min_similarity <= 1.0):
+            raise ValueError("min_similarity must be in [-1, 1] or None")
+        if not math.isfinite(transition_width) or transition_width < MIN_IDENTITY_TRANSITION_WIDTH:
+            raise ValueError(f"transition_width must be finite and >= {MIN_IDENTITY_TRANSITION_WIDTH}")
         self.weight = weight
         self.reduction = reduction
+        self.min_similarity = min_similarity
+        self.transition_width = transition_width
         self.id_encoder = IDEncoder(provider=provider).eval().requires_grad_(False)
         self.eval()
 
@@ -50,11 +66,26 @@ class IdentityLoss(nn.Module):
             reference_embeddings: 目标身份嵌入向量，必须与生成嵌入向量同形。
 
         返回:
-            ``1 - cosine_similarity`` 经权重和 reduction 处理后的损失。"""
+            默认计算余弦距离；配置 min_similarity 后计算逐样本平滑阈值，再乘权重并按照 reduction 聚合。"""
         if generated_embeddings.shape != reference_embeddings.shape:
             raise ValueError(f"generated and reference embedding shapes must match: {tuple(generated_embeddings.shape)} != {tuple(reference_embeddings.shape)}")
-        loss = (1.0 - F.cosine_similarity(generated_embeddings, reference_embeddings, dim=1)) * self.weight
-        return _reduce_loss(loss, self.reduction)
+        if self.min_similarity is None:
+            # Preserve the exact legacy loss and dtype path when not configured.
+            loss = 1.0 - F.cosine_similarity(generated_embeddings, reference_embeddings, dim=1)
+        else:
+            # Use FP32 for a stable threshold comparison under FP16/BF16 autocast.
+            similarity = F.cosine_similarity(generated_embeddings.float(), reference_embeddings.float(), dim=1)
+            excess = (self.min_similarity - similarity).clamp_min(0.0)
+            width = self.transition_width
+            # Keep the inactive quadratic branch bounded too: torch.where
+            # still constructs both branches before selecting the result.
+            transition_excess = excess.clamp(max=width)
+            loss = torch.where(
+                excess < width,
+                transition_excess.square() / (2.0 * width),
+                excess - width / 2.0,
+            )
+        return _reduce_loss(loss * self.weight, self.reduction)
 
 
 class IFSRLoss(nn.Module):

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from losses.functional import _gaussian_blur_parameters
+from losses.identity import MIN_IDENTITY_TRANSITION_WIDTH
 from misc.models.face_mask import FACE_PARSING_NUM_CLASSES
 from misc.models.id_encoder import IDEncoderProvider
 from models.discriminator import INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION, DiscriminatorType
@@ -337,9 +338,26 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
     if "spatial_weight" in raw_gan:
         gan["spatial_weight"] = _float(raw_gan["spatial_weight"], f"{prefix}.gan.spatial_weight", minimum=0.0)
 
-    identity = _with_defaults(_table(loss, "identity", f"[{prefix}.identity]"), defaults["identity"], f"[{prefix}.identity]")
+    raw_identity = _table(loss, "identity", f"[{prefix}.identity]")
+    identity = _with_defaults(
+        {key: value for key, value in raw_identity.items() if key not in {"min_similarity", "transition_width"}},
+        defaults["identity"],
+        f"[{prefix}.identity]",
+    )
     identity["provider"] = _provider(identity["provider"], f"{prefix}.identity.provider")
     identity["weight"] = _float(identity["weight"], f"{prefix}.identity.weight", minimum=0.0)
+    # Opt-in fields must remain absent for legacy frozen run configs/hashes.
+    if "min_similarity" in raw_identity:
+        identity["min_similarity"] = _float(
+            raw_identity["min_similarity"], f"{prefix}.identity.min_similarity", minimum=-1.0, maximum=1.0
+        )
+        identity["transition_width"] = _float(
+            raw_identity.get("transition_width", 0.03),
+            f"{prefix}.identity.transition_width",
+            minimum=MIN_IDENTITY_TRANSITION_WIDTH,
+        )
+    elif "transition_width" in raw_identity:
+        raise ValueError(f"{prefix}.identity.transition_width 要求同时提供 min_similarity")
     labels = identity["exclude_parsing_labels"]
     if not isinstance(labels, list):
         raise TypeError(f"{prefix}.identity.exclude_parsing_labels 必须为整数数组")

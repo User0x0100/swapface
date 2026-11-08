@@ -95,6 +95,34 @@ exclude_parsing_labels = [4, 5, 11, 12, 13]  # 另外包含口腔内部
 
 注意：被屏蔽区域的**直接图像梯度**归零，并不意味着训练后该区域的最终视觉结果绝对不变。卷积生成器的共享参数及其他 loss 仍可能间接改变该区域；分割错误、边缘过渡以及 Coarse 下采样同样会影响有效覆盖。使用非空列表需要额外下载 `79999_iter.pth`，并增加每个 batch 的一次分割前向计算；配置变更应使用新 run/branch，而不是修改已冻结 run 的 resume 配置。
 
+### 逐样本平滑阈值 IDLoss
+
+Coarse 与 HQ 可以分别启用最低身份相似度软约束。示例：
+
+```toml
+[loss.coarse.identity]
+provider = "BLENDFACE"
+weight = 10.0
+min_similarity = 0.70
+transition_width = 0.03
+
+[loss.hq.identity]
+provider = "BLENDFACE"
+weight = 10.0
+min_similarity = 0.70
+transition_width = 0.03
+```
+
+其中 `min_similarity` 是生成身份与参考身份的余弦相似度下限，不是 Loss 数值阈值；取值范围 [-1,1]，`transition_width` 必须不小于 1e-6，以避免 FP32 计算中极窄过渡带引起的数值不稳定。未配置 `min_similarity` 时，保持原始 IDLoss（权重乘以 `1 - cosine_similarity`），旧 run 的冻结配置不增加新字段。
+
+令 `s` 为该样本余弦相似度，`e=max(0,min_similarity-s)`，`w=transition_width`。逐样本 IDLoss 在 `e=0` 时为 0，在 `0<e<w` 时为 `weight * e²/(2w)`，在 `e>=w` 时为 `weight * (e-w/2)`，最后对 batch 求平均。由此：
+- 已达到下限的样本不再接收 IDLoss 梯度；
+- 阈值下方宽度为 `w` 的区间内，IDLoss 梯度强度从 0 平滑恢复到原权重；
+- 未达标且低于过渡区的样本保留原始身份梯度强度；
+- 其他 GAN、L1、VGG、SMIRK 等损失保持原权重及训练路径，不因身份达标而放大。
+
+训练日志新增 `coarse_id_similarity_mean` / `hq_id_similarity_mean`、`*_id_satisfied_fraction`、`*_id_gradient_scale_mean`（相对于原始 IDLoss 梯度的平均缩放系数）。仅启用软阈值的阶段输出这些指标。身份相似度门槛应按所选 ID teacher 在同身份/跨身份及多姿态样本上的分布校准；`0.70` 是实验初值，并非所有 encoder 的通用合格线。切换该配置会改变冻结的 run 配置，请创建新 run/branch，不要修改历史 resume 配置。
+
 ### WebFace600K ArcFace R50（InSwapper-128 身份编码器）
 
 身份编码器可选 `WEBFACE600K_ARCFACE_R50`。它从项目共用模型仓库 `leehx/model_hub` 加载 `w600k_r50.pth`（原始权重来自 `Icar/buffalo_l-torch`，与 InsightFace `buffalo_l/w600k_r50.onnx` 输出数值等价），复用项目原有 IResNet50 / IBasicBlock 的 `fused_bn=True` 结构（与普通非融合 R50 checkpoint 不可互换）。权重与其他身份编码器一样通过公共 `MODEL_REPOSITORY_ID` 下载到 Hugging Face Hub 缓存，不把模型文件加入 Git。

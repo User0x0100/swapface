@@ -681,9 +681,19 @@ class Trainer:
 
         self.generator_id_encoder = IDEncoder(self.generator_id_encoder_provider).to(self.device).eval().requires_grad_(False)
         if self.hq_stage_active:
-            self.hq_id_loss = IdentityLoss(weight=float(hq_identity_config["weight"]), provider=self.hq_identity_loss_provider).to(self.device)
+            self.hq_id_loss = IdentityLoss(
+                weight=float(hq_identity_config["weight"]),
+                provider=self.hq_identity_loss_provider,
+                min_similarity=hq_identity_config.get("min_similarity"),
+                transition_width=float(hq_identity_config.get("transition_width", 0.03)),
+            ).to(self.device)
         if self.coarse_stage_active:
-            self.coarse_id_loss = IdentityLoss(weight=float(coarse_identity_config["weight"]), provider=self.coarse_identity_loss_provider).to(self.device)
+            self.coarse_id_loss = IdentityLoss(
+                weight=float(coarse_identity_config["weight"]),
+                provider=self.coarse_identity_loss_provider,
+                min_similarity=coarse_identity_config.get("min_similarity"),
+                transition_width=float(coarse_identity_config.get("transition_width", 0.03)),
+            ).to(self.device)
             if self.hq_stage_active and self.coarse_identity_loss_provider is self.hq_identity_loss_provider:
                 self.coarse_id_loss.id_encoder = self.hq_id_loss.id_encoder
         self.coarse_resolution = int(self.net_g.network_cfg["coarse_resolution"])
@@ -887,6 +897,27 @@ class Trainer:
         for key, value in zip(keys, values):
             self.log_writer.add_scalar(f"Loss/{key}", value, self.completed_step)
 
+    @torch.no_grad()
+    def _log_identity_threshold_metrics(
+        self,
+        stage: Literal["coarse", "hq"],
+        criterion: IdentityLoss,
+        generated_embeddings: Tensor,
+        reference_embeddings: Tensor,
+    ) -> None:
+        """Report per-sample threshold coverage without affecting training gradients."""
+        if (
+            not isinstance(criterion, IdentityLoss)
+            or criterion.min_similarity is None
+            or (self.completed_step + 1) % self.log_interval != 0
+        ):
+            return
+        similarity = NF.cosine_similarity(generated_embeddings.float(), reference_embeddings.float(), dim=1)
+        excess = (criterion.min_similarity - similarity).clamp_min(0.0)
+        self.log(f"{stage}_id_similarity_mean", similarity.mean())
+        self.log(f"{stage}_id_satisfied_fraction", (excess == 0).float().mean())
+        self.log(f"{stage}_id_gradient_scale_mean", (excess / criterion.transition_width).clamp(max=1).mean())
+
     def prepare_identity_encoder_faces(self, faces: Tensor, theta_restore: Tensor | None = None) -> Tensor:
         """将生成图映射到 112 身份编码器坐标系；与 Generator 对齐模式一致。"""
         if self.face_alignment == "arcface":
@@ -1039,6 +1070,7 @@ class Trainer:
         coarse_identity_embeddings = self.coarse_identity_embeddings_forward(self.prepare_identity_encoder_faces(gate_identity_gradient(coarse, coarse_id_gate), theta_restore))
         coarse_id_loss = self.coarse_id_loss(coarse_identity_embeddings, source_identity_embeddings)
         self.log("coarse_id_loss", coarse_id_loss)
+        self._log_identity_threshold_metrics("coarse", self.coarse_id_loss, coarse_identity_embeddings, source_identity_embeddings)
         total = total + coarse_id_loss
 
         geometry_enabled = self.enable_coarse_gaze_loss or self.enable_coarse_smirk_loss
@@ -1109,6 +1141,7 @@ class Trainer:
         hq_identity_embeddings = self.hq_identity_embeddings_forward(self.prepare_identity_encoder_faces(gate_identity_gradient(fake, id_gate), theta_restore))
         hq_id_loss = self.hq_id_loss(hq_identity_embeddings, source_identity_embeddings)
         self.log("hq_id_loss", hq_id_loss)
+        self._log_identity_threshold_metrics("hq", self.hq_id_loss, hq_identity_embeddings, source_identity_embeddings)
         total = total + hq_id_loss
 
         geometry_enabled = self.enable_hq_gaze_loss or self.enable_hq_smirk_loss
