@@ -250,9 +250,10 @@ def upfirdn2d(
         - Critical for preventing aliasing in downsampling
     """
 
+    # ONNX exports standard ATen ops instead of the fused CUDA kernel.
+    # Regular NVIDIA execution remains on the optimized fused path.
     # PyTorch ROCm 保持 CUDA 设备 API 兼容，因此通过 torch.version.hip 区分后端。
-    # NVIDIA 保留原 fused CUDA kernel；ROCm/CPU 使用标准 PyTorch 实现。
-    if x.device.type != "cuda" or torch.version.hip is not None:
+    if torch.onnx.is_in_onnx_export() or x.device.type != "cuda" or torch.version.hip is not None:
         return _upfirdn2d_native(x, f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain)
 
     initialize_upfirdn2d()
@@ -461,6 +462,15 @@ class DownFIRDn2d(nn.Module):
             Tensor of the shape `[batch_size, num_channels, out_height, out_width]`.
         """
         f = self.get_buffer("f")
+        if torch.onnx.is_in_onnx_export():
+            # This wrapper calls the fused op directly on CUDA in normal execution.
+            return _upfirdn2d_native(
+                x, f,
+                self.upx, self.upy, self.downx, self.downy,
+                self.padx0, self.padx1, self.pady0, self.pady1,
+                self.flip_filter, self.gain,
+            )
+
         match (x.device.type, torch.version.hip):
             case ("cuda", None):
                 initialize_upfirdn2d()
@@ -490,7 +500,7 @@ def setup_context(
     inputs: tuple[Tensor, Tensor, int, int, int, int, int, int, int, int, bool, float],
     output: Tensor,
 ):
-    x, f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain = inputs
+    x, f, upx, upy, downx, downy, padx0, _padx1, pady0, _pady1, flip_filter, gain = inputs
     ctx.save_for_backward(f)
     ctx.x_shape = x.shape
 
