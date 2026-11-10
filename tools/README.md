@@ -12,7 +12,7 @@
 先安装当前硬件对应的项目依赖。例如 NVIDIA：
 
 ```bash
-uv sync --group cuda
+uv sync --group nvidia
 ```
 
 AMD ROCm：

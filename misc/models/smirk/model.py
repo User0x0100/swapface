@@ -41,7 +41,7 @@ class _ImageHead(nn.Module):
         try:
             import timm
         except ImportError as exc:
-            raise RuntimeError("启用 SMIRK 损失需要安装 timm（uv sync --group cuda 或 rocm）") from exc
+            raise RuntimeError("启用 SMIRK 损失需要安装 timm（uv sync --group nvidia 或 rocm）") from exc
         # SMIRK checkpoint must provide all model weights. Do not implicitly fetch
         # unrelated ImageNet weights, which would mask an incomplete checkpoint.
         self.encoder = timm.create_model(backbone_name, pretrained=False, features_only=True)
