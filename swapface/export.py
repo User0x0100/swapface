@@ -241,6 +241,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_fs.add_argument("--checkpoint", required=True, metavar="PATH", help="当前 train.py 保存的检查点路径（.pth）")
     add_common(p_fs)
 
+    # ── split 子命令：InSwapper / StyleGAN2 均使用身份参数预计算 ──
+    p_split = sub.add_parser("split", help="分离导出服务端身份映射和客户端 Generator")
+    p_split.add_argument("--checkpoint", required=True, metavar="PATH", help="当前 train.py 保存的检查点路径（.pth）")
+    add_common(p_split)
+    p_split.set_defaults(opset_version=18)
+
     # ── id-encoder 子命令 ──────────────────────────────────────────────────────
     p_id = sub.add_parser("id-encoder", help="导出 IDEncoder（人脸识别编码器）")
     p_id.add_argument(
@@ -277,6 +283,10 @@ def main() -> None:
 
     if args.command in ("swapface", "all"):
         output_path, provider = export_swapface(checkpoint_path=args.checkpoint, **kwargs)
+
+    if args.command == "split":
+        from .split_export import export_split
+        export_split(checkpoint_path=args.checkpoint, **kwargs)
 
     if args.command == "id-encoder":
         export_id_encoder(provider_name=args.provider, **kwargs)
