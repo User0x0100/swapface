@@ -1,5 +1,4 @@
 import argparse
-import multiprocessing as mp
 import random
 import time
 from pathlib import Path
@@ -13,7 +12,7 @@ from torch import Tensor
 from torchcodec.decoders import VideoDecoder
 from torchvision.io import ImageReadMode, decode_image
 
-from misc.face_alignment import align_faces, make_alignment_grid_theta, make_ffhq_to_arcface_112_grid, restore_faces_to_original, transform_sampling_grid
+from misc.face_alignment import align_faces, invert_grid_theta, make_alignment_grid_theta, make_ffhq_to_arcface_112_grid, transform_sampling_grid
 from misc.models import ImageInputRange
 from misc.models.face_mask import FaceMasker
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
@@ -245,102 +244,165 @@ class SwapFace:
         return swapped.permute(0, 3, 1, 2).contiguous() if self.ort_layout == "NHWC" else swapped
 
     @staticmethod
-    def _display_worker(display_queue: mp.Queue, source_fps: float) -> None:
-        source_interval = 1.0 / source_fps
-        frame_interval = source_interval
-        while True:
-            item = display_queue.get()
-            if item is None:
-                break
-            frames, batch_elapsed = item
-            if len(frames) == 0:
-                continue
-
-            # 预览不能比输入视频更快；若处理速度更慢，则按实际吞吐平滑降速。
-            # 吞吐下降时立即跟随，恢复时缓慢加速，避免在 batch 边界反复耗尽队列。
-            measured_interval = batch_elapsed / len(frames)
-            target_interval = max(source_interval, measured_interval)
-            if target_interval > frame_interval:
-                frame_interval = target_interval
-            else:
-                frame_interval = frame_interval * 0.9 + target_interval * 0.1
-
-            for frame in frames:
-                started = time.perf_counter()
-                cv2.imshow("swapped", frame)
-                display_elapsed = time.perf_counter() - started
-                wait_ms = max(1, round((frame_interval - display_elapsed) * 1000.0))
-                cv2.waitKey(wait_ms)
-        cv2.destroyAllWindows()
-
-    @staticmethod
     def _make_preview(original_frames: Tensor, swapped_faces: Tensor, grid_theta: Tensor, segment_lengths: list[int]) -> Tensor:
-        """保留全分辨率还原，先缩小左右两侧再拼接，避免复制/拼接全尺寸视频。"""
-        if original_frames.shape[-1] % 4:
-            # 原实现的左右分界可能落在 bilinear 采样点上，奇数预览宽度保留原采样方式。
-            restored = original_frames.clone()
-            if swapped_faces.size(0):
-                restored = restore_faces_to_original(restored, swapped_faces, grid_theta, segment_lengths)
-            return NF.interpolate(torch.cat((original_frames, restored), dim=3), scale_factor=0.25, mode="bilinear", align_corners=False)
-        original_preview = NF.interpolate(original_frames, scale_factor=0.25, mode="bilinear", align_corners=False)
+        """返回原尺寸 RGB uint8 左右对比图，仅在受影响的人脸 ROI 内进行浮点还原。"""
+        height, width = original_frames.shape[-2:]
+        preview = torch.cat((original_frames, original_frames), dim=3)
         if not swapped_faces.size(0):
-            return torch.cat((original_preview, original_preview), dim=3)
-        restored = restore_faces_to_original(original_frames, swapped_faces, grid_theta, segment_lengths)
-        swapped_preview = NF.interpolate(restored, scale_factor=0.25, mode="bilinear", align_corners=False)
-        return torch.cat((original_preview, swapped_preview), dim=3)
+            return preview
+
+        # 映射对齐裁剪的四个角到源视频，外扩 2 个采样像素以容纳 bicubic 插值边缘。
+        pad = 1.0 + 4.0 / swapped_faces.shape[-1]
+        corners = grid_theta.new_tensor([[-pad, -pad], [-pad, pad], [pad, -pad], [pad, pad]])
+        coords = torch.matmul(corners, grid_theta[:, :, :2].transpose(1, 2)) + grid_theta[:, None, :, 2]
+        coords = (coords + 1.0) * coords.new_tensor([width / 2, height / 2]) - 0.5
+        lo = coords.amin(dim=1).floor().to(torch.int32)
+        hi = (coords.amax(dim=1) + 2).ceil().to(torch.int32)
+        # 高级索引会产生副本，必须直接夹取各列才能更新边界。
+        lo[:, 0].clamp_(0, width)
+        lo[:, 1].clamp_(0, height)
+        hi[:, 0].clamp_(0, width)
+        hi[:, 1].clamp_(0, height)
+        boxes = torch.cat((lo, hi), dim=1)
+        boxes_list = boxes.cpu().tolist()
+        inverses = invert_grid_theta(grid_theta)
+
+        offset = 0
+        for frame_index, count in enumerate(segment_lengths):
+            regions = [(offset + i, *boxes_list[offset + i]) for i in range(count)]
+            offset += count
+            regions = [(i, x0, y0, x1, y1) for i, x0, y0, x1, y1 in regions if x1 > x0 and y1 > y0]
+            if not regions:
+                continue
+            # 以所有人脸 ROI 的并集为画布，保留原版多脸重叠时的加权合成语义。
+            ux0, uy0 = min(v[1] for v in regions), min(v[2] for v in regions)
+            ux1, uy1 = max(v[3] for v in regions), max(v[4] for v in regions)
+            total = swapped_faces.new_zeros((3, uy1 - uy0, ux1 - ux0))
+            weights = swapped_faces.new_zeros((1, uy1 - uy0, ux1 - ux0))
+            for face_index, x0, y0, x1, y1 in regions:
+                roi_w, roi_h = x1 - x0, y1 - y0
+                inverse = inverses[face_index]
+                # 将 ROI 局部坐标映射回源图规范化坐标，再复合原图->人脸变换。
+                sx, sy = roi_w / width, roi_h / height
+                tx, ty = (2 * x0 + roi_w) / width - 1, (2 * y0 + roi_h) / height - 1
+                roi_theta = torch.stack(
+                    (inverse[:, 0] * sx, inverse[:, 1] * sy, inverse[:, 0] * tx + inverse[:, 1] * ty + inverse[:, 2]),
+                    dim=1,
+                ).unsqueeze(0)
+                grid = NF.affine_grid(roi_theta, (1, 3, roi_h, roi_w), align_corners=False)
+                face = swapped_faces[face_index:face_index + 1]
+                sampled = NF.grid_sample(face, grid, mode="bicubic", padding_mode="zeros", align_corners=False)
+                mask = NF.grid_sample(torch.ones_like(face[:, :1]), grid, mode="bicubic", padding_mode="zeros", align_corners=False)
+                ys, xs = slice(y0 - uy0, y1 - uy0), slice(x0 - ux0, x1 - ux0)
+                total[:, ys, xs].add_(sampled[0])
+                weights[:, ys, xs].add_(mask[0])
+
+            roi = preview[frame_index, :, uy0:uy1, width + ux0:width + ux1]
+            original = roi.float().div_(127.5).sub_(1.0)
+            mixed = torch.where(weights > 0.5, total / weights.clamp(min=1e-6), original)
+            roi.copy_(mixed.add_(1.0).mul_(127.5).clamp_(0, 255).to(torch.uint8))
+        return preview
 
     @torch.inference_mode()
-    def swap_video(self, video_path: str | Path, identity_image_path: str | Path, batch_size: int = 8, full_resolution_detection: bool = False) -> None:
-        if batch_size <= 0:
-            raise ValueError("batch_size 必须为正数")
+    def _process_batch(self, frames: Tensor, identity_embedding: Tensor, full_resolution_detection: bool, profile: dict[str, float] | None = None) -> np.ndarray:
+        def mark(stage: str, started: float) -> float:
+            if profile is None:
+                return started
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            now = time.perf_counter()
+            profile[stage] = profile.get(stage, 0.0) + now - started
+            return now
+
+        started = time.perf_counter()
+        height, width = frames.shape[-2:]
+        # 检测与采样继续使用原始 0..255 FP32，确保模型输入及插值规则不变。
+        float_frames = frames.to(dtype=torch.float32)
+        resize_detection = not full_resolution_detection and height * width > self.face_detector.config["image_size"] ** 2
+        detection_input = list(float_frames) if resize_detection else float_frames
+        detections, lengths = self.face_detector.detect(detection_input, confidence_threshold=0.99, iou_threshold=0.2, min_face_size=(256, 256))
+        started = mark("detect", started)
+        faces, theta = align_faces(float_frames, extract_landmarks(detections), lengths, self.alignment_template, self.img_resolution)
+        del detection_input, float_frames
+        faces.div_(127.5).sub_(1.0)
+        started = mark("align", started)
+        if faces.size(0):
+            swapped = self.swap_faces(faces, identity_embedding)
+        else:
+            swapped = faces
+        started = mark("generator", started)
+        if faces.size(0):
+            with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.bf16):
+                face_mask = self.face_masker(faces)
+            face_mask = F.gaussian_blur(face_mask.float(), [7, 7], [13.0, 13.0])
+            swapped = faces * (1.0 - face_mask) + swapped * face_mask
+        started = mark("mask", started)
+        preview = self._make_preview(frames, swapped, theta, lengths)
+        started = mark("composite", started)
+        result = preview[:, [2, 1, 0]].permute(0, 2, 3, 1).contiguous().cpu().numpy()
+        mark("transfer", started)
+        return result
+
+    @torch.inference_mode()
+    def swap_video(
+        self,
+        video_path: str | Path,
+        identity_image_path: str | Path,
+        batch_size: int = 1,
+        full_resolution_detection: bool = False,
+        start: float = 0.0,
+        frames: int | None = None,
+        profile: bool = False,
+    ) -> None:
+        if batch_size <= 0 or not np.isfinite(start) or start < 0 or (frames is not None and frames <= 0):
+            raise ValueError("batch_size 和 frames 必须为正数，start 必须为非负有限秒数")
         identity_embedding = self.extract_identity_embedding(identity_image_path)
         decoder = VideoDecoder(str(video_path), device=self.device)
         source_fps = decoder.metadata.average_fps
-        if source_fps is None:
-            raise ValueError("视频缺少有效帧率：average_fps=None")
-        source_fps = float(source_fps)
-        if not np.isfinite(source_fps) or source_fps <= 0:
+        if source_fps is None or not np.isfinite(source_fps) or source_fps <= 0:
             raise ValueError(f"视频缺少有效帧率：average_fps={source_fps!r}")
-        print(f"Preview source FPS={source_fps:.3f}; display cadence adapts to processing throughput")
+        source_fps = float(source_fps)
+        start_index = round(start * source_fps)  # 简单按平均帧率换算；VFR 视频可能不是精确时间点。
+        stop_index = min(len(decoder), start_index + frames if frames is not None else len(decoder))
+        if start_index >= len(decoder):
+            raise ValueError(f"起始时间超出视频范围：start={start}s")
+        print(f"Preview FPS={source_fps:.3f}, frames={stop_index - start_index}, start_index={start_index} (press Q/Esc to quit)")
 
-        context = mp.get_context("spawn")
-        # 仅保留少量 batch 吸收短时抖动；大队列会掩盖吞吐不足，并在耗尽后形成周期性卡顿。
-        display_queue = context.Queue(maxsize=3)
-        display_process = context.Process(target=self._display_worker, args=(display_queue, source_fps), daemon=True)
-        display_process.start()
+        stats: dict[str, float] | None = {} if profile else None
+        done = 0
+        compute_seconds = 0.0
+        started = time.perf_counter()
         try:
-            for start in range(0, len(decoder), batch_size):
-                batch_started = time.perf_counter()
-                original_frames = decoder[start : start + batch_size].data.to(device=self.device, dtype=torch.float32)
-                # 大帧复用检测器原生 resize/padding 路径；检测结果已还原到原图坐标。
-                # 小帧直接检测，避免上采样或 padding 反而增加工作量。
-                height, width = original_frames.shape[-2:]
-                resize_detection = not full_resolution_detection and height * width > self.face_detector.config["image_size"] ** 2
-                detection_input = list(original_frames) if resize_detection else original_frames
-                detections, segment_lengths = self.face_detector.detect(detection_input, confidence_threshold=0.99, iou_threshold=0.2, min_face_size=(256, 256))
-                faces, grid_theta = align_faces(original_frames, extract_landmarks(detections), segment_lengths, self.alignment_template, self.img_resolution)
-                original_frames.div_(127.5).sub_(1.0)
-                faces.div_(127.5).sub_(1.0)
-                swapped_faces = faces
-                if faces.size(0):
-                    swapped_faces = self.swap_faces(faces, identity_embedding)
-                    with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.bf16):
-                        face_mask = self.face_masker(faces)
-                    face_mask = F.gaussian_blur(face_mask.float(), [7, 7], [13.0, 13.0])
-                    swapped_faces = faces * (1.0 - face_mask) + swapped_faces * face_mask
-                frames = self._make_preview(original_frames, swapped_faces, grid_theta, segment_lengths)
-                frames = frames.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)[:, [2, 1, 0]]
-                preview_frames = frames.permute(0, 2, 3, 1).to(device="cpu", dtype=torch.uint8).numpy()
-                batch_elapsed = time.perf_counter() - batch_started
-                display_queue.put((preview_frames, batch_elapsed))
-            display_queue.put(None)
-            display_process.join()
+            # 解码用连续小块摊薄 MP4 随机定位开销；推理仍保持独立的低内存 batch。
+            decode_chunk = max(8, batch_size)
+            for index in range(start_index, stop_index, decode_chunk):
+                decode_started = time.perf_counter()
+                decoded = decoder.get_frames_in_range(index, min(index + decode_chunk, stop_index)).data.to(self.device)
+                if stats is not None and self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                decode_seconds = time.perf_counter() - decode_started
+                compute_seconds += decode_seconds
+                if stats is not None:
+                    stats["decode"] = stats.get("decode", 0.0) + decode_seconds
+                for offset in range(0, len(decoded), batch_size):
+                    batch_started = time.perf_counter()
+                    batch = decoded[offset:offset + batch_size]
+                    output = self._process_batch(batch, identity_embedding, full_resolution_detection, stats)
+                    batch_seconds = time.perf_counter() - batch_started
+                    compute_seconds += batch_seconds
+                    wait_ms = max(1, round(1000 * (1 / source_fps - batch_seconds / len(output))))
+                    for frame in output:
+                        cv2.imshow("swapped", frame)
+                        done += 1
+                        if (cv2.waitKey(wait_ms) & 0xff) in (ord("q"), 27):
+                            return
         finally:
-            if display_process.is_alive():
-                display_process.terminate()
-                display_process.join()
-            display_queue.cancel_join_thread()
-            display_queue.close()
+            cv2.destroyAllWindows()
+            elapsed = time.perf_counter() - started
+            if done:
+                print(f"Processed {done} frames, compute FPS={done / compute_seconds:.2f}, wall FPS={done / elapsed:.2f}")
+            if stats is not None and done:
+                print("Stage ms/frame: " + ", ".join(f"{key}={seconds * 1000 / done:.2f}" for key, seconds in stats.items()))
 
 
 def main() -> None:
@@ -350,7 +412,10 @@ def main() -> None:
     parser.add_argument("--video", required=True)
     parser.add_argument("--identity", required=True)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--batch-size", type=int, default=8, help="每批解码和检测的视频帧数")
+    parser.add_argument("--batch-size", type=int, default=1, help="每批推理帧数（默认 1；解码独立按小块读取）")
+    parser.add_argument("--start", type=float, default=0.0, help="从指定秒数开始预览（按平均 FPS 近似定位）")
+    parser.add_argument("--frames", type=int, help="最多预览多少帧，默认直到视频结束")
+    parser.add_argument("--profile", action="store_true", help="输出各阶段耗时；GPU 同步可能降低吞吐")
     parser.add_argument("--full-resolution-detection", action="store_true", help="按原视频分辨率检测，保留原有检测精度；默认大帧使用检测器原生缩放")
     parser.add_argument("--lookup-coarse", action="store_true", help="仅使用 Coarse 输出进行换脸；默认使用完整 Generator 输出")
     args = parser.parse_args()
@@ -359,6 +424,9 @@ def main() -> None:
         args.identity,
         batch_size=args.batch_size,
         full_resolution_detection=args.full_resolution_detection,
+        start=args.start,
+        frames=args.frames,
+        profile=args.profile,
     )
 
 

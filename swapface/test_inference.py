@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import onnx
+import numpy as np
 import torch
 import torch.nn.functional as NF
 from torch import nn
@@ -184,17 +185,15 @@ def main() -> None:
                     torch.testing.assert_close(gpu_output, expected, atol=5e-3, rtol=5e-3)
                     print(f"PASS: CUDA PyTorch (BF16={gpu_native.bf16})")
 
-            # 视频路径经过遮罩和原帧还原；检测缩放可关闭，小帧无需放大。
+            # 视频预览不创建子进程；保持原图分辨率、检测参数及模型输入。
             for engine, full_resolution, detection_size in ((native, False, 840), (native, False, 16), (native, True, 16)):
-                original = torch.full((1, 3, 32, 32), 127.5)
+                original = torch.full((1, 3, 32, 32), 127, dtype=torch.uint8)
                 crop = (faces[:1] + 1) * 127.5
                 theta = torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]])
                 decoder = Mock()
                 decoder.metadata.average_fps = 25.0
                 decoder.__len__ = Mock(return_value=2)
-                decoder.__getitem__ = Mock(side_effect=[Mock(data=original.clone()), Mock(data=original.clone())])
-                context = Mock()
-                context.Process.return_value.is_alive.return_value = False
+                decoder.get_frames_in_range = Mock(return_value=Mock(data=original.repeat(2, 1, 1, 1)))
                 engine.face_detector.config = {"image_size": detection_size}
                 with (
                     patch.object(engine, "extract_identity_embedding", return_value=identity),
@@ -202,50 +201,59 @@ def main() -> None:
                     patch.object(engine.face_detector, "detect", side_effect=[(None, [1]), (None, [0])]) as detect,
                     patch.object(swapper, "extract_landmarks", return_value=torch.empty(1, 5, 2)),
                     patch.object(swapper, "align_faces", side_effect=[(crop.clone(), theta), (crop[:0], theta[:0])]) as align,
-                    patch.object(swapper.mp, "get_context", return_value=context),
-                    patch.object(swapper, "restore_faces_to_original", wraps=swapper.restore_faces_to_original) as restore,
+                    patch.object(swapper.cv2, "imshow") as show,
+                    patch.object(swapper.cv2, "waitKey", return_value=-1),
+                    patch.object(swapper.cv2, "destroyAllWindows") as destroy,
                 ):
-                    engine.swap_video("unused.mp4", "unused.png", batch_size=1, full_resolution_detection=full_resolution)
-                    assert restore.call_count == 1
+                    engine.swap_video("unused.mp4", "unused.png", batch_size=1, full_resolution_detection=full_resolution, profile=True)
                     assert isinstance(detect.call_args_list[0].args[0], list) == (not full_resolution and detection_size < 32)
                     assert detect.call_args_list[0].kwargs == {"confidence_threshold": 0.99, "iou_threshold": 0.2, "min_face_size": (256, 256)}
                     torch.testing.assert_close(align.call_args_list[0].args[3], engine.alignment_template)
-                context.Queue.assert_called_once_with(maxsize=3)
-                queue = context.Queue.return_value
-                assert queue.put.call_count == 3  # 两批视频帧 + 结束标记。
-                preview_frames, batch_elapsed = queue.put.call_args_list[0].args[0]
-                assert preview_frames.shape == (1, 8, 16, 3)
-                assert batch_elapsed >= 0.0
-                assert queue.put.call_args_list[-1].args == (None,)
+                decoder.get_frames_in_range.assert_called_once_with(0, 2)
+                assert show.call_count == 2
+                assert show.call_args_list[0].args[1].shape == (32, 64, 3)
+                assert show.call_args_list[0].args[1].dtype == np.uint8
+                destroy.assert_called_once()
 
-            # 预览减复制不能改变像素：覆盖非 4 整除宽度、重叠人脸、无脸帧。
+            # ROI 对比全图还原：重叠人脸、部分出界、没有人脸和奇数尺寸均应保持一致。
             for width in (32, 33, 34, 35):
-                original = torch.rand(3, 3, 31, width) * 2 - 1
+                original = torch.randint(0, 256, (3, 3, 31, width), dtype=torch.uint8)
                 theta = torch.tensor([[[0.8, 0.1, -0.1], [-0.1, 0.8, 0.1]], [[0.6, -0.1, 0.2], [0.1, 0.6, 0.0]], [[0.9, 0.1, 0.8], [-0.1, 0.9, 0.7]]])
                 for test_faces, test_theta, lengths in ((faces, theta, [2, 0, 1]), (faces[:0], theta[:0], [0, 0, 0])):
-                    restored = restore_faces_to_original(original.clone(), test_faces, test_theta, lengths)
-                    expected_preview = NF.interpolate(torch.cat((original, restored), dim=3), scale_factor=0.25, mode="bilinear", align_corners=False)
-                    actual_preview = swapper.SwapFace._make_preview(original.clone(), test_faces, test_theta, lengths)
-                    torch.testing.assert_close(actual_preview, expected_preview, atol=0, rtol=0)
-            preview_queue = Mock()
-            preview_queue.get.side_effect = [([object()] * 8, 0.8), ([object()] * 8, 0.32), None]
-            preview_waits = []
-            with (
-                patch.object(swapper.cv2, "imshow"),
-                patch.object(swapper.cv2, "waitKey", side_effect=lambda wait_ms: preview_waits.append(wait_ms) or -1),
-                patch.object(swapper.cv2, "destroyAllWindows"),
-            ):
-                swapper.SwapFace._display_worker(preview_queue, 25.0)
-            assert len(preview_waits) == 16
-            assert min(preview_waits[:8]) >= 90
-            assert max(preview_waits[8:]) < min(preview_waits[:8])
+                    normalized = original.float() / 127.5 - 1.0
+                    restored = restore_faces_to_original(normalized.clone(), test_faces, test_theta, lengths)
+                    expected_preview = torch.cat((normalized, restored), dim=3).add_(1).mul_(127.5).clamp_(0, 255).to(torch.uint8)
+                    preview_input = original.clone()
+                    actual_preview = swapper.SwapFace._make_preview(preview_input, test_faces, test_theta, lengths)
+                    assert actual_preview.shape == (3, 3, 31, 2 * width)
+                    torch.testing.assert_close(preview_input, original, atol=0, rtol=0)
+                    assert (actual_preview.int() - expected_preview.int()).abs().max().item() <= 1
+                    torch.testing.assert_close(actual_preview[:, :, :, :width], original, atol=0, rtol=0)
 
-            try:
-                native.swap_video("unused.mp4", "unused.png", batch_size=0)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("Invalid video batch size was accepted")
+            # 只处理指定帧区间；按 Q 立即退出，始终释放显示窗口。
+            decoder = Mock()
+            decoder.metadata.average_fps = 25.0
+            decoder.__len__ = Mock(return_value=100)
+            decoder.get_frames_in_range.return_value.data = torch.full((2, 3, 32, 32), 127, dtype=torch.uint8)
+            with (
+                patch.object(native, "extract_identity_embedding", return_value=identity),
+                patch.object(swapper, "VideoDecoder", return_value=decoder),
+                patch.object(native, "_process_batch", return_value=np.zeros((2, 32, 64, 3), dtype=np.uint8)),
+                patch.object(swapper.cv2, "imshow") as show,
+                patch.object(swapper.cv2, "waitKey", return_value=ord("q")),
+                patch.object(swapper.cv2, "destroyAllWindows") as destroy,
+            ):
+                native.swap_video("unused.mp4", "unused.png", start=2.0, frames=5, batch_size=2)
+                decoder.get_frames_in_range.assert_called_once_with(50, 55)
+                assert show.call_count == 1
+                destroy.assert_called_once()
+            for kwargs in ({"batch_size": 0}, {"frames": 0}, {"start": -1.0}, {"start": float("nan")}):
+                try:
+                    native.swap_video("unused.mp4", "unused.png", **kwargs)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f"Invalid preview args accepted: {kwargs}")
 
         # all 必须使用 checkpoint 的生成器编码器，并透传导出选项。
         with patch.object(export, "export_swapface", return_value=(directory / "model.onnx", provider)) as export_swapface, patch.object(export, "export_id_encoder") as export_encoder:
