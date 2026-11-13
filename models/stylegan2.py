@@ -91,19 +91,21 @@ class ModulatedConv2d(nn.Module):
 
 
 class StyledConv(nn.Module):
-    """StyleGAN2 convolution with additive target-attribute feature injection."""
+    """StyleGAN2 convolution followed by StyleSwap target-feature concatenation."""
 
     def __init__(self, in_ch: int, out_ch: int, w_dim: int, *, upsample: bool = False, blur_kernel: Sequence[int] = (1, 3, 3, 1)) -> None:
         super().__init__()
         self.conv = ModulatedConv2d(in_ch, out_ch, w_dim, upsample=upsample, blur_kernel=blur_kernel)
-        # Retain StyleSwap's zero-initialized injection gain but add features
-        # instead of concatenating them, preserving rosinality channel widths.
+        # StyleSwap's NoiseInjection concatenates the target attribute map
+        # after the modulated convolution, doubling the activation channels.
+        # The target branch has a zero-initialized trainable gain.
         self.inject_gain = nn.Parameter(torch.zeros(()))
-        self.bias = nn.Parameter(torch.zeros(1, out_ch, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(1, 2 * out_ch, 1, 1))
 
     def forward(self, x: Tensor, w: Tensor, target_feat: Tensor) -> Tensor:
         x = self.conv(x, w)
-        return F.leaky_relu(x + self.inject_gain * target_feat + self.bias, negative_slope=0.2) * math.sqrt(2.0)
+        x = torch.cat((x, self.inject_gain * target_feat), dim=1)
+        return F.leaky_relu(x + self.bias, negative_slope=0.2) * math.sqrt(2.0)
 
 
 class ToOutput(nn.Module):
@@ -171,9 +173,11 @@ class AttributeEncoder(nn.Module):
 class SynthesisStage(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, w_dim: int, img_channels: int, *, blur_kernel: Sequence[int]) -> None:
         super().__init__()
-        self.conv0 = StyledConv(in_ch, out_ch, w_dim, upsample=True, blur_kernel=blur_kernel)
-        self.conv1 = StyledConv(out_ch, out_ch, w_dim, blur_kernel=blur_kernel)
-        self.to_rgb = ToOutput(out_ch, img_channels, w_dim, upsample=True, blur_kernel=blur_kernel)
+        # Both convolutions receive the attribute map, as in the official
+        # StyleSwap generator. Each convolution outputs 2 * out_ch after concat.
+        self.conv0 = StyledConv(2 * in_ch, out_ch, w_dim, upsample=True, blur_kernel=blur_kernel)
+        self.conv1 = StyledConv(2 * out_ch, out_ch, w_dim, blur_kernel=blur_kernel)
+        self.to_rgb = ToOutput(2 * out_ch, img_channels, w_dim, upsample=True, blur_kernel=blur_kernel)
 
     def forward(self, x: Tensor, w: Tensor, target_feat: Tensor, rgb: Tensor) -> tuple[Tensor, Tensor]:
         x = self.conv0(x, w, target_feat)
@@ -189,8 +193,8 @@ class Generator(nn.Module):
     Output: generated RGB image [B,C,R,R] without a mask branch.
 
     The identity embedding is mapped into the StyleGAN2 W space; the target
-    encoder supplies per-resolution features by addition after each styled
-    convolution. Synthesis channels follow rosinality/stylegan2-pytorch.
+    encoder supplies per-resolution features by concatenation after each styled
+    convolution. Feature widths follow the official StyleSwap doubling rule.
     """
 
     def __init__(
@@ -247,7 +251,7 @@ class Generator(nn.Module):
         )
         self.constant = nn.Parameter(torch.randn(1, self.channels[4], 4, 4))
         self.conv4 = StyledConv(self.channels[4], self.channels[4], w_dim, blur_kernel=blur_kernel)
-        self.to_rgb4 = ToOutput(self.channels[4], img_channels, w_dim, upsample=False, blur_kernel=blur_kernel)
+        self.to_rgb4 = ToOutput(2 * self.channels[4], img_channels, w_dim, upsample=False, blur_kernel=blur_kernel)
 
         self.stages = nn.ModuleList()
         for res in (2**i for i in range(3, img_resolution.bit_length())):

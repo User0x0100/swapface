@@ -28,7 +28,7 @@ def test_full_generator_output(size: int) -> None:
 
 
 @pytest.mark.parametrize("channel_multiplier", [1, 2])
-def test_channels_and_synthesis_shapes_match_rosinality(channel_multiplier: int) -> None:
+def test_channels_and_synthesis_shapes_match_styleswap_concat(channel_multiplier: int) -> None:
     model = Generator(img_resolution=128, mapping_layers=1, channel_multiplier=channel_multiplier)
     assert model.channels == {
         4: 512,
@@ -42,17 +42,18 @@ def test_channels_and_synthesis_shapes_match_rosinality(channel_multiplier: int)
         1024: 16 * channel_multiplier,
     }
     assert model.conv4.conv.in_ch == model.channels[4]
-    assert model.conv4.bias.shape[1] == model.channels[4]
-    assert model.to_rgb4.conv.in_ch == model.channels[4]
+    assert model.conv4.bias.shape[1] == 2 * model.channels[4]
+    assert model.to_rgb4.conv.in_ch == 2 * model.channels[4]
     for resolution, stage in zip([8, 16, 32, 64, 128], model.stages, strict=True):
-        assert stage.conv0.conv.in_ch == model.channels[resolution // 2]
+        assert stage.conv0.conv.in_ch == 2 * model.channels[resolution // 2]
         assert stage.conv0.conv.out_ch == model.channels[resolution]
-        assert stage.conv1.conv.in_ch == model.channels[resolution]
-        assert stage.to_rgb.conv.in_ch == model.channels[resolution]
-        assert stage.conv1.bias.shape[1] == model.channels[resolution]
+        assert stage.conv1.conv.in_ch == 2 * model.channels[resolution]
+        assert stage.to_rgb.conv.in_ch == 2 * model.channels[resolution]
+        assert stage.conv0.bias.shape[1] == 2 * model.channels[resolution]
+        assert stage.conv1.bias.shape[1] == 2 * model.channels[resolution]
 
 
-def test_styled_conv_uses_additive_feature_injection() -> None:
+def test_styled_conv_concatenates_target_features_after_modulated_conv() -> None:
     from models.stylegan2 import StyledConv
 
     torch.manual_seed(1)
@@ -64,13 +65,35 @@ def test_styled_conv_uses_additive_feature_injection() -> None:
     with torch.no_grad():
         layer.inject_gain.fill_(0.25)
         expected = torch.nn.functional.leaky_relu(
-            layer.conv(x, w) + 0.25 * features + layer.bias,
+            torch.cat((layer.conv(x, w), 0.25 * features), dim=1) + layer.bias,
             negative_slope=0.2,
         ) * (2**0.5)
         actual = layer(x, w, features)
 
     torch.testing.assert_close(actual, expected)
-    assert actual.shape == (2, 8, 4, 4)
+    assert actual.shape == (2, 16, 4, 4)
+
+
+def test_each_resolution_injects_at_both_styled_convs() -> None:
+    model = make_model(img_resolution=32)
+    calls: list[tuple[int, tuple[int, ...]]] = []
+    handles = []
+
+    def record_input(module, args):
+        calls.append((module.conv.out_ch, tuple(args[2].shape)))
+
+    for module in [model.conv4, *(conv for stage in model.stages for conv in (stage.conv0, stage.conv1))]:
+        handles.append(module.register_forward_pre_hook(record_input))
+    try:
+        with torch.no_grad():
+            model(torch.randn(1, 3, 32, 32), torch.randn(1, 512))
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    # Official StyleSwap: one injection at 4x4 and two at every higher resolution.
+    assert [shape[-1] for _, shape in calls] == [4, 8, 8, 16, 16, 32, 32]
+    assert all(channels == shape[1] for channels, shape in calls)
 
 
 def test_full_generator_training_gradients() -> None:
