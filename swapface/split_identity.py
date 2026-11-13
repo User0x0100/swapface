@@ -152,7 +152,8 @@ class PrecomputedStyledConv(nn.Module):
         self.bias = deepcopy(layer.bias)
 
     def forward(self, x: Tensor, style: Tensor, target_feat: Tensor) -> Tensor:
-        return F.leaky_relu(self.conv(x, style) + self.inject_gain * target_feat + self.bias, negative_slope=0.2) * (2.0 ** 0.5)
+        x = torch.cat((self.conv(x, style), self.inject_gain * target_feat), dim=1)
+        return F.leaky_relu(x + self.bias, negative_slope=0.2) * (2.0 ** 0.5)
 
 
 class PrecomputedToOutput(nn.Module):
@@ -257,7 +258,7 @@ class SplitGenerator(nn.Module):
         self.condition_width = self.coarse.condition_width
 
     def forward(self, target: Tensor, conditioning: Tensor) -> Tensor:
-        return self.hq(target, torch.tanh(self.coarse(target, conditioning)) if self.coarse_type == "stylegan2" else self.coarse(target, conditioning))
+        return self.hq(target, self.coarse(target, conditioning))
 
 
 def build_split_models(generator: Generator, encoder: nn.Module) -> tuple[SplitIdentityEncoder, SplitGenerator]:

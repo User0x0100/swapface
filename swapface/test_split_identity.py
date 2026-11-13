@@ -48,6 +48,12 @@ def _generator(coarse_type: str) -> Generator:
 
 def _run_pair(coarse_type: str, root: Path) -> None:
     model = _generator(coarse_type)
+    if coarse_type == "stylegan2":
+        # Exercise Target feature concatenation, not only the zero-gain initial state.
+        with torch.no_grad():
+            for module in model.coarse.modules():
+                if hasattr(module, "inject_gain"):
+                    module.inject_gain.fill_(0.25)
     encoder = FakeEncoder().eval()
     server, client = build_split_models(model, encoder)
     assert server.projection.coarse_type == client.coarse_type == coarse_type

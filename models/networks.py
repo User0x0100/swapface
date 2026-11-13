@@ -176,9 +176,9 @@ class StyleGAN2Coarse(nn.Module):
 
     def forward(self, x: Tensor, id_feat: Tensor, return_resize_in: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         resize_in = F.interpolate(x, size=self.img_resolution, mode="bilinear", align_corners=False)
-        # The original Coarse output is tanh-bounded; training losses and HQ
-        # assume the same normalized RGB range for both implementations.
-        output = torch.tanh(self.generator(resize_in, id_feat))
+        # Preserve StyleGAN2's unbounded RGB output; the loss functions
+        # supervise its range without saturating the output gradient.
+        output = self.generator(resize_in, id_feat)
         if return_resize_in:
             return output, resize_in
         return output

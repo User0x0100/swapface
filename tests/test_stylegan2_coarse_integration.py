@@ -82,7 +82,10 @@ def test_stylegan2_forward_training_gradients_and_hq_boundary() -> None:
     coarse, reference = net.coarse(target, identity, return_resize_in=True)
     assert coarse.shape == reference.shape == (2, 3, 8, 8)
     torch.testing.assert_close(reference, F.interpolate(target, size=8, mode="bilinear", align_corners=False))
-    assert coarse.min() >= -1 and coarse.max() <= 1
+    with torch.no_grad():
+        expected_raw = net.coarse.generator(reference, identity)
+    torch.testing.assert_close(coarse.detach(), expected_raw)
+    assert torch.isfinite(coarse).all()
     coarse.mean().backward()
     assert target.grad is not None and target.grad.abs().sum() > 0
     assert identity.grad is not None and identity.grad.abs().sum() > 0
@@ -102,6 +105,19 @@ def test_stylegan2_forward_training_gradients_and_hq_boundary() -> None:
     net.hq(target.detach(), frozen_coarse).square().mean().backward()
     assert all(p.grad is None for p in net.coarse.parameters())
     assert any(p.grad is not None for p in net.hq.parameters())
+
+
+def test_stylegan2_coarse_does_not_squash_raw_rgb() -> None:
+    from unittest.mock import patch
+
+    net = StyleGAN2Coarse(img_resolution=8, id_dim=32, w_dim=32, mapping_layers=1)
+    x = torch.randn(1, 3, 16, 16)
+    identity = torch.randn(1, 32)
+    raw = torch.tensor([2.0, -2.0, 0.5]).view(1, 3, 1, 1).expand(1, 3, 8, 8)
+    with patch.object(net.generator, "forward", return_value=raw):
+        output, resized = net(x, identity, return_resize_in=True)
+    torch.testing.assert_close(output, raw)
+    torch.testing.assert_close(resized, F.interpolate(x, size=8, mode="bilinear", align_corners=False))
 
 
 def test_stylegan2_checkpoint_roundtrip_and_coarse_branch_guards(tmp_path) -> None:
