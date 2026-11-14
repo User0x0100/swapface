@@ -25,7 +25,7 @@ def main():
     resolved=resolve_train_config(raw)
     assert any(entry.get('alignment')=='arcface' for entry in resolved['data']['src'])
 
-    # Legacy configs omitted alignment entirely and therefore default to FFHQ.
+    # Explicit and omitted FFHQ settings normalize to the same current schema.
     legacy_raw=copy.deepcopy(raw)
     legacy_raw['data']['src']=[
         {key:value for key,value in entry.items() if key!='alignment'}
@@ -127,7 +127,7 @@ def main():
         encoded,dst_encoded,same,arcface=dali_same(None)
         assert bool(same) and not bool(arcface)
         assert np.array_equal(encoded,dst_encoded)
-    print('PASS: FFHQ defaults and legacy config hash; 112 source pixels at 256/512, unchanged FFHQ crop, coupled RGB/flip, same pairs and DALI source metadata')
+    print('PASS: canonical FFHQ alignment and config hash; 112 source pixels at 256/512, unchanged FFHQ crop, coupled RGB/flip, same pairs and DALI source metadata')
 
 if __name__=='__main__':
     main()

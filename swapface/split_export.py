@@ -75,7 +75,7 @@ def _pair_identity(
 ) -> dict[str, Any]:
     generator_id = _stable_digest(generator, metadata={
         "network_cfg": generator.network_cfg,
-        "face_alignment": getattr(generator, "face_alignment", "ffhq"),
+        "face_alignment": generator.face_alignment,
     })
     encoder_metadata: dict[str, Any] = {"provider": provider.name, "encoder_type": type(encoder).__qualname__}
     for name in ("input_mean", "input_std"):
@@ -179,7 +179,7 @@ def export_split(
         "swapface.step": str(step),
         "swapface.provider": provider.name,
         "swapface.layout": layout,
-        "swapface.face_alignment": getattr(generator, "face_alignment", "ffhq"),
+        "swapface.face_alignment": generator.face_alignment,
     }
 
     output_root.mkdir(parents=True, exist_ok=True)
@@ -219,7 +219,7 @@ def export_split(
                 "client": {
                     "onnx": client_name,
                     "onnx_sha256": _file_sha256(client_path),
-                    "face_alignment": getattr(generator, "face_alignment", "ffhq"),
+                    "face_alignment": generator.face_alignment,
                     "input_names": ["faces", "identity_condition"],
                     "output_names": ["swapped_faces"],
                 },

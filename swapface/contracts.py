@@ -1,6 +1,6 @@
 """训练检查点与部署模型共享的轻量格式约定。"""
 
-CHECKPOINT_VERSION = 6
+CHECKPOINT_VERSION = 7
 
 ONNX_CONTRACT = {
     "swapface.format": "2",

@@ -19,7 +19,7 @@ RUN_CONFIG_FILE = "config.toml"
 RUN_RESOLVED_CONFIG_FILE = "config.resolved.json"
 RUN_METADATA_FILE = "metadata.json"
 RUN_LATEST_FILE = "latest.json"
-RESOLVED_CONFIG_FORMAT_VERSION = 1
+RESOLVED_CONFIG_FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True)

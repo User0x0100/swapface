@@ -93,6 +93,7 @@ def main() -> None:
         checkpoint_path = directory / "current.pth"
         checkpoint = {
             "version": CHECKPOINT_VERSION,
+            "face_alignment": "ffhq",
             "step": 123,
             "identity_encoders": {"generator": provider.name, "coarse_identity_loss": "BLENDFACE", "hq_identity_loss": "BLENDFACE"},
             "net_g": {"network_cfg": model.network_cfg, "state_dict": model.state_dict()},

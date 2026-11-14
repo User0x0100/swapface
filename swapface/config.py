@@ -50,6 +50,7 @@ DEFAULT_GENERATOR_CONFIG: dict[str, Any] = {
     "coarse_num_latent": 6,
     "coarse_base_ch": 64,
     "coarse_max_ch": 256,
+    "coarse_type": "inswapper",
     "hq_bottleneck_resolution": 16,
     "hq_base_ch": 8,
     "hq_max_ch": 128,
@@ -244,9 +245,7 @@ def _normalize_image_sources(entries: object, section: str) -> list[dict[str, An
         if section == "data.dst" and alignment != "ffhq":
             raise ValueError("data.dst 仅支持 ffhq 对齐；arcface 仅用于 source identity")
         item = {"path": path, "adjustment": _float(entry.get("adjustment", 0.0), f"{section}[{index}].adjustment")}
-        # 默认 FFHQ 保留旧 canonical 表示及冻结 run/checkpoint 的配置哈希。
-        if alignment != "ffhq":
-            item["alignment"] = alignment
+        item["alignment"] = alignment
         normalized.append(item)
     return normalized
 
@@ -346,7 +345,6 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
     )
     identity["provider"] = _provider(identity["provider"], f"{prefix}.identity.provider")
     identity["weight"] = _float(identity["weight"], f"{prefix}.identity.weight", minimum=0.0)
-    # Opt-in fields must remain absent for legacy frozen run configs/hashes.
     if "min_similarity" in raw_identity:
         identity["min_similarity"] = _float(
             raw_identity["min_similarity"], f"{prefix}.identity.min_similarity", minimum=-1.0, maximum=1.0
@@ -440,7 +438,6 @@ def _normalize_loss(config: dict[str, Any]) -> dict[str, Any]:
 
 
 STYLEGAN2_COARSE_CONFIG_DEFAULTS: dict[str, Any] = {
-    "coarse_type": "inswapper",
     "coarse_w_dim": 512,
     "coarse_mapping_layers": 8,
     "coarse_start_resolution": 4,
@@ -449,7 +446,7 @@ STYLEGAN2_COARSE_CONFIG_DEFAULTS: dict[str, Any] = {
 
 
 def _normalize_target_injection(result: dict[str, Any], raw: dict[str, Any]) -> None:
-    """Validate optional StyleGAN2 injection options without altering old run schemas."""
+    """Validate synthesis injection options for StyleGAN2 Coarse."""
     mode = raw.get("coarse_target_inject_mode", "concat")
     if not isinstance(mode, str) or mode not in {"concat", "add"}:
         raise ValueError("generator.coarse_target_inject_mode 仅支持 concat 或 add")
@@ -469,21 +466,18 @@ def _normalize_target_injection(result: dict[str, Any], raw: dict[str, Any]) -> 
 
 def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
     raw = _table(config, "generator", "[generator]")
-    # Preserve existing frozen run configs/hashes when no new Coarse options
-    # were selected. An explicit option enables the extended canonical schema.
-    extended = bool(set(raw) & set(STYLEGAN2_COARSE_CONFIG_DEFAULTS))
-    style_specific_keys = {"coarse_start_resolution", "coarse_channels"}
+    coarse_type = raw.get("coarse_type", "inswapper")
+    if not isinstance(coarse_type, str) or coarse_type not in {"inswapper", "stylegan2"}:
+        raise ValueError("generator.coarse_type 仅支持 inswapper 或 stylegan2")
+
     defaults = dict(DEFAULT_GENERATOR_CONFIG)
-    if extended:
-        defaults.update({key: value for key, value in STYLEGAN2_COARSE_CONFIG_DEFAULTS.items()
-                         if key not in style_specific_keys})
-        if raw.get("coarse_type") == "stylegan2":
-            defaults.update({key: STYLEGAN2_COARSE_CONFIG_DEFAULTS[key] for key in style_specific_keys})
-    if "coarse_channel_multiplier" in raw:
-        if raw.get("coarse_type") != "inswapper":
-            raise ValueError("generator.coarse_channel_multiplier 仅用于旧 InSwapper 配置")
-        defaults["coarse_channel_multiplier"] = 1
+    if coarse_type == "stylegan2":
+        defaults.update(STYLEGAN2_COARSE_CONFIG_DEFAULTS)
     injection_keys = {"coarse_target_inject_mode", "coarse_target_inject_layers"}
+    # Injection options are validated separately because their defaults depend
+    # on coarse_start_resolution and coarse_resolution.
+    if coarse_type == "inswapper" and set(raw) & injection_keys:
+        raise ValueError("generator.coarse_target_inject_* 仅适用于 stylegan2")
     result = _with_defaults(
         {key: value for key, value in raw.items() if key not in injection_keys},
         defaults, "[generator]",
@@ -504,21 +498,10 @@ def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
     )
     for key in integer_keys:
         result[key] = _int(result[key], f"generator.{key}", minimum=1)
-    if extended:
-        for key in ("coarse_w_dim", "coarse_mapping_layers"):
+    if coarse_type == "stylegan2":
+        for key in ("coarse_w_dim", "coarse_mapping_layers", "coarse_start_resolution"):
             result[key] = _int(result[key], f"generator.{key}", minimum=1)
-        if "coarse_start_resolution" in result:
-            result["coarse_start_resolution"] = _int(
-                result["coarse_start_resolution"], "generator.coarse_start_resolution", minimum=1,
-            )
-    if "coarse_channel_multiplier" in result:
-        result["coarse_channel_multiplier"] = _int(
-            result["coarse_channel_multiplier"], "generator.coarse_channel_multiplier", minimum=1,
-        )
 
-    coarse_type = result.get("coarse_type", "inswapper")
-    if not isinstance(coarse_type, str) or coarse_type not in {"inswapper", "stylegan2"}:
-        raise ValueError("generator.coarse_type 仅支持 inswapper 或 stylegan2")
     if result["coarse_resolution"] > result["img_resolution"]:
         raise ValueError("generator.coarse_resolution 不能大于 generator.img_resolution")
     if coarse_type == "inswapper" and result["coarse_max_ch"] < result["coarse_base_ch"]:
@@ -537,8 +520,6 @@ def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("generator.coarse_channels 必须为 [base_ch, max_ch] 且 0 < base_ch <= max_ch")
         result["coarse_channels"] = list(channels)
         _normalize_target_injection(result, raw)
-    elif set(raw) & (injection_keys | {"coarse_start_resolution", "coarse_channels"}):
-        raise ValueError("generator.coarse_start_resolution/coarse_channels/coarse_target_inject_* 仅适用于 stylegan2")
     if result["hq_max_ch"] < result["hq_base_ch"]:
         raise ValueError("generator.hq_max_ch 必须 >= generator.hq_base_ch")
 
@@ -680,9 +661,7 @@ def _normalize_data(config: dict[str, Any]) -> dict[str, Any]:
         "src": _normalize_image_sources(data.get("src"), "data.src"),
         "dst": _normalize_image_sources(data.get("dst"), "data.dst"),
     }
-    # 旧 FFHQ run 的 canonical config/hash 不新增字段，保持严格 resume 兼容。
-    if alignment != "ffhq":
-        result["alignment"] = alignment
+    result["alignment"] = alignment
     if occlusion is not None:
         result["occlusion"] = occlusion
     return result

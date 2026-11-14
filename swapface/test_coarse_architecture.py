@@ -26,6 +26,7 @@ def _compact_config() -> dict[str, int]:
         "coarse_num_latent": 2,
         "coarse_base_ch": 4,
         "coarse_max_ch": 16,
+        "coarse_type": "inswapper",
         "hq_bottleneck_resolution": 4,
         "hq_base_ch": 2,
         "hq_max_ch": 8,
@@ -167,6 +168,7 @@ def _assert_checkpoint_and_config() -> None:
         checkpoint_path = Path(tmp) / "gen.pth"
         checkpoint = {
             "version": CHECKPOINT_VERSION,
+            "face_alignment": "ffhq",
             "step": 1,
             "identity_encoders": {"generator": "WEBFACE600K_ARCFACE_R50"},
             "net_g": {"network_cfg": cfg, "state_dict": model.state_dict()},
@@ -174,6 +176,15 @@ def _assert_checkpoint_and_config() -> None:
         torch.save(checkpoint, checkpoint_path)
         loaded, _, step = load_generator(checkpoint_path)
         assert step == 1
+        missing_type = dict(checkpoint)
+        missing_type["net_g"] = {**checkpoint["net_g"], "network_cfg": {k: v for k, v in cfg.items() if k != "coarse_type"}}
+        torch.save(missing_type, checkpoint_path)
+        try:
+            load_generator(checkpoint_path)
+        except ValueError as error:
+            assert "coarse_type" in str(error)
+        else:
+            raise AssertionError("未拒绝缺少 coarse_type 的模型检查点")
         assert loaded.network_cfg == cfg
 
 

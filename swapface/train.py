@@ -58,7 +58,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 22
+TRAINING_SEMANTICS_VERSION = 23
 SAMPLE_LABEL_WIDTH = 300
 SAMPLE_GRID_PADDING = 2
 # 默认保留原有逐损失亮度归一化；改为 "shared" 可直观比较同 stage 各梯度图的绝对强度。
@@ -291,13 +291,6 @@ def _reduce_reconstruction_loss(rec_per_sample: Tensor, same_mask: Tensor, scope
     raise ValueError(f"reconstruction_scope 无效：{scope!r}")
 
 
-def _canonical_checkpoint_discriminator_config(config: Mapping[str, Any]) -> dict[str, Any]:
-    """把新增 type 字段前保存的当前 FIR D checkpoint 映射到新判别器配置协议。"""
-    result = dict(config)
-    result.setdefault("type", DiscriminatorType.FIR_MINIBATCH_STD.name)
-    return result
-
-
 def print_mapping(title: str, mapping: Mapping[Any, Any], indent: int = 0) -> None:
     print(f"{' ' * indent}{title}:")
     for key, value in mapping.items():
@@ -330,7 +323,7 @@ class Trainer:
         identity_config = config["identity"]
         loss_config = config["loss"]
         data_config = config["data"]
-        self.face_alignment = str(data_config.get("alignment", "ffhq"))
+        self.face_alignment = str(data_config["alignment"])
         net_g_cfg = dict(config["generator"])
         net_d_cfg = dict(config["discriminator"]["hq"])
         net_d_coarse_cfg = dict(config["discriminator"]["coarse"])
@@ -480,7 +473,7 @@ class Trainer:
             saved_net_g_cfg = _canonical_generator_config(checkpoint["net_g"]["network_cfg"])
             branch_mode: Literal["inherit", "hq_rebuild"] = "inherit"
             if checkpoint_mode == "resume":
-                if checkpoint.get("face_alignment", "ffhq") != self.face_alignment:
+                if checkpoint["face_alignment"] != self.face_alignment:
                     raise ValueError("checkpoint 的人脸对齐标准与当前训练配置不一致")
                 if saved_net_g_cfg != _canonical_generator_config(net_g_cfg):
                     raise ValueError("checkpoint Generator 架构与当前配置不一致")
@@ -514,10 +507,10 @@ class Trainer:
                 if saved_identity_encoders["hq_identity_loss"] != self.hq_identity_loss_provider.name:
                     raise ValueError("checkpoint HQ Identity Loss teacher 与当前配置不一致")
 
-                saved_net_d_cfg = _canonical_checkpoint_discriminator_config(checkpoint["net_d"]["network_cfg"])
+                saved_net_d_cfg = checkpoint["net_d"]["network_cfg"]
                 if saved_net_d_cfg != net_d_cfg:
                     raise ValueError("checkpoint Discriminator 架构与当前配置不一致")
-                saved_net_d_coarse_cfg = _canonical_checkpoint_discriminator_config(checkpoint["net_d_coarse"]["network_cfg"])
+                saved_net_d_coarse_cfg = checkpoint["net_d_coarse"]["network_cfg"]
                 if saved_net_d_coarse_cfg != net_d_coarse_cfg:
                     raise ValueError("checkpoint Coarse Discriminator 架构与当前配置不一致")
 
@@ -1747,34 +1740,18 @@ def _load_run_config(paths: RunPaths) -> dict[str, Any]:
 
 
 def _canonical_generator_config(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Compare effective Coarse architectures without changing persisted run hashes."""
-    from .config import DEFAULT_GENERATOR_CONFIG, STYLEGAN2_COARSE_CONFIG_DEFAULTS
+    """Normalize current Generator configuration for architecture comparisons."""
+    from .config import _normalize_generator
 
-    canonical = {**STYLEGAN2_COARSE_CONFIG_DEFAULTS, **config}
-    if canonical["coarse_type"] == "stylegan2":
-        canonical.pop("coarse_channel_multiplier", None)
-        # Target injection indices are relative to the first synthesis resolution.
-        start_resolution = int(canonical["coarse_start_resolution"])
-        canonical.setdefault("coarse_target_inject_mode", "concat")
-        canonical.setdefault(
-            "coarse_target_inject_layers",
-            list(range(int(canonical["coarse_resolution"]).bit_length() - start_resolution.bit_length() + 1)),
-        )
-        canonical["coarse_target_inject_layers"] = sorted(canonical["coarse_target_inject_layers"])
-        for key in ("coarse_latent_resolution", "coarse_num_latent", "coarse_base_ch", "coarse_max_ch"):
-            canonical[key] = DEFAULT_GENERATOR_CONFIG[key]
-    else:
-        for key in ("coarse_w_dim", "coarse_mapping_layers", "coarse_start_resolution", "coarse_channels"):
-            canonical[key] = STYLEGAN2_COARSE_CONFIG_DEFAULTS[key]
-        canonical["coarse_target_inject_mode"] = "concat"
-        canonical["coarse_target_inject_layers"] = []
-    return canonical
+    if "coarse_type" not in config:
+        raise ValueError("Generator checkpoint 缺少 coarse_type")
+    return _normalize_generator({"generator": dict(config)})
 
 
 def _coarse_generator_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """提取决定 Coarse 参数结构与 identity 输入空间的 Generator 配置。"""
     canonical = _canonical_generator_config(config)
-    return {key: canonical[key] for key in COARSE_GENERATOR_CONFIG_KEYS}
+    return {key: canonical[key] for key in COARSE_GENERATOR_CONFIG_KEYS if key in canonical}
 
 
 def _branch_generator_mode(checkpoint: Mapping[str, Any], resolved: Mapping[str, Any]) -> Literal["inherit", "hq_rebuild"]:
@@ -1867,16 +1844,18 @@ def _load_branch_checkpoint(
     if filename_step != checkpoint_step:
         raise ValueError(f"checkpoint 文件名 step 与内部状态不一致：filename={filename_step}, checkpoint={checkpoint_step}")
 
-    # Branch 创建新的训练 run，只要求 checkpoint 的模型/状态结构可被当前配置安全载入。
-    # training_config/semantics_version 只用于严格 resume，不限制 branch。
+    # Fresh-phase branches may only inherit checkpoints using current training semantics.
+    _require_training_config(checkpoint)
+    if checkpoint.get("face_alignment") not in ("ffhq", "arcface"):
+        raise ValueError("branch checkpoint 缺少有效 face_alignment")
     branch_mode = _branch_generator_mode(checkpoint, resolved)
     hq_rebuild = branch_mode == "hq_rebuild"
     effective_reset_hq_discriminator = reset_hq_discriminator or hq_rebuild
 
-    if not effective_reset_hq_discriminator and _canonical_checkpoint_discriminator_config(checkpoint["net_d"]["network_cfg"]) != resolved["discriminator"]["hq"]:
+    if not effective_reset_hq_discriminator and checkpoint["net_d"]["network_cfg"] != resolved["discriminator"]["hq"]:
         raise ValueError("branch 继承 HQ Discriminator 时要求架构一致；如需新建请使用 --reset-hq-discriminator")
 
-    if not reset_coarse_discriminator and _canonical_checkpoint_discriminator_config(checkpoint["net_d_coarse"]["network_cfg"]) != resolved["discriminator"]["coarse"]:
+    if not reset_coarse_discriminator and checkpoint["net_d_coarse"]["network_cfg"] != resolved["discriminator"]["coarse"]:
         raise ValueError("branch 继承 Coarse Discriminator 时要求架构一致；如需新建请使用 --reset-coarse-discriminator")
 
     _branch_model_states(

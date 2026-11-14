@@ -341,10 +341,9 @@ class Generator(nn.Module):
         coarse_num_latent: int = 6,
         coarse_base_ch: int = 64,
         coarse_max_ch: int = 256,
-        coarse_type: str | None = None,
+        coarse_type: str = "inswapper",
         coarse_w_dim: int = 512,
         coarse_mapping_layers: int = 8,
-        coarse_channel_multiplier: int | None = None,  # InSwapper legacy config only.
         coarse_start_resolution: int = 4,
         coarse_channels: tuple[int, int] | list[int] = (128, 512),
         coarse_target_inject_mode: str | None = None,
@@ -364,21 +363,15 @@ class Generator(nn.Module):
             "coarse_num_latent": coarse_num_latent,
             "coarse_base_ch": coarse_base_ch,
             "coarse_max_ch": coarse_max_ch,
+            "coarse_type": coarse_type,
             "hq_bottleneck_resolution": hq_bottleneck_resolution,
             "hq_base_ch": hq_base_ch,
             "hq_max_ch": hq_max_ch,
         }
-        # Legacy InSwapper configs do not need any StyleGAN2-only fields.
-        if coarse_type is not None:
-            self.network_cfg["coarse_type"] = coarse_type
-            self.network_cfg["coarse_w_dim"] = coarse_w_dim
-            self.network_cfg["coarse_mapping_layers"] = coarse_mapping_layers
-        if coarse_channel_multiplier is not None:
-            if coarse_type != "inswapper":
-                raise ValueError("coarse_channel_multiplier is a legacy InSwapper option")
-            self.network_cfg["coarse_channel_multiplier"] = coarse_channel_multiplier
         if coarse_type == "stylegan2":
             self.network_cfg.update({
+                "coarse_w_dim": coarse_w_dim,
+                "coarse_mapping_layers": coarse_mapping_layers,
                 "coarse_start_resolution": coarse_start_resolution,
                 "coarse_channels": list(coarse_channels),
                 "coarse_target_inject_mode": ("concat" if coarse_target_inject_mode is None else coarse_target_inject_mode),
@@ -388,7 +381,7 @@ class Generator(nn.Module):
         self.id_dim = id_dim
         self.coarse_resolution = coarse_resolution
 
-        if coarse_type is None or coarse_type == "inswapper":
+        if coarse_type == "inswapper":
             self.coarse = Coarse(
                 img_resolution=coarse_resolution,
                 img_channels=img_channels,

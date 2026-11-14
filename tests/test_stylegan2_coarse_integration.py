@@ -37,15 +37,15 @@ def small_config(*, coarse_type: str = "stylegan2") -> dict:
     }
 
 
-def test_legacy_generator_config_remains_unchanged() -> None:
-    legacy = small_config(coarse_type="inswapper")
-    for key in ("coarse_type", "coarse_w_dim", "coarse_mapping_layers", "coarse_start_resolution", "coarse_channels"):
-        legacy.pop(key)
-
-    assert _normalize_generator({"generator": legacy}) == legacy
-    model = Generator(**legacy)
-    assert model.network_cfg == legacy
-    assert isinstance(model.coarse, Coarse)
+def test_current_inswapper_config() -> None:
+    config = _normalize_generator({"generator": {
+        "coarse_type": "inswapper", "coarse_resolution": 128,
+    }})
+    assert config["coarse_type"] == "inswapper"
+    assert "coarse_channel_multiplier" not in config
+    assert "coarse_w_dim" not in config
+    assert "coarse_start_resolution" not in config
+    assert isinstance(Generator(**config).coarse, Coarse)
 
 
 def test_stylegan2_coarse_config_and_validation() -> None:
@@ -156,6 +156,7 @@ def test_stylegan2_checkpoint_roundtrip_and_coarse_branch_guards(tmp_path) -> No
     torch.save(
         {
             "version": CHECKPOINT_VERSION,
+            "face_alignment": "ffhq",
             "step": 1,
             "identity_encoders": {"generator": IDEncoderProvider.BLENDFACE.name},
             "net_g": {"network_cfg": model.network_cfg, "state_dict": model.state_dict()},
@@ -179,12 +180,8 @@ def test_stylegan2_checkpoint_roundtrip_and_coarse_branch_guards(tmp_path) -> No
         ("coarse_target_inject_mode", "add"), ("coarse_target_inject_layers", [0]),
     ):
         different = {"generator": config | {key: val}, "train": {"stage": "hq"}, "identity": {"provider": "BLENDFACE"}}
-        with pytest.raises(ValueError, match="Coarse"):
+        with pytest.raises(ValueError, match="Coarse|未知字段"):
             _branch_generator_mode(parent, different)
-
-    # Inactive legacy options must not invalidate a StyleGAN2 Coarse checkpoint.
-    unused_legacy = {"generator": config | {"coarse_base_ch": 32}, "train": {"stage": "hq"}, "identity": {"provider": "BLENDFACE"}}
-    assert _branch_generator_mode(parent, unused_legacy) == "inherit"
 
 
 @pytest.mark.parametrize("injection", [
@@ -235,6 +232,7 @@ def test_swapface_export_forces_cpu_even_if_cuda_requested() -> None:
     from swapface import export
 
     model = Generator(**small_config())
+    model.face_alignment = "ffhq"  # Mocked loader must satisfy the current checkpoint contract.
     with (
         patch.object(export, "load_generator", return_value=(model, IDEncoderProvider.BLENDFACE, 1)),
         patch.object(export, "export_to_onnx", return_value=Path("/tmp/mock.onnx")) as mocked,
@@ -350,20 +348,11 @@ def test_split_with_nondefault_start_resolution_and_selective_injection(mode: st
 
 
 
-def test_legacy_inswapper_multiplier_is_not_interpreted_as_stylegan2_config() -> None:
-    legacy = small_config(coarse_type="inswapper")
-    legacy.pop("coarse_start_resolution")
-    legacy.pop("coarse_channels")
-    legacy["coarse_channel_multiplier"] = 2
-    normalized = _normalize_generator({"generator": legacy})
-    assert normalized["coarse_channel_multiplier"] == 2
-    assert "coarse_start_resolution" not in normalized
-    assert "coarse_channels" not in normalized
-    assert _normalize_generator({"generator": normalized}) == normalized
-    model = Generator(**normalized)
-    assert model.network_cfg == normalized
-    assert isinstance(model.coarse, Coarse)
-    with pytest.raises(ValueError, match="coarse_channel_multiplier"):
-        _normalize_generator({"generator": {
-            "coarse_type": "stylegan2", "coarse_channel_multiplier": 2,
-        }})
+def test_obsolete_multiplier_rejected() -> None:
+    for coarse_type in ("inswapper", "stylegan2"):
+        with pytest.raises(ValueError, match="coarse_channel_multiplier"):
+            _normalize_generator({"generator": {
+                "coarse_type": coarse_type, "coarse_channel_multiplier": 2,
+            }})
+        with pytest.raises(TypeError, match="coarse_channel_multiplier"):
+            Generator(**(small_config(coarse_type=coarse_type) | {"coarse_channel_multiplier": 2}))

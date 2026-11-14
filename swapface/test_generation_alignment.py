@@ -25,7 +25,7 @@ def main():
     import tomllib
     config = tomllib.loads((Path(__file__).parents[1] / "experiments/train.toml").read_text())
     ffhq_config = resolve_train_config(config)
-    assert "alignment" not in ffhq_config["data"]
+    assert ffhq_config["data"]["alignment"] == "ffhq"
     explicit = copy.deepcopy(config)
     explicit["data"]["alignment"] = "ffhq"
     assert resolve_train_config(explicit) == ffhq_config
@@ -151,7 +151,7 @@ def main():
     (teacher_input.mean() + restored_input.mean()).backward()
     assert generated.grad is not None and torch.isfinite(generated.grad).all()
 
-    # 模型保存/导出：旧 checkpoint 视作 FFHQ，新 checkpoint 随元数据选择 ArcFace。
+    # Model export requires explicit alignment metadata in the current checkpoint schema.
     from unittest.mock import patch
     from models.networks import Generator
     from misc.models.id_encoder import IDEncoderProvider
@@ -172,8 +172,12 @@ def main():
             "net_g": {"network_cfg": model.network_cfg, "state_dict": model.state_dict()},
         }
         torch.save(ckpt, checkpoint_path)
-        legacy, _, _ = load_generator(checkpoint_path)
-        assert legacy.face_alignment == "ffhq"
+        try:
+            load_generator(checkpoint_path)
+        except ValueError as error:
+            assert "face_alignment" in str(error)
+        else:
+            raise AssertionError("缺少 face_alignment 的 checkpoint 被错误接受")
         ckpt["face_alignment"] = "arcface"
         torch.save(ckpt, checkpoint_path)
         modern, _, _ = load_generator(checkpoint_path)

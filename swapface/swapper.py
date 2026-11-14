@@ -109,7 +109,7 @@ class SwapFace:
             net_g, self.id_encoder_provider, self.training_step = load_generator(model_path)
             self.img_resolution = net_g.network_cfg["img_resolution"]
             self.net_g = net_g.to(self.device).eval()
-            self.face_alignment = getattr(net_g, "face_alignment", "ffhq")
+            self.face_alignment = net_g.face_alignment
 
         print(f"Loaded step={self.training_step}, provider={self.id_encoder_provider.name}, alignment={self.face_alignment.upper()}")
         self.face_detector = RetinaFace(input_range=ImageInputRange.ZERO_TO_255).to(self.device).eval()

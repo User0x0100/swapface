@@ -37,13 +37,15 @@ class FakeEncoder(nn.Module):
 
 
 def _generator(coarse_type: str) -> Generator:
-    return Generator(
+    model = Generator(
         img_resolution=16, img_channels=3, coarse_resolution=8,
         coarse_latent_resolution=4, coarse_num_latent=2,
         coarse_base_ch=4, coarse_max_ch=8,
         hq_bottleneck_resolution=4, hq_base_ch=2, hq_max_ch=8,
         coarse_type=coarse_type,
     ).eval()
+    model.face_alignment = "ffhq"
+    return model
 
 
 def _run_pair(coarse_type: str, root: Path) -> None:
@@ -97,6 +99,7 @@ def _run_pair(coarse_type: str, root: Path) -> None:
     provider = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16
     torch.save({
         "version": CHECKPOINT_VERSION,
+        "face_alignment": "ffhq",
         "step": 12,
         "identity_encoders": {"generator": provider.name},
         "net_g": {"network_cfg": model.network_cfg, "state_dict": model.state_dict()},
@@ -183,6 +186,7 @@ def _test_nchw_pair(root: Path, coarse_type: str) -> None:
     provider = IDEncoderProvider.BLENDFACE
     torch.save({
         "version": CHECKPOINT_VERSION,
+        "face_alignment": "ffhq",
         "step": 31,
         "identity_encoders": {"generator": provider.name},
         "net_g": {"network_cfg": model.network_cfg, "state_dict": model.state_dict()},
@@ -237,6 +241,7 @@ def _test_failure_cleanup(root: Path) -> None:
     checkpoint_path = root / "failure.pth"
     torch.save({
         "version": CHECKPOINT_VERSION,
+        "face_alignment": "ffhq",
         "step": 123,
         "identity_encoders": {"generator": IDEncoderProvider.BLENDFACE.name},
         "net_g": {"network_cfg": model.network_cfg, "state_dict": model.state_dict()},

@@ -24,7 +24,7 @@ from models.discriminator import (
 from models.networks import Generator
 from swapface.config import DEFAULT_GENERATOR_CONFIG, DEFAULT_LOSS_CONFIG, load_train_config, resolve_train_config
 from swapface.contracts import CHECKPOINT_VERSION
-from swapface.experiment import RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
+from swapface.experiment import RESOLVED_CONFIG_FORMAT_VERSION, RunLock, RunPaths, config_sha256, create_run, load_resolved_config, resolve_branch_target, resolve_resume_target, write_latest
 from swapface.train import (
     TRAINING_SEMANTICS_VERSION,
     Trainer,
@@ -190,6 +190,17 @@ def _check_train_config(root: Path) -> None:
 
     paths = create_run(root / "config-runs", source, resolved, name="canonical")
     assert load_resolved_config(paths) == resolved
+    current_document = json.loads(paths.resolved_config.read_text(encoding="utf-8"))
+    assert current_document["format_version"] == RESOLVED_CONFIG_FORMAT_VERSION == 2
+    old_document = dict(current_document, format_version=RESOLVED_CONFIG_FORMAT_VERSION - 1)
+    paths.resolved_config.write_text(json.dumps(old_document), encoding="utf-8")
+    try:
+        load_resolved_config(paths)
+    except ValueError as error:
+        assert "resolved config" in str(error)
+    else:
+        raise AssertionError("旧格式 run 配置被错误接受")
+    paths.resolved_config.write_text(json.dumps(current_document), encoding="utf-8")
     metadata = json.loads(paths.metadata.read_text(encoding="utf-8"))
     assert metadata["config_sha256"] == config_sha256(resolved)
 
@@ -800,12 +811,6 @@ def _check_discriminator_types_and_wfm() -> None:
     assert InstanceNormResidualDiscriminator.MIN_RESOLUTION == INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION == 4
     assert len(old.down_blocks) == 3  # 32 -> 16 -> 8 -> 4
     assert "num_encoder" not in old.network_cfg
-    from swapface.train import _canonical_checkpoint_discriminator_config
-
-    legacy_fir_cfg = dict(fir_cfg)
-    legacy_fir_cfg.pop("type")
-    assert _canonical_checkpoint_discriminator_config(legacy_fir_cfg) == fir_cfg
-
     wfm = WeakFeatureMatchingLoss({0: 0.5, 1: 1.0})
     for model in (fir, old):
         fake = torch.randn(2, 3, 32, 32, requires_grad=True)
@@ -1630,6 +1635,7 @@ def main() -> None:
         torch.save(
             {
                 "version": CHECKPOINT_VERSION,
+                "face_alignment": "ffhq",
                 "step": 7500,
                 "run": {"id": metadata["run_id"], "config_sha256": metadata["config_sha256"]},
                 "training_config": {"semantics_version": TRAINING_SEMANTICS_VERSION, "precision": "fp16", "stage": "joint"},
@@ -1755,32 +1761,32 @@ def main() -> None:
         else:
             raise AssertionError("含未知字段的 training_config 被错误接受")
 
-        # Branch 是新训练 run：旧 semantics_version 或缺少 training_config 都不应阻止加载。
+        # New-phase branches reject older training semantics and incomplete state.
         old_semantics = copy.deepcopy(loaded)
         old_semantics["step"] = 7502
         old_semantics["training_config"]["semantics_version"] = TRAINING_SEMANTICS_VERSION - 1
         old_semantics_path = root / "step_000007502.pth"
         torch.save(old_semantics, old_semantics_path)
-        old_loaded, _ = _load_branch_checkpoint(
-            old_semantics_path,
-            resolved,
-            reset_hq_discriminator=True,
-            reset_coarse_discriminator=True,
-        )
-        assert old_loaded["training_config"]["semantics_version"] == TRAINING_SEMANTICS_VERSION - 1
+        try:
+            _load_branch_checkpoint(old_semantics_path, resolved,
+                                    reset_hq_discriminator=True, reset_coarse_discriminator=True)
+        except ValueError as error:
+            assert "语义版本" in str(error)
+        else:
+            raise AssertionError("branch 错误接受了旧训练语义版本")
 
         no_training_config = copy.deepcopy(loaded)
         no_training_config["step"] = 7503
         no_training_config.pop("training_config")
         no_training_config_path = root / "step_000007503.pth"
         torch.save(no_training_config, no_training_config_path)
-        no_config_loaded, _ = _load_branch_checkpoint(
-            no_training_config_path,
-            resolved,
-            reset_hq_discriminator=True,
-            reset_coarse_discriminator=True,
-        )
-        assert "training_config" not in no_config_loaded
+        try:
+            _load_branch_checkpoint(no_training_config_path, resolved,
+                                    reset_hq_discriminator=True, reset_coarse_discriminator=True)
+        except (TypeError, ValueError) as error:
+            assert "training_config" in str(error)
+        else:
+            raise AssertionError("branch 错误接受了不完整 checkpoint")
 
         parent = dict(standalone_parent)
         branch = create_run(runs_root, source_config, resolved, name="branch", parent=parent)
@@ -1796,6 +1802,7 @@ def main() -> None:
             "coarse_num_latent": 1,
             "coarse_base_ch": 2,
             "coarse_max_ch": 8,
+            "coarse_type": "inswapper",
             "hq_bottleneck_resolution": 4,
             "hq_base_ch": 2,
             "hq_max_ch": 8,
@@ -1818,6 +1825,7 @@ def main() -> None:
         torch.save(
             {
                 "version": CHECKPOINT_VERSION,
+                "face_alignment": "ffhq",
                 "step": 7501,
                 "run": {"id": metadata["run_id"], "config_sha256": metadata["config_sha256"]},
                 "training_config": {"semantics_version": TRAINING_SEMANTICS_VERSION, "precision": "fp16", "stage": "joint"},

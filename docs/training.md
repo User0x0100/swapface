@@ -137,7 +137,7 @@ min_similarity = 0.70
 transition_width = 0.03
 ```
 
-其中 `min_similarity` 是生成身份与参考身份的余弦相似度下限，不是 Loss 数值阈值；取值范围 [-1,1]，`transition_width` 必须不小于 1e-6，以避免 FP32 计算中极窄过渡带引起的数值不稳定。未配置 `min_similarity` 时，保持原始 IDLoss（权重乘以 `1 - cosine_similarity`），旧 run 的冻结配置不增加新字段。
+其中 `min_similarity` 是生成身份与参考身份的余弦相似度下限，不是 Loss 数值阈值；取值范围 [-1,1]，`transition_width` 必须不小于 1e-6，以避免 FP32 计算中极窄过渡带引起的数值不稳定。未配置 `min_similarity` 时使用基础 IDLoss（权重乘以 `1 - cosine_similarity`）。
 
 令 `s` 为该样本余弦相似度，`e=max(0,min_similarity-s)`，`w=transition_width`。逐样本 IDLoss 在 `e=0` 时为 0，在 `0<e<w` 时为 `weight * e²/(2w)`，在 `e>=w` 时为 `weight * (e-w/2)`，最后对 batch 求平均。由此：
 - 已达到下限的样本不再接收 IDLoss 梯度；
@@ -159,7 +159,7 @@ provider = "WEBFACE600K_ARCFACE_R50"  # Generator 的 source embedding
 provider = "MS1MV3_ARCFACE_R50_FP16"  # Identity teacher 可独立选择
 ```
 
-与其他 Provider 一样，输入必须是 ArcFace 112 对齐的 RGB、`[-1,1]`，输出是 L2 归一化的 512 维 embedding。`[loss.hq.identity].provider` 也可以独立选择该模型。对应 CLI 的 `id-encoder --provider WEBFACE600K_ARCFACE_R50` 可用于导出 ONNX。这里仅接入 **身份编码器**；InSwapper 换脸模型内部的 `emap` 投影矩阵不属于该编码器，不会用于本项目的生成器。2026-10-23 已移除先前针对 WebFace600K 的临时 `emap` 投影及矩阵文件，当前始终使用骨干输出的原生 L2 归一化特征；历史使用该投影训练的 checkpoint 虽可能结构兼容，但源身份条件与 ID teacher 的特征语义已改变，不应直接将继续训练的指标与原实验视为同一训练条件。InsightFace 的预训练权重有非商业研究用途限制，不因以 `.pth` 格式分发而获得商业使用授权。
+与其他 Provider 一样，输入必须是 ArcFace 112 对齐的 RGB、`[-1,1]`，输出是 L2 归一化的 512 维 embedding。`[loss.hq.identity].provider` 也可以独立选择该模型。对应 CLI 的 `id-encoder --provider WEBFACE600K_ARCFACE_R50` 可用于导出 ONNX。这里仅接入 **身份编码器**；InSwapper 换脸模型内部的 `emap` 投影矩阵不属于该编码器，不会用于本项目的生成器。身份编码器始终使用骨干输出的原生 L2 归一化特征。InsightFace 的预训练权重有非商业研究用途限制，不因以 `.pth` 格式分发而获得商业使用授权。
 
 
 优化策略按训练实体分开配置：`[optimizer.generator]`、`[optimizer.hq_discriminator]`、`[optimizer.coarse_discriminator]` 分别设置 LR；对应的 `[scheduler.generator]`、`[scheduler.hq_discriminator]`、`[scheduler.coarse_discriminator]` 分别设置 `type / t_max / min_lr_ratio`。Adam 的 `betas=(0.0, 0.99)` 与 fused 实现仍固定在训练代码中。
@@ -210,7 +210,7 @@ gamma = 10.0
 
 ### 可选 StyleGAN2 Coarse
 
-现有 `models/networks.py::Generator` 可通过 `[generator].coarse_type` 选择 Coarse 实现。省略该字段时仍使用原 `inswapper`（AdaIN/IDInject），并保持历史 run 的 canonical 配置与哈希不变。启用新架构示例：
+现有 `models/networks.py::Generator` 可通过 `[generator].coarse_type` 选择 Coarse 实现。新配置规范始终包含 `coarse_type`（默认 `inswapper`），不再保留旧 run 的 canonical 哈希兼容逻辑。启用新架构示例：
 
 ```toml
 [generator]
@@ -229,15 +229,15 @@ coarse_target_inject_layers = [0]      # 相对于起始分辨率编号
 
 `coarse_target_inject_mode` 可选 `concat`（拼接，开启注入的 StyledConv 输出通道翻倍）和 `add`（逐元素加法），默认 `concat`。`coarse_target_inject_layers` 支持非连续整数索引；`0` 对应 `coarse_start_resolution`，`1` 对应其两倍分辨率，以此类推。上例仅在 32×32 注入 Target；也可以设置 `[0, 2]` 分别在 32×32 和 128×128 注入，或设置 `[]` 禁用全部 Target 注入。未选中层仍接受 Source Identity 调制。默认在所有合成分辨率注入。Target Encoder 最多下采样到实际启用的最低注入分辨率；不启用任何注入时不会构建 Target Encoder。
 
-原 Coarse 的 `coarse_latent_resolution`、`coarse_num_latent`、`coarse_base_ch`、`coarse_max_ch` 不影响 StyleGAN2。`coarse_resolution` 必须为 4～1024 的 2 的整数次幂，且不超过 HQ 输出分辨率；`coarse_start_resolution` 必须是位于 4 到 `coarse_resolution` 之间的 2 的整数次幂。旧 StyleGAN2 检查点不支持直接按新架构载入。
+原 Coarse 的 `coarse_latent_resolution`、`coarse_num_latent`、`coarse_base_ch`、`coarse_max_ch` 不影响 StyleGAN2。`coarse_resolution` 必须为 4～1024 的 2 的整数次幂，且不超过 HQ 输出分辨率；`coarse_start_resolution` 必须是位于 4 到 `coarse_resolution` 之间的 2 的整数次幂。两种架构的检查点均使用当前版本协议，不迁移历史权重。
 
 两种 Coarse 共用 `coarse(target, identity, return_resize_in=True)` 接口：输入自动双线性缩放，输出形状为 `[B,3,coarse_resolution,coarse_resolution]`。当前两种 Coarse 与 HQRefiner 的 RGB 输出均为线性输出，不再通过 `tanh` 限制到 `[-1,1]`；训练损失负责约束输出，预览与保存时再裁剪到显示范围。InSwapper Coarse 与 HQRefiner 的隐藏层使用 SiLU，IDInject 仅在第一个 AdaIN 后使用 SiLU，第二个 AdaIN 的结果直接参与残差相加。InSwapper Coarse 恢复了 WSpaceMap：身份向量先经过四层共享残差映射，再经过 `2 × coarse_num_latent` 个两层私有残差映射，每个 AdaIN 独立接收一个 W 向量；原有 AdaIN 的仿射投影仍然保留。WSpaceMap 的隐藏层使用 SiLU，末层使用小权重初始化。拆分导出时，WSpaceMap 与 AdaIN 仿射投影一同位于服务端身份编码器，客户端只接收预计算的 gamma/beta。StyleGAN2 Coarse 仍使用 LeakyReLU。StyleGAN2 的注入增益初始为 0；训练初期 Target Encoder 的梯度需经注入增益逐步建立。
 
-**激活函数变更**：旧 InSwapper/HQ 使用的 ReLU/LeakyReLU 和输出 Tanh 已更改，即使权重形状匹配也不能视为等价恢复。应为新计算图启动独立训练实验。
+**激活函数**：InSwapper Coarse/HQ 使用 SiLU 与线性 RGB 输出；新的训练实验不继承旧激活设计的权重。
 
-**WSpaceMap 检查点变更**：新增 `w_space_map.*` 参数后，缺少这些参数的旧 InSwapper 检查点无法按严格权重加载直接恢复训练或推理；需要用新结构重新训练。StyleGAN2 Coarse 不受此变更影响。
+**新训练阶段**：检查点版本为 `7`，训练语义版本为 `23`，规范化 run 配置格式版本为 `2`。InSwapper 检查点包含 `w_space_map.*`；旧格式不支持加载或迁移。StyleGAN2 使用相同版本协议，但其网络结构不变。
 
-**检查点隔离**：不同 Coarse 架构的权重不可互换。`resume`/继承 Coarse 的 `branch` 必须保持同一架构；HQ rebuild 只允许修改 HQ 配置，不允许把 InSwapper Coarse 的权重当成 StyleGAN2 权重。旧检查点缺少 `coarse_type` 时按原 InSwapper 解释。
+**检查点隔离**：不同 Coarse 架构的权重不可互换。`resume`/继承 Coarse 的 `branch` 必须保持同一架构；HQ rebuild 只允许修改 HQ 配置，不允许把 InSwapper Coarse 的权重当成 StyleGAN2 权重。
 
 **ONNX 导出**：Generator 统一在 CPU 上执行 PyTorch strict export，`upfirdn2d` 展开为标准 ONNX 算子，不需要自定义 runtime 插件；`--device` 仅决定 IDEncoder 的导出设备。导出的 ONNX 仍需在目标 TensorRT 版本中独立验证 Engine 构建和性能。
 
@@ -457,7 +457,7 @@ hq_max_ch = 128
 img_resolution = 512
 ```
 
-`img_resolution`、`hq_bottleneck_resolution`、`hq_base_ch`、`hq_max_ch` 等 HQ 结构参数都可以改变，因为 HQ 会完整重建；`img_channels`、`id_dim` 和所有 `coarse_*` 结构参数属于 Coarse compatibility signature，不允许变化。
+`img_resolution`、`hq_bottleneck_resolution`、`hq_base_ch`、`hq_max_ch` 等 HQ 结构参数都可以改变，因为 HQ 会完整重建；`img_channels`、`id_dim` 和所有 `coarse_*` 结构参数共同决定 Coarse 架构，不能变化。
 
 因此三种入口的语义为：
 
@@ -465,7 +465,7 @@ img_resolution = 512
 - **resume**：原 run、原冻结配置、latest checkpoint，完整恢复训练态 Generator、EMA、Discriminator、optimizer、scheduler、GradScaler 与 step；
 - **branch**：新 run；普通 branch 继承父训练态 Generator，HQ rebuild 只继承 Coarse 并重建 HQ/HQ D；optimizer/scheduler/GradScaler 均重新初始化。普通 branch 的 step 默认继承父 checkpoint，HQ rebuild 固定从 0 开始。
 
-Branch 不检查 `training_config.semantics_version`，因为它不恢复父训练状态；resume 仍严格检查该版本。
+Branch 和 Resume 均要求 `training_config.semantics_version` 与当前版本一致；Branch 虽不恢复优化器状态，也不能导入旧训练语义。
 
 ### 可选严格校验训练精度
 
@@ -483,7 +483,7 @@ uv run python -m swapface.train \
 
 此时程序比较 checkpoint 中记录的实际 `training_config.precision` 与当前进程实际生效的精度；不一致时拒绝 resume。`--strict-precision` 是本次 resume 的运行时策略，不写入 TOML，也不能用于 fresh training。
 
-训练 checkpoint 还记录 `training_config.semantics_version` 和实际 `stage`。Resume 与 Branch 都要求 checkpoint 的 `semantics_version` 与当前训练代码完全一致，不提供旧训练语义迁移；Resume 还要求 active stage 一致，因为它会恢复 optimizer/scheduler/scaler 状态。Branch 不恢复这些状态，因此在同一训练语义版本内仍允许通过新配置切换 stage。纯推理/导出仍只依赖模型 checkpoint 格式。
+训练 checkpoint 还记录 `training_config.semantics_version` 和实际 `stage`。Resume 与 Branch 都要求 checkpoint 的 `semantics_version` 与当前训练代码完全一致，不提供旧训练语义迁移；Resume 还要求 active stage 一致，因为它会恢复 optimizer/scheduler/scaler 状态。Branch 不恢复这些状态，因此在当前训练语义版本内仍允许通过新配置切换 stage。纯推理/导出仍只依赖模型 checkpoint 格式。
 
 ## 配置冻结与哈希
 
@@ -587,8 +587,6 @@ rotation_range_deg = [-40.0, 40.0]
 
 预处理后的素材形状不会被拉伸：加载时先按比例将**最长边缩放到 192 像素**（包括放大小图），再居中放入 192×192 透明 RGBA 画布，因此尺寸百分比独立于原素材的像素分辨率。实际遮挡面积还会受到物体轮廓/Alpha、旋转和超出边界的部分影响。旧实现仅通过 `thumbnail()` 缩小素材，会让小素材填不满缓存画布，从而使实际遮挡比设定值更小；现已修正。 缓存中 RGB 使用**预乘 Alpha**，避免几何插值在透明边界产生暗边，Alpha 仍保留原始覆盖语义。
 
-**旧 Run 的恢复边界**：此前已创建的遮挡训练 Run 若 `config.resolved.json` 中没有新增的四个几何范围字段，使用当前严格 canonical 配置校验时无法直接 `--resume`。不要编辑已有 Run 的冻结配置或检查点：应使用 `--branch-from <旧 Run 或 checkpoint> --config <包含新几何字段的 TOML>` 创建新实验。旧 Run 的既有训练结果仍然保留，未启用遮挡的旧 Run 不受这四个字段影响。
-
 注意：`assets_dir` **只接受本地目录**，当前不递归扫描子目录；不要填 Hugging Face 仓库 ID 或 `.tar.gz` 路径。启用后需把 328 张素材预加载到 GPU（以 192×192 RGBA FP16 计，纹理本体约 92.25 MiB，另有临时张量与 OCC 模型开销）。关闭可删除 `[data.occlusion]` 或设置 `prob = 0.0`。
 
 ### 从原始素材重新转换
@@ -606,7 +604,7 @@ uv run --no-sync python tools/prepare_occluders.py \
 ### 生成对齐标准（FFHQ / ArcFace-128 模板体系）
 
 在 TOML 的 `[data]` 节添加 `alignment = "arcface"` 可启用全局 ArcFace-128 模板体系的生成坐标系（始终按 128 基准五点模板缩放，不是 112 模板等比缩放）。
-缺省或显式 `alignment = "ffhq"` 均保持旧 FFHQ 行为与配置哈希。
+缺省或显式 `alignment = "ffhq"` 均使用 FFHQ 对齐，并在规范化配置中显式记录 `alignment`。
 
 - `alignment = "arcface"`：对 FFHQ 对齐数据采用固定五点模板拟合的仿射近似变换，
   统一转换 Generator source、target、未几何增强的 canonical reference；
@@ -618,7 +616,7 @@ uv run --no-sync python tools/prepare_occluders.py \
 - ArcFace 生成输出给身份 teacher 时使用 ArcFace128→112 固定裁剪。128 输出裁剪 x=[8,120)、y=[0,112)，而不是整图缩放到 112。
 - 固定 FFHQ→ArcFace 是基于现有 FFHQ 五点模板的**近似统一映射**，不是重新对每张图做关键点检测；
   极端表情、姿态的精确五点对齐可能存在差异。
-- Generator 的对齐类型写入 checkpoint 与导出 ONNX 元数据。旧 checkpoint 未包含该字段视为 FFHQ；
+- Generator 的对齐类型必须写入 checkpoint，并包含在导出 ONNX 元数据中；缺失字段会拒绝加载；
   严格 resume 禁止切换模式，切换应新建 run（可使用 branch）。
 - 切换对齐标准后的图像空间分布不同，不建议将新模型直接视作原 checkpoint 的无缝续训。
 

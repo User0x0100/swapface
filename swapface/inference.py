@@ -24,7 +24,14 @@ def load_generator(checkpoint_path: str | Path) -> tuple[Generator, IDEncoderPro
         provider = IDEncoderProvider[checkpoint["identity_encoders"]["generator"]]
     except (KeyError, TypeError) as error:
         raise ValueError("checkpoint 缺少有效的 Generator 身份编码器配置") from error
+    if "face_alignment" not in checkpoint:
+        raise ValueError("checkpoint 缺少 face_alignment")
+    face_alignment = checkpoint["face_alignment"]
+    if face_alignment not in ("ffhq", "arcface"):
+        raise ValueError(f"checkpoint 人脸对齐标准无效：{face_alignment!r}")
     config = checkpoint["net_g"]["network_cfg"]
+    if "coarse_type" not in config:
+        raise ValueError("checkpoint Generator 配置缺少 coarse_type")
     if config["img_channels"] != 3 or config["id_dim"] != 512:
         raise ValueError("当前推理要求 RGB 图像和 512 维身份特征")
     model = Generator(**config)
@@ -36,9 +43,6 @@ def load_generator(checkpoint_path: str | Path) -> tuple[Generator, IDEncoderPro
         raise ValueError("checkpoint 缺少 step") from error
     if not isinstance(completed_step, int) or isinstance(completed_step, bool) or completed_step <= 0:
         raise ValueError(f"checkpoint.step 必须是正整数：{completed_step!r}")
-    face_alignment = checkpoint.get("face_alignment", "ffhq")
-    if face_alignment not in ("ffhq", "arcface"):
-        raise ValueError(f"checkpoint 人脸对齐标准无效：{face_alignment!r}")
     model.face_alignment = face_alignment
     return model.eval(), provider, completed_step
 
