@@ -8,7 +8,7 @@ def make_model(img_resolution: int = 32) -> Generator:
     return Generator(
         img_resolution=img_resolution,
         mapping_layers=1,
-        channel_multiplier=2,
+        channels=(64, 256),
     )
 
 
@@ -27,23 +27,16 @@ def test_full_generator_output(size: int) -> None:
     assert "use_mask" not in model.network_cfg
 
 
-@pytest.mark.parametrize("channel_multiplier", [1, 2])
-def test_channels_and_synthesis_shapes_match_styleswap_concat(channel_multiplier: int) -> None:
-    model = Generator(img_resolution=128, mapping_layers=1, channel_multiplier=channel_multiplier)
+@pytest.mark.parametrize("base_ch,max_ch", [(128, 512), (64, 256), (64, 512)])
+def test_channels_and_synthesis_shapes_match_styleswap_concat(base_ch: int, max_ch: int) -> None:
+    model = Generator(img_resolution=128, mapping_layers=1, channels=(base_ch, max_ch))
     assert model.channels == {
-        4: 512,
-        8: 512,
-        16: 512,
-        32: 512,
-        64: 256 * channel_multiplier,
-        128: 128 * channel_multiplier,
-        256: 64 * channel_multiplier,
-        512: 32 * channel_multiplier,
-        1024: 16 * channel_multiplier,
+        resolution: min(max_ch, base_ch * (128 // resolution))
+        for resolution in (4, 8, 16, 32, 64, 128)
     }
-    assert model.conv4.conv.in_ch == model.channels[4]
-    assert model.conv4.bias.shape[1] == 2 * model.channels[4]
-    assert model.to_rgb4.conv.in_ch == 2 * model.channels[4]
+    assert model.conv_first.conv.in_ch == model.channels[4]
+    assert model.conv_first.bias.shape[1] == 2 * model.channels[4]
+    assert model.to_rgb_first.conv.in_ch == 2 * model.channels[4]
     for resolution, stage in zip([8, 16, 32, 64, 128], model.stages, strict=True):
         assert stage.conv0.conv.in_ch == 2 * model.channels[resolution // 2]
         assert stage.conv0.conv.out_ch == model.channels[resolution]
@@ -82,7 +75,7 @@ def test_each_resolution_injects_at_both_styled_convs() -> None:
     def record_input(module, args):
         calls.append((module.conv.out_ch, tuple(args[2].shape)))
 
-    for module in [model.conv4, *(conv for stage in model.stages for conv in (stage.conv0, stage.conv1))]:
+    for module in [model.conv_first, *(conv for stage in model.stages for conv in (stage.conv0, stage.conv1))]:
         handles.append(module.register_forward_pre_hook(record_input))
     try:
         with torch.no_grad():
@@ -112,7 +105,7 @@ def test_full_generator_training_gradients() -> None:
     assert identity.grad is not None and identity.grad.abs().sum() > 0
     assert model.encoder.from_rgb.weight.grad is not None
     assert model.encoder.from_rgb.weight.grad.abs().sum() > 0
-    assert model.conv4.conv.weight.grad is not None
+    assert model.conv_first.conv.weight.grad is not None
 
 
 def test_full_generator_invalid_config_and_inputs() -> None:
@@ -166,8 +159,8 @@ def test_cuda_autocast_forward_backward_with_fp32_fir_filters(
     assert torch.isfinite(output).all()
     assert identity.grad is not None and torch.isfinite(identity.grad).all()
     assert target.grad is not None and torch.isfinite(target.grad).all()
-    assert model.conv4.conv.weight.grad is not None
-    assert torch.isfinite(model.conv4.conv.weight.grad).all()
+    assert model.conv_first.conv.weight.grad is not None
+    assert torch.isfinite(model.conv_first.conv.weight.grad).all()
 
     # AMP does not mutate FIR filter storage dtype.
     for module in model.modules():
@@ -182,7 +175,7 @@ def test_selective_target_injection_has_correct_channels_and_gradients(mode: str
         img_resolution=32, mapping_layers=1, target_inject_mode=mode,
         target_inject_layers=(0, 1, 2),
     )
-    layers = (model.conv4, *(conv for stage in model.stages for conv in (stage.conv0, stage.conv1)))
+    layers = (model.conv_first, *(conv for stage in model.stages for conv in (stage.conv0, stage.conv1)))
     enabled = (True, True, True, True, True, False, False)
     for conv, is_enabled in zip(layers, enabled, strict=True):
         assert conv.inject_target is is_enabled
@@ -252,7 +245,7 @@ def test_invalid_target_inject_mode() -> None:
 def test_non_contiguous_target_layer_selection(mode: str, layers: tuple[int, ...]) -> None:
     torch.manual_seed(43)
     model = Generator(img_resolution=32, mapping_layers=1, target_inject_mode=mode, target_inject_layers=layers)
-    modules = [model.conv4, *(conv for stage in model.stages for conv in (stage.conv0, stage.conv1))]
+    modules = [model.conv_first, *(conv for stage in model.stages for conv in (stage.conv0, stage.conv1))]
     enabled_indices = [0, 1, 1, 2, 2, 3, 3]
     assert [conv.inject_target for conv in modules] == [index in layers for index in enabled_indices]
     for conv in modules:
@@ -264,3 +257,68 @@ def test_non_contiguous_target_layer_selection(mode: str, layers: tuple[int, ...
         output = model(target, identity)
     assert output.shape == target.shape
     assert torch.isfinite(output).all()
+
+
+
+@pytest.mark.parametrize("mode", ["concat", "add"])
+@pytest.mark.parametrize("layers", [(0,), (1,), (0, 2), ()])
+def test_non_default_start_resolution_and_injection(mode: str, layers: tuple[int, ...]) -> None:
+    # 32 -> 64 -> 128: layer 0 must mean 32x32, not the old 4x4.
+    model = Generator(
+        img_resolution=128, start_resolution=32, channels=(8, 32),
+        id_dim=32, w_dim=32, mapping_layers=1,
+        target_inject_mode=mode, target_inject_layers=layers,
+    )
+    assert model.synthesis_resolutions == (32, 64, 128)
+    assert model.channels == {32: 32, 64: 16, 128: 8}
+    assert model.constant.shape == (1, 32, 32, 32)
+    assert len(model.stages) == 2
+    styled_convs = [model.conv_first, *(c for stage in model.stages for c in (stage.conv0, stage.conv1))]
+    assert [c.inject_target for c in styled_convs] == [
+        0 in layers, 1 in layers, 1 in layers, 2 in layers, 2 in layers,
+    ]
+    if layers:
+        assert len(model.encoder.downs) == (128 // model.synthesis_resolutions[min(layers)]).bit_length() - 1
+    else:
+        assert model.encoder is None
+    for conv in styled_convs:
+        if conv.inject_target:
+            conv.inject_gain.data.fill_(0.25)
+    target = torch.randn(1, 3, 128, 128, requires_grad=True)
+    identity = torch.randn(1, 32, requires_grad=True)
+    out = model(target, identity)
+    assert out.shape == target.shape
+    out.square().mean().backward()
+    assert identity.grad is not None and identity.grad.abs().sum() > 0
+    if layers:
+        assert target.grad is not None and target.grad.abs().sum() > 0
+    else:
+        assert target.grad is None
+
+
+@pytest.mark.parametrize("size", [4, 8, 16, 32])
+def test_start_resolution_matches_output(size: int) -> None:
+    model = Generator(img_resolution=size, start_resolution=size, channels=(8, 16),
+                      w_dim=16, id_dim=16, mapping_layers=1, target_inject_layers=(0,))
+    assert model.synthesis_resolutions == (size,)
+    assert len(model.stages) == 0
+    with torch.no_grad():
+        output = model(torch.randn(1, 3, size, size), torch.randn(1, 16))
+    assert output.shape == (1, 3, size, size)
+
+
+@pytest.mark.parametrize("start", [0, 3, 12, 256, True])
+def test_reject_invalid_start_resolution(start: int) -> None:
+    with pytest.raises(ValueError, match="start_resolution"):
+        Generator(img_resolution=128, start_resolution=start)
+
+
+@pytest.mark.parametrize("channels", [[], [8], [16, 8], [0, 16], [-1, 16], [True, 16], [8, 16, 32]])
+def test_reject_invalid_channels(channels: list) -> None:
+    with pytest.raises(ValueError, match="channels"):
+        Generator(img_resolution=8, channels=channels)
+
+
+def test_start_relative_injection_index_validation() -> None:
+    with pytest.raises(ValueError, match="target_inject_layers"):
+        Generator(img_resolution=128, start_resolution=32, target_inject_layers=(3,))

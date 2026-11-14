@@ -29,7 +29,8 @@ def small_config(*, coarse_type: str = "stylegan2") -> dict:
         "coarse_type": coarse_type,
         "coarse_w_dim": 32,
         "coarse_mapping_layers": 1,
-        "coarse_channel_multiplier": 1,
+        "coarse_start_resolution": 4,
+        "coarse_channels": [128, 512],
         "hq_bottleneck_resolution": 4,
         "hq_base_ch": 2,
         "hq_max_ch": 8,
@@ -38,7 +39,7 @@ def small_config(*, coarse_type: str = "stylegan2") -> dict:
 
 def test_legacy_generator_config_remains_unchanged() -> None:
     legacy = small_config(coarse_type="inswapper")
-    for key in ("coarse_type", "coarse_w_dim", "coarse_mapping_layers", "coarse_channel_multiplier"):
+    for key in ("coarse_type", "coarse_w_dim", "coarse_mapping_layers", "coarse_start_resolution", "coarse_channels"):
         legacy.pop(key)
 
     assert _normalize_generator({"generator": legacy}) == legacy
@@ -51,9 +52,10 @@ def test_stylegan2_coarse_config_and_validation() -> None:
     config = _normalize_generator({"generator": {"coarse_type": "stylegan2", "coarse_resolution": 128}})
     assert config["coarse_w_dim"] == 512
     assert config["coarse_mapping_layers"] == 8
-    assert config["coarse_channel_multiplier"] == 1
-    assert "coarse_target_inject_mode" not in config
-    assert "coarse_target_inject_layers" not in config
+    assert config["coarse_start_resolution"] == 4
+    assert config["coarse_channels"] == [128, 512]
+    assert config["coarse_target_inject_mode"] == "concat"
+    assert config["coarse_target_inject_layers"] == list(range(6))
 
     selective = _normalize_generator({"generator": {
         "coarse_type": "stylegan2",
@@ -117,7 +119,7 @@ def test_stylegan2_forward_training_gradients_and_hq_boundary() -> None:
     assert identity.grad is not None and identity.grad.abs().sum() > 0
     assert net.coarse.generator.encoder.from_rgb.weight.grad is not None
     assert net.coarse.generator.encoder.from_rgb.weight.grad.abs().sum() > 0
-    assert net.coarse.generator.conv4.conv.weight.grad is not None
+    assert net.coarse.generator.conv_first.conv.weight.grad is not None
 
     net.zero_grad(set_to_none=True)
     output, low = net(target.detach(), identity.detach(), return_coarse=True)
@@ -173,7 +175,7 @@ def test_stylegan2_checkpoint_roundtrip_and_coarse_branch_guards(tmp_path) -> No
     changed_hq = {"generator": config | {"img_resolution": 32}, "train": {"stage": "hq"}, "identity": {"provider": "BLENDFACE"}}
     assert _branch_generator_mode(parent, changed_hq) == "hq_rebuild"
     for key, val in (
-        ("coarse_type", "inswapper"), ("coarse_mapping_layers", 2), ("coarse_channel_multiplier", 2),
+        ("coarse_type", "inswapper"), ("coarse_mapping_layers", 2), ("coarse_start_resolution", 8), ("coarse_channels", [64, 256]),
         ("coarse_target_inject_mode", "add"), ("coarse_target_inject_layers", [0]),
     ):
         different = {"generator": config | {key: val}, "train": {"stage": "hq"}, "identity": {"provider": "BLENDFACE"}}
@@ -189,6 +191,12 @@ def test_stylegan2_checkpoint_roundtrip_and_coarse_branch_guards(tmp_path) -> No
     {},
     {"coarse_target_inject_mode": "concat", "coarse_target_inject_layers": [0]},
     {"coarse_target_inject_mode": "add", "coarse_target_inject_layers": [0]},
+    {"coarse_resolution": 16, "coarse_start_resolution": 8, "coarse_channels": [8, 16],
+     "coarse_target_inject_mode": "concat", "coarse_target_inject_layers": [0]},
+    {"coarse_resolution": 16, "coarse_start_resolution": 8, "coarse_channels": [8, 16],
+     "coarse_target_inject_mode": "add", "coarse_target_inject_layers": [1]},
+    {"coarse_resolution": 16, "coarse_start_resolution": 8, "coarse_channels": [8, 16],
+     "coarse_target_inject_mode": "add", "coarse_target_inject_layers": []},
 ])
 def test_stylegan2_strict_cpu_export_and_runtime(tmp_path, injection: dict) -> None:
     onnx = pytest.importorskip("onnx")
@@ -269,3 +277,93 @@ def test_direct_constructor_records_canonical_layer_order() -> None:
     model = Generator(**config)
     assert model.network_cfg["coarse_target_inject_layers"] == [0, 1]
     assert model.coarse.generator.target_inject_layers == (0, 1)
+
+
+
+def test_start_resolution_and_channels_in_config() -> None:
+    config = _normalize_generator({"generator": {
+        "coarse_type": "stylegan2",
+        "coarse_resolution": 128,
+        "coarse_start_resolution": 32,
+        "coarse_channels": [64, 512],
+        "coarse_target_inject_mode": "add",
+        "coarse_target_inject_layers": [0],
+    }})
+    assert config["coarse_start_resolution"] == 32
+    assert config["coarse_channels"] == [64, 512]
+    assert config["coarse_target_inject_layers"] == [0]
+    model = Generator(**config)
+    assert model.network_cfg == config
+    assert model.coarse.generator.channels == {32: 256, 64: 128, 128: 64}
+    assert model.coarse.generator.start_resolution == 32
+
+
+@pytest.mark.parametrize("start", [3, 12, 256, 0])
+def test_invalid_start_resolution_config(start: int) -> None:
+    with pytest.raises(ValueError, match="coarse_start_resolution"):
+        _normalize_generator({"generator": {
+            "coarse_type": "stylegan2",
+            "coarse_resolution": 128,
+            "coarse_start_resolution": start,
+        }})
+
+
+@pytest.mark.parametrize("channels", [[], [8], [16, 8], [0, 16], [True, 16], [8, 16, 32]])
+def test_invalid_channels_config(channels: list) -> None:
+    with pytest.raises(ValueError, match="coarse_channels"):
+        _normalize_generator({"generator": {
+            "coarse_type": "stylegan2", "coarse_channels": channels,
+        }})
+
+
+def test_injection_indices_are_relative_to_start() -> None:
+    config = _normalize_generator({"generator": {
+        "coarse_type": "stylegan2", "coarse_resolution": 128, "coarse_start_resolution": 32,
+    }})
+    assert config["coarse_target_inject_layers"] == [0, 1, 2]
+    with pytest.raises(ValueError, match="coarse_target_inject_layers"):
+        _normalize_generator({"generator": {
+            "coarse_type": "stylegan2", "coarse_resolution": 128,
+            "coarse_start_resolution": 32, "coarse_target_inject_layers": [3],
+        }})
+
+
+@pytest.mark.parametrize("mode", ["concat", "add"])
+def test_split_with_nondefault_start_resolution_and_selective_injection(mode: str) -> None:
+    from swapface.split_identity import PrecomputedStyleGAN2, StyleGAN2Projection
+    config = small_config() | {
+        "coarse_resolution": 16, "coarse_start_resolution": 8, "coarse_channels": [8, 16],
+        "coarse_target_inject_mode": mode, "coarse_target_inject_layers": [0],
+    }
+    model = Generator(**config).eval()
+    projection = StyleGAN2Projection(model.coarse)
+    for module in model.coarse.generator.modules():
+        if hasattr(module, "inject_gain"):
+            module.inject_gain.data.fill_(0.5)
+    client = PrecomputedStyleGAN2(model.coarse).eval()
+    identity = torch.randn(1, 32)
+    target = torch.randn(1, 3, 16, 16)
+    with torch.no_grad():
+        expected = model.coarse(target, identity)
+        actual = client(target, projection(identity))
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+
+
+
+def test_legacy_inswapper_multiplier_is_not_interpreted_as_stylegan2_config() -> None:
+    legacy = small_config(coarse_type="inswapper")
+    legacy.pop("coarse_start_resolution")
+    legacy.pop("coarse_channels")
+    legacy["coarse_channel_multiplier"] = 2
+    normalized = _normalize_generator({"generator": legacy})
+    assert normalized["coarse_channel_multiplier"] == 2
+    assert "coarse_start_resolution" not in normalized
+    assert "coarse_channels" not in normalized
+    assert _normalize_generator({"generator": normalized}) == normalized
+    model = Generator(**normalized)
+    assert model.network_cfg == normalized
+    assert isinstance(model.coarse, Coarse)
+    with pytest.raises(ValueError, match="coarse_channel_multiplier"):
+        _normalize_generator({"generator": {
+            "coarse_type": "stylegan2", "coarse_channel_multiplier": 2,
+        }})

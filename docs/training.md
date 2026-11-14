@@ -219,12 +219,19 @@ coarse_resolution = 128
 coarse_type = "stylegan2"
 coarse_w_dim = 512
 coarse_mapping_layers = 8
-coarse_channel_multiplier = 1
+coarse_start_resolution = 32
+coarse_channels = [64, 512]            # [base_ch, max_ch]
+coarse_target_inject_mode = "add"      # "concat" 或 "add"
+coarse_target_inject_layers = [0]      # 相对于起始分辨率编号
 ```
 
-`stylegan2` 使用 `models/stylegan2.py` 的条件生成器（Target Encoder + 每层 ModulatedConv），`coarse_w_dim`、`coarse_mapping_layers`、`coarse_channel_multiplier` 控制新架构。原 Coarse 的 `coarse_latent_resolution`、`coarse_num_latent`、`coarse_base_ch`、`coarse_max_ch` 不影响 StyleGAN2。`coarse_resolution` 必须为 4～1024 的 2 的整数次幂，且不超过 HQ 输出分辨率。
+`stylegan2` 使用 `models/stylegan2.py` 的条件生成器：Source Identity 经 Mapping Network 调制每个合成卷积，Target Encoder 仅向选中的分辨率层注入特征。`coarse_w_dim`、`coarse_mapping_layers` 控制身份映射；`coarse_start_resolution` 决定 Constant 与首层合成的分辨率（默认 4）；`coarse_channels = [base_ch, max_ch]` 以 Coarse 输出分辨率的通道数为 `base_ch`，向低分辨率每降低一半则通道数翻倍，最多为 `max_ch`（默认 `[128, 512]`）。即 `C(r) = min(max_ch, base_ch * coarse_resolution / r)`。
 
-两种 Coarse 共用 `coarse(target, identity, return_resize_in=True)` 接口：输入自动双线性缩放，输出为 `[B,3,coarse_resolution,coarse_resolution]`，经 `tanh` 限制在 `[-1,1]`，HQRefiner 与 Coarse 损失路径不变。StyleGAN2 的注入增益初始为 0；训练初期 Target Encoder 的梯度需经注入增益逐步建立。
+`coarse_target_inject_mode` 可选 `concat`（拼接，开启注入的 StyledConv 输出通道翻倍）和 `add`（逐元素加法），默认 `concat`。`coarse_target_inject_layers` 支持非连续整数索引；`0` 对应 `coarse_start_resolution`，`1` 对应其两倍分辨率，以此类推。上例仅在 32×32 注入 Target；也可以设置 `[0, 2]` 分别在 32×32 和 128×128 注入，或设置 `[]` 禁用全部 Target 注入。未选中层仍接受 Source Identity 调制。默认在所有合成分辨率注入。Target Encoder 最多下采样到实际启用的最低注入分辨率；不启用任何注入时不会构建 Target Encoder。
+
+原 Coarse 的 `coarse_latent_resolution`、`coarse_num_latent`、`coarse_base_ch`、`coarse_max_ch` 不影响 StyleGAN2。`coarse_resolution` 必须为 4～1024 的 2 的整数次幂，且不超过 HQ 输出分辨率；`coarse_start_resolution` 必须是位于 4 到 `coarse_resolution` 之间的 2 的整数次幂。旧 StyleGAN2 检查点不支持直接按新架构载入。
+
+两种 Coarse 共用 `coarse(target, identity, return_resize_in=True)` 接口：输入自动双线性缩放，输出形状为 `[B,3,coarse_resolution,coarse_resolution]`。当前两种 Coarse 输出均未通过 `tanh` 强行限制到 `[-1,1]`，输出范围由训练损失约束；HQRefiner 与 Coarse 损失路径不变。StyleGAN2 的注入增益初始为 0；训练初期 Target Encoder 的梯度需经注入增益逐步建立。
 
 **检查点隔离**：不同 Coarse 架构的权重不可互换。`resume`/继承 Coarse 的 `branch` 必须保持同一架构；HQ rebuild 只允许修改 HQ 配置，不允许把 InSwapper Coarse 的权重当成 StyleGAN2 权重。旧检查点缺少 `coarse_type` 时按原 InSwapper 解释。
 

@@ -75,7 +75,7 @@ def test_stylegan2_cuda_generator_exports_without_custom_fir(tmp_path) -> None:
     from models.stylegan2 import Generator
 
     torch.manual_seed(2026)
-    generator = Generator(img_resolution=32, mapping_layers=1, channel_multiplier=1).cuda().eval()
+    generator = Generator(img_resolution=32, mapping_layers=1, channels=(128, 512)).cuda().eval()
     target = torch.randn(1, 3, 32, 32, device="cuda")
     identity = torch.randn(1, 512, device="cuda")
 

@@ -161,7 +161,8 @@ class StyleGAN2Coarse(nn.Module):
         id_dim: int = 512,
         w_dim: int = 512,
         mapping_layers: int = 8,
-        channel_multiplier: int = 1,
+        start_resolution: int = 4,
+        channels: tuple[int, int] | list[int] = (128, 512),
         target_inject_mode: str = "concat",
         target_inject_layers: tuple[int, ...] | list[int] | None = None,
     ) -> None:
@@ -173,7 +174,8 @@ class StyleGAN2Coarse(nn.Module):
             id_dim=id_dim,
             w_dim=w_dim,
             mapping_layers=mapping_layers,
-            channel_multiplier=channel_multiplier,
+            start_resolution=start_resolution,
+            channels=channels,
             target_inject_mode=target_inject_mode,
             target_inject_layers=target_inject_layers,
         )
@@ -300,7 +302,9 @@ class Generator(nn.Module):
         coarse_type: str | None = None,
         coarse_w_dim: int = 512,
         coarse_mapping_layers: int = 8,
-        coarse_channel_multiplier: int = 1,
+        coarse_channel_multiplier: int | None = None,  # InSwapper legacy config only.
+        coarse_start_resolution: int = 4,
+        coarse_channels: tuple[int, int] | list[int] = (128, 512),
         coarse_target_inject_mode: str | None = None,
         coarse_target_inject_layers: tuple[int, ...] | list[int] | None = None,
         hq_bottleneck_resolution: int = 16,
@@ -322,25 +326,23 @@ class Generator(nn.Module):
             "hq_base_ch": hq_base_ch,
             "hq_max_ch": hq_max_ch,
         }
-        # Old configurations retain their original network_cfg representation;
-        # new options are recorded only when the caller opts into the schema.
+        # Legacy InSwapper configs do not need any StyleGAN2-only fields.
         if coarse_type is not None:
+            self.network_cfg["coarse_type"] = coarse_type
+            self.network_cfg["coarse_w_dim"] = coarse_w_dim
+            self.network_cfg["coarse_mapping_layers"] = coarse_mapping_layers
+        if coarse_channel_multiplier is not None:
+            if coarse_type != "inswapper":
+                raise ValueError("coarse_channel_multiplier is a legacy InSwapper option")
+            self.network_cfg["coarse_channel_multiplier"] = coarse_channel_multiplier
+        if coarse_type == "stylegan2":
             self.network_cfg.update({
-                "coarse_type": coarse_type,
-                "coarse_w_dim": coarse_w_dim,
-                "coarse_mapping_layers": coarse_mapping_layers,
-                "coarse_channel_multiplier": coarse_channel_multiplier,
-            })
-            # Preserve the original checkpoint schema unless a new Target
-            # injection option was explicitly selected.
-            if coarse_target_inject_mode is not None or coarse_target_inject_layers is not None:
-                self.network_cfg["coarse_target_inject_mode"] = (
+                "coarse_start_resolution": coarse_start_resolution,
+                "coarse_channels": list(coarse_channels),
+                "coarse_target_inject_mode": (
                     "concat" if coarse_target_inject_mode is None else coarse_target_inject_mode
-                )
-                self.network_cfg["coarse_target_inject_layers"] = (
-                    list(range(coarse_resolution.bit_length() - 2))
-                    if coarse_target_inject_layers is None else list(coarse_target_inject_layers)
-                )
+                ),
+            })
         self.img_resolution = img_resolution
         self.img_channels = img_channels
         self.id_dim = id_dim
@@ -363,14 +365,16 @@ class Generator(nn.Module):
                 id_dim=id_dim,
                 w_dim=coarse_w_dim,
                 mapping_layers=coarse_mapping_layers,
-                channel_multiplier=coarse_channel_multiplier,
+                start_resolution=coarse_start_resolution,
+                channels=coarse_channels,
                 target_inject_mode="concat" if coarse_target_inject_mode is None else coarse_target_inject_mode,
                 target_inject_layers=coarse_target_inject_layers,
             )
         else:
             raise ValueError(f"unknown coarse_type: {coarse_type!r}")
-        if isinstance(self.coarse, StyleGAN2Coarse) and "coarse_target_inject_layers" in self.network_cfg:
-            # Persist the effective (validated and sorted) selection, not the caller's ordering.
+        if isinstance(self.coarse, StyleGAN2Coarse):
+            # Store the effective validated architecture and the start-relative
+            # injection selection in every new StyleGAN2 checkpoint.
             self.network_cfg["coarse_target_inject_layers"] = list(self.coarse.generator.target_inject_layers)
         self.hq = HQRefiner(
             img_resolution=img_resolution,

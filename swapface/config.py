@@ -443,23 +443,20 @@ STYLEGAN2_COARSE_CONFIG_DEFAULTS: dict[str, Any] = {
     "coarse_type": "inswapper",
     "coarse_w_dim": 512,
     "coarse_mapping_layers": 8,
-    "coarse_channel_multiplier": 1,
+    "coarse_start_resolution": 4,
+    "coarse_channels": [128, 512],
 }
 
 
 def _normalize_target_injection(result: dict[str, Any], raw: dict[str, Any]) -> None:
     """Validate optional StyleGAN2 injection options without altering old run schemas."""
-    names = {"coarse_target_inject_mode", "coarse_target_inject_layers"}
-    if not (names & raw.keys()):
-        return
-
     mode = raw.get("coarse_target_inject_mode", "concat")
     if not isinstance(mode, str) or mode not in {"concat", "add"}:
         raise ValueError("generator.coarse_target_inject_mode 仅支持 concat 或 add")
     result["coarse_target_inject_mode"] = mode
 
     resolution = result["coarse_resolution"]
-    max_layer = resolution.bit_length() - 3
+    max_layer = resolution.bit_length() - result["coarse_start_resolution"].bit_length()
     layers = raw.get("coarse_target_inject_layers", list(range(max_layer + 1)))
     if not isinstance(layers, (tuple, list)) or any(
         type(index) is not int or index < 0 or index > max_layer for index in layers
@@ -475,7 +472,17 @@ def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
     # Preserve existing frozen run configs/hashes when no new Coarse options
     # were selected. An explicit option enables the extended canonical schema.
     extended = bool(set(raw) & set(STYLEGAN2_COARSE_CONFIG_DEFAULTS))
-    defaults = DEFAULT_GENERATOR_CONFIG | (STYLEGAN2_COARSE_CONFIG_DEFAULTS if extended else {})
+    style_specific_keys = {"coarse_start_resolution", "coarse_channels"}
+    defaults = dict(DEFAULT_GENERATOR_CONFIG)
+    if extended:
+        defaults.update({key: value for key, value in STYLEGAN2_COARSE_CONFIG_DEFAULTS.items()
+                         if key not in style_specific_keys})
+        if raw.get("coarse_type") == "stylegan2":
+            defaults.update({key: STYLEGAN2_COARSE_CONFIG_DEFAULTS[key] for key in style_specific_keys})
+    if "coarse_channel_multiplier" in raw:
+        if raw.get("coarse_type") != "inswapper":
+            raise ValueError("generator.coarse_channel_multiplier 仅用于旧 InSwapper 配置")
+        defaults["coarse_channel_multiplier"] = 1
     injection_keys = {"coarse_target_inject_mode", "coarse_target_inject_layers"}
     result = _with_defaults(
         {key: value for key, value in raw.items() if key not in injection_keys},
@@ -498,8 +505,16 @@ def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
     for key in integer_keys:
         result[key] = _int(result[key], f"generator.{key}", minimum=1)
     if extended:
-        for key in ("coarse_w_dim", "coarse_mapping_layers", "coarse_channel_multiplier"):
+        for key in ("coarse_w_dim", "coarse_mapping_layers"):
             result[key] = _int(result[key], f"generator.{key}", minimum=1)
+        if "coarse_start_resolution" in result:
+            result["coarse_start_resolution"] = _int(
+                result["coarse_start_resolution"], "generator.coarse_start_resolution", minimum=1,
+            )
+    if "coarse_channel_multiplier" in result:
+        result["coarse_channel_multiplier"] = _int(
+            result["coarse_channel_multiplier"], "generator.coarse_channel_multiplier", minimum=1,
+        )
 
     coarse_type = result.get("coarse_type", "inswapper")
     if not isinstance(coarse_type, str) or coarse_type not in {"inswapper", "stylegan2"}:
@@ -512,10 +527,18 @@ def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
         resolution = result["coarse_resolution"]
         if resolution < 4 or resolution > 1024 or resolution & (resolution - 1):
             raise ValueError("generator.coarse_resolution 使用 stylegan2 时必须是 [4, 1024] 内的 2 的整数次幂")
-    if set(raw) & injection_keys:
-        if coarse_type != "stylegan2":
-            raise ValueError("generator.coarse_target_inject_* 仅适用于 stylegan2")
+        start = result["coarse_start_resolution"]
+        if start < 4 or start > resolution or start & (start - 1):
+            raise ValueError("generator.coarse_start_resolution 必须是 [4, coarse_resolution] 内的 2 的整数次幂")
+        channels = result["coarse_channels"]
+        if (not isinstance(channels, (list, tuple)) or len(channels) != 2
+                or any(type(ch) is not int or ch <= 0 for ch in channels)
+                or channels[1] < channels[0]):
+            raise ValueError("generator.coarse_channels 必须为 [base_ch, max_ch] 且 0 < base_ch <= max_ch")
+        result["coarse_channels"] = list(channels)
         _normalize_target_injection(result, raw)
+    elif set(raw) & (injection_keys | {"coarse_start_resolution", "coarse_channels"}):
+        raise ValueError("generator.coarse_start_resolution/coarse_channels/coarse_target_inject_* 仅适用于 stylegan2")
     if result["hq_max_ch"] < result["hq_base_ch"]:
         raise ValueError("generator.hq_max_ch 必须 >= generator.hq_base_ch")
 

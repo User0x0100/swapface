@@ -32,7 +32,7 @@ onnx_export/
 - 默认图像布局 NHWC；`--nchw` 同时改变两侧的图像布局。身份条件始终 `[B,D]`。
 - `B` 为导出时固定 batch（默认 1），`D` 为各身份注入层拼接后的宽度，由架构及检查点确定。
 - InSwapper 拼接顺序：各 `latent_space.layers` 依次 `adain0`、`adain1`，每个先 gamma 后 beta。
-- StyleGAN2 拼接顺序：`conv4`、`to_rgb4`，随后各 Stage 依次 `conv0`、`conv1`、`to_rgb`。
+- StyleGAN2 身份调制参数拼接顺序：`conv_first`、`to_rgb_first`，随后各 Stage 依次 `conv0`、`conv1`、`to_rgb`。首层合成分辨率由 `coarse_start_resolution` 决定，Stage 数量随起始分辨率变化；此处拼接的是 Source Identity 的调制参数，与 `coarse_target_inject_mode` 采用的 Target 特征拼接或加法无关。
 - 相同身份的 `identity_condition` 可以缓存并逐帧复用；切换身份或模型时应重新获取。
 
 ## 配对及完整性

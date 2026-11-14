@@ -172,7 +172,8 @@ COARSE_GENERATOR_CONFIG_KEYS = (
     "coarse_type",
     "coarse_w_dim",
     "coarse_mapping_layers",
-    "coarse_channel_multiplier",
+    "coarse_start_resolution",
+    "coarse_channels",
     "coarse_target_inject_mode",
     "coarse_target_inject_layers",
 )
@@ -1750,22 +1751,23 @@ def _canonical_generator_config(config: Mapping[str, Any]) -> dict[str, Any]:
     from .config import DEFAULT_GENERATOR_CONFIG, STYLEGAN2_COARSE_CONFIG_DEFAULTS
 
     canonical = {**STYLEGAN2_COARSE_CONFIG_DEFAULTS, **config}
-    # Old StyleGAN2 runs implicitly inject Target at every layer via concat.
-    canonical.setdefault("coarse_target_inject_mode", "concat")
-    canonical.setdefault(
-        "coarse_target_inject_layers", list(range(int(canonical["coarse_resolution"]).bit_length() - 2))
-    )
-    canonical["coarse_target_inject_layers"] = sorted(canonical["coarse_target_inject_layers"])
     if canonical["coarse_type"] == "stylegan2":
-        # Legacy InSwapper knobs do not affect the StyleGAN2 weights.
+        canonical.pop("coarse_channel_multiplier", None)
+        # Target injection indices are relative to the first synthesis resolution.
+        start_resolution = int(canonical["coarse_start_resolution"])
+        canonical.setdefault("coarse_target_inject_mode", "concat")
+        canonical.setdefault(
+            "coarse_target_inject_layers",
+            list(range(int(canonical["coarse_resolution"]).bit_length() - start_resolution.bit_length() + 1)),
+        )
+        canonical["coarse_target_inject_layers"] = sorted(canonical["coarse_target_inject_layers"])
         for key in ("coarse_latent_resolution", "coarse_num_latent", "coarse_base_ch", "coarse_max_ch"):
             canonical[key] = DEFAULT_GENERATOR_CONFIG[key]
     else:
-        # StyleGAN2-only options do not affect the legacy Coarse weights.
-        for key in ("coarse_w_dim", "coarse_mapping_layers", "coarse_channel_multiplier"):
+        for key in ("coarse_w_dim", "coarse_mapping_layers", "coarse_start_resolution", "coarse_channels"):
             canonical[key] = STYLEGAN2_COARSE_CONFIG_DEFAULTS[key]
         canonical["coarse_target_inject_mode"] = "concat"
-        canonical["coarse_target_inject_layers"] = list(range(int(canonical["coarse_resolution"]).bit_length() - 2))
+        canonical["coarse_target_inject_layers"] = []
     return canonical
 
 

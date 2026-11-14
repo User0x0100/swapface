@@ -93,7 +93,7 @@ class PrecomputedInSwapper(nn.Module):
 
 
 def _modulated_layers(generator: nn.Module) -> list[ModulatedConv2d]:
-    layers = [generator.conv4.conv, generator.to_rgb4.conv]
+    layers = [generator.conv_first.conv, generator.to_rgb_first.conv]
     for stage in generator.stages:
         layers.extend((stage.conv0.conv, stage.conv1.conv, stage.to_rgb.conv))
     return layers
@@ -197,24 +197,25 @@ class PrecomputedStyleGAN2(nn.Module):
         super().__init__()
         generator = coarse.generator
         self.img_resolution = coarse.img_resolution
-        self.target_inject_layers = generator.target_inject_layers
+        self.start_resolution = generator.start_resolution
+        self.synthesis_resolutions = generator.synthesis_resolutions
         self.encoder = deepcopy(generator.encoder)
         self.constant = deepcopy(generator.constant)
-        self.conv4 = PrecomputedStyledConv(generator.conv4)
-        self.to_rgb4 = PrecomputedToOutput(generator.to_rgb4)
+        self.conv_first = PrecomputedStyledConv(generator.conv_first)
+        self.to_rgb_first = PrecomputedToOutput(generator.to_rgb_first)
         self.stages = nn.ModuleList(PrecomputedSynthesisStage(stage) for stage in generator.stages)
         self.style_widths = [layer.in_ch for layer in _modulated_layers(generator)]
         self.condition_width = sum(self.style_widths)
 
     def forward(self, target: Tensor, conditioning: Tensor) -> Tensor:
         target = F.interpolate(target, size=self.img_resolution, mode="bilinear", align_corners=False)
-        features = self.encoder(target) if self.target_inject_layers else {}
+        features = self.encoder(target) if self.encoder is not None else {}
         styles = _static_condition_slices(conditioning, self.style_widths)
         x = self.constant.expand(target.shape[0], -1, -1, -1)
-        x = self.conv4(x, styles[0], features.get(4))
-        rgb = self.to_rgb4(x, styles[1], None)
+        x = self.conv_first(x, styles[0], features.get(self.start_resolution))
+        rgb = self.to_rgb_first(x, styles[1], None)
         for i, stage in enumerate(self.stages):
-            resolution = 2 ** (i + 3)
+            resolution = self.synthesis_resolutions[i + 1]
             x, rgb = stage(x, (styles[2 + 3 * i], styles[3 + 3 * i], styles[4 + 3 * i]), features.get(resolution), rgb)
         return rgb
 

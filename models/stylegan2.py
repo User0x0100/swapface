@@ -170,12 +170,15 @@ class EqualConv2d(nn.Module):
 
 
 class AttributeEncoder(nn.Module):
-    def __init__(self, channels: dict[int, int], img_resolution: int, img_channels: int, blur_kernel: Sequence[int]) -> None:
+    def __init__(
+        self, channels: dict[int, int], img_resolution: int, min_resolution: int,
+        img_channels: int, blur_kernel: Sequence[int],
+    ) -> None:
         super().__init__()
         self.from_rgb = EqualConv2d(img_channels, channels[img_resolution], 1, downsample=False, blur_kernel=blur_kernel)
         self.downs = nn.ModuleList()
         resolution = img_resolution
-        while resolution > 4:
+        while resolution > min_resolution:
             self.downs.append(EqualConv2d(channels[resolution], channels[resolution // 2], 3, downsample=True, blur_kernel=blur_kernel))
             resolution //= 2
         self.img_resolution = img_resolution
@@ -239,7 +242,8 @@ class Generator(nn.Module):
         id_dim: int = 512,
         w_dim: int = 512,
         mapping_layers: int = 8,
-        channel_multiplier: int = 1,
+        start_resolution: int = 4,
+        channels: Sequence[int] = (128, 512),
         target_inject_mode: str = "concat",
         target_inject_layers: Sequence[int] | None = None,
         blur_kernel: Sequence[int] = (1, 3, 3, 1),
@@ -249,13 +253,18 @@ class Generator(nn.Module):
             raise ValueError("img_resolution must be a power of two in [4,1024]")
         if img_channels <= 0 or id_dim <= 0 or w_dim <= 0 or mapping_layers < 1:
             raise ValueError("img_channels, id_dim, w_dim, mapping_layers must be positive")
-        if channel_multiplier <= 0:
-            raise ValueError("channel_multiplier must be positive")
+        if (type(start_resolution) is not int or start_resolution < 4 or
+                start_resolution > img_resolution or start_resolution & (start_resolution - 1)):
+            raise ValueError("start_resolution must be a power of two in [4, img_resolution]")
+        if (not isinstance(channels, (tuple, list)) or len(channels) != 2 or
+                any(type(ch) is not int or ch <= 0 for ch in channels) or channels[1] < channels[0]):
+            raise ValueError("channels must be (base_ch, max_ch) positive integers with max_ch >= base_ch")
+        base_ch, max_ch = channels
         if tuple(blur_kernel) != (1, 3, 3, 1):
             raise ValueError("only the original [1,3,3,1] StyleGAN2 FIR kernel is supported")
         if target_inject_mode not in {"concat", "add"}:
             raise ValueError("target_inject_mode must be concat or add")
-        max_layer = img_resolution.bit_length() - 3
+        max_layer = img_resolution.bit_length() - start_resolution.bit_length()
         if target_inject_layers is None:
             target_inject_layers = tuple(range(max_layer + 1))
         if not isinstance(target_inject_layers, (list, tuple)) or any(
@@ -273,7 +282,8 @@ class Generator(nn.Module):
             "id_dim": id_dim,
             "w_dim": w_dim,
             "mapping_layers": mapping_layers,
-            "channel_multiplier": channel_multiplier,
+            "start_resolution": start_resolution,
+            "channels": (base_ch, max_ch),
             "blur_kernel": tuple(blur_kernel),
             "target_inject_mode": target_inject_mode,
             "target_inject_layers": target_inject_layers,
@@ -281,40 +291,51 @@ class Generator(nn.Module):
         self.img_resolution = img_resolution
         self.img_channels = img_channels
         self.id_dim = id_dim
-
-        channel_base = {
-            4: 512,
-            8: 512,
-            16: 512,
-            32: 512,
-            64: 256 * channel_multiplier,
-            128: 128 * channel_multiplier,
-            256: 64 * channel_multiplier,
-            512: 32 * channel_multiplier,
-            1024: 16 * channel_multiplier,
+        self.start_resolution = start_resolution
+        self.synthesis_resolutions = tuple(
+            2**exponent
+            for exponent in range(start_resolution.bit_length() - 1, img_resolution.bit_length())
+        )
+        # base_ch belongs to the output-resolution stage. Each halving of
+        # resolution doubles the width, capped by max_ch.
+        self.channels = {
+            resolution: min(max_ch, base_ch * (img_resolution // resolution))
+            for resolution in self.synthesis_resolutions
         }
-        self.channels = channel_base
-
-        self.encoder = AttributeEncoder(self.channels, img_resolution, img_channels, blur_kernel)
+        # Encoding stops at the lowest resolution that actually consumes a
+        # Target feature. With no injection, Target is not encoded at all.
+        injected_resolutions = [self.synthesis_resolutions[index] for index in self.target_inject_layers]
+        self.encoder = (
+            AttributeEncoder(
+                self.channels, img_resolution, min(injected_resolutions), img_channels, blur_kernel,
+            )
+            if injected_resolutions else None
+        )
         self.id_mapping = EqualLinear(id_dim, w_dim, activate=True)
         self.style = nn.Sequential(
             PixelNorm(),
             *[EqualLinear(w_dim, w_dim, lr_mul=0.01, activate=True) for _ in range(mapping_layers)],
         )
-        self.constant = nn.Parameter(torch.randn(1, self.channels[4], 4, 4))
+        self.constant = nn.Parameter(torch.randn(
+            1, self.channels[start_resolution], start_resolution, start_resolution,
+        ))
         enabled = set(self.target_inject_layers)
-        self.conv4 = StyledConv(
-            self.channels[4], self.channels[4], w_dim, inject_mode=target_inject_mode,
-            inject_target=0 in enabled, blur_kernel=blur_kernel,
+        self.conv_first = StyledConv(
+            self.channels[start_resolution], self.channels[start_resolution], w_dim,
+            inject_mode=target_inject_mode, inject_target=0 in enabled, blur_kernel=blur_kernel,
         )
-        self.to_rgb4 = ToOutput(self.conv4.output_channels, img_channels, w_dim, upsample=False, blur_kernel=blur_kernel)
+        self.to_rgb_first = ToOutput(
+            self.conv_first.output_channels, img_channels, w_dim,
+            upsample=False, blur_kernel=blur_kernel,
+        )
 
         self.stages = nn.ModuleList()
-        previous_channels = self.conv4.output_channels
-        for layer_index, res in enumerate((2**i for i in range(3, img_resolution.bit_length())), start=1):
+        previous_channels = self.conv_first.output_channels
+        for layer_index, resolution in enumerate(self.synthesis_resolutions[1:], start=1):
             stage = SynthesisStage(
-                previous_channels, self.channels[res], w_dim, img_channels,
-                inject_mode=target_inject_mode, inject_target=layer_index in enabled, blur_kernel=blur_kernel,
+                previous_channels, self.channels[resolution], w_dim, img_channels,
+                inject_mode=target_inject_mode, inject_target=layer_index in enabled,
+                blur_kernel=blur_kernel,
             )
             self.stages.append(stage)
             previous_channels = stage.conv1.output_channels
@@ -326,13 +347,13 @@ class Generator(nn.Module):
         if id_feat.ndim != 2 or id_feat.shape != (target.shape[0], self.id_dim):
             raise ValueError(f"id_feat must be [B,{self.id_dim}], got {tuple(id_feat.shape)}")
 
-        features = self.encoder(target) if self.target_inject_layers else {}
+        features = self.encoder(target) if self.encoder is not None else {}
         w = self.style(self.id_mapping(id_feat))
         x = self.constant.expand(target.shape[0], -1, -1, -1)
-        x = self.conv4(x, w, features.get(4))
-        rgb = self.to_rgb4(x, w, None)
+        x = self.conv_first(x, w, features.get(self.start_resolution))
+        rgb = self.to_rgb_first(x, w, None)
 
-        for res, stage in zip((2**i for i in range(3, self.img_resolution.bit_length())), self.stages, strict=True):
+        for res, stage in zip(self.synthesis_resolutions[1:], self.stages, strict=True):
             x, rgb = stage(x, w, features.get(res), rgb)
 
         return rgb
@@ -353,7 +374,8 @@ if __name__ == "__main__":
         "id_dim": 512,
         "w_dim": 512,
         "mapping_layers": 8,
-        "channel_multiplier": 1,
+        "start_resolution": 4,
+        "channels": (128, 512),
         "blur_kernel": (1, 3, 3, 1),
     }
 
