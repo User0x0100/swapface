@@ -173,3 +173,94 @@ def test_cuda_autocast_forward_backward_with_fp32_fir_filters(
     for module in model.modules():
         if isinstance(module, FIRBlur):
             assert module.kernel.dtype == torch.float32
+
+
+@pytest.mark.parametrize("mode", ["concat", "add"])
+def test_selective_target_injection_has_correct_channels_and_gradients(mode: str) -> None:
+    torch.manual_seed(7)
+    model = Generator(
+        img_resolution=32, mapping_layers=1, target_inject_mode=mode,
+        target_inject_layers=(0, 1, 2),
+    )
+    layers = (model.conv4, *(conv for stage in model.stages for conv in (stage.conv0, stage.conv1)))
+    enabled = (True, True, True, True, True, False, False)
+    for conv, is_enabled in zip(layers, enabled, strict=True):
+        assert conv.inject_target is is_enabled
+        assert hasattr(conv, "inject_gain") is is_enabled
+        assert conv.output_channels == conv.conv.out_ch * (2 if is_enabled and mode == "concat" else 1)
+        assert conv.bias.shape[1] == conv.output_channels
+    assert model.stages[-1].conv0.conv.in_ch == model.stages[-2].conv1.output_channels
+    assert model.stages[-1].to_rgb.conv.in_ch == model.stages[-1].conv1.output_channels
+    for conv in layers:
+        if conv.inject_target:
+            conv.inject_gain.data.fill_(0.5)
+
+    target = torch.randn(1, 3, 32, 32, requires_grad=True)
+    identity = torch.randn(1, 512, requires_grad=True)
+    output = model(target, identity)
+    assert output.shape == target.shape
+    output.square().mean().backward()
+    assert target.grad is not None and target.grad.abs().sum() > 0
+    assert identity.grad is not None and identity.grad.abs().sum() > 0
+
+
+def test_add_injection_and_disabled_layer_operations() -> None:
+    from models.stylegan2 import StyledConv
+
+    torch.manual_seed(11)
+    x = torch.randn(2, 16, 4, 4)
+    w = torch.randn(2, 32)
+    features = torch.randn(2, 8, 4, 4)
+    layer = StyledConv(16, 8, 32, inject_mode="add")
+    with torch.no_grad():
+        layer.inject_gain.fill_(0.25)
+        expected = torch.nn.functional.leaky_relu(
+            layer.conv(x, w) + 0.25 * features + layer.bias, negative_slope=0.2,
+        ) * (2**0.5)
+        torch.testing.assert_close(layer(x, w, features), expected)
+    disabled = StyledConv(16, 8, 32, inject_mode="concat", inject_target=False)
+    assert not hasattr(disabled, "inject_gain")
+    assert disabled(x, w).shape == (2, 8, 4, 4)
+    with torch.no_grad():
+        torch.testing.assert_close(disabled(x, w, features), disabled(x, w))
+
+
+@pytest.mark.parametrize("mode", ["concat", "add"])
+def test_empty_target_layers_completely_disables_target_condition(mode: str) -> None:
+    torch.manual_seed(23)
+    model = Generator(img_resolution=8, mapping_layers=1, target_inject_mode=mode, target_inject_layers=())
+    identity = torch.randn(1, 512)
+    with torch.no_grad():
+        a = model(torch.randn(1, 3, 8, 8), identity)
+        b = model(torch.randn(1, 3, 8, 8), identity)
+    torch.testing.assert_close(a, b)
+
+
+@pytest.mark.parametrize("layers", [(0, 0), (-1,), (3,), (True,), ("1",)])
+def test_invalid_target_inject_layer_indices(layers: tuple) -> None:
+    with pytest.raises(ValueError, match="target_inject_layers"):
+        Generator(img_resolution=16, mapping_layers=1, target_inject_layers=layers)
+
+
+def test_invalid_target_inject_mode() -> None:
+    with pytest.raises(ValueError, match="target_inject_mode"):
+        Generator(img_resolution=8, target_inject_mode="invalid")
+
+
+@pytest.mark.parametrize("mode", ["concat", "add"])
+@pytest.mark.parametrize("layers", [(2,), (0, 2), (1, 3), ()])
+def test_non_contiguous_target_layer_selection(mode: str, layers: tuple[int, ...]) -> None:
+    torch.manual_seed(43)
+    model = Generator(img_resolution=32, mapping_layers=1, target_inject_mode=mode, target_inject_layers=layers)
+    modules = [model.conv4, *(conv for stage in model.stages for conv in (stage.conv0, stage.conv1))]
+    enabled_indices = [0, 1, 1, 2, 2, 3, 3]
+    assert [conv.inject_target for conv in modules] == [index in layers for index in enabled_indices]
+    for conv in modules:
+        if conv.inject_target:
+            conv.inject_gain.data.fill_(0.1)
+    target = torch.randn(1, 3, 32, 32)
+    identity = torch.randn(1, 512)
+    with torch.no_grad():
+        output = model(target, identity)
+    assert output.shape == target.shape
+    assert torch.isfinite(output).all()

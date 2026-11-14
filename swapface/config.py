@@ -447,13 +447,40 @@ STYLEGAN2_COARSE_CONFIG_DEFAULTS: dict[str, Any] = {
 }
 
 
+def _normalize_target_injection(result: dict[str, Any], raw: dict[str, Any]) -> None:
+    """Validate optional StyleGAN2 injection options without altering old run schemas."""
+    names = {"coarse_target_inject_mode", "coarse_target_inject_layers"}
+    if not (names & raw.keys()):
+        return
+
+    mode = raw.get("coarse_target_inject_mode", "concat")
+    if not isinstance(mode, str) or mode not in {"concat", "add"}:
+        raise ValueError("generator.coarse_target_inject_mode 仅支持 concat 或 add")
+    result["coarse_target_inject_mode"] = mode
+
+    resolution = result["coarse_resolution"]
+    max_layer = resolution.bit_length() - 3
+    layers = raw.get("coarse_target_inject_layers", list(range(max_layer + 1)))
+    if not isinstance(layers, (tuple, list)) or any(
+        type(index) is not int or index < 0 or index > max_layer for index in layers
+    ):
+        raise ValueError(f"generator.coarse_target_inject_layers 必须为 [0, {max_layer}] 范围内的整数数组")
+    if len(set(layers)) != len(layers):
+        raise ValueError("generator.coarse_target_inject_layers 不能包含重复层级")
+    result["coarse_target_inject_layers"] = sorted(layers)
+
+
 def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
     raw = _table(config, "generator", "[generator]")
     # Preserve existing frozen run configs/hashes when no new Coarse options
     # were selected. An explicit option enables the extended canonical schema.
     extended = bool(set(raw) & set(STYLEGAN2_COARSE_CONFIG_DEFAULTS))
     defaults = DEFAULT_GENERATOR_CONFIG | (STYLEGAN2_COARSE_CONFIG_DEFAULTS if extended else {})
-    result = _with_defaults(raw, defaults, "[generator]")
+    injection_keys = {"coarse_target_inject_mode", "coarse_target_inject_layers"}
+    result = _with_defaults(
+        {key: value for key, value in raw.items() if key not in injection_keys},
+        defaults, "[generator]",
+    )
 
     integer_keys = (
         "img_resolution",
@@ -485,6 +512,10 @@ def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
         resolution = result["coarse_resolution"]
         if resolution < 4 or resolution > 1024 or resolution & (resolution - 1):
             raise ValueError("generator.coarse_resolution 使用 stylegan2 时必须是 [4, 1024] 内的 2 的整数次幂")
+    if set(raw) & injection_keys:
+        if coarse_type != "stylegan2":
+            raise ValueError("generator.coarse_target_inject_* 仅适用于 stylegan2")
+        _normalize_target_injection(result, raw)
     if result["hq_max_ch"] < result["hq_base_ch"]:
         raise ValueError("generator.hq_max_ch 必须 >= generator.hq_base_ch")
 

@@ -162,6 +162,8 @@ class StyleGAN2Coarse(nn.Module):
         w_dim: int = 512,
         mapping_layers: int = 8,
         channel_multiplier: int = 1,
+        target_inject_mode: str = "concat",
+        target_inject_layers: tuple[int, ...] | list[int] | None = None,
     ) -> None:
         super().__init__()
         self.img_resolution = img_resolution
@@ -172,6 +174,8 @@ class StyleGAN2Coarse(nn.Module):
             w_dim=w_dim,
             mapping_layers=mapping_layers,
             channel_multiplier=channel_multiplier,
+            target_inject_mode=target_inject_mode,
+            target_inject_layers=target_inject_layers,
         )
 
     def forward(self, x: Tensor, id_feat: Tensor, return_resize_in: bool = False) -> Tensor | tuple[Tensor, Tensor]:
@@ -297,6 +301,8 @@ class Generator(nn.Module):
         coarse_w_dim: int = 512,
         coarse_mapping_layers: int = 8,
         coarse_channel_multiplier: int = 1,
+        coarse_target_inject_mode: str | None = None,
+        coarse_target_inject_layers: tuple[int, ...] | list[int] | None = None,
         hq_bottleneck_resolution: int = 16,
         hq_base_ch: int = 8,
         hq_max_ch: int = 128,
@@ -325,6 +331,16 @@ class Generator(nn.Module):
                 "coarse_mapping_layers": coarse_mapping_layers,
                 "coarse_channel_multiplier": coarse_channel_multiplier,
             })
+            # Preserve the original checkpoint schema unless a new Target
+            # injection option was explicitly selected.
+            if coarse_target_inject_mode is not None or coarse_target_inject_layers is not None:
+                self.network_cfg["coarse_target_inject_mode"] = (
+                    "concat" if coarse_target_inject_mode is None else coarse_target_inject_mode
+                )
+                self.network_cfg["coarse_target_inject_layers"] = (
+                    list(range(coarse_resolution.bit_length() - 2))
+                    if coarse_target_inject_layers is None else list(coarse_target_inject_layers)
+                )
         self.img_resolution = img_resolution
         self.img_channels = img_channels
         self.id_dim = id_dim
@@ -348,9 +364,14 @@ class Generator(nn.Module):
                 w_dim=coarse_w_dim,
                 mapping_layers=coarse_mapping_layers,
                 channel_multiplier=coarse_channel_multiplier,
+                target_inject_mode="concat" if coarse_target_inject_mode is None else coarse_target_inject_mode,
+                target_inject_layers=coarse_target_inject_layers,
             )
         else:
             raise ValueError(f"unknown coarse_type: {coarse_type!r}")
+        if isinstance(self.coarse, StyleGAN2Coarse) and "coarse_target_inject_layers" in self.network_cfg:
+            # Persist the effective (validated and sorted) selection, not the caller's ordering.
+            self.network_cfg["coarse_target_inject_layers"] = list(self.coarse.generator.target_inject_layers)
         self.hq = HQRefiner(
             img_resolution=img_resolution,
             img_channels=img_channels,

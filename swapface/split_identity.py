@@ -148,11 +148,19 @@ class PrecomputedStyledConv(nn.Module):
     def __init__(self, layer: StyledConv) -> None:
         super().__init__()
         self.conv = PrecomputedModulatedConv2d(layer.conv)
-        self.inject_gain = deepcopy(layer.inject_gain)
+        self.inject_mode = layer.inject_mode
+        self.inject_target = layer.inject_target
+        if layer.inject_target:
+            self.inject_gain = deepcopy(layer.inject_gain)
         self.bias = deepcopy(layer.bias)
 
-    def forward(self, x: Tensor, style: Tensor, target_feat: Tensor) -> Tensor:
-        x = torch.cat((self.conv(x, style), self.inject_gain * target_feat), dim=1)
+    def forward(self, x: Tensor, style: Tensor, target_feat: Tensor | None) -> Tensor:
+        x = self.conv(x, style)
+        if self.inject_target:
+            if target_feat is None:
+                raise ValueError("target_feat is required for an enabled injection layer")
+            injected = self.inject_gain * target_feat
+            x = torch.cat((x, injected), dim=1) if self.inject_mode == "concat" else x + injected
         return F.leaky_relu(x + self.bias, negative_slope=0.2) * (2.0 ** 0.5)
 
 
@@ -178,7 +186,7 @@ class PrecomputedSynthesisStage(nn.Module):
         self.conv1 = PrecomputedStyledConv(stage.conv1)
         self.to_rgb = PrecomputedToOutput(stage.to_rgb)
 
-    def forward(self, x: Tensor, styles: tuple[Tensor, Tensor, Tensor], target_feat: Tensor, rgb: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, styles: tuple[Tensor, Tensor, Tensor], target_feat: Tensor | None, rgb: Tensor) -> tuple[Tensor, Tensor]:
         x = self.conv0(x, styles[0], target_feat)
         x = self.conv1(x, styles[1], target_feat)
         return x, self.to_rgb(x, styles[2], rgb)
@@ -189,6 +197,7 @@ class PrecomputedStyleGAN2(nn.Module):
         super().__init__()
         generator = coarse.generator
         self.img_resolution = coarse.img_resolution
+        self.target_inject_layers = generator.target_inject_layers
         self.encoder = deepcopy(generator.encoder)
         self.constant = deepcopy(generator.constant)
         self.conv4 = PrecomputedStyledConv(generator.conv4)
@@ -199,14 +208,14 @@ class PrecomputedStyleGAN2(nn.Module):
 
     def forward(self, target: Tensor, conditioning: Tensor) -> Tensor:
         target = F.interpolate(target, size=self.img_resolution, mode="bilinear", align_corners=False)
-        features = self.encoder(target)
+        features = self.encoder(target) if self.target_inject_layers else {}
         styles = _static_condition_slices(conditioning, self.style_widths)
         x = self.constant.expand(target.shape[0], -1, -1, -1)
-        x = self.conv4(x, styles[0], features[4])
+        x = self.conv4(x, styles[0], features.get(4))
         rgb = self.to_rgb4(x, styles[1], None)
         for i, stage in enumerate(self.stages):
             resolution = 2 ** (i + 3)
-            x, rgb = stage(x, (styles[2 + 3 * i], styles[3 + 3 * i], styles[4 + 3 * i]), features[resolution], rgb)
+            x, rgb = stage(x, (styles[2 + 3 * i], styles[3 + 3 * i], styles[4 + 3 * i]), features.get(resolution), rgb)
         return rgb
 
 

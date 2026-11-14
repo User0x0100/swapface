@@ -1,6 +1,6 @@
 """StyleSwap-inspired StyleGAN2 face-swap generator.
 
-The target-image encoder supplies spatial features at every synthesis resolution.
+The target-image encoder optionally supplies spatial features at selected synthesis resolutions.
 The source identity embedding controls the synthesis convolutions via StyleGAN2
 weight modulation/demodulation. This module is independent of the current
 Coarse/HQ training model; it does not change the active generator selection.
@@ -91,20 +91,41 @@ class ModulatedConv2d(nn.Module):
 
 
 class StyledConv(nn.Module):
-    """StyleGAN2 convolution followed by StyleSwap target-feature concatenation."""
+    """Modulated convolution with optional Target feature injection."""
 
-    def __init__(self, in_ch: int, out_ch: int, w_dim: int, *, upsample: bool = False, blur_kernel: Sequence[int] = (1, 3, 3, 1)) -> None:
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        w_dim: int,
+        *,
+        inject_mode: str = "concat",
+        inject_target: bool = True,
+        upsample: bool = False,
+        blur_kernel: Sequence[int] = (1, 3, 3, 1),
+    ) -> None:
         super().__init__()
+        if inject_mode not in {"concat", "add"}:
+            raise ValueError("inject_mode must be concat or add")
+        self.inject_mode = inject_mode
+        self.inject_target = inject_target
+        self.output_channels = out_ch * 2 if inject_target and inject_mode == "concat" else out_ch
         self.conv = ModulatedConv2d(in_ch, out_ch, w_dim, upsample=upsample, blur_kernel=blur_kernel)
-        # StyleSwap's NoiseInjection concatenates the target attribute map
-        # after the modulated convolution, doubling the activation channels.
-        # The target branch has a zero-initialized trainable gain.
-        self.inject_gain = nn.Parameter(torch.zeros(()))
-        self.bias = nn.Parameter(torch.zeros(1, 2 * out_ch, 1, 1))
+        if inject_target:
+            # The original StyleSwap path uses zero-initialized learnable gain.
+            self.inject_gain = nn.Parameter(torch.zeros(()))
+        self.bias = nn.Parameter(torch.zeros(1, self.output_channels, 1, 1))
 
-    def forward(self, x: Tensor, w: Tensor, target_feat: Tensor) -> Tensor:
+    def forward(self, x: Tensor, w: Tensor, target_feat: Tensor | None = None) -> Tensor:
         x = self.conv(x, w)
-        x = torch.cat((x, self.inject_gain * target_feat), dim=1)
+        if self.inject_target:
+            if target_feat is None:
+                raise ValueError("target_feat is required for an enabled injection layer")
+            injected = self.inject_gain * target_feat
+            if self.inject_mode == "concat":
+                x = torch.cat((x, injected), dim=1)
+            else:
+                x = x + injected
         return F.leaky_relu(x + self.bias, negative_slope=0.2) * math.sqrt(2.0)
 
 
@@ -171,15 +192,29 @@ class AttributeEncoder(nn.Module):
 
 
 class SynthesisStage(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, w_dim: int, img_channels: int, *, blur_kernel: Sequence[int]) -> None:
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        w_dim: int,
+        img_channels: int,
+        *,
+        inject_mode: str,
+        inject_target: bool,
+        blur_kernel: Sequence[int],
+    ) -> None:
         super().__init__()
-        # Both convolutions receive the attribute map, as in the official
-        # StyleSwap generator. Each convolution outputs 2 * out_ch after concat.
-        self.conv0 = StyledConv(2 * in_ch, out_ch, w_dim, upsample=True, blur_kernel=blur_kernel)
-        self.conv1 = StyledConv(2 * out_ch, out_ch, w_dim, blur_kernel=blur_kernel)
-        self.to_rgb = ToOutput(2 * out_ch, img_channels, w_dim, upsample=True, blur_kernel=blur_kernel)
+        self.conv0 = StyledConv(
+            in_ch, out_ch, w_dim, inject_mode=inject_mode, inject_target=inject_target,
+            upsample=True, blur_kernel=blur_kernel,
+        )
+        self.conv1 = StyledConv(
+            self.conv0.output_channels, out_ch, w_dim, inject_mode=inject_mode,
+            inject_target=inject_target, blur_kernel=blur_kernel,
+        )
+        self.to_rgb = ToOutput(self.conv1.output_channels, img_channels, w_dim, upsample=True, blur_kernel=blur_kernel)
 
-    def forward(self, x: Tensor, w: Tensor, target_feat: Tensor, rgb: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, w: Tensor, target_feat: Tensor | None, rgb: Tensor) -> tuple[Tensor, Tensor]:
         x = self.conv0(x, w, target_feat)
         x = self.conv1(x, w, target_feat)
         rgb = self.to_rgb(x, w, rgb)
@@ -193,8 +228,8 @@ class Generator(nn.Module):
     Output: generated RGB image [B,C,R,R] without a mask branch.
 
     The identity embedding is mapped into the StyleGAN2 W space; the target
-    encoder supplies per-resolution features by concatenation after each styled
-    convolution. Feature widths follow the official StyleSwap doubling rule.
+    encoder optionally supplies per-resolution Target features using concatenation
+    or addition after the styled convolutions.
     """
 
     def __init__(
@@ -205,6 +240,8 @@ class Generator(nn.Module):
         w_dim: int = 512,
         mapping_layers: int = 8,
         channel_multiplier: int = 1,
+        target_inject_mode: str = "concat",
+        target_inject_layers: Sequence[int] | None = None,
         blur_kernel: Sequence[int] = (1, 3, 3, 1),
     ) -> None:
         super().__init__()
@@ -216,6 +253,19 @@ class Generator(nn.Module):
             raise ValueError("channel_multiplier must be positive")
         if tuple(blur_kernel) != (1, 3, 3, 1):
             raise ValueError("only the original [1,3,3,1] StyleGAN2 FIR kernel is supported")
+        if target_inject_mode not in {"concat", "add"}:
+            raise ValueError("target_inject_mode must be concat or add")
+        max_layer = img_resolution.bit_length() - 3
+        if target_inject_layers is None:
+            target_inject_layers = tuple(range(max_layer + 1))
+        if not isinstance(target_inject_layers, (list, tuple)) or any(
+            type(index) is not int or index < 0 or index > max_layer for index in target_inject_layers
+        ):
+            raise ValueError(f"target_inject_layers must contain integer indices in [0, {max_layer}]")
+        if len(set(target_inject_layers)) != len(target_inject_layers):
+            raise ValueError("target_inject_layers must not contain duplicate indices")
+        target_inject_layers = tuple(sorted(target_inject_layers))
+        self.target_inject_layers = target_inject_layers
 
         self.network_cfg = {
             "img_resolution": img_resolution,
@@ -225,6 +275,8 @@ class Generator(nn.Module):
             "mapping_layers": mapping_layers,
             "channel_multiplier": channel_multiplier,
             "blur_kernel": tuple(blur_kernel),
+            "target_inject_mode": target_inject_mode,
+            "target_inject_layers": target_inject_layers,
         }
         self.img_resolution = img_resolution
         self.img_channels = img_channels
@@ -250,12 +302,22 @@ class Generator(nn.Module):
             *[EqualLinear(w_dim, w_dim, lr_mul=0.01, activate=True) for _ in range(mapping_layers)],
         )
         self.constant = nn.Parameter(torch.randn(1, self.channels[4], 4, 4))
-        self.conv4 = StyledConv(self.channels[4], self.channels[4], w_dim, blur_kernel=blur_kernel)
-        self.to_rgb4 = ToOutput(2 * self.channels[4], img_channels, w_dim, upsample=False, blur_kernel=blur_kernel)
+        enabled = set(self.target_inject_layers)
+        self.conv4 = StyledConv(
+            self.channels[4], self.channels[4], w_dim, inject_mode=target_inject_mode,
+            inject_target=0 in enabled, blur_kernel=blur_kernel,
+        )
+        self.to_rgb4 = ToOutput(self.conv4.output_channels, img_channels, w_dim, upsample=False, blur_kernel=blur_kernel)
 
         self.stages = nn.ModuleList()
-        for res in (2**i for i in range(3, img_resolution.bit_length())):
-            self.stages.append(SynthesisStage(self.channels[res // 2], self.channels[res], w_dim, img_channels, blur_kernel=blur_kernel))
+        previous_channels = self.conv4.output_channels
+        for layer_index, res in enumerate((2**i for i in range(3, img_resolution.bit_length())), start=1):
+            stage = SynthesisStage(
+                previous_channels, self.channels[res], w_dim, img_channels,
+                inject_mode=target_inject_mode, inject_target=layer_index in enabled, blur_kernel=blur_kernel,
+            )
+            self.stages.append(stage)
+            previous_channels = stage.conv1.output_channels
 
     def forward(self, target: Tensor, id_feat: Tensor) -> Tensor:
         expected = (self.img_channels, self.img_resolution, self.img_resolution)
@@ -264,14 +326,14 @@ class Generator(nn.Module):
         if id_feat.ndim != 2 or id_feat.shape != (target.shape[0], self.id_dim):
             raise ValueError(f"id_feat must be [B,{self.id_dim}], got {tuple(id_feat.shape)}")
 
-        features = self.encoder(target)
+        features = self.encoder(target) if self.target_inject_layers else {}
         w = self.style(self.id_mapping(id_feat))
         x = self.constant.expand(target.shape[0], -1, -1, -1)
-        x = self.conv4(x, w, features[4])
+        x = self.conv4(x, w, features.get(4))
         rgb = self.to_rgb4(x, w, None)
 
         for res, stage in zip((2**i for i in range(3, self.img_resolution.bit_length())), self.stages, strict=True):
-            x, rgb = stage(x, w, features[res], rgb)
+            x, rgb = stage(x, w, features.get(res), rgb)
 
         return rgb
 

@@ -52,6 +52,32 @@ def test_stylegan2_coarse_config_and_validation() -> None:
     assert config["coarse_w_dim"] == 512
     assert config["coarse_mapping_layers"] == 8
     assert config["coarse_channel_multiplier"] == 1
+    assert "coarse_target_inject_mode" not in config
+    assert "coarse_target_inject_layers" not in config
+
+    selective = _normalize_generator({"generator": {
+        "coarse_type": "stylegan2",
+        "coarse_resolution": 128,
+        "coarse_target_inject_mode": "add",
+        "coarse_target_inject_layers": [2, 0, 1],
+    }})
+    assert selective["coarse_target_inject_mode"] == "add"
+    assert selective["coarse_target_inject_layers"] == [0, 1, 2]
+    default_layers = _normalize_generator({"generator": {
+        "coarse_type": "stylegan2",
+        "coarse_target_inject_mode": "concat",
+        "coarse_resolution": 128,
+    }})
+    assert default_layers["coarse_target_inject_layers"] == list(range(6))
+    for invalid in ([0, 0], [6], [-1], [True], ["1"], "0,1"):
+        with pytest.raises(ValueError, match="coarse_target_inject_layers"):
+            _normalize_generator({"generator": {
+                "coarse_type": "stylegan2", "coarse_target_inject_layers": invalid,
+            }})
+    with pytest.raises(ValueError, match="coarse_target_inject_mode"):
+        _normalize_generator({"generator": {
+            "coarse_type": "stylegan2", "coarse_target_inject_mode": "bad",
+        }})
 
     for invalid in ("invalid", 2):
         with pytest.raises(ValueError, match="coarse_type"):
@@ -146,7 +172,10 @@ def test_stylegan2_checkpoint_roundtrip_and_coarse_branch_guards(tmp_path) -> No
     assert _branch_generator_mode(parent, current) == "inherit"
     changed_hq = {"generator": config | {"img_resolution": 32}, "train": {"stage": "hq"}, "identity": {"provider": "BLENDFACE"}}
     assert _branch_generator_mode(parent, changed_hq) == "hq_rebuild"
-    for key, val in (("coarse_type", "inswapper"), ("coarse_mapping_layers", 2), ("coarse_channel_multiplier", 2)):
+    for key, val in (
+        ("coarse_type", "inswapper"), ("coarse_mapping_layers", 2), ("coarse_channel_multiplier", 2),
+        ("coarse_target_inject_mode", "add"), ("coarse_target_inject_layers", [0]),
+    ):
         different = {"generator": config | {key: val}, "train": {"stage": "hq"}, "identity": {"provider": "BLENDFACE"}}
         with pytest.raises(ValueError, match="Coarse"):
             _branch_generator_mode(parent, different)
@@ -156,13 +185,18 @@ def test_stylegan2_checkpoint_roundtrip_and_coarse_branch_guards(tmp_path) -> No
     assert _branch_generator_mode(parent, unused_legacy) == "inherit"
 
 
-def test_stylegan2_strict_cpu_export_and_runtime(tmp_path) -> None:
+@pytest.mark.parametrize("injection", [
+    {},
+    {"coarse_target_inject_mode": "concat", "coarse_target_inject_layers": [0]},
+    {"coarse_target_inject_mode": "add", "coarse_target_inject_layers": [0]},
+])
+def test_stylegan2_strict_cpu_export_and_runtime(tmp_path, injection: dict) -> None:
     onnx = pytest.importorskip("onnx")
     ort = pytest.importorskip("onnxruntime")
     from swapface.export import OnnxExportOptions, export_to_onnx
 
     torch.manual_seed(31)
-    model = Generator(**small_config()).eval()
+    model = Generator(**(small_config() | injection)).eval()
     target = torch.randn(1, 3, 16, 16)
     identity = torch.randn(1, 32)
     with torch.inference_mode():
@@ -201,3 +235,37 @@ def test_swapface_export_forces_cpu_even_if_cuda_requested() -> None:
     wrapped, inputs = mocked.call_args.args[:2]
     assert all(p.device.type == "cpu" for p in wrapped.parameters())
     assert all(t.device.type == "cpu" for t in inputs)
+
+
+@pytest.mark.parametrize("mode", ["concat", "add"])
+def test_selective_stylegan2_split_identity_matches_full_model(mode: str) -> None:
+    from swapface.split_identity import PrecomputedStyleGAN2, StyleGAN2Projection
+
+    config = small_config() | {
+        "coarse_target_inject_mode": mode,
+        "coarse_target_inject_layers": [0],
+    }
+    model = Generator(**config).eval()
+    assert isinstance(model.coarse, StyleGAN2Coarse)
+    projection = StyleGAN2Projection(model.coarse).eval()
+    for layer in model.coarse.generator.modules():
+        if hasattr(layer, "inject_gain"):
+            layer.inject_gain.data.fill_(0.25)
+    client = PrecomputedStyleGAN2(model.coarse).eval()
+    target = torch.randn(1, 3, 16, 16)
+    identity = torch.randn(1, 32)
+    with torch.no_grad():
+        conditioning = projection(identity)
+        expected = model.coarse(target, identity)
+        actual = client(target, conditioning)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+
+
+def test_direct_constructor_records_canonical_layer_order() -> None:
+    config = small_config() | {
+        "coarse_target_inject_mode": "concat",
+        "coarse_target_inject_layers": [1, 0],
+    }
+    model = Generator(**config)
+    assert model.network_cfg["coarse_target_inject_layers"] == [0, 1]
+    assert model.coarse.generator.target_inject_layers == (0, 1)

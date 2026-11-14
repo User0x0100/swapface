@@ -270,6 +270,12 @@ hq_max_ch = 128
 # coarse_w_dim = 512
 # coarse_mapping_layers = 8
 # coarse_channel_multiplier = 1
+# Target 注入方式：concat（拼接）或 add（逐元素加法），默认 concat。
+# coarse_target_inject_mode = "concat"
+# 注入的分辨率层级（TOML 数组传入，内部作为整数元组使用）。
+# 0=4x4、1=8x8、2=16x16、3=32x32、4=64x64、5=128x128。
+# 默认所有层启用；例如 [0, 1, 2] 只在 4x4/8x8/16x16 注入。
+# coarse_target_inject_layers = [0, 1, 2]
 # hq_bottleneck_resolution = 16
 # hq_base_ch = 8
 # hq_max_ch = 128
