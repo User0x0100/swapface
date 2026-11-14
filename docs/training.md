@@ -231,9 +231,11 @@ coarse_target_inject_layers = [0]      # 相对于起始分辨率编号
 
 原 Coarse 的 `coarse_latent_resolution`、`coarse_num_latent`、`coarse_base_ch`、`coarse_max_ch` 不影响 StyleGAN2。`coarse_resolution` 必须为 4～1024 的 2 的整数次幂，且不超过 HQ 输出分辨率；`coarse_start_resolution` 必须是位于 4 到 `coarse_resolution` 之间的 2 的整数次幂。旧 StyleGAN2 检查点不支持直接按新架构载入。
 
-两种 Coarse 共用 `coarse(target, identity, return_resize_in=True)` 接口：输入自动双线性缩放，输出形状为 `[B,3,coarse_resolution,coarse_resolution]`。当前两种 Coarse 与 HQRefiner 的 RGB 输出均为线性输出，不再通过 `tanh` 限制到 `[-1,1]`；训练损失负责约束输出，预览与保存时再裁剪到显示范围。InSwapper Coarse 与 HQRefiner 的隐藏层使用 SiLU，IDInject 仅在第一个 AdaIN 后使用 SiLU，第二个 AdaIN 的结果直接参与残差相加；StyleGAN2 Coarse 仍使用 LeakyReLU。StyleGAN2 的注入增益初始为 0；训练初期 Target Encoder 的梯度需经注入增益逐步建立。
+两种 Coarse 共用 `coarse(target, identity, return_resize_in=True)` 接口：输入自动双线性缩放，输出形状为 `[B,3,coarse_resolution,coarse_resolution]`。当前两种 Coarse 与 HQRefiner 的 RGB 输出均为线性输出，不再通过 `tanh` 限制到 `[-1,1]`；训练损失负责约束输出，预览与保存时再裁剪到显示范围。InSwapper Coarse 与 HQRefiner 的隐藏层使用 SiLU，IDInject 仅在第一个 AdaIN 后使用 SiLU，第二个 AdaIN 的结果直接参与残差相加。InSwapper Coarse 恢复了 WSpaceMap：身份向量先经过四层共享残差映射，再经过 `2 × coarse_num_latent` 个两层私有残差映射，每个 AdaIN 独立接收一个 W 向量；原有 AdaIN 的仿射投影仍然保留。WSpaceMap 的隐藏层使用 SiLU，末层使用小权重初始化。拆分导出时，WSpaceMap 与 AdaIN 仿射投影一同位于服务端身份编码器，客户端只接收预计算的 gamma/beta。StyleGAN2 Coarse 仍使用 LeakyReLU。StyleGAN2 的注入增益初始为 0；训练初期 Target Encoder 的梯度需经注入增益逐步建立。
 
-**激活函数变更**：旧检查点的权重形状与当前模型兼容，但旧 InSwapper/HQ 使用的 ReLU/LeakyReLU 和输出 Tanh 已更改；加载旧检查点会按新计算图运行，不能视为旧模型的等价恢复。建议针对新激活设计启动独立训练实验。
+**激活函数变更**：旧 InSwapper/HQ 使用的 ReLU/LeakyReLU 和输出 Tanh 已更改，即使权重形状匹配也不能视为等价恢复。应为新计算图启动独立训练实验。
+
+**WSpaceMap 检查点变更**：新增 `w_space_map.*` 参数后，缺少这些参数的旧 InSwapper 检查点无法按严格权重加载直接恢复训练或推理；需要用新结构重新训练。StyleGAN2 Coarse 不受此变更影响。
 
 **检查点隔离**：不同 Coarse 架构的权重不可互换。`resume`/继承 Coarse 的 `branch` 必须保持同一架构；HQ rebuild 只允许修改 HQ 配置，不允许把 InSwapper Coarse 的权重当成 StyleGAN2 权重。旧检查点缺少 `coarse_type` 时按原 InSwapper 解释。
 

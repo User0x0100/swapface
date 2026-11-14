@@ -38,13 +38,14 @@ class IDInject(nn.Module):
         self.adain1 = AdaIN(channels, w_dim)
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, padding_mode="reflect")
 
-    def forward(self, x: Tensor, id_feat: Tensor) -> Tensor:
+    def forward(self, x: Tensor, w: tuple[Tensor, Tensor]) -> Tensor:
+        w0, w1 = w
         residual = self.conv0(x)
-        residual = self.adain0(residual, id_feat)
+        residual = self.adain0(residual, w0)
         residual = self.act(residual)
 
         residual = self.conv1(residual)
-        residual = self.adain1(residual, id_feat)
+        residual = self.adain1(residual, w1)
 
         return x + residual
 
@@ -85,15 +86,56 @@ class DownSample(nn.Sequential):
         )
 
 
+class WSpaceMap(nn.Module):
+    """Shared identity mapping plus one private residual mapping per AdaIN."""
+
+    def __init__(self, id_dim: int, num: int, num_share_layers: int = 4, num_w_p_layers: int = 2) -> None:
+        super().__init__()
+
+        self.shared_delta = nn.Sequential()
+        for _ in range(num_share_layers - 1):
+            self.shared_delta.append(nn.Linear(id_dim, id_dim))
+            self.shared_delta.append(nn.SiLU())
+        self.shared_delta.append(nn.Linear(id_dim, id_dim))
+
+        self.private_delta = nn.ModuleList()
+        for _ in range(num):
+            layers = nn.Sequential()
+            for _ in range(num_w_p_layers):
+                layers.append(nn.SiLU())
+                layers.append(nn.Linear(id_dim, id_dim))
+            self.private_delta.append(layers)
+
+        self.num = num
+        self.id_dim = id_dim
+
+        shared_output = self.shared_delta[-1]
+        assert isinstance(shared_output, nn.Linear)
+        nn.init.normal_(shared_output.weight, mean=0.0, std=0.005)
+        nn.init.zeros_(shared_output.bias)
+
+        for head in self.private_delta:
+            private_output = head[-1]
+            assert isinstance(private_output, nn.Linear)
+            nn.init.normal_(private_output.weight, mean=0.0, std=0.005)
+            nn.init.zeros_(private_output.bias)
+
+    def forward(self, id_feat: Tensor) -> tuple[Tensor, ...]:
+        w = id_feat + self.shared_delta(id_feat)
+        return tuple(w + head(w) for head in self.private_delta)
+
+
 class LatentBlock(nn.Module):
     def __init__(self, channels: int, w_dim: int, num_layers: int) -> None:
         super().__init__()
 
         self.layers = nn.ModuleList([IDInject(channels, w_dim) for _ in range(num_layers)])
 
-    def forward(self, x: Tensor, id_feat: Tensor) -> Tensor:
-        for layer in self.layers:
-            x = layer(x, id_feat)
+    def forward(self, x: Tensor, w_space: tuple[Tensor, ...]) -> Tensor:
+        if len(w_space) != len(self.layers) * 2:
+            raise ValueError(f"Expected {len(self.layers) * 2} W vectors, got {len(w_space)}")
+        for index, layer in enumerate(self.layers):
+            x = layer(x, (w_space[index * 2], w_space[index * 2 + 1]))
         return x
 
 
@@ -128,6 +170,7 @@ class Coarse(nn.Module):
 
         num_depth = int(math.log2(scale))
 
+        self.w_space_map = WSpaceMap(id_dim, num_latent * 2)
         features = [min(max_ch, base_ch * (2**i)) for i in range(num_depth + 1)]
 
         self.from_rgb = FromRGB(img_channels, base_ch)
@@ -141,7 +184,7 @@ class Coarse(nn.Module):
 
         feat = self.from_rgb(resize_in)
         encoder_feat = self.encoder(feat)
-        latent_feat = self.latent_space(encoder_feat, id_feat)
+        latent_feat = self.latent_space(encoder_feat, self.w_space_map(id_feat))
         decoder_feat = self.decoder(latent_feat)
         output = self.to_rgb(decoder_feat)
 

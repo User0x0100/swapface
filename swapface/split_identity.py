@@ -32,6 +32,7 @@ def _static_condition_slices(conditioning: Tensor, widths: list[int]) -> list[Te
 class InSwapperProjection(nn.Module):
     def __init__(self, coarse: Coarse) -> None:
         super().__init__()
+        self.w_space_map = deepcopy(coarse.w_space_map)
         self.linears = nn.ModuleList(
             deepcopy(projection)
             for layer in coarse.latent_space.layers
@@ -40,7 +41,8 @@ class InSwapperProjection(nn.Module):
         self.width = sum(linear.out_features for linear in self.linears)
 
     def forward(self, identity: Tensor) -> Tensor:
-        return torch.cat([linear(identity) for linear in self.linears], dim=1)
+        w_space = self.w_space_map(identity)
+        return torch.cat([linear(w) for linear, w in zip(self.linears, w_space, strict=True)], dim=1)
 
 
 class PrecomputedAdaIN(nn.Module):

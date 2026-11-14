@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 import torch
 from torch import nn
 
-from models.networks import AdaIN, Coarse, Generator, HQRefiner, IDInject
+from models.networks import AdaIN, Coarse, Generator, HQRefiner, IDInject, WSpaceMap
 from swapface.config import _normalize_generator
 from swapface.contracts import CHECKPOINT_VERSION
 from swapface.inference import load_generator
@@ -34,11 +34,14 @@ def _compact_config() -> dict[str, int]:
 
 def _assert_topology_and_scaling() -> None:
     with torch.device("meta"):
-        # This size configuration reproduces the InSwapper128 ONNX learnable
-        # graph's exact layer-wise channels and trainable parameter count.
+        # The restored WSpace adds shared/private MLPs on top of the original
+        # InSwapper-style convolution and AdaIN topology.
         full = Coarse(img_resolution=128, img_channels=3, latent_resolution=32,
                       num_latent=6, base_ch=256, max_ch=1024, id_dim=512)
-    assert sum(p.numel() for p in full.parameters()) == 138_292_739
+    assert sum(p.numel() for p in full.parameters()) == 145_647_107
+    assert sum(p.numel() for p in full.w_space_map.parameters()) == 7_354_368
+    assert len(full.w_space_map.shared_delta) == 7  # 4 Linear + 3 SiLU
+    assert all(len(head) == 4 for head in full.w_space_map.private_delta)
 
     cases = [(64, 256, 6), (96, 384, 4), (256, 1024, 6)]
     for base_ch, max_ch, num_latent in cases:
@@ -47,7 +50,9 @@ def _assert_topology_and_scaling() -> None:
                              num_latent=num_latent, base_ch=base_ch,
                              max_ch=max_ch)
         assert len(network.latent_space.layers) == num_latent
-        assert not hasattr(network, "w_space_map")
+        assert isinstance(network.w_space_map, WSpaceMap)
+        assert len(network.w_space_map.private_delta) == num_latent * 2
+        assert network.w_space_map.num == num_latent * 2
         assert network.from_rgb[0].out_channels == base_ch // 2
         assert network.from_rgb[2].out_channels == base_ch
         latent_ch = min(max_ch, base_ch * 4)
@@ -85,7 +90,12 @@ def _assert_conditioning_and_gradients() -> None:
         for handle in handles:
             handle.remove()
     assert len(identities_seen) == 4
-    assert all(t is src for t in identities_seen)
+    assert all(t is not src for t in identities_seen)
+    with torch.no_grad():
+        w_space = coarse.w_space_map(src.detach())
+    assert all(torch.allclose(actual.detach(), expected) for actual, expected in zip(identities_seen, w_space, strict=True))
+    assert len(w_space) == 4
+    assert not torch.equal(w_space[0], w_space[1])
     assert y.shape == (2, 3, 8, 8)
     assert bool(torch.isfinite(y).all())
     (y.square().mean()).backward()
@@ -94,13 +104,28 @@ def _assert_conditioning_and_gradients() -> None:
         for adain in (layer.adain0, layer.adain1):
             assert adain.linear.weight.grad is not None
             assert torch.isfinite(adain.linear.weight.grad).all()
+    assert coarse.w_space_map.shared_delta[-1].weight.grad is not None
+    assert torch.count_nonzero(coarse.w_space_map.shared_delta[-1].weight.grad) > 0
+    for head in coarse.w_space_map.private_delta:
+        assert head[-1].weight.grad is not None
+        assert torch.count_nonzero(head[-1].weight.grad) > 0
 
-    # The shared source vector should affect the output of both style
-    # projections, not a learned intermediate WSpaceMap.
     with torch.inference_mode():
         y0 = coarse(x, torch.zeros_like(src))
         y1 = coarse(x, torch.ones_like(src))
     assert not torch.allclose(y0, y1)
+
+
+def _assert_w_space_initialization() -> None:
+    torch.manual_seed(13)
+    mapping = WSpaceMap(8, 4)
+    identity = torch.randn(2, 8)
+    w_space = mapping(identity)
+    assert len(w_space) == 4
+    assert all(w.shape == identity.shape for w in w_space)
+    # Small residual initialization keeps initial W close to the input identity.
+    assert max((w - identity).abs().max().item() for w in w_space) < 0.1
+    assert not torch.equal(w_space[0], w_space[1])
 
 
 def _assert_linear_rgb_outputs() -> None:
@@ -127,11 +152,11 @@ def _assert_id_inject_residual() -> None:
     """The final AdaIN result is added directly, without an activation."""
     block = IDInject(channels=4, w_dim=8).eval()
     x = torch.randn(2, 4, 4, 4)
-    identity = torch.randn(2, 8)
+    w0, w1 = torch.randn(2, 8), torch.randn(2, 8)
     with torch.no_grad():
-        residual = block.act(block.adain0(block.conv0(x), identity))
-        residual = block.adain1(block.conv1(residual), identity)
-        torch.testing.assert_close(block(x, identity), x + residual)
+        residual = block.act(block.adain0(block.conv0(x), w0))
+        residual = block.adain1(block.conv1(residual), w1)
+        torch.testing.assert_close(block(x, (w0, w1)), x + residual)
 
 
 def _assert_checkpoint_and_config() -> None:
@@ -156,6 +181,7 @@ def main() -> None:
     torch.set_num_threads(2)
     _assert_topology_and_scaling()
     _assert_conditioning_and_gradients()
+    _assert_w_space_initialization()
     _assert_id_inject_residual()
     _assert_linear_rgb_outputs()
     _assert_checkpoint_and_config()
