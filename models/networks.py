@@ -30,7 +30,7 @@ class IDInject(nn.Module):
     def __init__(self, channels: int, w_dim: int) -> None:
         super().__init__()
 
-        self.act = nn.ReLU()
+        self.act = nn.SiLU()
 
         self.adain0 = AdaIN(channels, w_dim)
         self.conv0 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, padding_mode="reflect")
@@ -53,9 +53,9 @@ class FromRGB(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__(
             nn.Conv2d(in_ch, out_ch // 2, kernel_size=7, stride=1, padding=3, padding_mode="reflect"),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
             nn.Conv2d(out_ch // 2, out_ch, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
         )
 
 
@@ -63,9 +63,8 @@ class ToRGB(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__(
             nn.Conv2d(in_ch, in_ch // 2, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
             nn.Conv2d(in_ch // 2, out_ch, kernel_size=7, stride=1, padding=3, padding_mode="reflect"),
-            nn.Tanh(),
         )
 
 
@@ -74,7 +73,7 @@ class UpSample(nn.Sequential):
         super().__init__(
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
         )
 
 
@@ -82,7 +81,7 @@ class DownSample(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__(
             nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
         )
 
 
@@ -231,9 +230,9 @@ class HQRefiner(nn.Module):
             encoder.append(
                 nn.Sequential(
                     nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.LeakyReLU(0.2),
+                    nn.SiLU(),
                     nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.LeakyReLU(0.2),
+                    nn.SiLU(),
                 )
             )
             in_ch = out_ch
@@ -241,9 +240,9 @@ class HQRefiner(nn.Module):
 
         self.bottleneck = nn.Sequential(
             nn.Conv2d(self.feature_channels[-2], self.feature_channels[-1], kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
             nn.Conv2d(self.feature_channels[-1], self.feature_channels[-1], kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
+            nn.SiLU(),
         )
 
         self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
@@ -255,9 +254,9 @@ class HQRefiner(nn.Module):
             decoder.append(
                 nn.Sequential(
                     nn.Conv2d(concat_ch, mid_ch, kernel_size=3, stride=1, padding=1),
-                    nn.LeakyReLU(0.2),
+                    nn.SiLU(),
                     nn.Conv2d(mid_ch, skip_ch, kernel_size=3, stride=1, padding=1),
-                    nn.LeakyReLU(0.2),
+                    nn.SiLU(),
                 )
             )
             decoder_ch = skip_ch
@@ -285,7 +284,7 @@ class HQRefiner(nn.Module):
         for block, skip in zip(self.decoder, reversed(skips), strict=True):
             x = block(torch.cat((skip, self.up(x)), dim=1))
 
-        return torch.tanh(self.to_rgb(x))
+        return self.to_rgb(x)
 
 
 class Generator(nn.Module):
@@ -339,9 +338,7 @@ class Generator(nn.Module):
             self.network_cfg.update({
                 "coarse_start_resolution": coarse_start_resolution,
                 "coarse_channels": list(coarse_channels),
-                "coarse_target_inject_mode": (
-                    "concat" if coarse_target_inject_mode is None else coarse_target_inject_mode
-                ),
+                "coarse_target_inject_mode": ("concat" if coarse_target_inject_mode is None else coarse_target_inject_mode),
             })
         self.img_resolution = img_resolution
         self.img_channels = img_channels
