@@ -13,47 +13,47 @@
 
 ## 安装 GPU 后端
 
-依赖组按用途与下载网络区分，默认不安装任何组（`default-groups = []`）。
+依赖组按用途与计算后端区分，默认不启用依赖组（`default-groups = []`）。锁文件只面向 Linux x86_64，统一记录公共 PyPI、PyTorch CUDA 12.6、PyTorch ROCm 7.2、NVIDIA DALI 的**官方制品来源**，避免其他运行环境在更新锁文件时访问阿里云内网。
 
-| 组 | 用途 | 源 |
+| 组 | 用途 | 依赖来源 |
 | --- | --- | --- |
-| `nvidia` | NVIDIA 完整开发环境（含导出、预览、测试） | 阿里云公网镜像 |
-| `nvidia-train` | NVIDIA 最小训练环境 | 阿里云公网镜像 |
-| `nvidia-train-aliyun` | PAI-DSW NVIDIA 最小训练环境 | CUDA/DALI 阿里云内网镜像，普通包使用 `--default-index` 指向阿里云内网 |
-| `rocm` | AMD ROCm | PyTorch ROCm 官方索引，普通包使用阿里云公网镜像 |
+| `nvidia-train` | NVIDIA 最小训练环境 | PyTorch CUDA 12.6 + NVIDIA DALI + PyPI |
+| `nvidia` | NVIDIA 完整开发环境（含导出、预览、测试） | PyTorch CUDA 12.6 + NVIDIA DALI + PyPI |
+| `rocm` | AMD ROCm 环境 | PyTorch ROCm 7.2 + PyPI |
 
 NVIDIA 最小训练（包含 DALI、SMIRK、VGG、TensorBoard、自定义 CUDA 算子）：
 
 ```bash
-uv sync --only-group nvidia-train
+uv sync --locked --only-group nvidia-train
 uv run --no-sync python -m swapface.train --config experiments/train.toml
 ```
 
-PAI-DSW 使用内网镜像：
+阿里云 PAI-DSW 如果需要**内网镜像**，使用单独的镜像安装入口：
 
 ```bash
-uv sync --only-group nvidia-train-aliyun \
-  --default-index http://mirrors.cloud.aliyuncs.com/pypi/simple/
+bash scripts/sync-pai.sh
 uv run --no-sync python -m swapface.train --config experiments/train.toml
 ```
 
-**注意**：uv 的默认索引是项目级，而不是组级；即使使用 `--only-group`，首次更新共享 `uv.lock` 时也会解析其他组。因此不同网络下重新锁定会影响默认源及锁文件下载 URL，不能仅凭选择内网组保证锁文件里全部资源都使用内网。如果要严格离线内网/固定内网制品，应单独维护锁文件或独立环境。使用 `--frozen` 会跳过重新锁定，也不会将原锁文件记录的公网下载地址自动替换为内网地址。
+`sync-pai.sh` 先从同一份 `uv.lock` 导出 NVIDIA 最小训练组的固定版本和 SHA-256 哈希，再将 PyPI 包和 CUDA 12.6 wheel 分别从 PAI 的阿里云内网镜像安装到项目 `.venv`。因此**无需另设 `nvidia-train-aliyun` 依赖组，也不会重新锁定 ROCm 依赖或改写共享 `uv.lock`**。内网镜像须完整包含锁文件要求的相同 wheel，否则安装应失败，而不是静默更换版本或校验哈希。可以通过 `PAI_PYPI_INDEX`、`PAI_CUDA_WHEELS` 覆盖镜像地址；脚本将额外参数透传给 `uv pip sync`（例如 `--dry-run`）。此入口仅用于阿里云 PAI 或能够访问同一内网的环境。
+
+锁定变更后在公共网络执行 `uv lock --check`。切换依赖组用 `uv sync --locked ...`，避免安装时顺便修改锁文件。**`--only-group` 控制安装范围，不会缩小 uv 重新锁定时要解析的所有依赖组**，因此不可将内网专有 URL 放入项目共享 `tool.uv.index`。
 
 `--only-group` 用于避免安装 `[project].dependencies` 中与训练无关的包。当前最小组不含 TensorRT、ONNX Runtime GPU、TorchCodec、xFormers；如启用遮挡增强，需另行安装 `segmentation-models-pytorch`。
 
 NVIDIA 完整开发环境：
 
 ```bash
-uv sync --group nvidia
+uv sync --locked --group nvidia
 ```
 
 AMD ROCm 环境：
 
 ```bash
-uv sync --group rocm
+uv sync --locked --group rocm
 ```
 
-ROCm 不安装 DALI、TorchCodec、ONNX Runtime GPU、xFormers 或 TensorRT。NVIDIA 与 ROCm 组互斥；内网和公网 NVIDIA 组也互斥。运行训练时建议使用 `uv run --no-sync ...`，避免再次同步环境。
+ROCm 不安装 DALI、TorchCodec、ONNX Runtime GPU、xFormers 或 TensorRT。NVIDIA 与 ROCm 组互斥。运行训练时建议使用 `uv run --no-sync ...`，避免再次同步环境。
 
 ## 新建训练
 

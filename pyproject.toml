@@ -22,24 +22,9 @@ dependencies = [
 ]
 
 [dependency-groups]
-# 仅 NVIDIA 训练运行时；使用 `uv sync --only-group nvidia-train`，
+# 仅 NVIDIA 训练运行时；使用 `uv sync --locked --only-group nvidia-train`，
 # 排除 [project].dependencies 中的预览、导出及数据预处理工具。
 nvidia-train = [
-    "torch",
-    "torchvision",
-    "numpy",
-    "opencv-python",
-    "pillow",
-    "huggingface-hub>=1.32.0",
-    "tensorboard",
-    "tqdm",
-    "timm>=1.0.0",
-    "nvidia-dali-cuda120",
-    "ninja",
-]
-# NVIDIA 最小训练依赖，面向阿里云 PAI 内网镜像。
-# 与 nvidia-train 内容保持一致，区别是 CUDA/DALI 来源由 sources 按组切换。
-nvidia-train-aliyun = [
     "torch",
     "torchvision",
     "numpy",
@@ -72,26 +57,23 @@ rocm = [
 [tool.uv]
 package = false
 default-groups = []
-# 内网 CUDA 和公网 CUDA 使用不同的制品源，ROCm 使用官方源。
+# Training and export tools in this repository target Linux x86_64 only.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+# NVIDIA uses public CUDA/DALI indexes; ROCm uses its own official index.
 conflicts = [
     [{ group = "nvidia" }, { group = "rocm" }],
     [{ group = "nvidia-train" }, { group = "rocm" }],
-    [{ group = "nvidia-train-aliyun" }, { group = "rocm" }],
-    [{ group = "nvidia" }, { group = "nvidia-train-aliyun" }],
-    [{ group = "nvidia-train" }, { group = "nvidia-train-aliyun" }],
 ]
 
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cu126", group = "nvidia" },
     { index = "pytorch-cu126", group = "nvidia-train" },
-    { index = "pytorch-cu126-internal", group = "nvidia-train-aliyun" },
     { index = "pytorch-rocm", group = "rocm" },
 ]
 torchvision = [
     { index = "pytorch-cu126", group = "nvidia" },
     { index = "pytorch-cu126", group = "nvidia-train" },
-    { index = "pytorch-cu126-internal", group = "nvidia-train-aliyun" },
     { index = "pytorch-rocm", group = "rocm" },
 ]
 torchcodec = { index = "pytorch-cu126", group = "nvidia" }
@@ -99,21 +81,13 @@ triton-rocm = { index = "pytorch-rocm", group = "rocm" }
 nvidia-dali-cuda120 = [
     { index = "nvidia-pypi", group = "nvidia" },
     { index = "nvidia-pypi", group = "nvidia-train" },
-    { index = "nvidia-pypi-internal", group = "nvidia-train-aliyun" },
 ]
 tensorrt-cu12 = { index = "nvidia-pypi", group = "nvidia" }
 
-# CUDA 12.6 wheel 目录是 flat HTML，不是 PEP 503 Simple API。
+# NVIDIA CUDA 12.6 PyTorch wheel index.
 [[tool.uv.index]]
 name = "pytorch-cu126"
-url = "https://mirrors.aliyun.com/pytorch-wheels/cu126/"
-format = "flat"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu126-internal"
-url = "http://mirrors.cloud.aliyuncs.com/pytorch-wheels/cu126/"
-format = "flat"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 # ROCm 不更换源。
@@ -124,18 +98,14 @@ explicit = true
 
 [[tool.uv.index]]
 name = "nvidia-pypi"
-url = "https://mirrors.aliyun.com/pypi/simple/"
+url = "https://pypi.nvidia.com/"
 explicit = true
 
+# Common dependencies use the public PyPI index. Keep all named sources publicly
+# reachable: uv resolves every dependency group when updating the shared lock.
 [[tool.uv.index]]
-name = "nvidia-pypi-internal"
-url = "http://mirrors.cloud.aliyuncs.com/pypi/simple/"
-explicit = true
-
-# 其他依赖默认走阿里云公网；内网模式需通过 --default-index 覆盖。
-[[tool.uv.index]]
-name = "aliyun-public"
-url = "https://mirrors.aliyun.com/pypi/simple/"
+name = "pypi"
+url = "https://pypi.org/simple/"
 default = true
 
 [tool.ruff]
