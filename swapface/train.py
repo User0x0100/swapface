@@ -59,7 +59,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG_PATH = PROJECT_ROOT / "experiments" / "train.toml"
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "experiments" / "runs"
 MAX_AMP_OVERFLOW_RETRIES = 16
-TRAINING_SEMANTICS_VERSION = 23
+# ArcFace 输入由两级缩放/仿射改为原图直接抗混叠采样，不能静默 resume 旧预处理状态。
+TRAINING_SEMANTICS_VERSION = 24
 SAMPLE_LABEL_WIDTH = 300
 SAMPLE_GRID_PADDING = 2
 # 默认保留原有逐损失亮度归一化；改为 "shared" 可直观比较同 stage 各梯度图的绝对强度。

@@ -2,7 +2,7 @@
 
 数据流:
     1. ``src`` 与 ``dst`` 默认独立采样；按 ``same_prob`` 可令二者来自同一张 dst 原图。
-    2. DALI 解码后在 GPU 上执行 resize 与随机水平翻转。
+    2. ArcFace 模式从解码原图直接使用 Lanczos ROI resize，FFHQ 模式保持普通 resize；随后在 GPU 上执行随机水平翻转。
     3. ``dst`` 额外执行亮度、对比度、饱和度增强，并保留几何增强前的 ``dst_canonical``。
     4. ``dst`` 再执行随机仿射增强。
     5. 图像统一归一化到 ``[-1, 1]`` 并转换为 NCHW。
@@ -17,7 +17,7 @@
 
 性能原则:
     Python 侧只负责目录扫描和读取压缩图像字节；解码后的 resize、flip、颜色增强、
-    仿射、归一化和布局转换均保留在 DALI 图中。随机仿射矩阵也由 DALI 原生算子
+    随机仿射、归一化和布局转换均保留在 DALI 图中。随机仿射矩阵也由 DALI 原生算子
     生成，避免逐样本 Python/OpenCV 回调和小矩阵 CPU→GPU 拷贝。
 
 输出契约:
@@ -28,8 +28,8 @@
     ``torch.nn.functional.affine_grid(..., align_corners=False)``。
     ``same_mask``: ``bool``，形状 ``(B,)``，标记 src/dst 是否来自同一张原图。
     ``src_arcface_mask``: ``bool``，形状 ``(B,)``，标记 src 是否已经使用 ArcFace 对齐；same pair 为 False。
-    ``src_arcface_faces``: 原始解码图的独立 112×112 身份分支，使用与展示 src 相同的 flip。
-    适配器在 PyTorch 中选择 FFHQ 裁剪或 ArcFace 身份分支，统一返回六项。
+    ``src_arcface_faces``: ArcFace 模式下是从原图直接采样的 112×112 身份输入；FFHQ 模式下保留原有 ArcFace 源图分支。
+    FFHQ 生成模式保留 PyTorch 侧原有身份裁剪；ArcFace 生成模式直接返回解码原图产生的身份图。
 """
 
 import os
@@ -37,15 +37,26 @@ from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 from numpy import ndarray
 from nvidia.dali import fn, pipeline_def
 from nvidia.dali.math import clamp
 from nvidia.dali.types import DALIDataType, DALIImageType, DALIInterpType
 
-from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, is_identity_geometry, prepare_source_identity_faces, validate_range
-from misc.face_alignment import ffhq_to_arcface_affine, make_arcface112_to_arcface128_grid, make_ffhq_to_arcface_112_grid, make_ffhq_to_arcface_grid
+from misc.face_alignment import make_ffhq_to_arcface_112_grid
+
+from .dataloader_common import (
+    FFHQ_TO_ARCFACE112_ROI,
+    FloatRange,
+    ImageDecoderBackend,
+    ImageSource,
+    LocalImagePool,
+    build_image_pools,
+    generation_alignment_rois,
+    is_identity_geometry,
+    prepare_source_identity_faces,
+    print_image_pools,
+    validate_range,
+)
 
 
 class _RandomImagePairSource:
@@ -150,6 +161,21 @@ def _normalize_chw(image):
     )
 
 
+def _roi_in_dali_order(roi: tuple[float, float, float, float]) -> tuple[tuple[float, float], tuple[float, float]]:
+    left, top, right, bottom = roi
+    return (top, left), (bottom, right)
+
+
+def _select_source_roi(arcface_mask, ffhq_roi: tuple[float, float, float, float], arcface_roi: tuple[float, float, float, float]):
+    """每张 src 只运行一个 resize；ROI 根据原图对齐类型逐样本选择。"""
+    ffhq_start, ffhq_end = _roi_in_dali_order(ffhq_roi)
+    arc_start, arc_end = _roi_in_dali_order(arcface_roi)
+    selected = fn.cast(arcface_mask, dtype=DALIDataType.FLOAT)
+    start = fn.stack(*(ffhq_start[i] + selected * (arc_start[i] - ffhq_start[i]) for i in range(2)))
+    end = fn.stack(*(ffhq_end[i] + selected * (arc_end[i] - ffhq_end[i]) for i in range(2)))
+    return start, end
+
+
 @pipeline_def
 def create_dataloader_pipeline(
     img_resolution: int,
@@ -238,12 +264,36 @@ def create_dataloader_pipeline(
     )
 
     src_image = _decode(src_raw, decoder_backend, decoder_hw_load)
-    # 身份分支从原始解码图生成；112 输入不会经过展示分辨率。
-    src_arcface_faces = fn.resize(src_image, device="gpu", size=112, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
     dst_image = _decode(dst_raw, decoder_backend, decoder_hw_load)
 
-    src_image = fn.resize(src_image, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
-    dst_image = fn.resize(dst_image, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
+    if alignment == "arcface":
+        # ROI 以原图尺寸为基准，直接完成固定 FFHQ->ArcFace128 和输出尺寸的抗混叠采样。
+        # 112 teacher 分支也从原图独立采样，绝不经过生成图缩放。
+        # 纯 FFHQ 或纯 ArcFace（且无 same pair）使用静态 ROI，避免逐样本构造动态参数。
+        ffhq_roi, native_arcface_roi = generation_alignment_rois(img_resolution)
+        source_alignments = {entry[2] if isinstance(entry, tuple) and len(entry) == 3 else "ffhq" for entry in src}
+        if same_prob >= 1.0 or source_alignments == {"ffhq"}:
+            src_start, src_end = _roi_in_dali_order(ffhq_roi)
+            id_start, id_end = _roi_in_dali_order(FFHQ_TO_ARCFACE112_ROI)
+        elif source_alignments == {"arcface"} and same_prob <= 0.0:
+            # same pair 的 src 来自 FFHQ dst；只要 same_prob>0，就不能使用 ArcFace 静态 ROI。
+            src_start, src_end = _roi_in_dali_order(native_arcface_roi)
+            id_start, id_end = (0.0, 0.0), (1.0, 1.0)
+        else:
+            src_start, src_end = _select_source_roi(src_arcface_mask, ffhq_roi, native_arcface_roi)
+            id_start, id_end = _select_source_roi(src_arcface_mask, FFHQ_TO_ARCFACE112_ROI, (0.0, 0.0, 1.0, 1.0))
+        src_arcface_faces = fn.resize(src_image, device="gpu", size=112, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3,
+                                      roi_start=id_start, roi_end=id_end, roi_relative=True, antialias=True)
+        src_image = fn.resize(src_image, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3,
+                              roi_start=src_start, roi_end=src_end, roi_relative=True, antialias=True)
+        dst_start, dst_end = _roi_in_dali_order(ffhq_roi)
+        dst_image = fn.resize(dst_image, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3,
+                              roi_start=dst_start, roi_end=dst_end, roi_relative=True, antialias=True)
+    else:
+        # FFHQ 快速路径保持原样，无固定对齐仿射和额外重采样。
+        src_arcface_faces = fn.resize(src_image, device="gpu", size=112, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
+        src_image = fn.resize(src_image, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
+        dst_image = fn.resize(dst_image, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
 
     if flip_prob > 0.0:
         src_flip = fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.INT32)
@@ -259,11 +309,6 @@ def create_dataloader_pipeline(
             contrast=fn.random.uniform(range=(1.0 - contrast, 1.0 + contrast)) if contrast else 1.0,
             saturation=fn.random.uniform(range=(1.0 - saturation, 1.0 + saturation)) if saturation else 1.0,
         )
-
-    if alignment == "arcface":
-        # 固定 FFHQ->ArcFace 空间变换先于随机几何增强，canonical/restoration 坐标一致。
-        fixed_matrix = np.asarray(ffhq_to_arcface_affine(img_resolution, img_resolution), dtype=np.float32)
-        dst_image = fn.warp_affine(dst_image, fixed_matrix, device="gpu", inverse_map=False, fill_value=0.0)
 
     dst_canonical = _normalize_chw(dst_image)
     if apply_geometry:
@@ -295,17 +340,10 @@ class _DALITrainingDataLoader:
         import torch
         from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 
-        self._source_ffhq_grid = make_ffhq_to_arcface_112_grid(img_resolution, batch_size, device)
         if alignment not in ("ffhq", "arcface"):
             raise ValueError(f"生成对齐标准无效：{alignment!r}")
-        self._generation_grid = (
-            make_ffhq_to_arcface_grid(img_resolution, img_resolution, batch_size, device)
-            if alignment == "arcface" else None
-        )
-        self._arcface_source_grid = (
-            make_arcface112_to_arcface128_grid(img_resolution, img_resolution, batch_size, device)
-            if alignment == "arcface" else None
-        )
+        self.alignment = alignment
+        self._source_ffhq_grid = make_ffhq_to_arcface_112_grid(img_resolution, batch_size, device) if alignment == "ffhq" else None
         device_id = device.index if device.index is not None else torch.cuda.current_device()
         pipe = create_dataloader_pipeline(
             batch_size=batch_size,
@@ -326,10 +364,9 @@ class _DALITrainingDataLoader:
 
     def next(self):
         data = self._iterator.next()[0]
-        identity = prepare_source_identity_faces(data["src"], data["src_arcface_faces"], data["src_arcface_mask"], self._source_ffhq_grid)
-        src = data["src"]
-        if self._generation_grid is not None:
-            aligned_src = F.grid_sample(src, self._generation_grid, mode="bilinear", padding_mode="border", align_corners=False)
-            aligned_arcface_src = F.grid_sample(src, self._arcface_source_grid, mode="bilinear", padding_mode="border", align_corners=False)
-            src = torch.where(data["src_arcface_mask"][:, None, None, None], aligned_arcface_src, aligned_src)
-        return src, data["dst"], data["dst_canonical"], data["theta_restore"], data["same_mask"], identity
+        if self.alignment == "arcface":
+            identity = data["src_arcface_faces"]
+        else:
+            assert self._source_ffhq_grid is not None
+            identity = prepare_source_identity_faces(data["src"], data["src_arcface_faces"], data["src_arcface_mask"], self._source_ffhq_grid)
+        return data["src"], data["dst"], data["dst_canonical"], data["theta_restore"], data["same_mask"], identity

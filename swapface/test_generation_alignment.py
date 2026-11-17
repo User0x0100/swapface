@@ -10,14 +10,18 @@ import torch.nn.functional as F
 from PIL import Image
 
 from misc.face_alignment import (
-    FFHQ_TO_ARCFACE_112_AFFINE_512, ffhq_to_arcface_affine,
-    make_ffhq_to_arcface_grid, make_ffhq_to_arcface_112_grid, ffhq_to_arcface_112,
-    make_arcface112_to_arcface128_grid, make_arcface128_to_arcface112_grid,
+    FFHQ_TO_ARCFACE_112_AFFINE_512,
+    ffhq_to_arcface_affine,
+    make_arcface128_to_arcface112_grid,
+    make_ffhq_to_arcface_112_grid,
+    make_ffhq_to_arcface_grid,
 )
 from misc.models.id_encoder import get_alignment_template
+
 from .config import resolve_train_config
 from .dataloader import TrainingDataLoader
-from .dataloader_native import make_affine_thetas
+from .dataloader_common import FFHQ_TO_ARCFACE112_ROI, generation_alignment_rois
+from .dataloader_native import _resize_roi, make_affine_thetas
 from .experiment import config_sha256
 
 
@@ -84,11 +88,15 @@ def main():
         assert src.shape == dst.shape == canonical.shape == (2, 3, 128, 128)
         torch.testing.assert_close(src, canonical, atol=3e-6, rtol=0)
         torch.testing.assert_close(canonical, dst, atol=3e-6, rtol=0)
-        orig = torch.from_numpy(np.asarray(Image.open(dst_dir / "face.png").resize((128, 128), Image.Resampling.LANCZOS)).copy()).permute(2,0,1).float().unsqueeze(0).expand(2,-1,-1,-1).div(127.5).sub(1)
-        grid = make_ffhq_to_arcface_grid(128, 128, 2, device)
-        expected = F.grid_sample(orig, grid, padding_mode="border", align_corners=False)
-        torch.testing.assert_close(src, expected, atol=3e-6, rtol=0)
-        expected_identity = ffhq_to_arcface_112(orig, make_ffhq_to_arcface_112_grid(128, 2, device))
+        original_image = Image.open(dst_dir / "face.png").convert("RGB")
+        def normalized_roi(roi, size, batch):
+            pixels = np.asarray(_resize_roi(original_image, size, roi)).copy()
+            return torch.from_numpy(pixels).permute(2, 0, 1).float().unsqueeze(0).expand(batch, -1, -1, -1).div(127.5).sub(1)
+
+        ffhq_roi, arcface_roi = generation_alignment_rois(128)
+        expected = normalized_roi(ffhq_roi, 128, 2)
+        torch.testing.assert_close(src, expected, atol=0, rtol=0)
+        expected_identity = normalized_roi(FFHQ_TO_ARCFACE112_ROI, 112, 2)
         torch.testing.assert_close(identity, expected_identity, atol=0, rtol=0)
 
         native["same_prob"] = 0.0
@@ -96,8 +104,7 @@ def main():
                                     src=[ffhq_dir, (arc_dir, 0.0, "arcface")], dst=[dst_dir], **native)
         src, dst, canonical, theta, same, identity = loader.next()
         assert not same.any()
-        arc_source_grid = make_arcface112_to_arcface128_grid(128, 128, 16, device)
-        direct = F.grid_sample(orig[:1].expand(16,-1,-1,-1), arc_source_grid, padding_mode="border", align_corners=False)
+        direct = normalized_roi(arcface_roi, 128, 16)
         direct_arc_identity = torch.from_numpy(rgba.copy()).permute(2,0,1).float().div(127.5).sub(1).unsqueeze(0).expand(16,-1,-1,-1)
         ffhq_identity = expected_identity[:1].expand(16,-1,-1,-1)
         src_ffhq = expected[:1].expand(16,-1,-1,-1)
@@ -153,11 +160,13 @@ def main():
 
     # Model export requires explicit alignment metadata in the current checkpoint schema.
     from unittest.mock import patch
-    from models.networks import Generator
+
     from misc.models.id_encoder import IDEncoderProvider
+    from models.networks import Generator
+
+    from . import export
     from .contracts import CHECKPOINT_VERSION
     from .inference import get_arcface_alignment_template, load_generator
-    from . import export
     model = Generator(
         img_resolution=16, coarse_resolution=8, coarse_latent_resolution=4,
         coarse_base_ch=2, coarse_max_ch=8, coarse_num_latent=1,

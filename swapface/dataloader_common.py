@@ -7,11 +7,44 @@ from enum import Enum
 from pathlib import Path
 
 import numpy as np
-from numpy import ndarray
 import torch
+from numpy import ndarray
 from torch import Tensor
 
-from misc.face_alignment import ffhq_to_arcface_112
+from misc.face_alignment import FFHQ_TO_ARCFACE_112_AFFINE_512, ffhq_to_arcface_112, ffhq_to_arcface_affine
+
+
+# (left, top, right, bottom)，相对原始图像尺寸；供 Pillow 和 DALI 共享。
+# 只使用轴对齐 ROI 来近似固定 ArcFace 的微小旋转：最大角点输出坐标误差每轴 < 0.01 px。
+# ROI 使用像素边界，而 affine 使用像素中心；必须针对真实输出分辨率换算。
+def _axis_aligned_roi(
+    affine: tuple[tuple[float, float, float], tuple[float, float, float]], output_size: int, input_size: int
+) -> tuple[float, float, float, float]:
+    if min(input_size, output_size) <= 0:
+        raise ValueError("input_size/output_size 必须为正数")
+    (a, b, tx), (c, d, ty) = affine
+    if max(abs(b / a), abs(c / d)) > 2e-4:
+        raise ValueError("固定对齐变换不再适合使用轴对齐 ROI")
+    det = a * d - b * c
+    inv_a, inv_b, inv_c, inv_d = d / det, -b / det, -c / det, a / det
+    output_center = (output_size - 1) / 2
+    center_x = inv_a * (output_center - tx) + inv_b * (output_center - ty) + 0.5
+    center_y = inv_c * (output_center - tx) + inv_d * (output_center - ty) + 0.5
+    half_x, half_y = inv_a * output_size / 2, inv_d * output_size / 2
+    return ((center_x - half_x) / input_size, (center_y - half_y) / input_size, (center_x + half_x) / input_size, (center_y + half_y) / input_size)
+
+
+def generation_alignment_rois(output_size: int) -> tuple[tuple[float, float, float, float], tuple[float, float, float, float]]:
+    """返回 FFHQ→ArcFace128 与 ArcFace112→ArcFace128 的原图直采样 ROI。"""
+    ffhq = _axis_aligned_roi(ffhq_to_arcface_affine(512, output_size), output_size, 512)
+    scale = output_size / 128.0
+    arcface_affine = ((scale, 0.0, 8.0 * scale), (0.0, scale, 0.0))
+    arcface = _axis_aligned_roi(arcface_affine, output_size, 112)
+    return ffhq, arcface
+
+
+FFHQ_TO_ARCFACE112_ROI = _axis_aligned_roi(FFHQ_TO_ARCFACE_112_AFFINE_512, 112, 512)
+
 
 type ImagePath = str | os.PathLike[str]
 type FloatRange = tuple[float, float]

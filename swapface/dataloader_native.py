@@ -11,20 +11,58 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 
-from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, is_identity_geometry, prepare_source_identity_faces, validate_range
-from misc.face_alignment import make_arcface112_to_arcface128_grid, make_ffhq_to_arcface_112_grid, make_ffhq_to_arcface_grid
+from misc.face_alignment import make_ffhq_to_arcface_112_grid, make_ffhq_to_arcface_grid
+
+from .dataloader_common import (
+    FFHQ_TO_ARCFACE112_ROI,
+    FloatRange,
+    ImageDecoderBackend,
+    ImageSource,
+    LocalImagePool,
+    build_image_pools,
+    generation_alignment_rois,
+    is_identity_geometry,
+    prepare_source_identity_faces,
+    print_image_pools,
+    validate_range,
+)
 
 
-class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool, bool, Tensor]]):
+def _resize_roi(image: Image.Image, output_size: int, roi: tuple[float, float, float, float]) -> Image.Image:
+    """从原图直接以 Lanczos 抗混叠采样目标坐标；越界处复制边缘像素。"""
+    left, top, right, bottom = (roi[0] * image.width, roi[1] * image.height, roi[2] * image.width, roi[3] * image.height)
+    pad_left, pad_top = max(0, math.ceil(-left)), max(0, math.ceil(-top))
+    pad_right, pad_bottom = max(0, math.ceil(right - image.width)), max(0, math.ceil(bottom - image.height))
+    if pad_left or pad_top or pad_right or pad_bottom:
+        # 原有 grid_sample(padding_mode="border") 的边缘复制语义；仅 ArcFace 原生源图会触发。
+        pixels = np.pad(np.asarray(image), ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), mode="edge")
+        image = Image.fromarray(pixels)
+        left, right = left + pad_left, right + pad_left
+        top, bottom = top + pad_top, bottom + pad_top
+    return image.resize((output_size, output_size), resample=Image.Resampling.LANCZOS, box=(left, top, right, bottom))
+
+
+def _image_to_tensor(image: Image.Image) -> Tensor:
+    return torch.from_numpy(np.asarray(image, dtype=np.uint8).copy()).permute(2, 0, 1)
+
+
+class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool, bool, Tensor, bool, bool]]):
     """在 CPU worker 中随机采样、解码并 Lanczos resize 成固定尺寸。"""
 
-    def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource], img_resolution: int, same_prob: float) -> None:
+    def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource], img_resolution: int, same_prob: float, alignment: str = "ffhq", gpu_align_ffhq: bool = False) -> None:
         super().__init__()
         if img_resolution <= 0:
             raise ValueError(f"img_resolution 必须为正数，实际为 {img_resolution}")
         if not 0.0 <= same_prob <= 1.0:
             raise ValueError(f"same_prob 必须位于 [0, 1]，实际为 {same_prob}")
+        if alignment not in ("ffhq", "arcface"):
+            raise ValueError(f"生成对齐标准无效：{alignment!r}")
         self.img_resolution = img_resolution
+        self.alignment = alignment
+        self.generation_rois = generation_alignment_rois(img_resolution) if alignment == "arcface" else None
+        # 原图恰好等于生成尺寸且输出 >=512 时，固定对齐可留到 GPU：
+        # 无需提前缩小，不会发生二次采样，避免 CPU 同尺寸 Lanczos 的高额成本。
+        self.gpu_align_ffhq = gpu_align_ffhq
         self.same_prob = same_prob
         self.src_pools, self.src_cdf, src_info = build_image_pools(src)
         self.dst_pools, self.dst_cdf, dst_info = build_image_pools(dst)
@@ -40,40 +78,56 @@ class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool, bool, 
         file_name = pool.file_names[int(rng.integers(len(pool.file_names)))]
         return os.path.join(pool.root, file_name), pool.alignment
 
-    def _decode_resize(self, path: str) -> Tensor:
-        with Image.open(path) as image:
-            image = image.convert("RGB")
-            if image.size != (self.img_resolution, self.img_resolution):
-                image = image.resize((self.img_resolution, self.img_resolution), resample=Image.Resampling.LANCZOS)
-            array = np.asarray(image, dtype=np.uint8).copy()
-        return torch.from_numpy(array).permute(2, 0, 1)
+    def _resize_generation(self, image: Image.Image, source_alignment: str) -> tuple[Image.Image, bool]:
+        if self.gpu_align_ffhq and source_alignment == "ffhq" and image.size == (self.img_resolution, self.img_resolution):
+            return image, True
+        if self.alignment == "arcface":
+            assert self.generation_rois is not None
+            roi = self.generation_rois[0] if source_alignment == "ffhq" else self.generation_rois[1]
+            return _resize_roi(image, self.img_resolution, roi), False
+        if image.size != (self.img_resolution, self.img_resolution):
+            return image.resize((self.img_resolution, self.img_resolution), resample=Image.Resampling.LANCZOS), False
+        return image, False
 
-    def _decode_source(self, path: str, arcface: bool) -> tuple[Tensor, Tensor]:
-        if not arcface:
-            return self._decode_resize(path), torch.zeros((3, 112, 112), dtype=torch.uint8)
+    def _decode_resize_with_meta(self, path: str) -> tuple[Tensor, bool]:
+        with Image.open(path) as opened:
+            image, needs_gpu_align = self._resize_generation(opened.convert("RGB"), "ffhq")
+            return _image_to_tensor(image), needs_gpu_align
+
+    def _decode_resize(self, path: str) -> Tensor:
+        # 保留原有辅助接口，测试及 FFHQ 路径仅需图片。
+        return self._decode_resize_with_meta(path)[0]
+
+    def _decode_source(self, path: str, arcface: bool) -> tuple[Tensor, Tensor, bool]:
         with Image.open(path) as opened:
             image = opened.convert("RGB")
-            identity = image if image.size == (112, 112) else image.resize((112, 112), resample=Image.Resampling.LANCZOS)
-            identity_array = np.asarray(identity, dtype=np.uint8).copy()
-            display = image if image.size == (self.img_resolution, self.img_resolution) else image.resize((self.img_resolution, self.img_resolution), resample=Image.Resampling.LANCZOS)
-            display_array = np.asarray(display, dtype=np.uint8).copy()
-        return torch.from_numpy(display_array).permute(2, 0, 1), torch.from_numpy(identity_array).permute(2, 0, 1)
+            display, needs_gpu_align = self._resize_generation(image, "arcface" if arcface else "ffhq")
+            if arcface:
+                identity = image if image.size == (112, 112) else image.resize((112, 112), resample=Image.Resampling.LANCZOS)
+            elif self.alignment == "arcface":
+                # 112 teacher 必须直接从原始 FFHQ 图生成，不能从生成用的 128/256 图再次裁剪。
+                identity = _resize_roi(image, 112, FFHQ_TO_ARCFACE112_ROI)
+            else:
+                return _image_to_tensor(display), torch.zeros((3, 112, 112), dtype=torch.uint8), False
+            return _image_to_tensor(display), _image_to_tensor(identity), needs_gpu_align
 
-    def __iter__(self) -> Iterator[tuple[Tensor, Tensor, bool, bool, Tensor]]:
-        # DataLoader 会为每个 worker 设置独立 torch seed；以它初始化 NumPy RNG，
-        # 避免 spawn/fork worker 复制出相同采样序列。
+    def __iter__(self) -> Iterator[tuple[Tensor, Tensor, bool, bool, Tensor, bool, bool]]:
+        # DataLoader 会为每个 worker 设置独立 torch seed；以它初始化 NumPy RNG。
         rng = np.random.default_rng(torch.initial_seed())
         while True:
             dst_path, _ = self._sample_path(rng, self.dst_pools, self.dst_cdf)
             same = bool(rng.random() < self.same_prob)
             src_path, alignment = (dst_path, "ffhq") if same else self._sample_path(rng, self.src_pools, self.src_cdf)
             if same:
-                image = self._decode_resize(dst_path)
-                yield image, image, True, False, torch.zeros((3, 112, 112), dtype=torch.uint8)
+                if self.alignment == "arcface":
+                    image, identity, needs_gpu_align = self._decode_source(dst_path, False)
+                else:
+                    image, identity, needs_gpu_align = self._decode_resize(dst_path), torch.zeros((3, 112, 112), dtype=torch.uint8), False
+                yield image, image, True, False, identity, needs_gpu_align, needs_gpu_align
             else:
-                arcface = alignment == "arcface"
-                display, identity = self._decode_source(src_path, arcface)
-                yield display, self._decode_resize(dst_path), False, arcface, identity
+                display, identity, src_gpu_align = self._decode_source(src_path, alignment == "arcface")
+                dst, dst_gpu_align = self._decode_resize_with_meta(dst_path)
+                yield display, dst, False, alignment == "arcface", identity, src_gpu_align, dst_gpu_align
 
 
 def _uniform(batch_size: int, value_range: FloatRange, device: torch.device) -> Tensor:
@@ -203,17 +257,12 @@ class _NativeTrainingDataLoader:
 
         self.device = device
         self.img_resolution = img_resolution
-        self.source_ffhq_grid = make_ffhq_to_arcface_112_grid(img_resolution, batch_size, device)
         if alignment not in ("ffhq", "arcface"):
             raise ValueError(f"无效的生成对齐标准：{alignment!r}")
-        self.generation_grid = (
-            make_ffhq_to_arcface_grid(img_resolution, img_resolution, batch_size, device)
-            if alignment == "arcface" else None
-        )
-        self.arcface_source_grid = (
-            make_arcface112_to_arcface128_grid(img_resolution, img_resolution, batch_size, device)
-            if alignment == "arcface" else None
-        )
+        self.alignment = alignment
+        self.source_ffhq_grid = make_ffhq_to_arcface_112_grid(img_resolution, batch_size, device) if alignment == "ffhq" else None
+        gpu_align_ffhq = alignment == "arcface" and device.type == "cuda" and img_resolution >= 512
+        self.generation_grid = make_ffhq_to_arcface_grid(img_resolution, img_resolution, batch_size, device) if gpu_align_ffhq else None
         self.brightness = brightness
         self.contrast = contrast
         self.saturation = saturation
@@ -232,7 +281,7 @@ class _NativeTrainingDataLoader:
             if not self.apply_geometry else None
         )
 
-        dataset = _RandomImagePairDataset(src, dst, img_resolution, same_prob)
+        dataset = _RandomImagePairDataset(src, dst, img_resolution, same_prob, alignment, gpu_align_ffhq)
         loader_kwargs: dict[str, object] = {
             "batch_size": batch_size,
             "num_workers": py_num_workers,
@@ -247,17 +296,30 @@ class _NativeTrainingDataLoader:
             )
         self.loader = DataLoader(dataset, **loader_kwargs)
         self.iterator = iter(self.loader)
-        print(f"PyTorch 数据管线：CPU Pillow/Lanczos 解码缩放，workers={py_num_workers}, prefetch_factor={reader_prefetch_queue_depth}；批量增强在 {device} 执行")
+        description = f"PyTorch 数据管线：CPU Pillow/Lanczos 解码缩放，workers={py_num_workers}, prefetch_factor={reader_prefetch_queue_depth}；批量增强在 {device} 执行"
+        if gpu_align_ffhq:
+            description += "；同尺寸高分辨率 FFHQ 对齐使用 GPU Bicubic"
+        print(description)
 
     @torch.no_grad()
     def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        src, dst, same_mask, src_arcface_mask, arcface_faces = next(self.iterator)
+        src, dst, same_mask, src_arcface_mask, arcface_faces, src_gpu_align, dst_gpu_align = next(self.iterator)
         src = src.to(device=self.device, dtype=torch.float32, non_blocking=True)
         dst = dst.to(device=self.device, dtype=torch.float32, non_blocking=True)
         same_mask = same_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
         src_arcface_mask = src_arcface_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
         arcface_faces = arcface_faces.to(device=self.device, dtype=torch.float32, non_blocking=True)
         batch_size = src.shape[0]
+
+        if self.generation_grid is not None:
+            # 原图恰好就是目标尺寸时，在 GPU 数据加载阶段执行一次高质量固定仿射。
+            # 对非同尺寸 FFHQ 或 ArcFace 原生 SRC，CPU 已一次 Lanczos 采样，不能再变换。
+            if src_gpu_align.any():
+                aligned_src = F.grid_sample(src, self.generation_grid, mode="bicubic", padding_mode="border", align_corners=False).clamp_(0.0, 255.0)
+                src = aligned_src if src_gpu_align.all() else torch.where(src_gpu_align.to(self.device)[:, None, None, None], aligned_src, src)
+            if dst_gpu_align.any():
+                aligned_dst = F.grid_sample(dst, self.generation_grid, mode="bicubic", padding_mode="border", align_corners=False).clamp_(0.0, 255.0)
+                dst = aligned_dst if dst_gpu_align.all() else torch.where(dst_gpu_align.to(self.device)[:, None, None, None], aligned_dst, dst)
 
         if self.flip_prob > 0.0:
             src_flip = torch.rand((batch_size, 1, 1, 1), device=self.device) < self.flip_prob
@@ -268,10 +330,8 @@ class _NativeTrainingDataLoader:
 
         if self.apply_color_twist:
             dst = _color_twist(dst, self.brightness, self.contrast, self.saturation)
-        # 固定 FFHQ->ArcFace 对齐不属于随机几何增强，必须保留。
+        # 固定 FFHQ->ArcFace 对齐已在 CPU Lanczos 或 GPU Bicubic 快速路径完成。
         dst_canonical = dst
-        if self.generation_grid is not None:
-            dst_canonical = F.grid_sample(dst_canonical, self.generation_grid, mode="bilinear", padding_mode="border", align_corners=False)
         if self.apply_geometry:
             theta_augment, theta_restore = make_affine_thetas(
                 batch_size, self.img_resolution, self.rotation_range, self.scale_factor_range, self.tx_range, self.ty_range, self.device
@@ -290,13 +350,9 @@ class _NativeTrainingDataLoader:
             dst = dst_canonical
         arcface_faces = arcface_faces.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
         # Identity 始终从原始 source 对齐标准裁剪；不要从重采样的生成输入再次裁剪。
-        source_identity_faces = prepare_source_identity_faces(src, arcface_faces, src_arcface_mask, self.source_ffhq_grid)
-        if self.generation_grid is not None:
-            aligned_src = F.grid_sample(
-                src, self.generation_grid, mode="bilinear", padding_mode="border", align_corners=False
-            )
-            aligned_arcface_src = F.grid_sample(
-                src, self.arcface_source_grid, mode="bilinear", padding_mode="border", align_corners=False
-            )
-            src = torch.where(src_arcface_mask[:, None, None, None], aligned_arcface_src, aligned_src)
+        if self.alignment == "arcface":
+            source_identity_faces = arcface_faces
+        else:
+            assert self.source_ffhq_grid is not None
+            source_identity_faces = prepare_source_identity_faces(src, arcface_faces, src_arcface_mask, self.source_ffhq_grid)
         return src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces
