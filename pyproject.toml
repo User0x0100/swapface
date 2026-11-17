@@ -34,6 +34,7 @@ nvidia-train = [
     "tensorboard",
     "tqdm",
     "timm>=1.0.0",
+    "segmentation-models-pytorch",
     "nvidia-dali-cuda120",
     "ninja",
 ]

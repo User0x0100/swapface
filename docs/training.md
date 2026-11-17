@@ -21,7 +21,7 @@
 | `nvidia` | NVIDIA 完整开发环境（含导出、预览、测试） | PyTorch CUDA 12.6 + NVIDIA DALI + PyPI |
 | `rocm` | AMD ROCm 环境 | PyTorch ROCm 7.2 + PyPI |
 
-NVIDIA 最小训练（包含 DALI、SMIRK、VGG、TensorBoard、自定义 CUDA 算子）：
+NVIDIA 最小训练（包含 DALI、SMIRK、VGG、遮挡增强所需的 `segmentation-models-pytorch`、TensorBoard、自定义 CUDA 算子）：
 
 ```bash
 uv sync --locked --only-group nvidia-train
@@ -39,7 +39,7 @@ uv run --no-sync python -m swapface.train --config experiments/train.toml
 
 锁定变更后在公共网络执行 `uv lock --check`。切换依赖组用 `uv sync --locked ...`，避免安装时顺便修改锁文件。**`--only-group` 控制安装范围，不会缩小 uv 重新锁定时要解析的所有依赖组**，因此不可将内网专有 URL 放入项目共享 `tool.uv.index`。
 
-`--only-group` 用于避免安装 `[project].dependencies` 中与训练无关的包。当前最小组不含 TensorRT、ONNX Runtime GPU、TorchCodec、xFormers；如启用遮挡增强，需另行安装 `segmentation-models-pytorch`。
+`--only-group` 用于避免安装 `[project].dependencies` 中与训练无关的包。当前最小组不含 TensorRT、ONNX Runtime GPU、TorchCodec、xFormers；遮挡增强所需的 `segmentation-models-pytorch` 已包含在最小训练组中，无需另行安装。
 
 NVIDIA 完整开发环境：
 
