@@ -144,6 +144,7 @@ class TestIdentityParsingGradient(unittest.TestCase):
         trainer.coarse_identity_embeddings_forward = lambda x: x
         trainer.hq_identity_embeddings_forward = lambda x: x
         trainer.prepare_identity_encoder_faces = lambda x, transform: x
+        trainer.geometry_augmentation_enabled = True
         trainer.coarse_id_loss = lambda generated, reference: generated.sum()
         trainer.hq_id_loss = lambda generated, reference: generated.sum()
         trainer.enable_coarse_wfm_loss = trainer.enable_hq_wfm_loss = False

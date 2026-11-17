@@ -38,6 +38,7 @@ from models.networks import Generator
 from .config import load_train_config, resolve_train_config
 from .contracts import CHECKPOINT_VERSION
 from .dataloader import ImageDecoderBackend, TrainingDataLoader
+from .dataloader_common import is_identity_geometry
 from .experiment import (
     RunLock,
     RunPaths,
@@ -394,7 +395,16 @@ class Trainer:
         self.enable_coarse_vgg_loss = self.coarse_stage_active and bool(coarse_vgg_config["enable"])
         self.enable_hq_vgg_loss = self.hq_stage_active and bool(hq_vgg_config["enable"])
 
-        dataloader_cfg = {**data_config["loader"], **data_config["augmentation"], **data_config["sampling"]}
+        augmentation_config = data_config["augmentation"]
+        # 与两条 DataLoader 管线使用相同的恒等判断。此项仅控制随机几何恢复，
+        # 不影响水平翻转、颜色增强或固定 FFHQ/ArcFace 对齐。
+        self.geometry_augmentation_enabled = not is_identity_geometry(
+            tuple(augmentation_config["rotation_range"]),
+            tuple(augmentation_config["scale_factor_range"]),
+            tuple(augmentation_config["tx_range"]),
+            tuple(augmentation_config["ty_range"]),
+        )
+        dataloader_cfg = {**data_config["loader"], **augmentation_config, **data_config["sampling"]}
         dataloader_cfg["alignment"] = self.face_alignment
         dataloader_cfg["decoder_backend"] = ImageDecoderBackend(dataloader_cfg["decoder_backend"])
         src = [(str(entry["path"]), float(entry["adjustment"]), str(entry.get("alignment", "ffhq"))) for entry in data_config["src"]]
@@ -1032,6 +1042,18 @@ class Trainer:
             return hq_features, hq_features
         return self.coarse_smirk_loss.encode_reference(reference), hq_features
 
+    def _restore_for_geometry_loss(self, generated: Tensor, canonical_size: tuple[int, int], restore_grid: Tensor | None) -> Tensor:
+        """Gaze/SMIRK 在 canonical 坐标系比较；没有随机仿射时仅保留必需的 Coarse 上采样。"""
+        with autocast(device_type="cuda", enabled=False):
+            result = generated.float()
+            if tuple(result.shape[-2:]) != canonical_size:
+                result = NF.interpolate(result, size=canonical_size, mode="bilinear", align_corners=False)
+            if self.geometry_augmentation_enabled:
+                if restore_grid is None:
+                    raise RuntimeError("几何增强已开启，但缺少 restore_grid")
+                result = NF.grid_sample(result, restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+            return result
+
     def _coarse_generator_stage_loss(
         self,
         coarse: Tensor,
@@ -1063,7 +1085,9 @@ class Trainer:
             total = total + coarse_wfm_loss
 
         coarse_id_gate = None if id_gate is None else NF.interpolate(id_gate, size=coarse.shape[-2:], mode="area")
-        coarse_identity_embeddings = self.coarse_identity_embeddings_forward(self.prepare_identity_encoder_faces(gate_identity_gradient(coarse, coarse_id_gate), theta_restore))
+        coarse_identity_embeddings = self.coarse_identity_embeddings_forward(
+            self.prepare_identity_encoder_faces(gate_identity_gradient(coarse, coarse_id_gate), theta_restore if self.geometry_augmentation_enabled else None)
+        )
         coarse_id_loss = self.coarse_id_loss(coarse_identity_embeddings, source_identity_embeddings)
         self.log("coarse_id_loss", coarse_id_loss)
         self._log_identity_threshold_metrics("coarse", self.coarse_id_loss, coarse_identity_embeddings, source_identity_embeddings)
@@ -1071,11 +1095,7 @@ class Trainer:
 
         geometry_enabled = self.enable_coarse_gaze_loss or self.enable_coarse_smirk_loss
         if geometry_enabled:
-            if restore_grid is None:
-                raise RuntimeError("Coarse geometry loss 需要 restore_grid")
-            with autocast(device_type="cuda", enabled=False):
-                coarse_full = NF.interpolate(coarse.float(), size=restore_grid.shape[1:3], mode="bilinear", align_corners=False)
-                coarse_restored = NF.grid_sample(coarse_full, restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+            coarse_restored = self._restore_for_geometry_loss(coarse, tuple(dst_canonical.shape[-2:]), restore_grid)
 
             if self.enable_coarse_gaze_loss:
                 coarse_gaze_loss = self.coarse_gaze_loss_forward(coarse_restored, dst_canonical)
@@ -1134,7 +1154,9 @@ class Trainer:
             self.log("hq_wfm_loss", hq_wfm_loss)
             total = total + hq_wfm_loss
 
-        hq_identity_embeddings = self.hq_identity_embeddings_forward(self.prepare_identity_encoder_faces(gate_identity_gradient(fake, id_gate), theta_restore))
+        hq_identity_embeddings = self.hq_identity_embeddings_forward(
+            self.prepare_identity_encoder_faces(gate_identity_gradient(fake, id_gate), theta_restore if self.geometry_augmentation_enabled else None)
+        )
         hq_id_loss = self.hq_id_loss(hq_identity_embeddings, source_identity_embeddings)
         self.log("hq_id_loss", hq_id_loss)
         self._log_identity_threshold_metrics("hq", self.hq_id_loss, hq_identity_embeddings, source_identity_embeddings)
@@ -1142,10 +1164,7 @@ class Trainer:
 
         geometry_enabled = self.enable_hq_gaze_loss or self.enable_hq_smirk_loss
         if geometry_enabled:
-            if restore_grid is None:
-                raise RuntimeError("HQ geometry loss 需要 restore_grid")
-            with autocast(device_type="cuda", enabled=False):
-                fake_restored = NF.grid_sample(fake.float(), restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+            fake_restored = self._restore_for_geometry_loss(fake, tuple(dst_canonical.shape[-2:]), restore_grid)
 
             if self.enable_hq_gaze_loss:
                 hq_gaze_loss = self.hq_gaze_loss_forward(fake_restored, dst_canonical)
@@ -1257,7 +1276,7 @@ class Trainer:
         generated: Tensor,
         reconstruction_target: Tensor,
         dst_canonical: Tensor,
-        theta_restore: Tensor,
+        theta_restore: Tensor | None,
         same_mask: Tensor,
         source_identity_embeddings: Tensor,
         restore_grid: Tensor | None,
@@ -1336,16 +1355,8 @@ class Trainer:
             generated_identity_embeddings = identity_embeddings_forward(self.prepare_identity_encoder_faces(gate_identity_gradient(x, stage_gate), theta_restore))
             add_row(f"{prefix} ID GRAD", identity_loss_fn(generated_identity_embeddings, source_identity_embeddings.detach()), x)
 
-        geometry_enabled = gaze_enabled or smirk_enabled
-        if geometry_enabled and restore_grid is None:
-            raise RuntimeError(f"{stage} sample geometry gradient 需要 restore_grid")
-
         def restored_input(x: Tensor) -> Tensor:
-            assert restore_grid is not None
-            with autocast(device_type="cuda", enabled=False):
-                if stage == "coarse":
-                    x = NF.interpolate(x.float(), size=restore_grid.shape[1:3], mode="bilinear", align_corners=False)
-                return NF.grid_sample(x.float(), restore_grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+            return self._restore_for_geometry_loss(x, tuple(dst_canonical.shape[-2:]), restore_grid)
 
         if gaze_enabled:
             assert gaze_loss_fn is not None
@@ -1401,7 +1412,10 @@ class Trainer:
             src_vis = torch.cat((sample_src, src[:dynamic_count]), dim=0)
             dst_vis = torch.cat((sample_dst, dst[:dynamic_count]), dim=0)
             dst_canonical_vis = torch.cat((sample_dst_canonical, dst_canonical[:dynamic_count]), dim=0)
-            theta_restore_vis = torch.cat((sample_theta_restore, theta_restore[:dynamic_count]), dim=0)
+            theta_restore_vis = (
+                torch.cat((sample_theta_restore, theta_restore[:dynamic_count]), dim=0)
+                if self.geometry_augmentation_enabled else None
+            )
             same_mask_vis = torch.cat((sample_same_mask, same_mask[:dynamic_count]), dim=0)
             source_identity_faces_vis = torch.cat((sample_src_identity_faces, source_identity_faces[:dynamic_count]), dim=0)
             id_gates_vis = tuple(
@@ -1436,12 +1450,13 @@ class Trainer:
             identity_encoder_input_display_vis = NF.interpolate(identity_encoder_input_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
 
             restore_grid_vis = None
-            if (
+            if self.geometry_augmentation_enabled and (
                 self.enable_hq_gaze_loss
                 or self.enable_hq_smirk_loss
                 or self.enable_coarse_gaze_loss
                 or self.enable_coarse_smirk_loss
             ):
+                assert theta_restore_vis is not None
                 with autocast(device_type="cuda", enabled=False):
                     restore_grid_vis = NF.affine_grid(theta_restore_vis.float(), size=list(dst_vis.shape), align_corners=False)
 
@@ -1653,7 +1668,7 @@ class Trainer:
 
                     with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                         restore_grid = None
-                        if self.enable_hq_gaze_loss or self.enable_coarse_gaze_loss or self.enable_hq_smirk_loss or self.enable_coarse_smirk_loss:
+                        if self.geometry_augmentation_enabled and (self.enable_hq_gaze_loss or self.enable_coarse_gaze_loss or self.enable_hq_smirk_loss or self.enable_coarse_smirk_loss):
                             with autocast(device_type="cuda", enabled=False):
                                 restore_grid = NF.affine_grid(theta_restore.float(), size=list(dst.shape), align_corners=False)
 

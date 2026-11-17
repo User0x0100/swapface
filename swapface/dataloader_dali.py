@@ -44,7 +44,7 @@ from nvidia.dali import fn, pipeline_def
 from nvidia.dali.math import clamp
 from nvidia.dali.types import DALIDataType, DALIImageType, DALIInterpType
 
-from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, prepare_source_identity_faces, validate_range
+from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, is_identity_geometry, prepare_source_identity_faces, validate_range
 from misc.face_alignment import ffhq_to_arcface_affine, make_arcface112_to_arcface128_grid, make_ffhq_to_arcface_112_grid, make_ffhq_to_arcface_grid
 
 
@@ -85,6 +85,13 @@ class _RandomImagePairSource:
         return src, dst, np.asarray(same, dtype=np.bool_), np.asarray(arcface, dtype=np.bool_)
 
 
+def _constant_or_random_uniform(value_range: FloatRange):
+    """DALI 不允许零宽的 uniform 范围；固定参数使用常量而非伪随机扰动。"""
+    if value_range[0] == value_range[1]:
+        return fn.constant(fdata=float(value_range[0]), shape=[], dtype=DALIDataType.FLOAT, device="cpu")
+    return fn.random.uniform(range=value_range)
+
+
 def _random_affine_matrices(img_resolution: int, rotation_range: FloatRange, scale_factor_range: FloatRange, tx_range: FloatRange, ty_range: FloatRange):
     rotation_range = validate_range("rotation_range", rotation_range)
     scale_factor_range = validate_range("scale_factor_range", scale_factor_range)
@@ -95,10 +102,10 @@ def _random_affine_matrices(img_resolution: int, rotation_range: FloatRange, sca
         raise ValueError(f"scale_factor_range 必须为正数范围，实际为 {scale_factor_range}")
 
     center = img_resolution * 0.5
-    angle = fn.random.uniform(range=rotation_range)
-    scale = fn.random.uniform(range=scale_factor_range)
-    tx = fn.random.uniform(range=tx_range) * img_resolution
-    ty = fn.random.uniform(range=ty_range) * img_resolution
+    angle = _constant_or_random_uniform(rotation_range)
+    scale = _constant_or_random_uniform(scale_factor_range)
+    tx = _constant_or_random_uniform(tx_range) * img_resolution
+    ty = _constant_or_random_uniform(ty_range) * img_resolution
 
     # DALI 与 OpenCV 的二维旋转正方向相反，因此 angle 取负即可保持旧数据增强语义。
     rotation = fn.transforms.rotation(angle=-angle, center=(center, center))
@@ -211,6 +218,13 @@ def create_dataloader_pipeline(
         raise ValueError(f"flip_prob 必须位于 [0, 1]，实际为 {flip_prob}")
     if not 0.0 <= same_prob <= 1.0:
         raise ValueError(f"same_prob 必须位于 [0, 1]，实际为 {same_prob}")
+    rotation_range = validate_range("rotation_range", rotation_range)
+    scale_factor_range = validate_range("scale_factor_range", scale_factor_range)
+    tx_range = validate_range("tx_range", tx_range)
+    ty_range = validate_range("ty_range", ty_range)
+    if scale_factor_range[0] <= 0.0:
+        raise ValueError("scale_factor_range 必须为正数范围")
+    apply_geometry = not is_identity_geometry(rotation_range, scale_factor_range, tx_range, ty_range)
 
     src_raw, dst_raw, same_mask, src_arcface_mask = fn.external_source(
         source=_RandomImagePairSource(src, dst, same_prob),
@@ -231,18 +245,20 @@ def create_dataloader_pipeline(
     src_image = fn.resize(src_image, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
     dst_image = fn.resize(dst_image, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
 
-    src_flip = fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.INT32)
-    src_image = fn.flip(src_image, device="gpu", horizontal=src_flip)
-    src_arcface_faces = fn.flip(src_arcface_faces, device="gpu", horizontal=src_flip)
-    dst_image = fn.flip(dst_image, device="gpu", horizontal=fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.INT32))
+    if flip_prob > 0.0:
+        src_flip = fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.INT32)
+        src_image = fn.flip(src_image, device="gpu", horizontal=src_flip)
+        src_arcface_faces = fn.flip(src_arcface_faces, device="gpu", horizontal=src_flip)
+        dst_image = fn.flip(dst_image, device="gpu", horizontal=fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.INT32))
 
-    dst_image = fn.color_twist(
-        dst_image,
-        device="gpu",
-        brightness=fn.random.uniform(range=(1.0 - brightness, 1.0 + brightness)),
-        contrast=fn.random.uniform(range=(1.0 - contrast, 1.0 + contrast)),
-        saturation=fn.random.uniform(range=(1.0 - saturation, 1.0 + saturation)),
-    )
+    if any(value != 0.0 for value in (brightness, contrast, saturation)):
+        dst_image = fn.color_twist(
+            dst_image,
+            device="gpu",
+            brightness=fn.random.uniform(range=(1.0 - brightness, 1.0 + brightness)) if brightness else 1.0,
+            contrast=fn.random.uniform(range=(1.0 - contrast, 1.0 + contrast)) if contrast else 1.0,
+            saturation=fn.random.uniform(range=(1.0 - saturation, 1.0 + saturation)) if saturation else 1.0,
+        )
 
     if alignment == "arcface":
         # 固定 FFHQ->ArcFace 空间变换先于随机几何增强，canonical/restoration 坐标一致。
@@ -250,10 +266,16 @@ def create_dataloader_pipeline(
         dst_image = fn.warp_affine(dst_image, fixed_matrix, device="gpu", inverse_map=False, fill_value=0.0)
 
     dst_canonical = _normalize_chw(dst_image)
-    affine_matrix, theta_restore = _random_affine_matrices(img_resolution, rotation_range, scale_factor_range, tx_range, ty_range)
-    dst_image = fn.warp_affine(dst_image, affine_matrix, device="gpu", inverse_map=False, fill_value=-1.0)
+    if apply_geometry:
+        affine_matrix, theta_restore = _random_affine_matrices(img_resolution, rotation_range, scale_factor_range, tx_range, ty_range)
+        dst_image = fn.warp_affine(dst_image, affine_matrix, device="gpu", inverse_map=False, fill_value=-1.0)
+        dst_output = _normalize_chw(dst_image)
+    else:
+        # 恒等矩阵作为 DALI 常量输出，跳过随机仿射计算、warp 和重复归一化。
+        theta_restore = fn.constant(fdata=[1.0, 0.0, 0.0, 0.0, 1.0, 0.0], shape=[2, 3], dtype=DALIDataType.FLOAT, device="gpu")
+        dst_output = dst_canonical
 
-    return _normalize_chw(src_image), _normalize_chw(dst_image), dst_canonical, theta_restore, fn.copy(same_mask, device="gpu"), fn.copy(src_arcface_mask, device="gpu"), _normalize_chw(src_arcface_faces)
+    return _normalize_chw(src_image), dst_output, dst_canonical, theta_restore, fn.copy(same_mask, device="gpu"), fn.copy(src_arcface_mask, device="gpu"), _normalize_chw(src_arcface_faces)
 
 
 class _DALITrainingDataLoader:

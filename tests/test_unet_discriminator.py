@@ -28,6 +28,7 @@ def _stub_trainer(model: UNetDiscriminatorSN) -> tuple[Trainer, dict[str, float]
     trainer.d_loss = DiscriminatorAdversarialLoss(weight=1.0, reduction="mean")
     trainer.amp_enabled = False
     trainer.amp_dtype = None
+    trainer.geometry_augmentation_enabled = True
     trainer.enable_coarse_wfm_loss = False
     trainer.enable_coarse_gaze_loss = False
     trainer.enable_coarse_smirk_loss = False

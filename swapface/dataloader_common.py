@@ -44,6 +44,11 @@ def validate_range(name: str, value: FloatRange) -> FloatRange:
     return low, high
 
 
+def is_identity_geometry(rotation_range: FloatRange, scale_factor_range: FloatRange, tx_range: FloatRange, ty_range: FloatRange) -> bool:
+    """几何增强是否严格等于恒等变换；与翻转和色彩增强无关。"""
+    return rotation_range == (0.0, 0.0) and scale_factor_range == (1.0, 1.0) and tx_range == (0.0, 0.0) and ty_range == (0.0, 0.0)
+
+
 def scan_image_files(directory: ImagePath) -> LocalImagePool:
     folder = Path(directory).resolve(strict=True)
     with os.scandir(folder) as entries:

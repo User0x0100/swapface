@@ -92,6 +92,8 @@ uv run python -m swapface.train \
 - `[identity]`：Generator 的 source identity 条件编码器；
 - `[loss.*]`：每一种训练损失及其共享 reconstruction 策略；
 - `[data.loader]` / `[data.augmentation]` / `[data.sampling]`：数据执行、增强和配对采样；
+  - 色彩参数全部为 `0` 时跳过色彩增强；`flip_prob = 0` 时跳过翻转；几何四组参数分别为 `rotation_range = [0, 0]`、`scale_factor_range = [1, 1]`、`tx_range = [0, 0]`、`ty_range = [0, 0]` 时跳过随机仿射与重采样，直接返回恒等恢复矩阵。三类增强独立判断，FFHQ→ArcFace 固定对齐仍按 `data.alignment` 执行。PyTorch 与 DALI 数据管线均适用。
+  - 当几何增强关闭时，训练阶段的 IDLoss 直接执行固定身份裁剪，不再叠加恒等恢复矩阵；Gaze/SMIRK 与样本梯度可视化跳过恢复网格和重采样。Coarse 仍保留必要的分辨率上采样，在线遮挡和固定对齐不受影响。
 - `[[data.src]]` / `[[data.dst]]`：训练数据源；
 - `[generator]` / `[discriminator.hq]` / `[discriminator.coarse]`：Generator 与两个 Discriminator 的独立模型定义。
 

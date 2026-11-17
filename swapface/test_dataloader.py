@@ -109,6 +109,36 @@ def main() -> None:
         torch.testing.assert_close(theta, torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]), atol=0, rtol=0)
         assert not same_mask.item()
 
+        # 关闭色彩、翻转和几何增强时，不应调用任何相关算子；dst 与 canonical 直接共享张量。
+        with (
+            patch("swapface.dataloader_native._color_twist", side_effect=AssertionError("不应执行色彩增强")),
+            patch("swapface.dataloader_native.make_affine_thetas", side_effect=AssertionError("不应构造随机仿射")),
+            patch("swapface.dataloader_native.F.affine_grid", side_effect=AssertionError("不应生成仿射网格")),
+            patch("swapface.dataloader_native.torch.rand", side_effect=AssertionError("不应采样翻转")),
+        ):
+            _, fast_target, fast_canonical, fast_theta, _, _ = rgb_loader.next()
+        assert fast_target.data_ptr() == fast_canonical.data_ptr()
+        torch.testing.assert_close(fast_theta, torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]), atol=0, rtol=0)
+
+        # 三组增强相互独立：仅开启颜色不执行几何；仅开启几何不执行色彩或翻转。
+        color_config = {**config, "brightness": 0.2}
+        color_loader = TrainingDataLoader(batch_size=1, device=torch.device("cpu"), img_resolution=8, src=[rgb_src], dst=[rgb_dst], **color_config)
+        with patch("swapface.dataloader_native.make_affine_thetas", side_effect=AssertionError("颜色增强不应触发几何增强")):
+            _, color_target, color_canonical, color_theta, _, _ = color_loader.next()
+        assert color_target.data_ptr() == color_canonical.data_ptr()
+        torch.testing.assert_close(color_theta, fast_theta, atol=0, rtol=0)
+
+        # 其余均关闭时，只有几何增强发生，canonical 不受影响。
+        geometry_config = {**config, "tx_range": (0.25, 0.25)}
+        geometry_loader = TrainingDataLoader(batch_size=1, device=torch.device("cpu"), img_resolution=8, src=[rgb_src], dst=[rgb_dst], **geometry_config)
+        with (
+            patch("swapface.dataloader_native._color_twist", side_effect=AssertionError("几何增强不应执行颜色变换")),
+            patch("swapface.dataloader_native.torch.rand", side_effect=AssertionError("几何增强不应执行翻转")),
+        ):
+            _, geo_target, geo_canonical, geo_theta, _, _ = geometry_loader.next()
+        assert not torch.equal(geo_target, geo_canonical)
+        assert float(geo_theta[0, 0, 2]) > 0.0
+
         # same_prob=1 时 src 必须直接来自同一张 dst 原图，而不是继续从 src pool 独立采样。
         config.update(same_prob=1.0)
         same_loader = TrainingDataLoader(batch_size=1, device=torch.device("cpu"), img_resolution=8, src=[rgb_src], dst=[rgb_dst], **config)

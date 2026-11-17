@@ -11,7 +11,7 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 
-from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, prepare_source_identity_faces, validate_range
+from .dataloader_common import FloatRange, ImageDecoderBackend, ImageSource, LocalImagePool, build_image_pools, print_image_pools, is_identity_geometry, prepare_source_identity_faces, validate_range
 from misc.face_alignment import make_arcface112_to_arcface128_grid, make_ffhq_to_arcface_112_grid, make_ffhq_to_arcface_grid
 
 
@@ -224,6 +224,13 @@ class _NativeTrainingDataLoader:
         self.ty_range = validate_range("ty_range", ty_range)
         if self.scale_factor_range[0] <= 0.0:
             raise ValueError("scale_factor_range 必须为正数范围")
+        self.apply_color_twist = any(value != 0.0 for value in (brightness, contrast, saturation))
+        self.apply_geometry = not is_identity_geometry(self.rotation_range, self.scale_factor_range, self.tx_range, self.ty_range)
+        # 仅在禁用随机几何增强时创建一次恒等矩阵，避免每个 batch 重复构造。
+        self.identity_theta_restore = (
+            torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=torch.float32, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+            if not self.apply_geometry else None
+        )
 
         dataset = _RandomImagePairDataset(src, dst, img_resolution, same_prob)
         loader_kwargs: dict[str, object] = {
@@ -259,28 +266,28 @@ class _NativeTrainingDataLoader:
             arcface_faces = torch.where(src_flip, arcface_faces.flip(-1), arcface_faces)
             dst = torch.where(dst_flip, dst.flip(-1), dst)
 
-        dst = _color_twist(dst, self.brightness, self.contrast, self.saturation)
-        # 在几何增强前统一生成坐标系，避免改变 theta_restore 的语义。
+        if self.apply_color_twist:
+            dst = _color_twist(dst, self.brightness, self.contrast, self.saturation)
+        # 固定 FFHQ->ArcFace 对齐不属于随机几何增强，必须保留。
         dst_canonical = dst
         if self.generation_grid is not None:
-            dst_canonical = F.grid_sample(
-                dst_canonical, self.generation_grid, mode="bilinear", padding_mode="border", align_corners=False
+            dst_canonical = F.grid_sample(dst_canonical, self.generation_grid, mode="bilinear", padding_mode="border", align_corners=False)
+        if self.apply_geometry:
+            theta_augment, theta_restore = make_affine_thetas(
+                batch_size, self.img_resolution, self.rotation_range, self.scale_factor_range, self.tx_range, self.ty_range, self.device
             )
-        theta_augment, theta_restore = make_affine_thetas(
-            batch_size,
-            self.img_resolution,
-            self.rotation_range,
-            self.scale_factor_range,
-            self.tx_range,
-            self.ty_range,
-            self.device,
-        )
-        grid = F.affine_grid(theta_augment, dst_canonical.shape, align_corners=False)
-        dst = F.grid_sample(dst_canonical, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+            grid = F.affine_grid(theta_augment, dst_canonical.shape, align_corners=False)
+            dst = F.grid_sample(dst_canonical, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+            dst = dst.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
+        else:
+            assert self.identity_theta_restore is not None
+            theta_restore = self.identity_theta_restore
 
         src = src.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
-        dst = dst.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
         dst_canonical = dst_canonical.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
+        if not self.apply_geometry:
+            # 无仿射时直接共用 canonical，避免重采样和原地重复归一化。
+            dst = dst_canonical
         arcface_faces = arcface_faces.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
         # Identity 始终从原始 source 对齐标准裁剪；不要从重采样的生成输入再次裁剪。
         source_identity_faces = prepare_source_identity_faces(src, arcface_faces, src_arcface_mask, self.source_ffhq_grid)
