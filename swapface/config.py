@@ -102,6 +102,7 @@ DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
     "identity": {**DEFAULT_IDENTITY_LOSS_CONFIG, "exclude_parsing_labels": []},
     "r1": dict(DEFAULT_R1_LOSS_CONFIG),
     "wfm": {"enable": DEFAULT_WFM_LOSS_CONFIG["enable"], "weights": dict(DEFAULT_WFM_LOSS_CONFIG["weights"])},
+    "mask": {"weight": 1.0, "labels": [1, 2, 3, 4, 5, 6, 10, 11, 12, 13]},
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
     "smirk": dict(DEFAULT_SMIRK_LOSS_CONFIG),
     "reconstruction": {"scope": "same"},
@@ -402,6 +403,17 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
         smirk[key] = _float(smirk[key], f"{prefix}.smirk.{key}", minimum=0.0)
 
     result = {"gan": gan, "identity": identity, "r1": r1, "wfm": wfm, "gaze": gaze, "smirk": smirk}
+    if stage == "coarse":
+        mask = _with_defaults(_table(loss, "mask", "[loss.coarse.mask]"), defaults["mask"], "[loss.coarse.mask]")
+        mask["weight"] = _float(mask["weight"], "loss.coarse.mask.weight", minimum=0.0)
+        labels = mask["labels"]
+        if not isinstance(labels, list) or not labels:
+            raise ValueError("loss.coarse.mask.labels 必须为非空整数数组")
+        label_indices = [_int(label, f"loss.coarse.mask.labels[{i}]", minimum=0) for i, label in enumerate(labels)]
+        if any(index >= FACE_PARSING_NUM_CLASSES for index in label_indices) or len(set(label_indices)) != len(label_indices):
+            raise ValueError(f"loss.coarse.mask.labels 必须为不重复的 [0, {FACE_PARSING_NUM_CLASSES - 1}] 整数")
+        mask["labels"] = sorted(label_indices)
+        result["mask"] = mask
 
     reconstruction = _with_defaults(_table(loss, "reconstruction", f"[{prefix}.reconstruction]"), defaults["reconstruction"], f"[{prefix}.reconstruction]")
     scope = reconstruction["scope"]
@@ -442,6 +454,10 @@ STYLEGAN2_COARSE_CONFIG_DEFAULTS: dict[str, Any] = {
     "coarse_mapping_layers": 8,
     "coarse_start_resolution": 4,
     "coarse_channels": [128, 512],
+    "coarse_mask_enabled": False,
+    "coarse_mask_noise_blank_level": 9,
+    "coarse_mask_guidance_epsilon": 1e-4,
+    "coarse_mask_guidance_interpolation": "bilinear",
 }
 
 
@@ -474,10 +490,11 @@ def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
     if coarse_type == "stylegan2":
         defaults.update(STYLEGAN2_COARSE_CONFIG_DEFAULTS)
     injection_keys = {"coarse_target_inject_mode", "coarse_target_inject_layers"}
+    mask_keys = {"coarse_mask_enabled", "coarse_mask_noise_blank_level", "coarse_mask_guidance_epsilon", "coarse_mask_guidance_interpolation"}
     # Injection options are validated separately because their defaults depend
     # on coarse_start_resolution and coarse_resolution.
-    if coarse_type == "inswapper" and set(raw) & injection_keys:
-        raise ValueError("generator.coarse_target_inject_* 仅适用于 stylegan2")
+    if coarse_type == "inswapper" and set(raw) & (injection_keys | mask_keys):
+        raise ValueError("generator.coarse_target_inject_* 与 coarse_mask_* 仅适用于 stylegan2")
     result = _with_defaults(
         {key: value for key, value in raw.items() if key not in injection_keys},
         defaults, "[generator]",
@@ -520,6 +537,12 @@ def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("generator.coarse_channels 必须为 [base_ch, max_ch] 且 0 < base_ch <= max_ch")
         result["coarse_channels"] = list(channels)
         _normalize_target_injection(result, raw)
+        result["coarse_mask_enabled"] = _bool(result["coarse_mask_enabled"], "generator.coarse_mask_enabled")
+        result["coarse_mask_noise_blank_level"] = _int(result["coarse_mask_noise_blank_level"], "generator.coarse_mask_noise_blank_level", minimum=-1)
+        result["coarse_mask_guidance_epsilon"] = _float(result["coarse_mask_guidance_epsilon"], "generator.coarse_mask_guidance_epsilon", minimum=1e-8)
+        interpolation = result["coarse_mask_guidance_interpolation"]
+        if not isinstance(interpolation, str) or interpolation not in {"bilinear", "nearest"}:
+            raise ValueError("generator.coarse_mask_guidance_interpolation 仅支持 bilinear 或 nearest")
     if result["hq_max_ch"] < result["hq_base_ch"]:
         raise ValueError("generator.hq_max_ch 必须 >= generator.hq_base_ch")
 

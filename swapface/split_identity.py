@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from models.networks import Coarse, Generator, IDInject, StyleGAN2Coarse
-from models.stylegan2 import ModulatedConv2d, StyledConv, SynthesisStage, ToOutput
+from models.stylegan2 import ModulatedConv2d, StyledConv, SynthesisStage, ToMask, ToOutput, mask_guided_target_features, mask_probability, stylegan2_mask_layer_index
 
 
 def _static_condition_slices(conditioning: Tensor, widths: list[int]) -> list[Tensor]:
@@ -96,8 +96,12 @@ class PrecomputedInSwapper(nn.Module):
 
 def _modulated_layers(generator: nn.Module) -> list[ModulatedConv2d]:
     layers = [generator.conv_first.conv, generator.to_rgb_first.conv]
+    if generator.to_mask_first is not None:
+        layers.append(generator.to_mask_first.conv)
     for stage in generator.stages:
         layers.extend((stage.conv0.conv, stage.conv1.conv, stage.to_rgb.conv))
+        if stage.to_mask is not None:
+            layers.append(stage.to_mask.conv)
     return layers
 
 
@@ -181,17 +185,38 @@ class PrecomputedToOutput(nn.Module):
         return out
 
 
+class PrecomputedToMask(nn.Module):
+    def __init__(self, layer: ToMask) -> None:
+        super().__init__()
+        self.conv = PrecomputedModulatedConv2d(layer.conv)
+        self.upsample = deepcopy(layer.upsample)
+
+    def forward(self, x: Tensor, style: Tensor, previous_logits: Tensor | None) -> Tensor:
+        logits = self.conv(x, style).float()
+        if previous_logits is not None:
+            assert self.upsample is not None
+            logits = logits + self.upsample(previous_logits)
+        return logits
+
+
 class PrecomputedSynthesisStage(nn.Module):
     def __init__(self, stage: SynthesisStage) -> None:
         super().__init__()
         self.conv0 = PrecomputedStyledConv(stage.conv0)
         self.conv1 = PrecomputedStyledConv(stage.conv1)
         self.to_rgb = PrecomputedToOutput(stage.to_rgb)
+        self.to_mask = PrecomputedToMask(stage.to_mask) if stage.to_mask is not None else None
 
-    def forward(self, x: Tensor, styles: tuple[Tensor, Tensor, Tensor], target_feat: Tensor | None, rgb: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self, x: Tensor, styles: tuple[Tensor, ...], target_feat: Tensor | None, rgb: Tensor, mask: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
         x = self.conv0(x, styles[0], target_feat)
         x = self.conv1(x, styles[1], target_feat)
-        return x, self.to_rgb(x, styles[2], rgb)
+        rgb = self.to_rgb(x, styles[2], rgb)
+        if self.to_mask is not None:
+            assert mask is not None
+            mask = self.to_mask(x, styles[3], mask)
+        return x, rgb, mask
 
 
 class PrecomputedStyleGAN2(nn.Module):
@@ -201,10 +226,15 @@ class PrecomputedStyleGAN2(nn.Module):
         self.img_resolution = coarse.img_resolution
         self.start_resolution = generator.start_resolution
         self.synthesis_resolutions = generator.synthesis_resolutions
+        self.mask_enabled = generator.mask_enabled
+        self.mask_noise_blank_level = generator.mask_noise_blank_level
+        self.mask_guidance_epsilon = generator.mask_guidance_epsilon
+        self.mask_guidance_interpolation = generator.mask_guidance_interpolation
         self.encoder = deepcopy(generator.encoder)
         self.constant = deepcopy(generator.constant)
         self.conv_first = PrecomputedStyledConv(generator.conv_first)
         self.to_rgb_first = PrecomputedToOutput(generator.to_rgb_first)
+        self.to_mask_first = PrecomputedToMask(generator.to_mask_first) if generator.to_mask_first is not None else None
         self.stages = nn.ModuleList(PrecomputedSynthesisStage(stage) for stage in generator.stages)
         self.style_widths = [layer.in_ch for layer in _modulated_layers(generator)]
         self.condition_width = sum(self.style_widths)
@@ -216,9 +246,20 @@ class PrecomputedStyleGAN2(nn.Module):
         x = self.constant.expand(target.shape[0], -1, -1, -1)
         x = self.conv_first(x, styles[0], features.get(self.start_resolution))
         rgb = self.to_rgb_first(x, styles[1], None)
+        mask_logits = self.to_mask_first(x, styles[2], None) if self.to_mask_first is not None else None
+        offset = 3 if self.mask_enabled else 2
+        stage_width = 4 if self.mask_enabled else 3
         for i, stage in enumerate(self.stages):
             resolution = self.synthesis_resolutions[i + 1]
-            x, rgb = stage(x, (styles[2 + 3 * i], styles[3 + 3 * i], styles[4 + 3 * i]), features.get(resolution), rgb)
+            target_feat = features.get(resolution)
+            if mask_logits is not None and stage.conv0.inject_target and target_feat is not None and stylegan2_mask_layer_index(resolution) > self.mask_noise_blank_level:
+                target_feat = mask_guided_target_features(
+                    target_feat, mask_probability(mask_logits), epsilon=self.mask_guidance_epsilon,
+                    interpolation=self.mask_guidance_interpolation,
+                )
+            index = offset + stage_width * i
+            stage_styles = tuple(styles[index:index + stage_width])
+            x, rgb, mask_logits = stage(x, stage_styles, target_feat, rgb, mask_logits)
         return rgb
 
 
@@ -234,7 +275,7 @@ class IdentityProjection(nn.Module):
             self.mapping = StyleGAN2Projection(generator.coarse)
             self.coarse_type = "stylegan2"
         else:
-            raise ValueError(f"unsupported Coarse type: {type(generator.coarse).__name__}")
+            raise TypeError(f"unsupported Coarse type: {type(generator.coarse).__name__}")
         self.condition_width = self.mapping.width
 
     def forward(self, identity: Tensor) -> Tensor:
@@ -265,7 +306,7 @@ class SplitGenerator(nn.Module):
         elif isinstance(generator.coarse, StyleGAN2Coarse):
             self.coarse = PrecomputedStyleGAN2(generator.coarse)
         else:
-            raise ValueError(f"unsupported Coarse type: {type(generator.coarse).__name__}")
+            raise TypeError(f"unsupported Coarse type: {type(generator.coarse).__name__}")
         self.hq = deepcopy(generator.hq)
         self.condition_width = self.coarse.condition_width
 

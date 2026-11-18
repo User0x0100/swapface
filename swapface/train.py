@@ -31,7 +31,7 @@ from losses import (
 from misc.face_alignment import arcface_to_identity_112, ffhq_to_arcface_112, make_arcface128_to_arcface112_grid, make_ffhq_to_arcface_112_grid, transform_sampling_grid
 from misc.models.face_mask import FaceMasker
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
-from models.discriminator import DiscriminatorType, UNetDiscriminatorSN, build_discriminator
+from models.discriminator import UNetDiscriminatorSN, build_discriminator
 from models.discriminator.upfirdn2d import initialize_upfirdn2d
 from models.networks import Generator
 
@@ -178,6 +178,10 @@ COARSE_GENERATOR_CONFIG_KEYS = (
     "coarse_channels",
     "coarse_target_inject_mode",
     "coarse_target_inject_layers",
+    "coarse_mask_enabled",
+    "coarse_mask_noise_blank_level",
+    "coarse_mask_guidance_epsilon",
+    "coarse_mask_guidance_interpolation",
 )
 
 
@@ -379,6 +383,10 @@ class Trainer:
         self.reuse_generator_identity_for_hq_source = self.hq_stage_active and self.generator_id_encoder_provider is self.hq_identity_loss_provider
         self.coarse_reconstruction_scope = coarse_reconstruction_scope
         self.hq_reconstruction_scope = hq_reconstruction_scope
+        self.coarse_mask_enabled = self.coarse_stage_active and config["generator"]["coarse_type"] == "stylegan2" and bool(config["generator"]["coarse_mask_enabled"])
+        self.coarse_mask_weight = float(coarse_loss_config["mask"]["weight"])
+        self.coarse_mask_labels = tuple(coarse_loss_config["mask"]["labels"])
+        self.enable_coarse_mask_loss = self.coarse_mask_enabled and self.coarse_mask_weight > 0.0
         self.enable_coarse_l1_loss = self.coarse_stage_active and bool(coarse_l1_config["enable"])
         self.enable_hq_l1_loss = self.hq_stage_active and bool(hq_l1_config["enable"])
         self.enable_coarse_r1_loss = self.coarse_stage_active and bool(coarse_r1_config["enable"])
@@ -807,12 +815,16 @@ class Trainer:
         # 单个冻结 parsing teacher 同时服务 Coarse/HQ 的 ID 梯度过滤。
         # 无标签时不加载模型或权重，默认训练路径保持原有开销。
         self.face_parser: FaceMasker | None = None
-        if self.coarse_excluded_parsing_labels or self.hq_excluded_parsing_labels:
+        if self.coarse_excluded_parsing_labels or self.hq_excluded_parsing_labels or self.enable_coarse_mask_loss:
             self.face_parser = FaceMasker(mode="parsing").to(self.device).eval().requires_grad_(False)
         # 标签索引常驻设备，避免在每个训练 step 重复创建与传输。
         self.parsing_exclusion_indices = tuple(
             torch.tensor(indices, device=self.device, dtype=torch.long) if indices else None
             for indices in (self.coarse_excluded_parsing_labels, self.hq_excluded_parsing_labels)
+        )
+        self.coarse_mask_label_indices = (
+            torch.tensor(self.coarse_mask_labels, device=self.device, dtype=torch.long)
+            if self.enable_coarse_mask_loss else None
         )
 
         # ========================= 编译模型 =========================
@@ -1067,6 +1079,9 @@ class Trainer:
         id_gate: Tensor | None,
         smirk_reference: dict[str, Tensor] | None = None,
         smirk_sample_weights: Tensor | None = None,
+        *,
+        coarse_mask_logits: Tensor | None = None,
+        coarse_mask_target: Tensor | None = None,
     ) -> Tensor:
         """计算 Coarse stage 的全部 Generator 训练目标。"""
         coarse_result = self.train_d_coarse(coarse, False, self.enable_coarse_wfm_loss)
@@ -1077,6 +1092,18 @@ class Trainer:
         coarse_gan_loss = self.coarse_gan_loss(coarse_score)
         self.log("coarse_gan_loss", coarse_gan_loss)
         total = coarse_gan_loss
+
+        if getattr(self, "enable_coarse_mask_loss", False):
+            if coarse_mask_logits is None or coarse_mask_target is None:
+                raise RuntimeError("StyleGAN2 Mask BCE 已开启，但缺少预测 Logits 或面部分割监督")
+            target_mask = NF.interpolate(coarse_mask_target, size=coarse_mask_logits.shape[-2:], mode="nearest")
+            # Compute BCE from logits directly to retain gradients when FP16
+            # sigmoid would round a confident but incorrect mask to 0 or 1.
+            with autocast(device_type="cuda", enabled=False):
+                loss_mask = NF.binary_cross_entropy_with_logits(coarse_mask_logits.float(), target_mask.float())
+            weighted_mask_loss = loss_mask * self.coarse_mask_weight
+            self.log("coarse_mask_loss", weighted_mask_loss)
+            total = total + weighted_mask_loss
 
         if self.enable_coarse_wfm_loss:
             with torch.no_grad():
@@ -1444,7 +1471,15 @@ class Trainer:
                 else:
                     coarse_source_identity_embeddings_vis = self.coarse_identity_embeddings_forward(source_identity_faces_vis)
 
-            fake_vis, coarse_vis = self.net_g_ema(dst_vis, generator_identity_embeddings_vis, return_coarse=True)
+            if getattr(self, "coarse_mask_enabled", False):
+                # Read RGB/Mask from one Coarse forward; don't run the costly
+                # StyleGAN2 synthesis twice just to render the preview row.
+                coarse_vis, predicted_mask_vis = self.net_g_ema.coarse(dst_vis, generator_identity_embeddings_vis, return_mask=True)
+                fake_vis = self.net_g_ema.hq(dst_vis, coarse_vis)
+                mask_display_vis = NF.interpolate(predicted_mask_vis, size=fake_vis.shape[-2:], mode="bilinear", align_corners=False).mul(2).sub(1).expand(-1, 3, -1, -1)
+            else:
+                fake_vis, coarse_vis = self.net_g_ema(dst_vis, generator_identity_embeddings_vis, return_coarse=True)
+                mask_display_vis = None
             coarse_resize_in_vis = NF.interpolate(dst_vis, size=self.coarse_resolution, mode="bilinear", align_corners=False)
             coarse_display_vis = NF.interpolate(coarse_vis, size=fake_vis.shape[2:], mode="bilinear", align_corners=False)
             identity_encoder_input_vis = self.prepare_identity_encoder_faces(fake_vis, theta_restore_vis)
@@ -1471,6 +1506,8 @@ class Trainer:
                 ("DST CANONICAL", dst_canonical_vis),
                 ("FINAL ID INPUT", identity_encoder_input_display_vis),
             ]
+            if mask_display_vis is not None:
+                rows.append(("COARSE MASK", mask_display_vis))
 
             if self.coarse_stage_active:
                 rows.extend(
@@ -1515,7 +1552,7 @@ class Trainer:
         if not cv2.imwrite(sample_file, grid_cpu, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
             raise OSError(f"保存训练 sample 失败：{sample_file}")
 
-    def _next_training_batch(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, tuple[Tensor | None, Tensor | None], Tensor | None]:
+    def _next_training_batch(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, tuple[Tensor | None, Tensor | None], Tensor | None, Tensor | None]:
         src, dst, canonical, theta_restore, same_mask, identity_faces = self.dataset.next()
 
         # 在加入在线遮挡之前解析干净 dst，避免遮挡素材干扰标签分类。
@@ -1523,6 +1560,13 @@ class Trainer:
         if self.face_parser is not None:
             with torch.no_grad(), autocast(device_type="cuda", enabled=False):
                 labels = self.face_parser.predict_labels(dst.float())
+
+        # Reuse the same clean-target parsing inference as the identity gate.
+        # The Mask teacher is computed before synthetic occlusion is applied.
+        coarse_mask_target = None
+        if getattr(self, "enable_coarse_mask_loss", False):
+            assert labels is not None and self.coarse_mask_label_indices is not None
+            coarse_mask_target = torch.isin(labels, self.coarse_mask_label_indices).unsqueeze(1).float()
 
         occlusion_gate = None
         if self.occlusion is not None:
@@ -1546,12 +1590,12 @@ class Trainer:
                 gate = keep if gate is None else gate * keep
             gates.append(gate)
 
-        return src, dst, canonical, theta_restore, same_mask, identity_faces, (gates[0], gates[1]), smirk_sample_weights
+        return src, dst, canonical, theta_restore, same_mask, identity_faces, (gates[0], gates[1]), smirk_sample_weights, coarse_mask_target
 
     def train(self) -> None:
 
         net_coarse = self.train_coarse
-        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces, sample_id_gate, sample_smirk_weights = self._next_training_batch()
+        sample_src, sample_dst, sample_dst_canonical, sample_theta_restore, sample_same_mask, sample_src_identity_faces, sample_id_gate, sample_smirk_weights, _ = self._next_training_batch()
         half = self.batch_size // 2
         sample_id_gate = tuple(gate[:half].detach().cpu() if gate is not None else None for gate in sample_id_gate)
         sample_smirk_weights = sample_smirk_weights[:half].detach().cpu() if sample_smirk_weights is not None else None
@@ -1564,7 +1608,7 @@ class Trainer:
                 if self._stop_requested:
                     raise KeyboardInterrupt
 
-                src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces, id_gate, smirk_sample_weights = self._next_training_batch()
+                src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces, id_gate, smirk_sample_weights, coarse_mask_target = self._next_training_batch()
                 self._step_in_progress = True
 
                 # ========================= 生成器前向 =========================
@@ -1573,7 +1617,10 @@ class Trainer:
                         generator_identity_embeddings = self.generator_id_encoder_forward(source_identity_faces)
 
                     if self.coarse_stage_active:
-                        coarse, coarse_resize_in = net_coarse(dst, generator_identity_embeddings, return_resize_in=True)
+                        if self.coarse_mask_enabled:
+                            coarse, coarse_resize_in, coarse_mask_logits = net_coarse(dst, generator_identity_embeddings, return_resize_in=True, return_mask_logits=True)
+                        else:
+                            coarse, coarse_resize_in = net_coarse(dst, generator_identity_embeddings, return_resize_in=True)
                     else:
                         with torch.no_grad():
                             coarse = net_coarse(dst, generator_identity_embeddings)
@@ -1663,7 +1710,10 @@ class Trainer:
                         # D 已经成功更新，G overflow 时只重算 active Generator stage。
                         with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                             if self.coarse_stage_active:
-                                coarse, coarse_resize_in = net_coarse(dst, generator_identity_embeddings, return_resize_in=True)
+                                if self.coarse_mask_enabled:
+                                    coarse, coarse_resize_in, coarse_mask_logits = net_coarse(dst, generator_identity_embeddings, return_resize_in=True, return_mask_logits=True)
+                                else:
+                                    coarse, coarse_resize_in = net_coarse(dst, generator_identity_embeddings, return_resize_in=True)
                             if self.hq_stage_active:
                                 fake = self.train_hq(dst, coarse.detach())
 
@@ -1685,6 +1735,8 @@ class Trainer:
                                 id_gate[0],
                                 coarse_smirk_reference,
                                 smirk_sample_weights,
+                                coarse_mask_logits=coarse_mask_logits if self.coarse_mask_enabled else None,
+                                coarse_mask_target=coarse_mask_target,
                             )
                         if self.hq_stage_active:
                             hq_g_loss = self._hq_generator_stage_loss(

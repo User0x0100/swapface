@@ -207,6 +207,10 @@ class StyleGAN2Coarse(nn.Module):
         channels: tuple[int, int] | list[int] = (128, 512),
         target_inject_mode: str = "concat",
         target_inject_layers: tuple[int, ...] | list[int] | None = None,
+        mask_enabled: bool = False,
+        mask_noise_blank_level: int = 9,
+        mask_guidance_epsilon: float = 1e-4,
+        mask_guidance_interpolation: str = "bilinear",
     ) -> None:
         super().__init__()
         self.img_resolution = img_resolution
@@ -220,16 +224,28 @@ class StyleGAN2Coarse(nn.Module):
             channels=channels,
             target_inject_mode=target_inject_mode,
             target_inject_layers=target_inject_layers,
+            mask_enabled=mask_enabled,
+            mask_noise_blank_level=mask_noise_blank_level,
+            mask_guidance_epsilon=mask_guidance_epsilon,
+            mask_guidance_interpolation=mask_guidance_interpolation,
         )
 
-    def forward(self, x: Tensor, id_feat: Tensor, return_resize_in: bool = False) -> Tensor | tuple[Tensor, Tensor]:
+    def forward(
+        self, x: Tensor, id_feat: Tensor, return_resize_in: bool = False, return_mask: bool = False,
+        return_mask_logits: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
         resize_in = F.interpolate(x, size=self.img_resolution, mode="bilinear", align_corners=False)
         # Preserve StyleGAN2's unbounded RGB output; the loss functions
         # supervise its range without saturating the output gradient.
-        output = self.generator(resize_in, id_feat)
+        result = self.generator(
+            resize_in, id_feat, return_mask=return_mask, return_mask_logits=return_mask_logits,
+        )
+        if return_mask or return_mask_logits:
+            output, mask_or_logits = result
+            return (output, resize_in, mask_or_logits) if return_resize_in else (output, mask_or_logits)
         if return_resize_in:
-            return output, resize_in
-        return output
+            return result, resize_in
+        return result
 
 
 class HQRefiner(nn.Module):
@@ -348,6 +364,10 @@ class Generator(nn.Module):
         coarse_channels: tuple[int, int] | list[int] = (128, 512),
         coarse_target_inject_mode: str | None = None,
         coarse_target_inject_layers: tuple[int, ...] | list[int] | None = None,
+        coarse_mask_enabled: bool = False,
+        coarse_mask_noise_blank_level: int = 9,
+        coarse_mask_guidance_epsilon: float = 1e-4,
+        coarse_mask_guidance_interpolation: str = "bilinear",
         hq_bottleneck_resolution: int = 16,
         hq_base_ch: int = 8,
         hq_max_ch: int = 128,
@@ -375,6 +395,10 @@ class Generator(nn.Module):
                 "coarse_start_resolution": coarse_start_resolution,
                 "coarse_channels": list(coarse_channels),
                 "coarse_target_inject_mode": ("concat" if coarse_target_inject_mode is None else coarse_target_inject_mode),
+                "coarse_mask_enabled": coarse_mask_enabled,
+                "coarse_mask_noise_blank_level": coarse_mask_noise_blank_level,
+                "coarse_mask_guidance_epsilon": coarse_mask_guidance_epsilon,
+                "coarse_mask_guidance_interpolation": coarse_mask_guidance_interpolation,
             })
         self.img_resolution = img_resolution
         self.img_channels = img_channels
@@ -402,6 +426,10 @@ class Generator(nn.Module):
                 channels=coarse_channels,
                 target_inject_mode="concat" if coarse_target_inject_mode is None else coarse_target_inject_mode,
                 target_inject_layers=coarse_target_inject_layers,
+                mask_enabled=coarse_mask_enabled,
+                mask_noise_blank_level=coarse_mask_noise_blank_level,
+                mask_guidance_epsilon=coarse_mask_guidance_epsilon,
+                mask_guidance_interpolation=coarse_mask_guidance_interpolation,
             )
         else:
             raise ValueError(f"unknown coarse_type: {coarse_type!r}")

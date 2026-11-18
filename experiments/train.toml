@@ -88,6 +88,14 @@ transition_width = 0.03
 exclude_parsing_labels = []
 
 
+# StyleGAN2 开启 coarse_mask_enabled 后，Mask 使用 clean DST 面部解析标签作 BCE 监督。
+# weight=0 时关闭额外的解析 teacher 与 BCE，但仍可通过预测 Mask 引导 Target 特征。
+[loss.coarse.mask]
+weight = 1.0
+# CelebAMask-HQ / BiSeNet 19 类索引，默认面部区域（不含头发与背景）。
+labels = [1, 2, 3, 4, 5, 6, 10, 11, 12, 13]
+
+
 [loss.coarse.l1]
 # 0: 直接逐像素 L1；正整数 N: Gaussian blur（sigma = 当前分辨率 / N），N 越小模糊越强；384 为旧强度。
 enable = true
@@ -282,6 +290,14 @@ hq_max_ch = 128
 # 如 coarse_start_resolution=32，设置 [0] 仅在 32x32 注入 Target。
 # 默认全部层级启用，可设 [] 关闭所有 Target 注入。
 # coarse_target_inject_layers = [0]
+# 可选 Mask：逐层累计 FP32 Logits，仅在特征引导/输出时取 Sigmoid；BCEWithLogits 直接监督最终 Logits。
+# coarse_mask_enabled = false
+# 旧版 noise_blank_level=9：4x4 起算的绝对层级，8=1、16=3、32=5、64=7、128=9、256=11；i > 此值才执行引导。
+# 对于起始 32 分辨率，可设为 -1 使所有上采样层均启用 Mask 引导。
+# coarse_mask_noise_blank_level = 9
+# Mask 区域加权均值的分母最小值，及前一级 Mask 到当前层的插值方式。
+# coarse_mask_guidance_epsilon = 1e-4
+# coarse_mask_guidance_interpolation = "bilinear"  # 或 "nearest"
 # hq_bottleneck_resolution = 16
 # hq_base_ch = 8
 # hq_max_ch = 128

@@ -1026,7 +1026,12 @@ def _check_generator_responsibility_boundary() -> None:
 
     coarse_forward_calls = [node for node in ast.walk(train_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "net_coarse"]
     active_coarse_calls = [call for call in coarse_forward_calls if any(keyword.arg == "return_resize_in" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True for keyword in call.keywords)]
-    assert len(active_coarse_calls) == 2
+    assert len(active_coarse_calls) == 4  # 正常 forward + overflow retry，分别支持 Mask 开关。
+    masked_coarse_calls = [
+        call for call in active_coarse_calls
+        if any(keyword.arg == "return_mask_logits" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True for keyword in call.keywords)
+    ]
+    assert len(masked_coarse_calls) == 2
 
     def guarded_calls(stage_attr: str) -> set[str]:
         calls = set()

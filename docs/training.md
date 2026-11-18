@@ -231,6 +231,8 @@ coarse_target_inject_layers = [0]      # 相对于起始分辨率编号
 
 `stylegan2` 使用 `models/stylegan2.py` 的条件生成器：Source Identity 经 Mapping Network 调制每个合成卷积，Target Encoder 仅向选中的分辨率层注入特征。`coarse_w_dim`、`coarse_mapping_layers` 控制身份映射；`coarse_start_resolution` 决定 Constant 与首层合成的分辨率（默认 4）；`coarse_channels = [base_ch, max_ch]` 以 Coarse 输出分辨率的通道数为 `base_ch`，向低分辨率每降低一半则通道数翻倍，最多为 `max_ch`（默认 `[128, 512]`）。即 `C(r) = min(max_ch, base_ch * coarse_resolution / r)`。
 
+StyleGAN2 可选 Mask 分支：`coarse_mask_enabled=true` 时创建独立的逐层 `ToMask` 1 通道调制卷积头；初始层输出 FP32 Logits，后续层将本层 Logits 与上采样的前层 Logits 在 FP32 中累加；仅在 Target 特征引导或请求 Mask 输出时执行 Sigmoid（不同于旧 StyleSwap 的逐层概率累加）。`return_mask=True` 可由 Coarse 模型单独取回 `[B,1,R,R]` Mask，常规 Generator/HQ/ONNX 输出仍只包含 RGB，不将 Mask 用于最终 RGB 合成。启用时新增 `[loss.coarse.mask].weight`（默认 `1.0`）和 `.labels`（默认 `[1,2,3,4,5,6,10,11,12,13]`），复用冻结的 BiSeNet parsing teacher 对**在线遮挡前的 clean DST** 生成 Mask 监督；跨层累积使用 FP32 Logits，在需要特征引导时计算 FP32 Mask 概率，训练的最终监督使用 FP32 `BCEWithLogits`；不在跨层递推中叠加 Sigmoid，从而避免梯度反复经过非线性压缩；权重为 `0` 则不加载额外教师、也不计算 BCE。另有 `coarse_mask_noise_blank_level`（默认旧值 `9`，从绝对 4×4 层起算：8×8=1、16×16=3、32×32=5、64×64=7、128×128=9、256×256=11，不随 `coarse_start_resolution` 重新编号；满足 `i > level` 时生效）、`coarse_mask_guidance_epsilon`（默认 `1e-4`）及 `coarse_mask_guidance_interpolation`（`bilinear` / `nearest`）：启用 Mask 引导时，对该层需要注入的 Target 特征进行 Mask 加权区域均值替换；没有 Target 注入的层不会执行该计算。使用 `coarse_start_resolution=32` 时可设置 `coarse_mask_noise_blank_level=-1` 从第一层上采样起启用引导。Mask 关闭时不创建 Mask 参数，不改变原有生成器推理路径。
+
 `coarse_target_inject_mode` 可选 `concat`（拼接，开启注入的 StyledConv 输出通道翻倍）和 `add`（逐元素加法），默认 `concat`。`coarse_target_inject_layers` 支持非连续整数索引；`0` 对应 `coarse_start_resolution`，`1` 对应其两倍分辨率，以此类推。上例仅在 32×32 注入 Target；也可以设置 `[0, 2]` 分别在 32×32 和 128×128 注入，或设置 `[]` 禁用全部 Target 注入。未选中层仍接受 Source Identity 调制。默认在所有合成分辨率注入。Target Encoder 最多下采样到实际启用的最低注入分辨率；不启用任何注入时不会构建 Target Encoder。
 
 原 Coarse 的 `coarse_latent_resolution`、`coarse_num_latent`、`coarse_base_ch`、`coarse_max_ch` 不影响 StyleGAN2。`coarse_resolution` 必须为 4～1024 的 2 的整数次幂，且不超过 HQ 输出分辨率；`coarse_start_resolution` 必须是位于 4 到 `coarse_resolution` 之间的 2 的整数次幂。两种架构的检查点均使用当前版本协议，不迁移历史权重。
@@ -239,7 +241,7 @@ coarse_target_inject_layers = [0]      # 相对于起始分辨率编号
 
 **激活函数**：InSwapper Coarse/HQ 使用 SiLU 与线性 RGB 输出；新的训练实验不继承旧激活设计的权重。
 
-**新训练阶段**：检查点版本为 `7`，训练语义版本为 `23`，规范化 run 配置格式版本为 `2`。InSwapper 检查点包含 `w_space_map.*`；旧格式不支持加载或迁移。StyleGAN2 使用相同版本协议，但其网络结构不变。
+**新训练阶段**：检查点版本为 `7`，训练语义版本为 `24`，规范化 run 配置格式版本为 `2`。InSwapper 检查点包含 `w_space_map.*`；旧格式不支持加载或迁移。StyleGAN2 使用相同版本协议；新增 Mask 配置会改变开启 Mask 时的网络结构，训练或继承相应 Coarse 必须保持配置一致。
 
 **检查点隔离**：不同 Coarse 架构的权重不可互换。`resume`/继承 Coarse 的 `branch` 必须保持同一架构；HQ rebuild 只允许修改 HQ 配置，不允许把 InSwapper Coarse 的权重当成 StyleGAN2 权重。
 

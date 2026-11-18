@@ -148,6 +148,50 @@ class ToOutput(nn.Module):
         return out
 
 
+def mask_probability(logits: Tensor) -> Tensor:
+    """Keep Mask probabilities and their sigmoid gradients in FP32 under autocast."""
+    return torch.sigmoid(logits.float())
+
+
+class ToMask(nn.Module):
+    """Accumulate Mask logits across synthesis resolutions, without intermediate sigmoid."""
+
+    def __init__(self, in_ch: int, w_dim: int, *, upsample: bool, blur_kernel: Sequence[int]) -> None:
+        super().__init__()
+        self.conv = ModulatedConv2d(in_ch, 1, w_dim, kernel_size=1, demodulate=False)
+        self.upsample = UpFIRDn2d(filt_size=len(blur_kernel)) if upsample else None
+
+    def forward(self, x: Tensor, w: Tensor, previous_logits: Tensor | None) -> Tensor:
+        logits = self.conv(x, w).float()
+        if previous_logits is not None:
+            assert self.upsample is not None
+            logits = logits + self.upsample(previous_logits)
+        return logits
+
+
+def stylegan2_mask_layer_index(resolution: int) -> int:
+    """Legacy StyleSwap synthesis index, anchored at 4x4 even when synthesis starts later.
+
+    8->1, 16->3, 32->5, 64->7, 128->9, 256->11, 512->13.
+    """
+    return 2 * (resolution.bit_length() - 1) - 5
+
+
+def mask_guided_target_features(
+    target_feat: Tensor, mask: Tensor, *, epsilon: float, interpolation: str,
+) -> Tensor:
+    """Replace masked Target features by their spatially weighted channel mean.
+
+    Corresponds to the original StyleSwap `conver_noise_withmask` operation;
+    it does not blend the generated RGB image with the input image.
+    """
+    mask = F.interpolate(mask, size=target_feat.shape[-2:], mode=interpolation)
+    weights = mask.float()
+    target_fp32 = target_feat.float()
+    mean = (target_fp32 * weights).sum(dim=(2, 3), keepdim=True) / weights.sum(dim=(2, 3), keepdim=True).clamp_min(epsilon)
+    return torch.lerp(target_fp32, mean, weights).to(target_feat.dtype)
+
+
 class EqualConv2d(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int, *, downsample: bool, blur_kernel: Sequence[int]) -> None:
         super().__init__()
@@ -205,6 +249,7 @@ class SynthesisStage(nn.Module):
         inject_mode: str,
         inject_target: bool,
         blur_kernel: Sequence[int],
+        mask_enabled: bool = False,
     ) -> None:
         super().__init__()
         self.conv0 = StyledConv(
@@ -216,19 +261,25 @@ class SynthesisStage(nn.Module):
             inject_target=inject_target, blur_kernel=blur_kernel,
         )
         self.to_rgb = ToOutput(self.conv1.output_channels, img_channels, w_dim, upsample=True, blur_kernel=blur_kernel)
+        self.to_mask = ToMask(self.conv1.output_channels, w_dim, upsample=True, blur_kernel=blur_kernel) if mask_enabled else None
 
-    def forward(self, x: Tensor, w: Tensor, target_feat: Tensor | None, rgb: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self, x: Tensor, w: Tensor, target_feat: Tensor | None, rgb: Tensor, mask_logits: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
         x = self.conv0(x, w, target_feat)
         x = self.conv1(x, w, target_feat)
         rgb = self.to_rgb(x, w, rgb)
-        return x, rgb
+        if self.to_mask is not None:
+            assert mask_logits is not None
+            mask_logits = self.to_mask(x, w, mask_logits)
+        return x, rgb, mask_logits
 
 
 class Generator(nn.Module):
     """StyleSwap Generator with a project-style interface.
 
     Input: target image [B,C,R,R] and identity embedding [B,id_dim].
-    Output: generated RGB image [B,C,R,R] without a mask branch.
+    Output: generated RGB image [B,C,R,R]; optional StyleSwap mask head.
 
     The identity embedding is mapped into the StyleGAN2 W space; the target
     encoder optionally supplies per-resolution Target features using concatenation
@@ -247,6 +298,10 @@ class Generator(nn.Module):
         target_inject_mode: str = "concat",
         target_inject_layers: Sequence[int] | None = None,
         blur_kernel: Sequence[int] = (1, 3, 3, 1),
+        mask_enabled: bool = False,
+        mask_noise_blank_level: int = 9,
+        mask_guidance_epsilon: float = 1e-4,
+        mask_guidance_interpolation: str = "bilinear",
     ) -> None:
         super().__init__()
         if img_resolution < 4 or img_resolution > 1024 or img_resolution & (img_resolution - 1):
@@ -264,6 +319,14 @@ class Generator(nn.Module):
             raise ValueError("only the original [1,3,3,1] StyleGAN2 FIR kernel is supported")
         if target_inject_mode not in {"concat", "add"}:
             raise ValueError("target_inject_mode must be concat or add")
+        if type(mask_enabled) is not bool:
+            raise TypeError("mask_enabled must be bool")
+        if type(mask_noise_blank_level) is not int or mask_noise_blank_level < -1:
+            raise ValueError("mask_noise_blank_level must be an integer >= -1")
+        if not math.isfinite(mask_guidance_epsilon) or mask_guidance_epsilon <= 0:
+            raise ValueError("mask_guidance_epsilon must be a finite positive value")
+        if mask_guidance_interpolation not in {"nearest", "bilinear"}:
+            raise ValueError("mask_guidance_interpolation must be nearest or bilinear")
         max_layer = img_resolution.bit_length() - start_resolution.bit_length()
         if target_inject_layers is None:
             target_inject_layers = tuple(range(max_layer + 1))
@@ -275,6 +338,10 @@ class Generator(nn.Module):
             raise ValueError("target_inject_layers must not contain duplicate indices")
         target_inject_layers = tuple(sorted(target_inject_layers))
         self.target_inject_layers = target_inject_layers
+        self.mask_enabled = mask_enabled
+        self.mask_noise_blank_level = mask_noise_blank_level
+        self.mask_guidance_epsilon = mask_guidance_epsilon
+        self.mask_guidance_interpolation = mask_guidance_interpolation
 
         self.network_cfg = {
             "img_resolution": img_resolution,
@@ -287,6 +354,10 @@ class Generator(nn.Module):
             "blur_kernel": tuple(blur_kernel),
             "target_inject_mode": target_inject_mode,
             "target_inject_layers": target_inject_layers,
+            "mask_enabled": mask_enabled,
+            "mask_noise_blank_level": mask_noise_blank_level,
+            "mask_guidance_epsilon": mask_guidance_epsilon,
+            "mask_guidance_interpolation": mask_guidance_interpolation,
         }
         self.img_resolution = img_resolution
         self.img_channels = img_channels
@@ -328,6 +399,10 @@ class Generator(nn.Module):
             self.conv_first.output_channels, img_channels, w_dim,
             upsample=False, blur_kernel=blur_kernel,
         )
+        self.to_mask_first = (
+            ToMask(self.conv_first.output_channels, w_dim, upsample=False, blur_kernel=blur_kernel)
+            if mask_enabled else None
+        )
 
         self.stages = nn.ModuleList()
         previous_channels = self.conv_first.output_channels
@@ -335,12 +410,18 @@ class Generator(nn.Module):
             stage = SynthesisStage(
                 previous_channels, self.channels[resolution], w_dim, img_channels,
                 inject_mode=target_inject_mode, inject_target=layer_index in enabled,
-                blur_kernel=blur_kernel,
+                blur_kernel=blur_kernel, mask_enabled=mask_enabled,
             )
             self.stages.append(stage)
             previous_channels = stage.conv1.output_channels
 
-    def forward(self, target: Tensor, id_feat: Tensor) -> Tensor:
+    def forward(
+        self, target: Tensor, id_feat: Tensor, return_mask: bool = False, return_mask_logits: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        if return_mask and return_mask_logits:
+            raise ValueError("return_mask and return_mask_logits are mutually exclusive")
+        if (return_mask or return_mask_logits) and not self.mask_enabled:
+            raise ValueError("return_mask/return_mask_logits requires mask_enabled=True")
         expected = (self.img_channels, self.img_resolution, self.img_resolution)
         if target.ndim != 4 or target.shape[1:] != expected:
             raise ValueError(f"target must be [B,{self.img_channels},{self.img_resolution},{self.img_resolution}], got {tuple(target.shape)}")
@@ -352,10 +433,28 @@ class Generator(nn.Module):
         x = self.constant.expand(target.shape[0], -1, -1, -1)
         x = self.conv_first(x, w, features.get(self.start_resolution))
         rgb = self.to_rgb_first(x, w, None)
+        mask_logits = self.to_mask_first(x, w, None) if self.to_mask_first is not None else None
 
-        for res, stage in zip(self.synthesis_resolutions[1:], self.stages, strict=True):
-            x, rgb = stage(x, w, features.get(res), rgb)
+        for layer_index, (res, stage) in enumerate(zip(self.synthesis_resolutions[1:], self.stages, strict=True), start=1):
+            target_feat = features.get(res)
+            # Layer indices are absolute: 8x8=1, 16x16=3, ..., 256x256=11.
+            if (
+                mask_logits is not None and layer_index in self.target_inject_layers
+                and target_feat is not None and stylegan2_mask_layer_index(res) > self.mask_noise_blank_level
+            ):
+                target_feat = mask_guided_target_features(
+                    target_feat, mask_probability(mask_logits),
+                    epsilon=self.mask_guidance_epsilon,
+                    interpolation=self.mask_guidance_interpolation,
+                )
+            x, rgb, mask_logits = stage(x, w, target_feat, rgb, mask_logits)
 
+        if return_mask_logits:
+            assert mask_logits is not None
+            return rgb, mask_logits
+        if return_mask:
+            assert mask_logits is not None
+            return rgb, mask_probability(mask_logits)
         return rgb
 
 

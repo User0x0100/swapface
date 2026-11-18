@@ -104,7 +104,8 @@ class TestIdentityParsingGradient(unittest.TestCase):
         trainer.hq_excluded_parsing_labels = (11,)
         trainer.parsing_exclusion_indices = (torch.tensor([4, 12]), torch.tensor([11]))
 
-        _, augmented_dst, _, _, _, _, (coarse_gate, hq_gate), smirk_weights = trainer._next_training_batch()
+        _, augmented_dst, _, _, _, _, (coarse_gate, hq_gate), smirk_weights, mask_target = trainer._next_training_batch()
+        assert mask_target is None
         assert torch.allclose(parser.last_input, dst)
         assert torch.allclose(augmented_dst, dst + 0.1)
         assert torch.allclose(smirk_weights, occlusion_gate.flatten(1).mean(dim=1))
@@ -183,8 +184,8 @@ class TestIdentityParsingGradient(unittest.TestCase):
         trainer.coarse_excluded_parsing_labels = ()
         trainer.hq_excluded_parsing_labels = ()
         trainer.parsing_exclusion_indices = (None, None)
-        assert trainer._next_training_batch()[-2] == (None, None)
-        assert trainer._next_training_batch()[-1] is None
+        assert trainer._next_training_batch()[-3] == (None, None)
+        assert trainer._next_training_batch()[-2:] == (None, None)
 
 
 if __name__ == "__main__":
