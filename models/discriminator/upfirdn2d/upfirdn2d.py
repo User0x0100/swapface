@@ -389,42 +389,28 @@ def _downfirdn2d_separable(
 
 
 class DownFIRDn2d(nn.Module):
-    def __init__(self, filt_size: int = 4, scale_factor: int = 2, padding: int = 0, flip_filter: bool = False, gain: int = 1) -> None:
-        r"""Anti-aliased downsampling layer using FIR filtering.
+    """StyleGAN2 FIR prefilter for a following strided convolution.
 
-        Performs:
-            FIR filter → downsample
+    This module does not decimate; the convolution with ``stride=scale_factor``
+    performs the actual downsampling. The convolution kernel size determines
+    FIR padding so the combined operation produces the intended resolution.
+    """
 
-        This layer ensures proper low-pass filtering before subsampling,
-        preventing aliasing artifacts.
-
-        Args:
-            filt_size:
-                FIR filter size (binomial kernel)
-
-            scale_factor:
-                Downsampling factor
-
-            padding:
-                Input-side padding
-
-            flip_filter:
-                Convolution vs correlation
-
-            gain:
-                Output scaling
-
-        Behavior:
-            - Applies low-pass filter BEFORE decimation
-            - Ensures signal is band-limited
-            - Avoids aliasing during downsampling
-
-        Notes:
-            - Critical for discriminator stability
-            - Often paired with UpFIRDn2d
-            - Equivalent to anti-aliased pooling
-        """
+    def __init__(
+        self,
+        filt_size: int = 4,
+        scale_factor: int = 2,
+        padding: int = 0,
+        flip_filter: bool = False,
+        gain: int = 1,
+        *,
+        conv_kernel_size: int,
+    ) -> None:
         super().__init__()
+        if type(conv_kernel_size) is not int or conv_kernel_size <= 0 or conv_kernel_size % 2 != 1:
+            raise ValueError("conv_kernel_size must be a positive odd integer")
+        if type(scale_factor) is not int or scale_factor < 2:
+            raise ValueError("scale_factor must be an integer >= 2")
 
         resample_filter = {
             1: [1.0],
@@ -439,16 +425,17 @@ class DownFIRDn2d(nn.Module):
         resample_filter = setup_filter(resample_filter, flip_filter=flip_filter)
         self.register_buffer("f", resample_filter, persistent=False)
         fw, fh = _get_filter_size(resample_filter)
-        self.scale_factor = scale_factor
-
         self.upx, self.upy = _parse_scaling(1)
-        self.downx, self.downy = _parse_scaling(scale_factor)
+        self.downx, self.downy = _parse_scaling(1)
         padx0, padx1, pady0, pady1 = _parse_padding(padding)
 
-        self.padx0 = padx0 + (fw - self.downx + 1) // 2
-        self.padx1 = padx1 + (fw - self.downx) // 2
-        self.pady0 = pady0 + (fh - self.downy + 1) // 2
-        self.pady1 = pady1 + (fh - self.downy) // 2
+        # FIR padding for the next stride-`scale_factor` convolution.
+        px = fw - scale_factor + conv_kernel_size - 1
+        py = fh - scale_factor + conv_kernel_size - 1
+        self.padx0 = padx0 + (px + 1) // 2
+        self.padx1 = padx1 + px // 2
+        self.pady0 = pady0 + (py + 1) // 2
+        self.pady1 = pady1 + py // 2
 
         self.flip_filter = flip_filter
         self.gain = gain
@@ -465,33 +452,64 @@ class DownFIRDn2d(nn.Module):
         if torch.onnx.is_in_onnx_export():
             # This wrapper calls the fused op directly on CUDA in normal execution.
             return _upfirdn2d_native(
-                x, f,
-                self.upx, self.upy, self.downx, self.downy,
-                self.padx0, self.padx1, self.pady0, self.pady1,
-                self.flip_filter, self.gain,
+                x,
+                f,
+                self.upx,
+                self.upy,
+                self.downx,
+                self.downy,
+                self.padx0,
+                self.padx1,
+                self.pady0,
+                self.pady1,
+                self.flip_filter,
+                self.gain,
             )
 
         match (x.device.type, torch.version.hip):
             case ("cuda", None):
                 initialize_upfirdn2d()
                 return torch.ops.upfirdn2d.upfirdn2d(
-                    x, f,
-                    self.upx, self.upy, self.downx, self.downy,
-                    self.padx0, self.padx1, self.pady0, self.pady1,
-                    self.flip_filter, self.gain,
+                    x,
+                    f,
+                    self.upx,
+                    self.upy,
+                    self.downx,
+                    self.downy,
+                    self.padx0,
+                    self.padx1,
+                    self.pady0,
+                    self.pady1,
+                    self.flip_filter,
+                    self.gain,
                 )
             case ("cuda", _) if is_rocm_gfx1100(x.device):
                 return _downfirdn2d_separable(
-                    x, f, self.downx, self.downy,
-                    self.padx0, self.padx1, self.pady0, self.pady1,
-                    self.flip_filter, self.gain,
+                    x,
+                    f,
+                    self.downx,
+                    self.downy,
+                    self.padx0,
+                    self.padx1,
+                    self.pady0,
+                    self.pady1,
+                    self.flip_filter,
+                    self.gain,
                 )
             case _:
                 return _upfirdn2d_native(
-                    x, f,
-                    self.upx, self.upy, self.downx, self.downy,
-                    self.padx0, self.padx1, self.pady0, self.pady1,
-                    self.flip_filter, self.gain,
+                    x,
+                    f,
+                    self.upx,
+                    self.upy,
+                    self.downx,
+                    self.downy,
+                    self.padx0,
+                    self.padx1,
+                    self.pady0,
+                    self.pady1,
+                    self.flip_filter,
+                    self.gain,
                 )
 
 

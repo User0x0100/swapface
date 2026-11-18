@@ -37,20 +37,20 @@ class MinibatchStdLayer(nn.Module):
 class FIRDownBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
-        self.shortcut_filter = DownFIRDn2d()
-        self.shortcut_conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
+        self.shortcut_filter = DownFIRDn2d(conv_kernel_size=1)
+        self.shortcut_conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=2, bias=False)
 
         self.conv0 = nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1)
-        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
-        self.residual_filter = DownFIRDn2d()
+        self.residual_filter = DownFIRDn2d(conv_kernel_size=3)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2)
         self.scale = 1.0 / math.sqrt(2.0)
 
     def forward(self, x: Tensor) -> Tensor:
         shortcut = self.shortcut_conv(self.shortcut_filter(x))
 
         residual = F.leaky_relu(self.conv0(x), negative_slope=0.2)
-        residual = F.leaky_relu(self.conv1(residual), negative_slope=0.2)
         residual = self.residual_filter(residual)
+        residual = F.leaky_relu(self.conv1(residual), negative_slope=0.2)
         return (shortcut + residual) * self.scale
 
 
@@ -80,9 +80,7 @@ class FIRMinibatchStdDiscriminator(nn.Module):
         channels = [min(max_ch, base_ch * (2**level)) for level in range(num_down + 1)]
 
         self.from_rgb = nn.Conv2d(img_channels, channels[0], kernel_size=1)
-        self.down_blocks = nn.ModuleList(
-            [FIRDownBlock(channels[index], channels[index + 1]) for index in range(num_down)]
-        )
+        self.down_blocks = nn.ModuleList([FIRDownBlock(channels[index], channels[index + 1]) for index in range(num_down)])
         self.minibatch_std = MinibatchStdLayer(minibatch_std_group_size)
         final_ch = channels[-1] + 1
         self.final_conv = nn.Conv2d(final_ch, final_ch, kernel_size=3, padding=1)
@@ -124,9 +122,7 @@ class FIRMinibatchStdDiscriminator(nn.Module):
             self.network_cfg["img_resolution"],
         )
         if x.ndim != 4 or tuple(x.shape[1:]) != expected:
-            raise ValueError(
-                f"x 必须为 [B,{expected[0]},{expected[1]},{expected[2]}]，实际为 {tuple(x.shape)}"
-            )
+            raise ValueError(f"x 必须为 [B,{expected[0]},{expected[1]},{expected[2]}]，实际为 {tuple(x.shape)}")
 
         encoded = self._encode(x, return_feats=return_feats)
         if return_feats:
@@ -195,9 +191,7 @@ class InstanceNormResidualDiscriminator(nn.Module):
         }
         self.from_rgb = nn.Conv2d(img_channels, base_ch, kernel_size=3, padding=1)
         channels = [min(max_ch, base_ch * (2**level)) for level in range(num_down + 1)]
-        self.down_blocks = nn.ModuleList(
-            [InstanceNormResidualDownBlock(channels[index], channels[index + 1]) for index in range(num_down)]
-        )
+        self.down_blocks = nn.ModuleList([InstanceNormResidualDownBlock(channels[index], channels[index + 1]) for index in range(num_down)])
 
         final_ch = channels[-1]
         final_resolution = self.MIN_RESOLUTION
@@ -221,9 +215,7 @@ class InstanceNormResidualDiscriminator(nn.Module):
             self.network_cfg["img_resolution"],
         )
         if x.ndim != 4 or tuple(x.shape[1:]) != expected:
-            raise ValueError(
-                f"x 必须为 [B,{expected[0]},{expected[1]},{expected[2]}]，实际为 {tuple(x.shape)}"
-            )
+            raise ValueError(f"x 必须为 [B,{expected[0]},{expected[1]},{expected[2]}]，实际为 {tuple(x.shape)}")
 
         x = self.from_rgb(x)
         feats = [] if return_feats else None

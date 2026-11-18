@@ -1,7 +1,8 @@
 import torch
 from torch.autograd import gradcheck
 from torch.library import opcheck
-from . import UpFIRDn2d, DownFIRDn2d
+
+from . import DownFIRDn2d, UpFIRDn2d
 
 if __name__ == "__main__":
     device = torch.device("cuda")
@@ -10,7 +11,7 @@ if __name__ == "__main__":
     y = torch.randn([1, 3, 16, 16], device=device, dtype=torch.double, requires_grad=True)
 
     up_op = UpFIRDn2d().to(device)
-    down_op = DownFIRDn2d().to(device)
+    down_op = DownFIRDn2d(conv_kernel_size=3).to(device)
 
     x_up = up_op(x)
     y_up = up_op(y)

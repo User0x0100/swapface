@@ -168,6 +168,8 @@ provider = "MS1MV3_ARCFACE_R50_FP16"  # Identity teacher 可独立选择
 
 两个 Discriminator 的架构也完全独立：`[discriminator.hq].img_resolution` 必须等于 `generator.img_resolution`，`[discriminator.coarse].img_resolution` 必须等于 `generator.coarse_resolution`；两者的 `img_channels` 都必须等于 `generator.img_channels`。FIR_MINIBATCH_STD 和 INSTANCE_NORM_RESIDUAL 支持 `base_ch`/`max_ch`；HQ/Coarse 的 UNET 只消费 `base_ch`，通道数固定按 1、2、4、8 倍扩展。默认 FIR_MINIBATCH_STD 是单 Global Discriminator：Encoder 通过 residual block 与 FIR 抗混叠逐级下采样到 4x4，再经 MinibatchStd、3x3 Conv 和两层 Linear 输出每图一个 logit。INSTANCE_NORM_RESIDUAL 保留全局残差判别器。HQ/Coarse 均可使用 BasicSR `UNetDiscriminatorSN`：三层 stride-2 下采样，双线性上采样、可选加法跳连；`conv1`～`conv8` 使用 SpectralNorm，只有一个全分辨率空间 logits 输出 `[B,1,H,W]`。
 
+下采样残差块采用 StyleGAN2 顺序：残差分支 `Conv3x3 → LeakyReLU → FIR Blur → stride-2 Conv3x3 → LeakyReLU`，shortcut 分支 `FIR Blur → stride-2 Conv1x1`；使用 `DownFIRDn2d(conv_kernel_size=3/1)` 只做 FIR 预滤波，分别应用对应 padding，由后续 Stride-2 Conv 完成下采样；`DownFIRDn2d` 不再支持独立降采样模式。
+
 ### 可选 HQ/Coarse UNet 判别器
 
 在新 run 配置中分别为 HQ 和 Coarse 选择（已有 run 修改判别器类型需 branch，并 reset 相应阶段的 Discriminator，不能原地 resume 改架构）：

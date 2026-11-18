@@ -59,13 +59,13 @@ def test_cuda_fused_fir_exports_as_standard_onnx(tmp_path, separable: bool) -> N
     _export_and_compare(_Filter(separable), image, str(tmp_path / f"fir_{separable}.onnx"))
 
 
-@pytest.mark.parametrize("layer", [UpFIRDn2d, DownFIRDn2d])
-def test_cuda_fir_modules_export_as_standard_onnx(tmp_path, layer: type[nn.Module]) -> None:
+@pytest.mark.parametrize("layer", [UpFIRDn2d(), DownFIRDn2d(conv_kernel_size=3)], ids=["upsample", "downsample_prefilter"])
+def test_cuda_fir_modules_export_as_standard_onnx(tmp_path, layer: nn.Module) -> None:
     if not torch.cuda.is_available() or torch.version.hip is not None:
         pytest.skip("requires NVIDIA CUDA for fused-kernel export regression")
 
     image = torch.randn(1, 3, 16, 16, device="cuda")
-    _export_and_compare(layer(), image, str(tmp_path / f"{layer.__name__}.onnx"))
+    _export_and_compare(layer, image, str(tmp_path / f"{type(layer).__name__}.onnx"))
 
 
 def test_stylegan2_cuda_generator_exports_without_custom_fir(tmp_path) -> None:
