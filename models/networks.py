@@ -446,15 +446,39 @@ class Generator(nn.Module):
             max_ch=hq_max_ch,
         )
 
-    def forward(self, target: Tensor, id_feat: Tensor, return_coarse: bool = False) -> Tensor | tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        target: Tensor,
+        id_feat: Tensor,
+        return_coarse: bool = False,
+        return_mask: bool = False,
+        return_mask_logits: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
+        if return_mask and return_mask_logits:
+            raise ValueError("return_mask and return_mask_logits are mutually exclusive")
         expected_target = (self.img_channels, self.img_resolution, self.img_resolution)
         if target.ndim != 4 or target.shape[1:] != expected_target:
             raise ValueError(f"target must be [B,{self.img_channels},{self.img_resolution},{self.img_resolution}], got {tuple(target.shape)}")
         if id_feat.ndim != 2 or id_feat.shape != (target.shape[0], self.id_dim):
             raise ValueError(f"id_feat must be [B,{self.id_dim}], got {tuple(id_feat.shape)}")
 
-        coarse = self.coarse(target, id_feat)
+        mask_requested = return_mask or return_mask_logits
+        if mask_requested:
+            if not isinstance(self.coarse, StyleGAN2Coarse):
+                raise ValueError("Mask output requires StyleGAN2Coarse with mask_enabled=True")
+            coarse, mask = self.coarse(
+                target,
+                id_feat,
+                return_mask=return_mask,
+                return_mask_logits=return_mask_logits,
+            )
+        else:
+            coarse = self.coarse(target, id_feat)
         output = self.hq(target, coarse)
+        if mask_requested:
+            # HQ has no Mask head: preserve the Coarse probability/logit semantics.
+            upsampled_mask = F.interpolate(mask, size=output.shape[-2:], mode="bilinear", align_corners=False)
+            return (output, coarse, upsampled_mask) if return_coarse else (output, upsampled_mask)
         if return_coarse:
             return output, coarse
         return output

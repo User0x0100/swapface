@@ -102,7 +102,7 @@ DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
     "identity": {**DEFAULT_IDENTITY_LOSS_CONFIG, "exclude_parsing_labels": []},
     "r1": dict(DEFAULT_R1_LOSS_CONFIG),
     "wfm": {"enable": DEFAULT_WFM_LOSS_CONFIG["enable"], "weights": dict(DEFAULT_WFM_LOSS_CONFIG["weights"])},
-    "mask": {"weight": 1.0, "labels": [1, 2, 3, 4, 5, 6, 10, 11, 12, 13]},
+    "mask": {"weight": 1.0},
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
     "smirk": dict(DEFAULT_SMIRK_LOSS_CONFIG),
     "reconstruction": {"scope": "same"},
@@ -325,7 +325,7 @@ def _normalize_identity(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
+def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, legacy_inswapper_mask: bool = False) -> dict[str, Any]:
     defaults = DEFAULT_HQ_LOSS_CONFIG if stage == "hq" else DEFAULT_COARSE_LOSS_CONFIG
     unknown = set(loss) - set(defaults)
     if unknown:
@@ -404,15 +404,22 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
 
     result = {"gan": gan, "identity": identity, "r1": r1, "wfm": wfm, "gaze": gaze, "smirk": smirk}
     if stage == "coarse":
-        mask = _with_defaults(_table(loss, "mask", "[loss.coarse.mask]"), defaults["mask"], "[loss.coarse.mask]")
+        # Preserve the unused historical Mask labels in InSwapper's canonical
+        # config so existing run hashes remain valid. New StyleGAN2 runs use
+        # only weight: their teacher region comes from FaceMasker + ID gate.
+        mask_defaults = defaults["mask"]
+        if legacy_inswapper_mask:
+            mask_defaults = {"weight": 1.0, "labels": [1, 2, 3, 4, 5, 6, 10, 11, 12, 13]}
+        mask = _with_defaults(_table(loss, "mask", "[loss.coarse.mask]"), mask_defaults, "[loss.coarse.mask]")
         mask["weight"] = _float(mask["weight"], "loss.coarse.mask.weight", minimum=0.0)
-        labels = mask["labels"]
-        if not isinstance(labels, list) or not labels:
-            raise ValueError("loss.coarse.mask.labels 必须为非空整数数组")
-        label_indices = [_int(label, f"loss.coarse.mask.labels[{i}]", minimum=0) for i, label in enumerate(labels)]
-        if any(index >= FACE_PARSING_NUM_CLASSES for index in label_indices) or len(set(label_indices)) != len(label_indices):
-            raise ValueError(f"loss.coarse.mask.labels 必须为不重复的 [0, {FACE_PARSING_NUM_CLASSES - 1}] 整数")
-        mask["labels"] = sorted(label_indices)
+        if legacy_inswapper_mask:
+            labels = mask["labels"]
+            if not isinstance(labels, list) or not labels:
+                raise ValueError("loss.coarse.mask.labels 必须为非空整数数组")
+            label_indices = [_int(label, f"loss.coarse.mask.labels[{i}]", minimum=0) for i, label in enumerate(labels)]
+            if any(index >= FACE_PARSING_NUM_CLASSES for index in label_indices) or len(set(label_indices)) != len(label_indices):
+                raise ValueError(f"loss.coarse.mask.labels 必须为不重复的 [0, {FACE_PARSING_NUM_CLASSES - 1}] 整数")
+            mask["labels"] = sorted(label_indices)
         result["mask"] = mask
 
     reconstruction = _with_defaults(_table(loss, "reconstruction", f"[{prefix}.reconstruction]"), defaults["reconstruction"], f"[{prefix}.reconstruction]")
@@ -438,13 +445,13 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str) -> dict[str, Any]:
     return result
 
 
-def _normalize_loss(config: dict[str, Any]) -> dict[str, Any]:
+def _normalize_loss(config: dict[str, Any], *, coarse_type: str) -> dict[str, Any]:
     loss = _table(config, "loss", "[loss]")
     unknown = set(loss) - set(DEFAULT_LOSS_CONFIG)
     if unknown:
         raise ValueError(f"[loss] 包含未知字段：{sorted(unknown)}")
     return {
-        "coarse": _normalize_stage_loss(_table(loss, "coarse", "[loss.coarse]"), "coarse"),
+        "coarse": _normalize_stage_loss(_table(loss, "coarse", "[loss.coarse]"), "coarse", legacy_inswapper_mask=coarse_type == "inswapper"),
         "hq": _normalize_stage_loss(_table(loss, "hq", "[loss.hq]"), "hq"),
     }
 
@@ -699,8 +706,8 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
 
     train = _normalize_train(config)
     discriminator = _normalize_discriminator(config)
-    loss = _normalize_loss(config)
     generator = _normalize_generator(config)
+    loss = _normalize_loss(config, coarse_type=generator["coarse_type"])
     for stage, stage_config in discriminator.items():
         divisor = loss[stage]["l1"]["gaussian_blur"]
         if divisor:

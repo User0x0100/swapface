@@ -385,7 +385,6 @@ class Trainer:
         self.hq_reconstruction_scope = hq_reconstruction_scope
         self.coarse_mask_enabled = self.coarse_stage_active and config["generator"]["coarse_type"] == "stylegan2" and bool(config["generator"]["coarse_mask_enabled"])
         self.coarse_mask_weight = float(coarse_loss_config["mask"]["weight"])
-        self.coarse_mask_labels = tuple(coarse_loss_config["mask"]["labels"])
         self.enable_coarse_mask_loss = self.coarse_mask_enabled and self.coarse_mask_weight > 0.0
         self.enable_coarse_l1_loss = self.coarse_stage_active and bool(coarse_l1_config["enable"])
         self.enable_hq_l1_loss = self.hq_stage_active and bool(hq_l1_config["enable"])
@@ -822,10 +821,6 @@ class Trainer:
             torch.tensor(indices, device=self.device, dtype=torch.long) if indices else None
             for indices in (self.coarse_excluded_parsing_labels, self.hq_excluded_parsing_labels)
         )
-        self.coarse_mask_label_indices = (
-            torch.tensor(self.coarse_mask_labels, device=self.device, dtype=torch.long)
-            if self.enable_coarse_mask_loss else None
-        )
 
         # ========================= 编译模型 =========================
         # Coarse 始终需要前向；HQ/D/loss teacher 仅为 active stage 构建训练热路径。
@@ -1096,7 +1091,7 @@ class Trainer:
         if getattr(self, "enable_coarse_mask_loss", False):
             if coarse_mask_logits is None or coarse_mask_target is None:
                 raise RuntimeError("StyleGAN2 Mask BCE 已开启，但缺少预测 Logits 或面部分割监督")
-            target_mask = NF.interpolate(coarse_mask_target, size=coarse_mask_logits.shape[-2:], mode="nearest")
+            target_mask = NF.interpolate(coarse_mask_target, size=coarse_mask_logits.shape[-2:], mode="area")
             # Compute BCE from logits directly to retain gradients when FP16
             # sigmoid would round a confident but incorrect mask to 0 or 1.
             with autocast(device_type="cuda", enabled=False):
@@ -1474,9 +1469,10 @@ class Trainer:
             if getattr(self, "coarse_mask_enabled", False):
                 # Read RGB/Mask from one Coarse forward; don't run the costly
                 # StyleGAN2 synthesis twice just to render the preview row.
-                coarse_vis, predicted_mask_vis = self.net_g_ema.coarse(dst_vis, generator_identity_embeddings_vis, return_mask=True)
-                fake_vis = self.net_g_ema.hq(dst_vis, coarse_vis)
-                mask_display_vis = NF.interpolate(predicted_mask_vis, size=fake_vis.shape[-2:], mode="bilinear", align_corners=False).mul(2).sub(1).expand(-1, 3, -1, -1)
+                fake_vis, coarse_vis, predicted_mask_vis = self.net_g_ema(
+                    dst_vis, generator_identity_embeddings_vis, return_coarse=True, return_mask=True,
+                )
+                mask_display_vis = predicted_mask_vis.mul(2).sub(1).expand(-1, 3, -1, -1)
             else:
                 fake_vis, coarse_vis = self.net_g_ema(dst_vis, generator_identity_embeddings_vis, return_coarse=True)
                 mask_display_vis = None
@@ -1561,13 +1557,6 @@ class Trainer:
             with torch.no_grad(), autocast(device_type="cuda", enabled=False):
                 labels = self.face_parser.predict_labels(dst.float())
 
-        # Reuse the same clean-target parsing inference as the identity gate.
-        # The Mask teacher is computed before synthetic occlusion is applied.
-        coarse_mask_target = None
-        if getattr(self, "enable_coarse_mask_loss", False):
-            assert labels is not None and self.coarse_mask_label_indices is not None
-            coarse_mask_target = torch.isin(labels, self.coarse_mask_label_indices).unsqueeze(1).float()
-
         occlusion_gate = None
         if self.occlusion is not None:
             dst, occlusion_gate = self.occlusion.apply(dst)
@@ -1589,6 +1578,16 @@ class Trainer:
                 keep = (~torch.isin(labels, excluded_tensor)).unsqueeze(1).to(dtype=dst.dtype)
                 gate = keep if gate is None else gate * keep
             gates.append(gate)
+
+        # Teacher Mask = clean face parsing region * the exact Coarse ID gradient gate.
+        # The gate already incorporates exclude_parsing_labels and synthetic/original
+        # occlusions. Keep its soft values; non-face regions must stay zero.
+        coarse_mask_target = None
+        if getattr(self, "enable_coarse_mask_loss", False):
+            assert labels is not None and self.face_parser is not None
+            face_indices = self.face_parser.get_buffer("face_part_indices")
+            face_mask = torch.isin(labels, face_indices).unsqueeze(1).float()
+            coarse_mask_target = face_mask if gates[0] is None else face_mask * gates[0].float()
 
         return src, dst, canonical, theta_restore, same_mask, identity_faces, (gates[0], gates[1]), smirk_sample_weights, coarse_mask_target
 

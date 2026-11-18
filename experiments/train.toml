@@ -88,12 +88,11 @@ transition_width = 0.03
 exclude_parsing_labels = []
 
 
-# StyleGAN2 开启 coarse_mask_enabled 后，Mask 使用 clean DST 面部解析标签作 BCE 监督。
-# weight=0 时关闭额外的解析 teacher 与 BCE，但仍可通过预测 Mask 引导 Target 特征。
+# StyleGAN2 Mask 教师 = BiSeNet 基础面部区域 × Coarse IDLoss 梯度门控。
+# 自动考虑 coarse.identity.exclude_parsing_labels 与 data.occlusion；无需单独配置标签。
+# weight=0 时不加载额外解析 teacher、不计算 BCE，但预测 Mask 仍可引导 Target 特征。
 [loss.coarse.mask]
 weight = 1.0
-# CelebAMask-HQ / BiSeNet 19 类索引，默认面部区域（不含头发与背景）。
-labels = [1, 2, 3, 4, 5, 6, 10, 11, 12, 13]
 
 
 [loss.coarse.l1]

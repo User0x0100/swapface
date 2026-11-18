@@ -236,10 +236,71 @@ def test_coarse_mask_forward_and_split_projection_equal() -> None:
     assert full(x, identity).shape == (1, 3, 16, 16)
 
 
-def test_mask_supervision_uses_clean_target_parsing() -> None:
+def test_full_generator_returns_hq_resolution_mask_without_changing_rgb() -> None:
+    torch.manual_seed(377)
+    generator = _full().eval()
+    target = torch.randn(1, 3, 16, 16)
+    identity = torch.randn(1, 32)
+
+    with torch.no_grad():
+        plain_rgb = generator(target, identity)
+        plain_rgb_and_coarse = generator(target, identity, return_coarse=True)
+        rgb, coarse, hq_mask = generator(target, identity, return_coarse=True, return_mask=True)
+        rgb_mask, hq_mask_without_coarse = generator(target, identity, return_mask=True)
+        rgb_logits, hq_logits = generator(target, identity, return_mask_logits=True)
+        _, coarse_mask = generator.coarse(target, identity, return_mask=True)
+        _, coarse_logits = generator.coarse(target, identity, return_mask_logits=True)
+
+    torch.testing.assert_close(rgb, plain_rgb)
+    torch.testing.assert_close(rgb_mask, plain_rgb)
+    torch.testing.assert_close(rgb_logits, plain_rgb)
+    torch.testing.assert_close(plain_rgb_and_coarse[0], rgb)
+    torch.testing.assert_close(plain_rgb_and_coarse[1], coarse)
+    torch.testing.assert_close(hq_mask, hq_mask_without_coarse)
+    assert hq_mask.shape == hq_logits.shape == (1, 1, 16, 16)
+    assert hq_mask.dtype is torch.float32 and hq_logits.dtype is torch.float32
+    torch.testing.assert_close(hq_mask, F.interpolate(coarse_mask, size=(16, 16), mode="bilinear", align_corners=False))
+    torch.testing.assert_close(hq_logits, F.interpolate(coarse_logits, size=(16, 16), mode="bilinear", align_corners=False))
+    assert 0 <= hq_mask.min() and hq_mask.max() <= 1
+
+
+def test_full_generator_mask_output_validation() -> None:
+    x = torch.randn(1, 3, 16, 16)
+    identity = torch.randn(1, 32)
+    generator = _full(coarse_mask_enabled=False)
+    with pytest.raises(ValueError, match="mask_enabled"):
+        generator(x, identity, return_mask=True)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _full()(x, identity, return_mask=True, return_mask_logits=True)
+    assert generator(x, identity).shape == x.shape
+
+    inswapper = FullGenerator(
+        img_resolution=16,
+        coarse_resolution=8,
+        id_dim=32,
+        coarse_type="inswapper",
+        coarse_latent_resolution=4,
+        coarse_num_latent=1,
+        coarse_base_ch=8,
+        coarse_max_ch=16,
+        hq_bottleneck_resolution=4,
+        hq_base_ch=2,
+        hq_max_ch=8,
+    )
+    with pytest.raises(ValueError, match="StyleGAN2Coarse"):
+        inswapper(x, identity, return_mask=True)
+
+
+def test_mask_supervision_reuses_clean_face_parsing_and_coarse_id_gate() -> None:
     clean = torch.ones(2, 3, 8, 8)
-    labels = torch.zeros(2, 8, 8, dtype=torch.long)
-    labels[:, :4] = 4
+    labels = torch.empty(2, 8, 8, dtype=torch.long)
+    labels[:, :2] = 1  # face skin
+    labels[:, 2:4] = 4  # excluded eye
+    labels[:, 4:6] = 12  # lip: still allowed for Coarse IDLoss
+    labels[:, 6:] = 17  # hair must not be replaced, even though ID gate permits it
+    occlusion_gate = torch.ones(2, 1, 8, 8)
+    occlusion_gate[:, :, :2, :4] = 0.2
+    occlusion_gate[:, :, 4:6] = 0.5
 
     class Dataset:
         def next(self):
@@ -250,21 +311,39 @@ def test_mask_supervision_uses_clean_target_parsing() -> None:
             assert torch.allclose(images, clean)
             return labels
 
+        def get_buffer(self, name):
+            assert name == "face_part_indices"
+            return torch.tensor([1, 4, 12])
+
     class Occlusion:
         def apply(self, images):
-            return images - 0.2, torch.ones(2, 1, 8, 8)
+            return images - 0.2, occlusion_gate
 
     trainer = Trainer.__new__(Trainer)
     trainer.dataset = Dataset()
     trainer.face_parser = Parser()
     trainer.occlusion = Occlusion()
-    trainer.parsing_exclusion_indices = (None, None)
+    trainer.parsing_exclusion_indices = (torch.tensor([4]), torch.tensor([12]))
     trainer.enable_coarse_mask_loss = True
-    trainer.coarse_mask_label_indices = torch.tensor([4])
-    _, augmented, _, _, _, _, _, _, teacher = trainer._next_training_batch()
+    _, augmented, _, _, _, _, (coarse_gate, hq_gate), _, teacher = trainer._next_training_batch()
     torch.testing.assert_close(augmented, clean - 0.2)
+    face_mask = torch.isin(labels, torch.tensor([1, 4, 12])).unsqueeze(1).float()
+    torch.testing.assert_close(teacher, face_mask * coarse_gate)
     assert teacher.shape == (2, 1, 8, 8)
-    assert teacher[:, :, :4].eq(1).all() and teacher[:, :, 4:].eq(0).all()
+    assert teacher[:, :, :2, :4].eq(0.2).all()  # preserve soft occlusion
+    assert teacher[:, :, :2, 4:].eq(1).all()
+    assert teacher[:, :, 2:4].eq(0).all()  # Coarse excludes eyes
+    assert teacher[:, :, 4:6].eq(0.5).all()  # Coarse permits lips
+    assert teacher[:, :, 6:].eq(0).all()  # hair excluded by base face mask
+    assert hq_gate[:, :, 4:6].eq(0).all()  # HQ exclusions do not change Coarse Mask
+
+    # When neither occlusion nor parsing exclusions are enabled, use the base face region.
+    trainer.occlusion = None
+    trainer.parsing_exclusion_indices = (None, None)
+    _, clean_dst, _, _, _, _, (coarse_gate, _), _, teacher = trainer._next_training_batch()
+    assert coarse_gate is None
+    torch.testing.assert_close(clean_dst, clean)
+    torch.testing.assert_close(teacher, face_mask)
 
 
 def test_mask_bce_added_to_coarse_loss() -> None:
@@ -305,6 +384,45 @@ def test_mask_bce_added_to_coarse_loss() -> None:
         trainer._coarse_generator_stage_loss(rgb, rgb.detach(), rgb.detach(), None, None, rgb.detach().mean(dim=(2, 3)), None, None)
 
 
+def test_mask_bce_uses_area_resampling_for_soft_teacher() -> None:
+    trainer = Trainer.__new__(Trainer)
+    trainer.enable_coarse_mask_loss = True
+    trainer.coarse_mask_weight = 1.0
+    trainer.geometry_augmentation_enabled = False
+    for name in ("wfm", "gaze", "smirk", "vgg", "l1"):
+        setattr(trainer, f"enable_coarse_{name}_loss", False)
+    trainer.train_d_coarse = lambda x, *_args: x.mean(dim=(1, 2, 3)).unsqueeze(1)
+    trainer.coarse_gan_loss = lambda scores: scores.sum() * 0
+    trainer.coarse_identity_embeddings_forward = lambda x: x.mean(dim=(2, 3))
+    trainer.prepare_identity_encoder_faces = lambda x, _theta: x
+    trainer.coarse_id_loss = lambda a, b: a.sum() * 0
+    trainer._log_identity_threshold_metrics = lambda *_args: None
+    trainer.log = lambda *_args, **_kwargs: None
+
+    rgb = torch.zeros(1, 3, 2, 2)
+    logits = torch.full((1, 1, 2, 2), 2.0, requires_grad=True)
+    teacher = torch.zeros(1, 1, 4, 4)
+    teacher[:, :, 0, 0] = 1.0
+    teacher[:, :, 0, 1] = 0.5
+    expected_soft = F.interpolate(teacher, size=(2, 2), mode="area")
+    torch.testing.assert_close(expected_soft[0, 0, 0, 0], torch.tensor(0.375))
+    loss = trainer._coarse_generator_stage_loss(
+        rgb,
+        rgb,
+        rgb,
+        None,
+        None,
+        rgb.mean((2, 3)),
+        None,
+        None,
+        coarse_mask_logits=logits,
+        coarse_mask_target=teacher,
+    )
+    torch.testing.assert_close(loss, F.binary_cross_entropy_with_logits(logits, expected_soft))
+    loss.backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
 def test_mask_config_validation() -> None:
     base = {"coarse_type": "stylegan2", "coarse_resolution": 128}
     normalized = _normalize_generator({"generator": base})
@@ -324,15 +442,33 @@ def test_mask_config_validation() -> None:
             _normalize_generator({"generator": base | {field: invalid}})
     with pytest.raises(ValueError, match="coarse_mask"):
         _normalize_generator({"generator": {"coarse_type": "inswapper", "coarse_mask_enabled": True}})
+    # The sample TOML selects InSwapper; its historical normalized fields must
+    # remain unchanged to allow resuming frozen pre-Mask runs.
+    legacy = tomllib.loads((Path(__file__).parents[1] / "experiments/train.toml").read_text())
+    resolved_legacy = resolve_train_config(legacy)
+    assert resolved_legacy["loss"]["coarse"]["mask"] == {
+        "weight": 1.0,
+        "labels": [1, 2, 3, 4, 5, 6, 10, 11, 12, 13],
+    }
+    assert resolve_train_config(resolved_legacy) == resolved_legacy
+
+    # StyleGAN2 uses the derived face × ID gate teacher; no duplicate labels.
     raw = tomllib.loads((Path(__file__).parents[1] / "experiments/train.toml").read_text())
+    raw["generator"]["coarse_type"] = "stylegan2"
     resolved = resolve_train_config(raw)
-    assert resolved["loss"]["coarse"]["mask"]["weight"] == pytest.approx(1.0)
-    assert resolved["loss"]["coarse"]["mask"]["labels"] == [1, 2, 3, 4, 5, 6, 10, 11, 12, 13]
+    assert resolved["loss"]["coarse"]["mask"] == {"weight": 1.0}
     for field, invalid in (("weight", -1), ("labels", []), ("labels", [1, 1]), ("labels", [19])):
         invalid_raw = tomllib.loads((Path(__file__).parents[1] / "experiments/train.toml").read_text())
+        invalid_raw["generator"]["coarse_type"] = "stylegan2"
         invalid_raw["loss"]["coarse"]["mask"][field] = invalid
         with pytest.raises((TypeError, ValueError), match="mask"):
             resolve_train_config(invalid_raw)
+
+    for invalid in ([], [1, 1], [19]):
+        invalid_legacy = tomllib.loads((Path(__file__).parents[1] / "experiments/train.toml").read_text())
+        invalid_legacy["loss"]["coarse"]["mask"]["labels"] = invalid
+        with pytest.raises((TypeError, ValueError), match="mask"):
+            resolve_train_config(invalid_legacy)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm")
