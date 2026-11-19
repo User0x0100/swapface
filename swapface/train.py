@@ -1,7 +1,7 @@
 import argparse
 import copy
 import signal
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -182,54 +182,17 @@ def _compile_training_callable(fn: Any, mode: str) -> Any:
     return torch.compile(fn, fullgraph=True, dynamic=False, mode=mode)
 
 
-def _ensure_finite_gradients(name: str, named_parameters: Iterable[tuple[str, Tensor]]) -> None:
-    """在 optimizer.step 前阻止 BF16/FP32 非有限梯度污染参数与优化器状态。"""
-    gradients = [(parameter_name, parameter.grad) for parameter_name, parameter in named_parameters if parameter.grad is not None]
-    if not gradients:
-        return
-
-    # infinity norm 不会像 L2 norm 那样因平方/求和而把有限大值误判为 Inf；
-    # foreach 让常规路径按 tensor list 批量归约，最终只同步一次标量结果。
-    gradient_norms = torch._foreach_norm([gradient.detach() for _, gradient in gradients], ord=float("inf"))
-    if bool(torch.isfinite(torch.stack(gradient_norms)).all().item()):
-        return
-
-    for (parameter_name, gradient), gradient_norm in zip(gradients, gradient_norms, strict=True):
-        if bool(torch.isfinite(gradient_norm).item()):
-            continue
-        detached = gradient.detach()
-        finite_count = int(torch.isfinite(detached).sum().item())
-        total_count = detached.numel()
-        raise FloatingPointError(f"{name} gradient 出现 NaN/Inf：parameter={parameter_name}, shape={tuple(detached.shape)}, dtype={detached.dtype}, finite={finite_count}/{total_count}")
-    raise AssertionError("检测到非有限梯度，但未找到对应参数")
-
-
-def _scaled_backward_step(
-    loss: Tensor,
-    optimizer: optim.Optimizer,
-    scaler: GradScaler,
-    *,
-    name: str,
-    named_parameters: Iterable[tuple[str, Tensor]],
-) -> bool:
-    """执行 backward/optimizer step；FP16 overflow 由 GradScaler 恢复，其余精度先验证梯度。"""
-    scale_before = scaler.get_scale()
+def _scaled_backward_step(loss: Tensor, optimizer: optim.Optimizer, scaler: GradScaler) -> bool:
+    """执行 backward/optimizer step；FP16 overflow 由 GradScaler 处理。"""
     scaler.scale(loss).backward()
-
     if not scaler.is_enabled():
-        _ensure_finite_gradients(name, named_parameters)
         optimizer.step()
         return True
 
+    scale_before = scaler.get_scale()
     scaler.step(optimizer)
     scaler.update()
     return scaler.get_scale() >= scale_before
-
-
-def _ensure_finite_loss(name: str, loss: Tensor) -> None:
-    """在进入 backward 前阻止非有限标量损失污染训练状态。"""
-    if not bool(torch.isfinite(loss.detach()).all().item()):
-        raise FloatingPointError(f"{name} 出现 NaN/Inf：{loss.detach().float().cpu().item()}")
 
 
 def _require_training_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
@@ -441,8 +404,6 @@ class Trainer:
             self.net_g_ema.load_state_dict(checkpoint["net_g"]["state_dict"], strict=True)
         self._train_g_params = tuple(self.net_g.parameters())
         self._ema_params = tuple(self.net_g_ema.parameters())
-        self._g_named_parameters = tuple(self.net_g.named_parameters())
-        self._d_named_parameters = tuple(self.net_d.named_parameters())
         opt = config["optimizer"]
         schedule = config["scheduler"]
         self.optim_g = optim.Adam(self._train_g_params, lr=opt["generator"]["lr"], betas=(0.0, .99), fused=True)
@@ -614,8 +575,7 @@ class Trainer:
         for retry in range(MAX_AMP_OVERFLOW_RETRIES):
             self.optim_d.zero_grad(set_to_none=True)
             loss = self._discriminator_loss(fake, real)
-            _ensure_finite_loss("d_loss", loss)
-            if _scaled_backward_step(loss, self.optim_d, self.scaler_d, name="Discriminator", named_parameters=self._d_named_parameters):
+            if _scaled_backward_step(loss, self.optim_d, self.scaler_d):
                 return
         raise FloatingPointError("Discriminator FP16 overflow retries exhausted")
 
@@ -871,8 +831,7 @@ class Trainer:
                                 restore_grid = NF.affine_grid(theta.float(), list(dst.shape), align_corners=False)
                         g_loss = self._generator_loss(generated, target, canonical, theta, same_mask, source_identity,
                                                       restore_grid, gate, smirk_reference, weights, mask_logits, mask_teacher)
-                    _ensure_finite_loss("g_loss", g_loss)
-                    if _scaled_backward_step(g_loss, self.optim_g, self.scaler_g, name="Generator", named_parameters=self._g_named_parameters):
+                    if _scaled_backward_step(g_loss, self.optim_g, self.scaler_g):
                         break
                 else:
                     raise FloatingPointError("Generator FP16 overflow retries exhausted")

@@ -152,7 +152,7 @@ def test_optimizer_update_and_step_boundary() -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     scaler = GradScaler("cpu", enabled=False)
     loss = model(torch.randn(2, 3)).square().mean()
-    assert _scaled_backward_step(loss, optimizer, scaler, name="Generator", named_parameters=model.named_parameters())
+    assert _scaled_backward_step(loss, optimizer, scaler)
     trainer = Trainer.__new__(Trainer)
     trainer._completed_step = 0
     trainer._step_in_progress = False
