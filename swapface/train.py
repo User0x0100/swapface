@@ -817,10 +817,12 @@ class Trainer:
         sample_ref = tuple(x[:half].detach().cpu() for x in sample[:6])
         sample_gate = sample[6][:half].detach().cpu() if sample[6] is not None else None
         sample_weights = sample[7][:half].detach().cpu() if sample[7] is not None else None
+        del sample  # 预览引用已转移到 CPU，不再持有首个 GPU batch。
         with tqdm(total=None, initial=self.completed_step, mininterval=1, bar_format="{n_fmt:7} | 速度 {rate_fmt:3} | 训练时间 {elapsed}") as progress:
             while True:
                 torch.compiler.cudagraph_mark_step_begin()
                 if self._stop_requested: raise KeyboardInterrupt
+                self.optim_g.zero_grad(set_to_none=True)
                 src, dst, canonical, theta, same_mask, id_faces, gate, weights, mask_teacher = self._next_training_batch()
                 self._step_in_progress = True
                 with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
@@ -840,8 +842,8 @@ class Trainer:
                 was_training = self.net_d.training
                 self.net_d.eval()
                 for retry in range(MAX_AMP_OVERFLOW_RETRIES):
-                    self.optim_g.zero_grad(set_to_none=True)
                     if retry:
+                        self.optim_g.zero_grad(set_to_none=True)
                         with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.amp_enabled):
                             if self.mask_enabled:
                                 generated, target, mask_logits = self.train_g(dst, id_vectors, return_resize_in=True, return_mask_logits=True)
