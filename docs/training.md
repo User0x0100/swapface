@@ -15,7 +15,7 @@
 
 ## 训练
 
-`[train]` 包含 `batch_size`、`precision` (`fp32/fp16/bf16`)、`device`、`compile_module` 和日志/样本/检查点间隔，不再有 `stage`。
+`[train]` 包含 `batch_size`、`precision` (`fp32/fp16/bf16`)、`device`、`compile_module`、`compile_mode` 和日志/样本/检查点间隔，不再有 `stage`。`compile_mode` 原样传递给 PyTorch `torch.compile(mode=...)`，不额外校验；`compile_module = false` 时不使用。默认 `max-autotune-no-cudagraphs`，常见模式为 `default`（标准优化）、`reduce-overhead`（尝试减少 Python/Kernel Launch 开销，通常使用 CUDA Graph）、`max-autotune`（更积极的内核调优）、`max-autotune-no-cudagraphs`（积极调优但禁用 CUDA Graph）。具体支持模式以安装的 PyTorch 版本为准。
 
 - `[optimizer.generator]`、`[optimizer.discriminator]`：两组 Adam 的学习率，`betas=(0,0.99)`，融合优化器。
 - `[scheduler.generator]`、`[scheduler.discriminator]`：各自的 `none/cosine` 调度。

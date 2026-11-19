@@ -18,6 +18,7 @@ DEFAULT_TRAIN_CONFIG: dict[str, Any] = {
     "precision": "bf16",
     "device": "cuda",
     "compile_module": True,
+    "compile_mode": "max-autotune-no-cudagraphs",
     "log_interval": 10,
     "sample_save_every": 1000,
     "checkpoint_save_every": 10000,

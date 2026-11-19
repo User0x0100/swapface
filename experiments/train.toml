@@ -6,6 +6,8 @@ batch_size = 12
 precision = "bf16"
 device = "cuda"
 compile_module = true
+# 直接传递给 torch.compile(mode=...)；常见值：default、reduce-overhead、max-autotune、max-autotune-no-cudagraphs。
+compile_mode = "max-autotune-no-cudagraphs"
 log_interval = 10
 sample_save_every = 1000
 checkpoint_save_every = 10000
@@ -141,13 +143,13 @@ same_prob = 0.2
 type = "inswapper"
 img_resolution = 512
 id_dim = 512
-latent_resolution = 32
-num_latent = 6
-base_ch = 64
-max_ch = 256
+latent_resolution = 8
+num_latent = 12
+base_ch = 8
+max_ch = 512
 # Decoder 从 Bottleneck 向外：0=64,1=128,2=256,3=512。
 skip_mode = "cat"  # "cat" 或 "add"
-skip_layers = [0, 1]
+skip_layers = [0,1,2,3,4,5]
 
 # [generator]
 # type = "stylegan2"
@@ -167,7 +169,7 @@ skip_layers = [0, 1]
 [discriminator]
 type = "FIR_MINIBATCH_STD"  # 或 INSTANCE_NORM_RESIDUAL、UNET
 img_resolution = 512
-base_ch = 64
+base_ch = 8
 max_ch = 512
 minibatch_std_group_size = 4
 

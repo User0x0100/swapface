@@ -178,8 +178,8 @@ def _supports_compiled_bf16(device_id: int) -> bool:
     return torch.cuda.get_device_capability(device_id)[0] >= 8
 
 
-def _compile_training_callable(fn: Any) -> Any:
-    return torch.compile(fn, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
+def _compile_training_callable(fn: Any, mode: str) -> Any:
+    return torch.compile(fn, fullgraph=True, dynamic=False, mode=mode)
 
 
 def _ensure_finite_gradients(name: str, named_parameters: Iterable[tuple[str, Tensor]]) -> None:
@@ -360,6 +360,7 @@ class Trainer:
             raise RuntimeError("Trainer requires a CUDA/HIP GPU")
         print_mapping("训练配置", config)
         compile_module = train_cfg["compile_module"]
+        compile_mode = train_cfg["compile_mode"]
         req = train_cfg["precision"]
         device_id = self.device.index if self.device.index is not None else torch.cuda.current_device()
         if req == "bf16" and not (torch.cuda.is_bf16_supported() and (not compile_module or _supports_compiled_bf16(device_id))):
@@ -521,12 +522,12 @@ class Trainer:
                                                 center_y_range_pct=occlusion["center_y_range_pct"], rotation_range_deg=occlusion["rotation_range_deg"])
         if compile_module:
             initialize_upfirdn2d()
-            self.train_g = _compile_training_callable(self.net_g.core)
-            self.train_d = _compile_training_callable(self.net_d)
-            self.generator_id_encoder_forward = _compile_training_callable(self.generator_id_encoder)
-            self.identity_embeddings_forward = _compile_training_callable(self.id_loss.extract_identity_embeddings)
-            if self.enable_gaze_loss: self.gaze_loss_forward = _compile_training_callable(self.gaze_loss)
-            if self.enable_vgg_loss: self.vgg_loss_forward = _compile_training_callable(self.vgg_loss)
+            self.train_g = _compile_training_callable(self.net_g.core, compile_mode)
+            self.train_d = _compile_training_callable(self.net_d, compile_mode)
+            self.generator_id_encoder_forward = _compile_training_callable(self.generator_id_encoder, compile_mode)
+            self.identity_embeddings_forward = _compile_training_callable(self.id_loss.extract_identity_embeddings, compile_mode)
+            if self.enable_gaze_loss: self.gaze_loss_forward = _compile_training_callable(self.gaze_loss, compile_mode)
+            if self.enable_vgg_loss: self.vgg_loss_forward = _compile_training_callable(self.vgg_loss, compile_mode)
         else:
             self.train_g = self.net_g.core
             self.train_d = self.net_d
