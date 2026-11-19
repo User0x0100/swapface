@@ -19,7 +19,7 @@ RUN_CONFIG_FILE = "config.toml"
 RUN_RESOLVED_CONFIG_FILE = "config.resolved.json"
 RUN_METADATA_FILE = "metadata.json"
 RUN_LATEST_FILE = "latest.json"
-RESOLVED_CONFIG_FORMAT_VERSION = 2
+RESOLVED_CONFIG_FORMAT_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -223,7 +223,6 @@ def resolve_branch_target(target: str | os.PathLike[str]) -> Path:
     else:
         raise ValueError(f"无效的 branch checkpoint：{requested}")
 
-    checkpoint_step_from_name(checkpoint.name)
     return checkpoint
 
 

@@ -97,8 +97,7 @@ def test_removed_loss_tables_rejected():
 
     for legacy in ("hrffa", "facs"):
         # Canonical schema must not silently accept obsolete loss tables.
-        assert legacy not in DEFAULT_LOSS_CONFIG["coarse"]
-        assert legacy not in DEFAULT_LOSS_CONFIG["hq"]
+        assert legacy not in DEFAULT_LOSS_CONFIG
 
 
 def test_smirk_checkpoint_integration_when_available():
@@ -172,9 +171,7 @@ def test_smirk_pose_loss_fp32_under_cuda_autocast():
         assert torch.isfinite(grad).all() and grad.abs().sum() > 0
 
 
-def test_shared_smirk_reference_only_encoded_once_for_joint_stages():
-    from swapface.train import Trainer
-
+def test_smirk_reference_is_cached_across_generator_retries():
     class CounterEncoder(_ToyEncoder):
         def __init__(self):
             super().__init__()
@@ -185,33 +182,21 @@ def test_shared_smirk_reference_only_encoded_once_for_joint_stages():
             return super().forward(images)
 
     encoder = CounterEncoder()
-    kwargs = {"pose_weight": 1, "expression_weight": 1, "jaw_weight": 1, "eyelid_weight": 1}
-    coarse = SMIRKMotionLoss(encoder=encoder, **kwargs)
-    hq = SMIRKMotionLoss(encoder=encoder, **kwargs)
-    trainer = Trainer.__new__(Trainer)
-    trainer.enable_coarse_smirk_loss = True
-    trainer.enable_hq_smirk_loss = True
-    trainer.coarse_smirk_loss = coarse
-    trainer.hq_smirk_loss = hq
-
+    loss = SMIRKMotionLoss(encoder=encoder, pose_weight=1, expression_weight=1,
+                           jaw_weight=1, eyelid_weight=1)
     reference = torch.rand(2, 3, 64, 64)
-    generated_coarse = torch.rand_like(reference, requires_grad=True)
-    generated_hq = torch.rand_like(reference, requires_grad=True)
-    coarse_reference, hq_reference = trainer._prepare_smirk_references(reference)
-    assert coarse_reference is hq_reference
+    generated = torch.rand_like(reference, requires_grad=True)
+    target_features = loss.encode_reference(reference)
     assert encoder.calls == 1
-    coarse_loss = sum(coarse.forward_components(generated_coarse, reference, reference_features=coarse_reference).values())
-    hq_loss = sum(hq.forward_components(generated_hq, reference, reference_features=hq_reference).values())
-    assert encoder.calls == 3  # 1 target + 1 generated per stage
-    (coarse_grad,) = torch.autograd.grad(coarse_loss, generated_coarse)
-    (hq_grad,) = torch.autograd.grad(hq_loss, generated_hq)
-    assert torch.isfinite(coarse_grad).all() and coarse_grad.abs().sum() > 0
-    assert torch.isfinite(hq_grad).all() and hq_grad.abs().sum() > 0
-    # Simulate Generator overflow retry. Target embedding must not be rerun.
-    generated_retry = generated_coarse.detach().requires_grad_(True)
-    sum(coarse.forward_components(generated_retry, reference, reference_features=coarse_reference).values()).backward()
-    assert encoder.calls == 4
-    torch.testing.assert_close(generated_retry.grad, coarse_grad)
+    first_loss = sum(loss.forward_components(generated, reference, reference_features=target_features).values())
+    first_grad = torch.autograd.grad(first_loss, generated)[0]
+    assert encoder.calls == 2
+    generated_retry = generated.detach().requires_grad_(True)
+    retry_loss = sum(loss.forward_components(generated_retry, reference, reference_features=target_features).values())
+    retry_loss.backward()
+    assert encoder.calls == 3  # One reference pass + one pass per Generator retry.
+    assert torch.isfinite(first_grad).all() and first_grad.abs().sum() > 0
+    torch.testing.assert_close(generated_retry.grad, first_grad)
 
 
 def test_smirk_nonfinite_target_exclusion_is_per_sample():

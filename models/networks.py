@@ -1,4 +1,3 @@
-import math
 
 import torch
 import torch.nn.functional as F
@@ -139,62 +138,76 @@ class LatentBlock(nn.Module):
         return x
 
 
-class Coarse(nn.Module):
+class InSwapper(nn.Module):
+    """Full-resolution U-Net generator with identity-modulated bottleneck."""
+
     def __init__(
         self,
-        img_resolution: int = 128,
+        img_resolution: int = 512,
         img_channels: int = 3,
         latent_resolution: int = 32,
         num_latent: int = 6,
         base_ch: int = 64,
         max_ch: int = 256,
         id_dim: int = 512,
+        skip_mode: str = "cat",
+        skip_layers: tuple[int, ...] | list[int] = (),
     ) -> None:
         super().__init__()
-
-        assert max_ch >= base_ch, f"max_ch={max_ch} must be >= base_ch={base_ch}"
-        if latent_resolution <= 0:
-            raise ValueError(f"latent_resolution must be greater than 0, got {latent_resolution}")
-
-        if latent_resolution > img_resolution:
-            raise ValueError(f"latent_resolution={latent_resolution} must be <= img_resolution={img_resolution}")
-
-        if img_resolution % latent_resolution != 0:
-            raise ValueError(f"img_resolution={img_resolution} must be divisible by latent_resolution={latent_resolution}")
-
+        if max_ch < base_ch or base_ch < 2 or max_ch < 2:
+            raise ValueError("invalid base_ch/max_ch")
+        if latent_resolution < 2 or img_resolution < latent_resolution or img_resolution % latent_resolution:
+            raise ValueError("latent_resolution must be >= 2 and divide img_resolution")
         scale = img_resolution // latent_resolution
-        if scale & (scale - 1):
-            raise ValueError(f"img_resolution / latent_resolution must be a power of 2, got {img_resolution} / {latent_resolution} = {scale}")
-
+        if scale < 2 or scale & (scale - 1):
+            raise ValueError("img_resolution / latent_resolution must be a power of 2 >= 2")
+        depth = scale.bit_length() - 1
+        if skip_mode not in ("cat", "add"):
+            raise ValueError("skip_mode must be cat or add")
+        if not isinstance(skip_layers, (list, tuple)) or any(type(i) is not int or i < 0 or i >= depth for i in skip_layers) or len(set(skip_layers)) != len(skip_layers):
+            raise ValueError(f"skip_layers must be unique integer indices in [0,{depth-1}]")
         self.img_resolution = img_resolution
-
-        num_depth = int(math.log2(scale))
-
-        self.w_space_map = WSpaceMap(id_dim, num_latent * 2)
-        features = [min(max_ch, base_ch * (2**i)) for i in range(num_depth + 1)]
-
+        self.skip_mode = skip_mode
+        self.skip_layers = tuple(sorted(skip_layers))
+        enabled = set(self.skip_layers)
+        channels = [min(max_ch, base_ch * 2**i) for i in range(depth + 1)]
         self.from_rgb = FromRGB(img_channels, base_ch)
-        self.encoder = nn.Sequential(*[DownSample(features[i], features[i + 1]) for i in range(num_depth)])
-        self.latent_space = LatentBlock(features[-1], id_dim, num_latent)
-        self.decoder = nn.Sequential(*[UpSample(features[-(i + 1)], features[-(i + 2)]) for i in range(num_depth)])
-        self.to_rgb = ToRGB(base_ch, img_channels)
+        self.encoder = nn.ModuleList(DownSample(channels[i], channels[i + 1]) for i in range(depth))
+        self.w_space_map = WSpaceMap(id_dim, num_latent * 2)
+        self.latent_space = LatentBlock(channels[-1], id_dim, num_latent)
+        self.decoder = nn.ModuleList()
+        current_ch = channels[-1]
+        for index in range(depth):
+            out_ch = channels[-index - 2]
+            self.decoder.append(UpSample(current_ch, out_ch))
+            current_ch = out_ch * (2 if index in enabled and skip_mode == "cat" else 1)
+        self.to_rgb = ToRGB(current_ch, img_channels)
 
     def forward(self, x: Tensor, id_feat: Tensor, return_resize_in: bool = False) -> Tensor | tuple[Tensor, Tensor]:
-        resize_in = F.interpolate(x, size=self.img_resolution, mode="bilinear", align_corners=False)
+        resized = x if x.shape[-2:] == (self.img_resolution, self.img_resolution) else F.interpolate(x, size=self.img_resolution, mode="bilinear", align_corners=False)
+        feature = self.from_rgb(resized)
+        # Retain only encoder features consumed by enabled Decoder skip layers.
+        skips: dict[int, Tensor] = {}
+        last_skip = len(self.decoder) - 1
+        if last_skip in self.skip_layers:
+            skips[last_skip] = feature
+        for encoder_index, block in enumerate(self.encoder):
+            feature = block(feature)
+            skip_index = len(self.encoder) - encoder_index - 2
+            if skip_index in self.skip_layers:
+                skips[skip_index] = feature
+        feature = self.latent_space(feature, self.w_space_map(id_feat))
+        for index, block in enumerate(self.decoder):
+            feature = block(feature)
+            if index in self.skip_layers:
+                target_feature = skips.pop(index)
+                feature = torch.cat((feature, target_feature), dim=1) if self.skip_mode == "cat" else feature + target_feature
+        result = self.to_rgb(feature)
+        return (result, resized) if return_resize_in else result
 
-        feat = self.from_rgb(resize_in)
-        encoder_feat = self.encoder(feat)
-        latent_feat = self.latent_space(encoder_feat, self.w_space_map(id_feat))
-        decoder_feat = self.decoder(latent_feat)
-        output = self.to_rgb(decoder_feat)
 
-        if return_resize_in:
-            return output, resize_in
-        return output
-
-
-class StyleGAN2Coarse(nn.Module):
-    """Adapt the StyleGAN2 generator to the existing Coarse training interface."""
+class StyleGAN2Swap(nn.Module):
+    """Single-stage StyleSwap synthesis with optional mask head."""
 
     def __init__(
         self,
@@ -234,7 +247,7 @@ class StyleGAN2Coarse(nn.Module):
         self, x: Tensor, id_feat: Tensor, return_resize_in: bool = False, return_mask: bool = False,
         return_mask_logits: bool = False,
     ) -> Tensor | tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
-        resize_in = F.interpolate(x, size=self.img_resolution, mode="bilinear", align_corners=False)
+        resize_in = x if x.shape[-2:] == (self.img_resolution, self.img_resolution) else F.interpolate(x, size=self.img_resolution, mode="bilinear", align_corners=False)
         # Preserve StyleGAN2's unbounded RGB output; the loss functions
         # supervise its range without saturating the output gradient.
         result = self.generator(
@@ -248,280 +261,83 @@ class StyleGAN2Coarse(nn.Module):
         return result
 
 
-class HQRefiner(nn.Module):
-    def __init__(
-        self,
-        img_resolution: int = 512,
-        img_channels: int = 3,
-        coarse_resolution: int = 128,
-        bottleneck_resolution: int = 16,
-        base_ch: int = 8,
-        max_ch: int = 128,
-    ) -> None:
-        super().__init__()
-
-        if coarse_resolution <= 0 or coarse_resolution > img_resolution:
-            raise ValueError(f"coarse_resolution must be in (0, {img_resolution}], got {coarse_resolution}")
-        if img_resolution % bottleneck_resolution != 0:
-            raise ValueError(f"img_resolution={img_resolution} must be divisible by bottleneck_resolution={bottleneck_resolution}")
-
-        scale = img_resolution // bottleneck_resolution
-        if scale <= 1 or scale & (scale - 1):
-            raise ValueError(f"img_resolution / bottleneck_resolution must be a power of 2 greater than 1, got {img_resolution} / {bottleneck_resolution} = {scale}")
-        if base_ch <= 0 or max_ch < base_ch:
-            raise ValueError(f"invalid HQ channels: base_ch={base_ch}, max_ch={max_ch}")
-
-        num_down = int(math.log2(scale))
-        num_levels = num_down + 1
-
-        self.img_resolution = img_resolution
-        self.img_channels = img_channels
-        self.coarse_resolution = coarse_resolution
-        self.bottleneck_resolution = bottleneck_resolution
-
-        self.feature_channels = tuple(min(max_ch, base_ch * (2**level)) for level in range(num_levels))
-
-        self.pool = nn.MaxPool2d(2, 2)
-
-        encoder: list[nn.Module] = []
-        in_ch = img_channels * 2
-        for out_ch in self.feature_channels[:-1]:
-            encoder.append(
-                nn.Sequential(
-                    nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.SiLU(),
-                    nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                    nn.SiLU(),
-                )
-            )
-            in_ch = out_ch
-        self.encoder = nn.ModuleList(encoder)
-
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(self.feature_channels[-2], self.feature_channels[-1], kernel_size=3, stride=1, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(self.feature_channels[-1], self.feature_channels[-1], kernel_size=3, stride=1, padding=1),
-            nn.SiLU(),
-        )
-
-        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-        decoder: list[nn.Module] = []
-        decoder_ch = self.feature_channels[-1]
-        for skip_ch in reversed(self.feature_channels[:-1]):
-            concat_ch = skip_ch + decoder_ch
-            mid_ch = concat_ch // 2
-            decoder.append(
-                nn.Sequential(
-                    nn.Conv2d(concat_ch, mid_ch, kernel_size=3, stride=1, padding=1),
-                    nn.SiLU(),
-                    nn.Conv2d(mid_ch, skip_ch, kernel_size=3, stride=1, padding=1),
-                    nn.SiLU(),
-                )
-            )
-            decoder_ch = skip_ch
-        self.decoder = nn.ModuleList(decoder)
-        self.to_rgb = nn.Conv2d(decoder_ch, img_channels, kernel_size=1, bias=True)
-
-    def forward(self, target: Tensor, coarse: Tensor) -> Tensor:
-        expected_target = (self.img_channels, self.img_resolution, self.img_resolution)
-        expected_coarse = (self.img_channels, self.coarse_resolution, self.coarse_resolution)
-        if target.ndim != 4 or target.shape[1:] != expected_target:
-            raise ValueError(f"target must be [B,{self.img_channels},{self.img_resolution},{self.img_resolution}], got {tuple(target.shape)}")
-        if coarse.ndim != 4 or coarse.shape[0] != target.shape[0] or coarse.shape[1:] != expected_coarse:
-            raise ValueError(f"coarse must be [B,{self.img_channels},{self.coarse_resolution},{self.coarse_resolution}], got {tuple(coarse.shape)}")
-
-        resize_coarse = F.interpolate(coarse, size=self.img_resolution, mode="bilinear", align_corners=False)
-        x = torch.cat((resize_coarse, target), dim=1)
-
-        skips: list[Tensor] = []
-        for block in self.encoder:
-            x = block(x)
-            skips.append(x)
-            x = self.pool(x)
-
-        x = self.bottleneck(x)
-        for block, skip in zip(self.decoder, reversed(skips), strict=True):
-            x = block(torch.cat((skip, self.up(x)), dim=1))
-
-        return self.to_rgb(x)
-
-
 class Generator(nn.Module):
+    """Single-stage generator, selecting InSwapper U-Net or StyleSwap synthesis."""
+
     def __init__(
         self,
         img_resolution: int = 512,
-        img_channels: int = 3,
         id_dim: int = 512,
-        coarse_resolution: int = 128,
-        coarse_latent_resolution: int = 32,
-        coarse_num_latent: int = 6,
-        coarse_base_ch: int = 64,
-        coarse_max_ch: int = 256,
-        coarse_type: str = "inswapper",
-        coarse_w_dim: int = 512,
-        coarse_mapping_layers: int = 8,
-        coarse_start_resolution: int = 4,
-        coarse_channels: tuple[int, int] | list[int] = (128, 512),
-        coarse_target_inject_mode: str | None = None,
-        coarse_target_inject_layers: tuple[int, ...] | list[int] | None = None,
-        coarse_mask_enabled: bool = False,
-        coarse_mask_noise_blank_level: int = 9,
-        coarse_mask_guidance_epsilon: float = 1e-4,
-        coarse_mask_guidance_interpolation: str = "bilinear",
-        hq_bottleneck_resolution: int = 16,
-        hq_base_ch: int = 8,
-        hq_max_ch: int = 128,
+        type: str = "inswapper",
+        latent_resolution: int = 32,
+        num_latent: int = 6,
+        base_ch: int = 64,
+        max_ch: int = 256,
+        skip_mode: str = "cat",
+        skip_layers: tuple[int, ...] | list[int] = (),
+        w_dim: int = 512,
+        mapping_layers: int = 8,
+        start_resolution: int = 4,
+        channels: tuple[int, int] | list[int] = (128, 512),
+        target_inject_mode: str = "concat",
+        target_inject_layers: tuple[int, ...] | list[int] | None = None,
+        mask_enabled: bool = False,
+        mask_noise_blank_level: int = 9,
+        mask_guidance_epsilon: float = 1e-4,
+        mask_guidance_interpolation: str = "bilinear",
     ) -> None:
         super().__init__()
-
-        self.network_cfg = {
-            "img_resolution": img_resolution,
-            "img_channels": img_channels,
-            "id_dim": id_dim,
-            "coarse_resolution": coarse_resolution,
-            "coarse_latent_resolution": coarse_latent_resolution,
-            "coarse_num_latent": coarse_num_latent,
-            "coarse_base_ch": coarse_base_ch,
-            "coarse_max_ch": coarse_max_ch,
-            "coarse_type": coarse_type,
-            "hq_bottleneck_resolution": hq_bottleneck_resolution,
-            "hq_base_ch": hq_base_ch,
-            "hq_max_ch": hq_max_ch,
-        }
-        if coarse_type == "stylegan2":
-            self.network_cfg.update({
-                "coarse_w_dim": coarse_w_dim,
-                "coarse_mapping_layers": coarse_mapping_layers,
-                "coarse_start_resolution": coarse_start_resolution,
-                "coarse_channels": list(coarse_channels),
-                "coarse_target_inject_mode": ("concat" if coarse_target_inject_mode is None else coarse_target_inject_mode),
-                "coarse_mask_enabled": coarse_mask_enabled,
-                "coarse_mask_noise_blank_level": coarse_mask_noise_blank_level,
-                "coarse_mask_guidance_epsilon": coarse_mask_guidance_epsilon,
-                "coarse_mask_guidance_interpolation": coarse_mask_guidance_interpolation,
-            })
+        img_channels = 3
         self.img_resolution = img_resolution
         self.img_channels = img_channels
         self.id_dim = id_dim
-        self.coarse_resolution = coarse_resolution
-
-        if coarse_type == "inswapper":
-            self.coarse = Coarse(
-                img_resolution=coarse_resolution,
-                img_channels=img_channels,
-                latent_resolution=coarse_latent_resolution,
-                num_latent=coarse_num_latent,
-                base_ch=coarse_base_ch,
-                max_ch=coarse_max_ch,
-                id_dim=id_dim,
+        self.type = type
+        common = {"type": type, "img_resolution": img_resolution, "id_dim": id_dim}
+        if type == "inswapper":
+            self.core = InSwapper(img_resolution=img_resolution, img_channels=img_channels,
+                                  latent_resolution=latent_resolution, num_latent=num_latent,
+                                  base_ch=base_ch, max_ch=max_ch, id_dim=id_dim,
+                                  skip_mode=skip_mode, skip_layers=skip_layers)
+            self.network_cfg = common | {
+                "latent_resolution": latent_resolution, "num_latent": num_latent,
+                "base_ch": base_ch, "max_ch": max_ch,
+                "skip_mode": skip_mode, "skip_layers": list(self.core.skip_layers),
+            }
+        elif type == "stylegan2":
+            self.core = StyleGAN2Swap(
+                img_resolution=img_resolution, img_channels=img_channels,
+                id_dim=id_dim, w_dim=w_dim, mapping_layers=mapping_layers,
+                start_resolution=start_resolution, channels=channels,
+                target_inject_mode=target_inject_mode, target_inject_layers=target_inject_layers,
+                mask_enabled=mask_enabled, mask_noise_blank_level=mask_noise_blank_level,
+                mask_guidance_epsilon=mask_guidance_epsilon,
+                mask_guidance_interpolation=mask_guidance_interpolation,
             )
-        elif coarse_type == "stylegan2":
-            self.coarse = StyleGAN2Coarse(
-                img_resolution=coarse_resolution,
-                img_channels=img_channels,
-                id_dim=id_dim,
-                w_dim=coarse_w_dim,
-                mapping_layers=coarse_mapping_layers,
-                start_resolution=coarse_start_resolution,
-                channels=coarse_channels,
-                target_inject_mode="concat" if coarse_target_inject_mode is None else coarse_target_inject_mode,
-                target_inject_layers=coarse_target_inject_layers,
-                mask_enabled=coarse_mask_enabled,
-                mask_noise_blank_level=coarse_mask_noise_blank_level,
-                mask_guidance_epsilon=coarse_mask_guidance_epsilon,
-                mask_guidance_interpolation=coarse_mask_guidance_interpolation,
-            )
+            self.network_cfg = common | {
+                "w_dim": w_dim, "mapping_layers": mapping_layers, "start_resolution": start_resolution,
+                "channels": list(channels), "target_inject_mode": target_inject_mode,
+                "target_inject_layers": list(self.core.generator.target_inject_layers),
+                "mask_enabled": mask_enabled, "mask_noise_blank_level": mask_noise_blank_level,
+                "mask_guidance_epsilon": mask_guidance_epsilon,
+                "mask_guidance_interpolation": mask_guidance_interpolation,
+            }
         else:
-            raise ValueError(f"unknown coarse_type: {coarse_type!r}")
-        if isinstance(self.coarse, StyleGAN2Coarse):
-            # Store the effective validated architecture and the start-relative
-            # injection selection in every new StyleGAN2 checkpoint.
-            self.network_cfg["coarse_target_inject_layers"] = list(self.coarse.generator.target_inject_layers)
-        self.hq = HQRefiner(
-            img_resolution=img_resolution,
-            img_channels=img_channels,
-            coarse_resolution=coarse_resolution,
-            bottleneck_resolution=hq_bottleneck_resolution,
-            base_ch=hq_base_ch,
-            max_ch=hq_max_ch,
-        )
+            raise ValueError(f"unknown Generator type: {type!r}")
 
-    def forward(
-        self,
-        target: Tensor,
-        id_feat: Tensor,
-        return_coarse: bool = False,
-        return_mask: bool = False,
-        return_mask_logits: bool = False,
-    ) -> Tensor | tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
-        if return_mask and return_mask_logits:
-            raise ValueError("return_mask and return_mask_logits are mutually exclusive")
-        expected_target = (self.img_channels, self.img_resolution, self.img_resolution)
-        if target.ndim != 4 or target.shape[1:] != expected_target:
-            raise ValueError(f"target must be [B,{self.img_channels},{self.img_resolution},{self.img_resolution}], got {tuple(target.shape)}")
-        if id_feat.ndim != 2 or id_feat.shape != (target.shape[0], self.id_dim):
-            raise ValueError(f"id_feat must be [B,{self.id_dim}], got {tuple(id_feat.shape)}")
-
-        mask_requested = return_mask or return_mask_logits
-        if mask_requested:
-            if not isinstance(self.coarse, StyleGAN2Coarse):
-                raise ValueError("Mask output requires StyleGAN2Coarse with mask_enabled=True")
-            coarse, mask = self.coarse(
-                target,
-                id_feat,
-                return_mask=return_mask,
-                return_mask_logits=return_mask_logits,
-            )
-        else:
-            coarse = self.coarse(target, id_feat)
-        output = self.hq(target, coarse)
-        if mask_requested:
-            # HQ has no Mask head: preserve the Coarse probability/logit semantics.
-            upsampled_mask = F.interpolate(mask, size=output.shape[-2:], mode="bilinear", align_corners=False)
-            return (output, coarse, upsampled_mask) if return_coarse else (output, upsampled_mask)
-        if return_coarse:
-            return output, coarse
-        return output
+    def forward(self, target: Tensor, id_feat: Tensor, return_mask: bool = False,
+                return_mask_logits: bool = False) -> Tensor | tuple[Tensor, Tensor]:
+        if target.ndim != 4 or target.shape[1:] != (self.img_channels, self.img_resolution, self.img_resolution):
+            raise ValueError("target shape does not match Generator")
+        if id_feat.shape != (target.shape[0], self.id_dim):
+            raise ValueError("identity feature shape does not match Generator")
+        if return_mask or return_mask_logits:
+            if not isinstance(self.core, StyleGAN2Swap):
+                raise ValueError("Mask requires StyleGAN2")
+            return self.core(target, id_feat, return_mask=return_mask, return_mask_logits=return_mask_logits)
+        return self.core(target, id_feat)
 
 
 if __name__ == "__main__":
-    from fvcore.nn import FlopCountAnalysis
-    from torchinfo import summary
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 1
-    network_cfg = {
-        "img_resolution": 512,
-        "img_channels": 3,
-        "id_dim": 512,
-        "coarse_resolution": 128,
-        "coarse_latent_resolution": 32,
-        "coarse_num_latent": 6,
-        "coarse_base_ch": 64,
-        "coarse_max_ch": 256,
-        "hq_bottleneck_resolution": 16,
-        "hq_base_ch": 8,
-        "hq_max_ch": 128,
-    }
-
-    model = Generator(**network_cfg).to(device).eval()
-    target = torch.randn((batch_size, 3, network_cfg["img_resolution"], network_cfg["img_resolution"]), device=device)
-    id_feat = torch.randn((batch_size, network_cfg["id_dim"]), device=device)
-
-    summary(
-        model,
-        input_data=(target, id_feat),
-        depth=3,
-        col_names=("input_size", "output_size", "num_params", "kernel_size", "mult_adds"),
-        row_settings=("var_names",),
-    )
-
-    output, coarse = model(target, id_feat, return_coarse=True)
-    print(f"output: {tuple(output.shape)}")
-    print(f"coarse: {tuple(coarse.shape)}")
-    print("NetWork_Info:")
-    for k, v in network_cfg.items():
-        print(f"  {k:30}: {v}")
-
-    flops = FlopCountAnalysis(model, (target, id_feat))
-    print(f"\n模型总FLOPs: {flops.total() / 1e9:.4f} GFLOPs")
+    model = Generator(img_resolution=32, latent_resolution=8, num_latent=1, base_ch=8,
+                      max_ch=32, skip_layers=[0, 1])
+    print(model(torch.randn(1, 3, 32, 32), torch.randn(1, 512)).shape)

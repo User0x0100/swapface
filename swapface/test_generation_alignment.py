@@ -131,21 +131,12 @@ def main():
     fake_trainer = object.__new__(Trainer)
     fake_trainer.face_alignment = "arcface"
     fake_trainer.img_resolution = 128
-    fake_trainer.coarse_resolution = 64
     fake_trainer.arcface_identity_grid = make_arcface128_to_arcface112_grid(128, 2, torch.device("cpu"))
-    fake_trainer.coarse_arcface_identity_grid = make_arcface128_to_arcface112_grid(64, 2, torch.device("cpu"))
     generated = torch.rand((2, 3, 128, 128), requires_grad=True)
     teacher_input = Trainer.prepare_identity_encoder_faces(fake_trainer, generated)
     assert teacher_input.shape == (2, 3, 112, 112)
     torch.testing.assert_close(
         teacher_input, generated[:, :, :112, 8:120], atol=2e-5, rtol=0,
-    )
-    coarse_generated = torch.rand((2, 3, 64, 64), requires_grad=True)
-    coarse_teacher = Trainer.prepare_identity_encoder_faces(fake_trainer, coarse_generated)
-    torch.testing.assert_close(
-        coarse_teacher,
-        F.grid_sample(coarse_generated, fake_trainer.coarse_arcface_identity_grid, padding_mode="border", align_corners=False),
-        atol=0, rtol=0,
     )
     restored_input = Trainer.prepare_identity_encoder_faces(fake_trainer, generated, theta_restore)
     from misc.face_alignment import transform_sampling_grid
@@ -167,11 +158,8 @@ def main():
     from . import export
     from .contracts import CHECKPOINT_VERSION
     from .inference import get_arcface_alignment_template, load_generator
-    model = Generator(
-        img_resolution=16, coarse_resolution=8, coarse_latent_resolution=4,
-        coarse_base_ch=2, coarse_max_ch=8, coarse_num_latent=1,
-        hq_bottleneck_resolution=4, hq_base_ch=2, hq_max_ch=8,
-    ).eval()
+    model = Generator(img_resolution=16, latent_resolution=4, base_ch=4,
+                      max_ch=8, num_latent=1).eval()
     with tempfile.TemporaryDirectory() as tmp:
         checkpoint_path = Path(tmp) / "test.pth"
         ckpt = {

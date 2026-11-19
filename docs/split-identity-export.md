@@ -1,60 +1,60 @@
-# 身份条件拆分导出（InSwapper / StyleGAN2）
+# 身份编码 / 推理拆分导出
 
-`split` 仅在 ONNX 导出阶段将身份映射计算与逐帧生成计算分离，不影响训练模型、EMA 检查点或常规 `swapface` / `id-encoder` / `all` 导出模式。
+单阶段 InSwapper 和 StyleGAN2 使用同一接口：服务端输入已对齐 Source 图像，输出身份调制条件；客户端输入 Target 图像与该条件，直接输出最终分辨率 RGB 图像。
+
+- InSwapper 的服务端包含身份编码器、WSpaceMap 和 Bottleneck 每个 AdaIN 的线性层。客户端包含 FromRGB、完整 U-Net（包括启用的 cat/add Skip）、预计算 AdaIN、ToRGB，不保留身份映射权重。
+- StyleGAN2 的服务端包含身份编码器、ID Mapping、Style Mapping 与各调制线性层；客户端包含原 StyleSwap Target 编码、Synthesis、可选 Mask 分支。
+- 两者的完整 Generator 与客户端+服务端组合在数学上等价，更新 U-Net 跳层必须同步更新 `PrecomputedInSwapper`。
+- 仅发布 `client.onnx`；`server.onnx` 为服务端私有。导出结果的 manifest 使用 `generator_type` 字段及 `SPLIT_PROTOCOL_VERSION=3`。该协议不兼容旧版使用 `coarse_type` 的消费端，需要同步调整客户端协议解析。
+- `--nhwc/--nchw` 以及固定 batch 的导出约定不变。使用 ONNX 标准 Slice 避免 TRT 不支持的序列算子。
+
+不再导出、中继或实例化 HQRefiner；客户端 ONNX 只需一次生成器推理即可输出最终结果。
+
+## 导出命令与产物
 
 ```bash
-uv run python -m swapface.export split \
+uv run --no-sync python -m swapface.export split \
   --checkpoint /path/to/step_XXXXXX.pth \
   --device cuda \
   --output-dir onnx_export
 ```
 
-所有本次导出的产物放在 `--output-dir` 下的一个独立文件夹内：
+构建目录示例：
 
 ```text
 onnx_export/
 └── swapface-split-STEP-PAIR-TIME/
-    ├── swapface-STEP-client.onnx  # 不含身份映射权重的生成器
-    ├── swapface-STEP-server.onnx  # 身份编码器 + 身份映射权重
-    └── manifest.json              # 双端配对信息与文件哈希
+    ├── swapface-STEP-client.onnx
+    ├── swapface-STEP-server.onnx
+    └── manifest.json
 ```
 
-不会额外创建 `-private` 目录，也不要求指定服务端输出路径。**这个目录是完整的构建产物，并不是客户端发布包。客户端部署时只应选择客户端 ONNX，不能将包含服务端 ONNX 的整个目录分发给终端。**
+先在目标文件系统的临时目录中生成两份 ONNX、验证图结构、计算 SHA-256 并写入 manifest；全部成功后再原子重命名为最终目录。仅分发客户端 ONNX，不要直接公开构建目录。
 
-导出使用单个临时目录：先完成两份 ONNX 导出、结构校验、TensorRT 不支持的序列算子检查，并写入 manifest，最后通过一次目录重命名发布。失败时不留下半成品发行目录。
+## 输入输出协议（`swapface.split.version = 3`）
 
-`split` 默认 ONNX opset 18、`optimize=False`；使用固定偏移的 `Slice` 避免产生 TensorRT 不支持的 `SplitToSequence` / `SequenceAt`。
+- 服务端输入：`faces`，ArcFace112 RGB、float32、`[-1,1]`；输出：`identity_condition`，`[B,D]`，不含原始 512 维 embedding。
+- 客户端输入：`faces`（目标分辨率与 checkpoint 的对齐方式一致）、`identity_condition`；输出：`swapped_faces`，最终单阶段 RGB 图像。
+- 默认 NHWC，也可指定 `--nchw`。`B` 为导出时固定 batch，`D` 取决于生成器架构；身份条件始终 `[B,D]`，与图像布局无关。
+- InSwapper 条件拼接：依次遍历 Bottleneck `latent_space.layers`，每层 `adain0` 后接 `adain1`，每个 AdaIN 先 gamma 后 beta。
+- StyleGAN2 条件拼接：`conv_first`、`to_rgb_first`，然后每个 Stage 的 `conv0`、`conv1`、`to_rgb`，与 Target 注入方式无关。
+- 对同一身份和生成器，`identity_condition` 可缓存并复用；切换身份或模型需重新生成。
 
-## 输入输出协议（`swapface.split.version = 2`）
+## 身份一致性与安全边界
 
-- 服务端输入 `faces`：ArcFace 112 对齐的 RGB 图像、float32、值域 `[-1,1]`；只输出 `identity_condition`，形状 `[B,D]`。原始 512D embedding 不对外输出。
-- 客户端输入 `faces`（根据检查点的 Generator 对齐方式和分辨率）和 `identity_condition` `[B,D]`；输出 `swapped_faces`。客户端 ONNX 不含身份编码器或身份映射权重。
-- 默认图像布局 NHWC；`--nchw` 同时改变两侧的图像布局。身份条件始终 `[B,D]`。
-- `B` 为导出时固定 batch（默认 1），`D` 为各身份注入层拼接后的宽度，由架构及检查点确定。
-- InSwapper 拼接顺序：各 `latent_space.layers` 依次 `adain0`、`adain1`，每个先 gamma 后 beta。
-- StyleGAN2 身份调制参数拼接顺序：`conv_first`、`to_rgb_first`，随后各 Stage 依次 `conv0`、`conv1`、`to_rgb`。首层合成分辨率由 `coarse_start_resolution` 决定，Stage 数量随起始分辨率变化；此处拼接的是 Source Identity 的调制参数，与 `coarse_target_inject_mode` 采用的 Target 特征拼接或加法无关。
-- 相同身份的 `identity_condition` 可以缓存并逐帧复用；切换身份或模型时应重新获取。
+manifest 包含 `generator_id`、`encoder_id`、`pair_id`、`generator_type`、`condition_width`、`batch_size`、`layout` 及每个制品的 SHA-256、输入输出名称与对齐方式。ONNX 的 metadata 带有相同的配对字段和 `swapface.split.role=client/server`。哈希仅保证缓存与配对一致性，不替代签名、身份授权和服务端鉴权。
 
-## 配对及完整性
-
-唯一的 `manifest.json` 包含 `generator_id`（有效 Generator 权重标识）、`encoder_id`（有效编码器权重标识）、`pair_id`（模型与协议参数指纹）、`batch_size`、`layout`、`coarse_type`、`condition_width`，以及 `artifacts.client` 和 `artifacts.server` 的文件名称、SHA-256、输入输出名称、对齐方式。
-
-两份 ONNX 各自的 metadata 均包含相同的配对信息，并通过 `swapface.split.role=client/server` 区分角色。所有 SHA-256 均仅用于一致性与缓存识别，不能替代签名、认证或授权。
-
-## 安全边界
-
-客户端仅接收由服务端计算的身份调制参数。服务端的 IDEncoder 及全部身份映射权重只在 `server.onnx` 中，因此最终分发客户端模型时不应包含它。已经获得的身份条件可以被客户端缓存并复用，这是设计允许的行为。身份登记、映射查询权限和 WSS 参数下发依然属于实际客户端/服务端实现，未由此导出工具强制控制。
-
-InSwapper 依然使用仿射身份映射；如果攻击者掌握大量已知 `(embedding, condition)` 样本，仍可能恢复线性变换。本次目录简化与此风险无关。
+客户端不含身份编码器或身份映射权重，但已经下发的条件可被客户端缓存。InSwapper 的仿射身份映射还存在已知输入输出样本过多时被逆推的潜在风险；目录与协议版本变更不消除该风险。
 
 ## 回归测试
 
 ```bash
-uv run python -m swapface.test_split_identity
-uv run python -m swapface.test_coarse_architecture
-uv run python -m swapface.test_inference
-# 可选：安装 CUDA + TensorRT 后验证小模型实际 Engine 构建
-SWAPFACE_TEST_TRT_ENGINE=1 uv run python -m swapface.test_split_identity
+uv run --no-sync python -m swapface.test_split_identity
+uv run --no-sync python -m swapface.test_inswapper_architecture
+uv run --no-sync python -m swapface.test_inference
+uv run --no-sync pytest -q tests/test_stylegan2_mask.py
+# 可选：在安装 TensorRT 的环境中额外构建小模型 Engine
+SWAPFACE_TEST_TRT_ENGINE=1 uv run --no-sync python -m swapface.test_split_identity
 ```
 
-已在真实 `step_000632974_hq.pth` + R100 Encoder 上验证 InSwapper 双端 ONNX 与 PyTorch 数值等价，客户端 TensorRT 解析通过；两种小尺寸架构 TensorRT Engine 构建通过。生产尺寸 FP16 Engine 运行和 Rust/WSS 集成尚未完成。
+以上测试覆盖模型条件映射数值一致性、ONNX 导出、ONNX Runtime 推理与 Mask 分支。正式部署的 TensorRT Engine 性能、精度和 Rust/WSS 集成仍需针对生产尺寸验证。

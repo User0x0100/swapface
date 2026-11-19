@@ -1,82 +1,45 @@
-# SwapFace 训练配置示例
-# 详细的 run / checkpoint / resume 约定见 docs/training.md。
-#
-# 使用方式：
-#   新训练：uv run python -m swapface.train --config experiments/train.toml [--name NAME]
-#   切换 Coarse：在下方 [generator] 区域切换两组注释即可。
-#   恢复训练：uv run python -m swapface.train --resume experiments/runs/<run_id> [--strict-precision]
-#
-# 本文件只描述训练实验本身。所有默认值、校验和 canonical schema 由 swapface/config.py 唯一维护。
-# checkpoint 只接受当前训练语义；旧配置/旧训练状态不做迁移或 alias。
+# SwapFace 单阶段换脸训练配置；不支持旧版 Coarse/HQ 双阶段配置。
+# StyleGAN2 Mask Loss 只在 type="stylegan2" 时可配置 [loss.mask] weight=1.0。
 
 [train]
-# 每个训练 batch 的样本数。
 batch_size = 12
-
-# 训练阶段：joint 同时训练 Coarse/HQ；coarse 或 hq 仅训练对应模块。
-stage = "joint"
-
-# 必须显式设置：fp32 / fp16 / bf16。
 precision = "bf16"
-
-# Trainer 支持 PyTorch CUDA/HIP GPU；ROCm 也沿用 PyTorch 的 "cuda" 设备名。
 device = "cuda"
-
-# 是否编译 Generator、Discriminator、身份编码器及启用的 loss 热路径。
 compile_module = true
-
-# 日志、样本和完整 checkpoint 的保存周期，单位均为 completed step。
 log_interval = 10
 sample_save_every = 1000
 checkpoint_save_every = 10000
 
-
 [optimizer.generator]
-# Generator Adam。betas=(0.0, 0.99) 与 fused 实现固定在训练代码中。
 lr = 1.0e-4
 
-[optimizer.hq_discriminator]
-# HQ Discriminator Adam。
+[optimizer.discriminator]
 lr = 1.0e-4
-
-[optimizer.coarse_discriminator]
-# Coarse Discriminator Adam。
-lr = 1.0e-4
-
 
 [scheduler.generator]
-# "none" 或 "cosine"。
 type = "none"
 t_max = 20000
 min_lr_ratio = 0.1
 
-[scheduler.hq_discriminator]
+[scheduler.discriminator]
 type = "none"
 t_max = 20000
 min_lr_ratio = 0.1
-
-[scheduler.coarse_discriminator]
-type = "none"
-t_max = 20000
-min_lr_ratio = 0.1
-
 
 [identity]
-# Generator 的 source identity 条件编码器。它属于模型条件输入，不属于 Identity Loss teacher。
 provider = "BLENDFACE"
 
-
-[loss.coarse.reconstruction]
-# Coarse L1/VGG 的共享作用范围；默认仅 same pair 做 self-reconstruction。
+[loss.reconstruction]
+# L1/VGG 的共享作用范围；默认仅 same pair 做 self-reconstruction。
 scope = "same"
 
 
-[loss.coarse.gan]
+[loss.gan]
 weight = 1.0
 # UNET 使用 BasicSR 的单一像素级 Logit 图，不再区分 Global/Spatial 权重。
 
 
-[loss.coarse.identity]
+[loss.identity]
 provider = "BLENDFACE"
 weight = 10.0
 # 逐样本身份相似度软下限；达到 0.70 后 IDLoss 梯度归零。
@@ -88,46 +51,39 @@ transition_width = 0.03
 exclude_parsing_labels = []
 
 
-# StyleGAN2 Mask 教师 = BiSeNet 基础面部区域 × Coarse IDLoss 梯度门控。
-# 自动考虑 coarse.identity.exclude_parsing_labels 与 data.occlusion；无需单独配置标签。
-# weight=0 时不加载额外解析 teacher、不计算 BCE，但预测 Mask 仍可引导 Target 特征。
-[loss.coarse.mask]
-weight = 1.0
-
-
-[loss.coarse.l1]
+[loss.l1]
 # 0: 直接逐像素 L1；正整数 N: Gaussian blur（sigma = 当前分辨率 / N），N 越小模糊越强；384 为旧强度。
 enable = true
 weight = 10.0
 gaussian_blur = 0
 
 
-# 使用 UNET 时，无论 Coarse 还是 HQ，对应 R1 都强制禁用。
-[loss.coarse.r1]
+# 使用 UNET 时，采用 UNET 判别器时，R1 都强制禁用。
+[loss.r1]
 enable = true
 interval = 16
 gamma = 10.0
 
 
-[loss.coarse.wfm]
+[loss.wfm]
 # 判别器 encoder 中间特征的弱特征匹配；real 特征无梯度，fake 特征向 Generator 回传。
 enable = false
 
-[loss.coarse.wfm.weights]
+[loss.wfm.weights]
 0 = 0.5
 1 = 1.0
 2 = 1.0
 3 = 1.0
 
 
-[loss.coarse.gaze]
+[loss.gaze]
 enable = true
 weight = 1.0
 distribution_weight = 0.1
 confidence_weighted = true
 
 
-[loss.coarse.smirk]
+[loss.smirk]
 # SMIRK 官方预训练权重由 Hugging Face Hub 自动下载并缓存，文件版本与 SHA 固定。
 enable = true
 pose_weight = 1.0
@@ -136,82 +92,14 @@ jaw_weight = 1.0
 eyelid_weight = 1.0
 
 
-[loss.coarse.vgg]
+[loss.vgg]
 enable = true
 
-[loss.coarse.vgg.weights]
+[loss.vgg.weights]
 relu1_2 = 1.0
 relu2_2 = 1.0
 relu3_4 = 1.0
 
-
-[loss.hq.reconstruction]
-# L1/VGG reconstruction 的共享作用范围："same" 仅 self-reconstruction；"all" 为全部 pair。
-scope = "same"
-
-
-[loss.hq.gan]
-weight = 1.0
-
-
-[loss.hq.identity]
-provider = "BLENDFACE"
-weight = 10.0
-# HQ 独立控制身份门槛；真实训练时应按所选 teacher 的相似度分布校准。
-min_similarity = 0.70
-transition_width = 0.03
-# HQ 可独立于 Coarse 配置。仅过滤 IDLoss 梯度，不修改前向像素与其他 loss。
-exclude_parsing_labels = []
-
-
-[loss.hq.l1]
-# 0: 直接逐像素 L1；正整数 N: Gaussian blur（sigma = 当前分辨率 / N），N 越小模糊越强；384 为旧强度。
-enable = true
-weight = 10.0
-gaussian_blur = 0
-
-
-# HQ 选择 UNET 时，此处 enable 也会被强制设为 false。
-[loss.hq.r1]
-enable = true
-interval = 16
-gamma = 10.0
-
-
-[loss.hq.wfm]
-# 判别器 encoder 中间特征的弱特征匹配。
-enable = false
-
-[loss.hq.wfm.weights]
-0 = 0.5
-1 = 1.0
-2 = 1.0
-3 = 1.0
-
-
-[loss.hq.gaze]
-enable = true
-weight = 1.0
-distribution_weight = 0.1
-confidence_weighted = true
-
-
-[loss.hq.smirk]
-# SMIRK 官方预训练权重由 Hugging Face Hub 自动下载并缓存，文件版本与 SHA 固定。
-enable = true
-pose_weight = 1.0
-expression_weight = 1.0
-jaw_weight = 1.0
-eyelid_weight = 1.0
-
-
-[loss.hq.vgg]
-enable = true
-
-[loss.hq.vgg.weights]
-relu1_2 = 1.0
-relu2_2 = 1.0
-relu3_4 = 1.0
 
 
 [data]
@@ -247,84 +135,41 @@ ty_range = [-0.15, 0.15]
 same_prob = 0.2
 
 
+
+# 选择单阶段 Generator；另一个版本配置整组注释，不要重复定义 [generator]
 [generator]
-# InSwapper / AdaIN Coarse，独立配置；HQ Refiner 保持原样。
-# 通道、latent 分辨率与残差层数仅作用于 InSwapper。
-coarse_type = "inswapper"
+type = "inswapper"
 img_resolution = 512
-img_channels = 3
 id_dim = 512
-coarse_resolution = 128
-coarse_latent_resolution = 32
-coarse_num_latent = 6
-coarse_base_ch = 64
-coarse_max_ch = 256
-hq_bottleneck_resolution = 16
-hq_base_ch = 8
-hq_max_ch = 128
+latent_resolution = 32
+num_latent = 6
+base_ch = 64
+max_ch = 256
+# Decoder 从 Bottleneck 向外：0=64,1=128,2=256,3=512。
+skip_mode = "cat"  # "cat" 或 "add"
+skip_layers = [0, 1]
 
-
-# StyleGAN2 / StyleSwap Coarse：要启用它，请注释掉上面完整的
-# InSwapper [generator] 配置，再取消注释下面整组字段。
-# 两个 [generator] 块不能同时启用（TOML 不允许重复定义同一表）。
-#
 # [generator]
-# coarse_type = "stylegan2"
+# type = "stylegan2"
 # img_resolution = 512
-# img_channels = 3
 # id_dim = 512
-# coarse_resolution = 128
-# coarse_w_dim = 512
-# coarse_mapping_layers = 8
-# 起始合成分辨率：4、8、16、32 ...，不超过 coarse_resolution。
-# coarse_start_resolution = 32
-# 通道定义：[最终 Coarse 分辨率的通道数, 通道上限]。
-# 每下降一级分辨率，通道数翻倍并受到 max_ch 限制。
-# coarse_channels = [64, 512]
-# Target 注入方式：concat（拼接）或 add（逐元素加法），默认 concat。
-# coarse_target_inject_mode = "concat"
-# 注入的分辨率层级（TOML 数组传入，内部作为整数元组使用）。
-# 层级编号相对于 coarse_start_resolution，0 为起始合成层，
-# 1 为起始分辨率的两倍，以此类推。
-# 如 coarse_start_resolution=32，设置 [0] 仅在 32x32 注入 Target。
-# 默认全部层级启用，可设 [] 关闭所有 Target 注入。
-# coarse_target_inject_layers = [0]
-# 可选 Mask：逐层累计 FP32 Logits，仅在特征引导/输出时取 Sigmoid；BCEWithLogits 直接监督最终 Logits。
-# coarse_mask_enabled = false
-# 旧版 noise_blank_level=9：4x4 起算的绝对层级，8=1、16=3、32=5、64=7、128=9、256=11；i > 此值才执行引导。
-# 对于起始 32 分辨率，可设为 -1 使所有上采样层均启用 Mask 引导。
-# coarse_mask_noise_blank_level = 9
-# Mask 区域加权均值的分母最小值，及前一级 Mask 到当前层的插值方式。
-# coarse_mask_guidance_epsilon = 1e-4
-# coarse_mask_guidance_interpolation = "bilinear"  # 或 "nearest"
-# hq_bottleneck_resolution = 16
-# hq_base_ch = 8
-# hq_max_ch = 128
+# w_dim = 512
+# mapping_layers = 8
+# start_resolution = 32
+# channels = [64, 512]
+# target_inject_mode = "concat"  # "concat" 或 "add"
+# target_inject_layers = [0, 1, 2, 3, 4]
+# mask_enabled = false
+# mask_noise_blank_level = 9
+# mask_guidance_epsilon = 1e-4
+# mask_guidance_interpolation = "bilinear"
 
-
-[discriminator.hq]
-# FIR_MINIBATCH_STD、INSTANCE_NORM_RESIDUAL 或 UNET。
-type = "FIR_MINIBATCH_STD"
-# HQ 使用 UNET 时：max_ch/minibatch_std_group_size 无效，强制关闭 R1，输出全分辨率空间 Logit。
+[discriminator]
+type = "FIR_MINIBATCH_STD"  # 或 INSTANCE_NORM_RESIDUAL、UNET
 img_resolution = 512
-img_channels = 3
 base_ch = 64
 max_ch = 512
 minibatch_std_group_size = 4
-
-[discriminator.coarse]
-# FIR_MINIBATCH_STD、INSTANCE_NORM_RESIDUAL 或 UNET。
-type = "FIR_MINIBATCH_STD"
-# UNET 采用 BasicSR UNetDiscriminatorSN：仅使用 base_ch（默认 64），自动按 1/2/4/8 倍扩展。
-# HQ 和 Coarse 的 UNET 都不读取 max_ch/minibatch_std_group_size，强制关闭 R1。
-# Coarse 的 img_resolution 必须等于 generator.coarse_resolution；HQ 必须等于 generator.img_resolution。
-# UNET 可选 skip_connection = true；输出为 [B,1,H,W]。
-img_resolution = 128
-img_channels = 3
-base_ch = 64
-max_ch = 512
-minibatch_std_group_size = 4
-
 
 # 身份来源数据池。采样权重为 sqrt(file_count) * 2**adjustment。
 # alignment 省略时默认为 ffhq；已预对齐到 canonical ArcFace 112 的 src 使用 arcface。

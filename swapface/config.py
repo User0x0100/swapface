@@ -15,7 +15,6 @@ from .dataloader_common import ImageDecoderBackend
 
 DEFAULT_TRAIN_CONFIG: dict[str, Any] = {
     "batch_size": 16,
-    "stage": "joint",
     "precision": "bf16",
     "device": "cuda",
     "compile_module": True,
@@ -28,8 +27,7 @@ DEFAULT_OPTIMIZER_STAGE_CONFIG: dict[str, Any] = {
 }
 DEFAULT_OPTIMIZER_CONFIG: dict[str, Any] = {
     "generator": dict(DEFAULT_OPTIMIZER_STAGE_CONFIG),
-    "hq_discriminator": dict(DEFAULT_OPTIMIZER_STAGE_CONFIG),
-    "coarse_discriminator": dict(DEFAULT_OPTIMIZER_STAGE_CONFIG),
+    "discriminator": dict(DEFAULT_OPTIMIZER_STAGE_CONFIG),
 }
 DEFAULT_SCHEDULER_STAGE_CONFIG: dict[str, Any] = {
     "type": "none",
@@ -38,41 +36,24 @@ DEFAULT_SCHEDULER_STAGE_CONFIG: dict[str, Any] = {
 }
 DEFAULT_SCHEDULER_CONFIG: dict[str, Any] = {
     "generator": dict(DEFAULT_SCHEDULER_STAGE_CONFIG),
-    "hq_discriminator": dict(DEFAULT_SCHEDULER_STAGE_CONFIG),
-    "coarse_discriminator": dict(DEFAULT_SCHEDULER_STAGE_CONFIG),
+    "discriminator": dict(DEFAULT_SCHEDULER_STAGE_CONFIG),
 }
 DEFAULT_GENERATOR_CONFIG: dict[str, Any] = {
-    "img_resolution": 512,
-    "img_channels": 3,
-    "id_dim": 512,
-    "coarse_resolution": 128,
-    "coarse_latent_resolution": 32,
-    "coarse_num_latent": 6,
-    "coarse_base_ch": 64,
-    "coarse_max_ch": 256,
-    "coarse_type": "inswapper",
-    "hq_bottleneck_resolution": 16,
-    "hq_base_ch": 8,
-    "hq_max_ch": 128,
+    "type": "inswapper", "img_resolution": 512, "id_dim": 512,
 }
-
+IN_SWAPPER_CONFIG_DEFAULTS = {
+    "latent_resolution": 32, "num_latent": 6, "base_ch": 64, "max_ch": 256,
+    "skip_mode": "cat", "skip_layers": [],
+}
+STYLEGAN2_CONFIG_DEFAULTS = {
+    "w_dim": 512, "mapping_layers": 8, "start_resolution": 4, "channels": [128, 512],
+    "target_inject_mode": "concat", "mask_enabled": False, "mask_noise_blank_level": 9,
+    "mask_guidance_epsilon": 1e-4, "mask_guidance_interpolation": "bilinear",
+}
 DEFAULT_DISCRIMINATOR_CONFIG: dict[str, Any] = {
-    "hq": {
-        "type": DiscriminatorType.FIR_MINIBATCH_STD.name,
-        "img_resolution": 512,
-        "img_channels": 3,
-        "base_ch": 64,
-        "max_ch": 512,
-        "minibatch_std_group_size": 4,
-    },
-    "coarse": {
-        "type": DiscriminatorType.FIR_MINIBATCH_STD.name,
-        "img_resolution": 128,
-        "img_channels": 3,
-        "base_ch": 64,
-        "max_ch": 512,
-        "minibatch_std_group_size": 4,
-    },
+    "type": DiscriminatorType.FIR_MINIBATCH_STD.name,
+    "img_resolution": 512, "base_ch": 64,
+    "max_ch": 512, "minibatch_std_group_size": 4,
 }
 DEFAULT_GENERATOR_ID_ENCODER_PROVIDER = IDEncoderProvider.BLENDFACE
 DEFAULT_IDENTITY_LOSS_PROVIDER = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16
@@ -97,32 +78,17 @@ DEFAULT_SMIRK_LOSS_CONFIG = {
     "jaw_weight": 1.0,
     "eyelid_weight": 1.0,
 }
-DEFAULT_COARSE_LOSS_CONFIG: dict[str, Any] = {
+DEFAULT_LOSS_CONFIG: dict[str, Any] = {
     "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
-    "identity": {**DEFAULT_IDENTITY_LOSS_CONFIG, "exclude_parsing_labels": []},
+    "identity": dict(DEFAULT_IDENTITY_LOSS_CONFIG),
     "r1": dict(DEFAULT_R1_LOSS_CONFIG),
-    "wfm": {"enable": DEFAULT_WFM_LOSS_CONFIG["enable"], "weights": dict(DEFAULT_WFM_LOSS_CONFIG["weights"])},
+    "wfm": dict(DEFAULT_WFM_LOSS_CONFIG),
     "mask": {"weight": 1.0},
     "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
     "smirk": dict(DEFAULT_SMIRK_LOSS_CONFIG),
     "reconstruction": {"scope": "same"},
     "l1": {"enable": True, "weight": 10.0, "gaussian_blur": 0},
     "vgg": {"enable": True, "weights": dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)},
-}
-DEFAULT_HQ_LOSS_CONFIG: dict[str, Any] = {
-    "gan": dict(DEFAULT_GAN_LOSS_CONFIG),
-    "identity": {**DEFAULT_IDENTITY_LOSS_CONFIG, "exclude_parsing_labels": []},
-    "r1": dict(DEFAULT_R1_LOSS_CONFIG),
-    "wfm": {"enable": DEFAULT_WFM_LOSS_CONFIG["enable"], "weights": dict(DEFAULT_WFM_LOSS_CONFIG["weights"])},
-    "gaze": dict(DEFAULT_GAZE_LOSS_CONFIG),
-    "smirk": dict(DEFAULT_SMIRK_LOSS_CONFIG),
-    "reconstruction": {"scope": "same"},
-    "l1": {"enable": True, "weight": 10.0, "gaussian_blur": 0},
-    "vgg": {"enable": True, "weights": dict(DEFAULT_VGG_PERCEPTUAL_LOSS_WEIGHT)},
-}
-DEFAULT_LOSS_CONFIG: dict[str, Any] = {
-    "coarse": DEFAULT_COARSE_LOSS_CONFIG,
-    "hq": DEFAULT_HQ_LOSS_CONFIG,
 }
 
 DEFAULT_DATA_CONFIG: dict[str, Any] = {
@@ -257,11 +223,6 @@ def _normalize_train(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("[train].precision 必须显式配置为 fp32、fp16 或 bf16")
     result = _with_defaults(raw, DEFAULT_TRAIN_CONFIG, "[train]")
     result["batch_size"] = _int(result["batch_size"], "train.batch_size", minimum=1)
-    if not isinstance(result["stage"], str):
-        raise TypeError(f"train.stage 必须为字符串，实际为 {type(result['stage']).__name__}")
-    result["stage"] = result["stage"].lower()
-    if result["stage"] not in {"joint", "coarse", "hq"}:
-        raise ValueError(f"train.stage={result['stage']!r} 无效，可选：joint、coarse、hq")
     if not isinstance(result["precision"], str):
         raise TypeError(f"train.precision 必须为字符串，实际为 {type(result['precision']).__name__}")
     result["precision"] = result["precision"].lower()
@@ -325,12 +286,14 @@ def _normalize_identity(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, legacy_inswapper_mask: bool = False) -> dict[str, Any]:
-    defaults = DEFAULT_HQ_LOSS_CONFIG if stage == "hq" else DEFAULT_COARSE_LOSS_CONFIG
+def _normalize_loss_config(loss: dict[str, Any], *, mask_enabled: bool = False) -> dict[str, Any]:
+    defaults = dict(DEFAULT_LOSS_CONFIG)
+    if not mask_enabled:
+        defaults.pop("mask")
     unknown = set(loss) - set(defaults)
     if unknown:
-        raise ValueError(f"[loss.{stage}] 包含未知字段：{sorted(unknown)}")
-    prefix = f"loss.{stage}"
+        raise ValueError(f"[loss] 包含未知字段：{sorted(unknown)}")
+    prefix = "loss"
 
     raw_gan = _table(loss, "gan", f"[{prefix}.gan]")
     gan = _with_defaults({key: value for key, value in raw_gan.items() if key != "spatial_weight"}, defaults["gan"], f"[{prefix}.gan]")
@@ -403,23 +366,9 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, legacy_inswapper_
         smirk[key] = _float(smirk[key], f"{prefix}.smirk.{key}", minimum=0.0)
 
     result = {"gan": gan, "identity": identity, "r1": r1, "wfm": wfm, "gaze": gaze, "smirk": smirk}
-    if stage == "coarse":
-        # Preserve the unused historical Mask labels in InSwapper's canonical
-        # config so existing run hashes remain valid. New StyleGAN2 runs use
-        # only weight: their teacher region comes from FaceMasker + ID gate.
-        mask_defaults = defaults["mask"]
-        if legacy_inswapper_mask:
-            mask_defaults = {"weight": 1.0, "labels": [1, 2, 3, 4, 5, 6, 10, 11, 12, 13]}
-        mask = _with_defaults(_table(loss, "mask", "[loss.coarse.mask]"), mask_defaults, "[loss.coarse.mask]")
-        mask["weight"] = _float(mask["weight"], "loss.coarse.mask.weight", minimum=0.0)
-        if legacy_inswapper_mask:
-            labels = mask["labels"]
-            if not isinstance(labels, list) or not labels:
-                raise ValueError("loss.coarse.mask.labels 必须为非空整数数组")
-            label_indices = [_int(label, f"loss.coarse.mask.labels[{i}]", minimum=0) for i, label in enumerate(labels)]
-            if any(index >= FACE_PARSING_NUM_CLASSES for index in label_indices) or len(set(label_indices)) != len(label_indices):
-                raise ValueError(f"loss.coarse.mask.labels 必须为不重复的 [0, {FACE_PARSING_NUM_CLASSES - 1}] 整数")
-            mask["labels"] = sorted(label_indices)
+    if mask_enabled:
+        mask = _with_defaults(_table(loss, "mask", "[loss.mask]"), defaults["mask"], "[loss.mask]")
+        mask["weight"] = _float(mask["weight"], "loss.mask.weight", minimum=0.0)
         result["mask"] = mask
 
     reconstruction = _with_defaults(_table(loss, "reconstruction", f"[{prefix}.reconstruction]"), defaults["reconstruction"], f"[{prefix}.reconstruction]")
@@ -445,130 +394,63 @@ def _normalize_stage_loss(loss: dict[str, Any], stage: str, *, legacy_inswapper_
     return result
 
 
-def _normalize_loss(config: dict[str, Any], *, coarse_type: str) -> dict[str, Any]:
-    loss = _table(config, "loss", "[loss]")
-    unknown = set(loss) - set(DEFAULT_LOSS_CONFIG)
-    if unknown:
-        raise ValueError(f"[loss] 包含未知字段：{sorted(unknown)}")
-    return {
-        "coarse": _normalize_stage_loss(_table(loss, "coarse", "[loss.coarse]"), "coarse", legacy_inswapper_mask=coarse_type == "inswapper"),
-        "hq": _normalize_stage_loss(_table(loss, "hq", "[loss.hq]"), "hq"),
-    }
-
-
-STYLEGAN2_COARSE_CONFIG_DEFAULTS: dict[str, Any] = {
-    "coarse_w_dim": 512,
-    "coarse_mapping_layers": 8,
-    "coarse_start_resolution": 4,
-    "coarse_channels": [128, 512],
-    "coarse_mask_enabled": False,
-    "coarse_mask_noise_blank_level": 9,
-    "coarse_mask_guidance_epsilon": 1e-4,
-    "coarse_mask_guidance_interpolation": "bilinear",
-}
-
-
-def _normalize_target_injection(result: dict[str, Any], raw: dict[str, Any]) -> None:
-    """Validate synthesis injection options for StyleGAN2 Coarse."""
-    mode = raw.get("coarse_target_inject_mode", "concat")
-    if not isinstance(mode, str) or mode not in {"concat", "add"}:
-        raise ValueError("generator.coarse_target_inject_mode 仅支持 concat 或 add")
-    result["coarse_target_inject_mode"] = mode
-
-    resolution = result["coarse_resolution"]
-    max_layer = resolution.bit_length() - result["coarse_start_resolution"].bit_length()
-    layers = raw.get("coarse_target_inject_layers", list(range(max_layer + 1)))
-    if not isinstance(layers, (tuple, list)) or any(
-        type(index) is not int or index < 0 or index > max_layer for index in layers
-    ):
-        raise ValueError(f"generator.coarse_target_inject_layers 必须为 [0, {max_layer}] 范围内的整数数组")
-    if len(set(layers)) != len(layers):
-        raise ValueError("generator.coarse_target_inject_layers 不能包含重复层级")
-    result["coarse_target_inject_layers"] = sorted(layers)
+def _normalize_loss(config: dict[str, Any], *, mask_enabled: bool) -> dict[str, Any]:
+    return _normalize_loss_config(_table(config, "loss", "[loss]"), mask_enabled=mask_enabled)
 
 
 def _normalize_generator(config: dict[str, Any]) -> dict[str, Any]:
     raw = _table(config, "generator", "[generator]")
-    coarse_type = raw.get("coarse_type", "inswapper")
-    if not isinstance(coarse_type, str) or coarse_type not in {"inswapper", "stylegan2"}:
-        raise ValueError("generator.coarse_type 仅支持 inswapper 或 stylegan2")
-
-    defaults = dict(DEFAULT_GENERATOR_CONFIG)
-    if coarse_type == "stylegan2":
-        defaults.update(STYLEGAN2_COARSE_CONFIG_DEFAULTS)
-    injection_keys = {"coarse_target_inject_mode", "coarse_target_inject_layers"}
-    mask_keys = {"coarse_mask_enabled", "coarse_mask_noise_blank_level", "coarse_mask_guidance_epsilon", "coarse_mask_guidance_interpolation"}
-    # Injection options are validated separately because their defaults depend
-    # on coarse_start_resolution and coarse_resolution.
-    if coarse_type == "inswapper" and set(raw) & (injection_keys | mask_keys):
-        raise ValueError("generator.coarse_target_inject_* 与 coarse_mask_* 仅适用于 stylegan2")
-    result = _with_defaults(
-        {key: value for key, value in raw.items() if key not in injection_keys},
-        defaults, "[generator]",
-    )
-
-    integer_keys = (
-        "img_resolution",
-        "img_channels",
-        "id_dim",
-        "coarse_resolution",
-        "coarse_latent_resolution",
-        "coarse_num_latent",
-        "coarse_base_ch",
-        "coarse_max_ch",
-        "hq_bottleneck_resolution",
-        "hq_base_ch",
-        "hq_max_ch",
-    )
-    for key in integer_keys:
+    kind = raw.get("type", "inswapper")
+    if kind not in ("inswapper", "stylegan2"):
+        raise ValueError("generator.type only supports inswapper/stylegan2")
+    defaults = DEFAULT_GENERATOR_CONFIG | (IN_SWAPPER_CONFIG_DEFAULTS if kind == "inswapper" else STYLEGAN2_CONFIG_DEFAULTS)
+    if kind == "stylegan2":
+        defaults = defaults | {"target_inject_layers": []}
+    result = _with_defaults(raw, defaults, "[generator]")
+    for key in ("img_resolution", "id_dim"):
         result[key] = _int(result[key], f"generator.{key}", minimum=1)
-    if coarse_type == "stylegan2":
-        for key in ("coarse_w_dim", "coarse_mapping_layers", "coarse_start_resolution"):
+    resolution = result["img_resolution"]
+    if resolution < 4 or resolution > 1024 or resolution & (resolution - 1):
+        raise ValueError("generator.img_resolution must be a power of 2 in [4,1024]")
+    if kind == "inswapper":
+        for key in ("latent_resolution", "num_latent", "base_ch", "max_ch"):
             result[key] = _int(result[key], f"generator.{key}", minimum=1)
-
-    if result["coarse_resolution"] > result["img_resolution"]:
-        raise ValueError("generator.coarse_resolution 不能大于 generator.img_resolution")
-    if coarse_type == "inswapper" and result["coarse_max_ch"] < result["coarse_base_ch"]:
-        raise ValueError("generator.coarse_max_ch 必须 >= generator.coarse_base_ch")
-    if coarse_type == "stylegan2":
-        resolution = result["coarse_resolution"]
-        if resolution < 4 or resolution > 1024 or resolution & (resolution - 1):
-            raise ValueError("generator.coarse_resolution 使用 stylegan2 时必须是 [4, 1024] 内的 2 的整数次幂")
-        start = result["coarse_start_resolution"]
+        if result["base_ch"] < 2 or result["max_ch"] < result["base_ch"]:
+            raise ValueError("generator.base_ch/max_ch invalid")
+        latent = result["latent_resolution"]
+        if latent < 2 or latent >= resolution or resolution % latent or (resolution // latent) & (resolution // latent - 1):
+            raise ValueError("generator.latent_resolution must be >= 2 and img_resolution / latent_resolution must be a power of 2 >= 2")
+        if result["skip_mode"] not in ("cat", "add"):
+            raise ValueError("generator.skip_mode must be cat/add")
+        max_layer = (resolution // latent).bit_length() - 2
+        layers = result["skip_layers"]
+        if not isinstance(layers, (list, tuple)) or any(type(i) is not int or i < 0 or i > max_layer for i in layers) or len(set(layers)) != len(layers):
+            raise ValueError(f"generator.skip_layers must be unique integer indices in [0,{max_layer}]")
+        result["skip_layers"] = sorted(layers)
+    else:
+        for key in ("w_dim", "mapping_layers", "start_resolution"):
+            result[key] = _int(result[key], f"generator.{key}", minimum=1)
+        start = result["start_resolution"]
         if start < 4 or start > resolution or start & (start - 1):
-            raise ValueError("generator.coarse_start_resolution 必须是 [4, coarse_resolution] 内的 2 的整数次幂")
-        channels = result["coarse_channels"]
-        if (not isinstance(channels, (list, tuple)) or len(channels) != 2
-                or any(type(ch) is not int or ch <= 0 for ch in channels)
-                or channels[1] < channels[0]):
-            raise ValueError("generator.coarse_channels 必须为 [base_ch, max_ch] 且 0 < base_ch <= max_ch")
-        result["coarse_channels"] = list(channels)
-        _normalize_target_injection(result, raw)
-        result["coarse_mask_enabled"] = _bool(result["coarse_mask_enabled"], "generator.coarse_mask_enabled")
-        result["coarse_mask_noise_blank_level"] = _int(result["coarse_mask_noise_blank_level"], "generator.coarse_mask_noise_blank_level", minimum=-1)
-        result["coarse_mask_guidance_epsilon"] = _float(result["coarse_mask_guidance_epsilon"], "generator.coarse_mask_guidance_epsilon", minimum=1e-8)
-        interpolation = result["coarse_mask_guidance_interpolation"]
-        if not isinstance(interpolation, str) or interpolation not in {"bilinear", "nearest"}:
-            raise ValueError("generator.coarse_mask_guidance_interpolation 仅支持 bilinear 或 nearest")
-    if result["hq_max_ch"] < result["hq_base_ch"]:
-        raise ValueError("generator.hq_max_ch 必须 >= generator.hq_base_ch")
-
-    dimension_pairs = [("img_resolution", "hq_bottleneck_resolution")]
-    if coarse_type == "inswapper":
-        dimension_pairs.append(("coarse_resolution", "coarse_latent_resolution"))
-    for resolution_key, latent_key in dimension_pairs:
-        resolution = result[resolution_key]
-        latent = result[latent_key]
-        if resolution < latent or resolution % latent != 0:
-            raise ValueError(f"generator.{resolution_key} 必须是 generator.{latent_key} 的整数倍")
-        ratio = resolution // latent
-        if ratio & (ratio - 1):
-            raise ValueError(f"generator.{resolution_key}/generator.{latent_key} 必须为 2 的整数次幂")
-
-    # HQRefiner 至少需要一级下采样；其 bottleneck 不能等于最终输出分辨率。
-    if result["hq_bottleneck_resolution"] == result["img_resolution"]:
-        raise ValueError("generator.hq_bottleneck_resolution 必须小于 generator.img_resolution")
-
+            raise ValueError("generator.start_resolution must be power of 2 <= img_resolution")
+        channels = result["channels"]
+        if not isinstance(channels, (list, tuple)) or len(channels) != 2 or any(type(ch) is not int or ch <= 0 for ch in channels) or channels[0] > channels[1]:
+            raise ValueError("generator.channels must contain [base_ch,max_ch]")
+        result["channels"] = list(channels)
+        max_layer = resolution.bit_length() - start.bit_length()
+        if "target_inject_layers" not in raw:
+            result["target_inject_layers"] = list(range(max_layer + 1))
+        layers = result["target_inject_layers"]
+        if not isinstance(layers, (list, tuple)) or any(type(i) is not int or i < 0 or i > max_layer for i in layers) or len(set(layers)) != len(layers):
+            raise ValueError(f"generator.target_inject_layers must contain unique indices in [0,{max_layer}]")
+        result["target_inject_layers"] = sorted(layers)
+        if result["target_inject_mode"] not in ("concat", "add"):
+            raise ValueError("generator.target_inject_mode must be concat/add")
+        result["mask_enabled"] = _bool(result["mask_enabled"], "generator.mask_enabled")
+        result["mask_noise_blank_level"] = _int(result["mask_noise_blank_level"], "generator.mask_noise_blank_level", minimum=-1)
+        result["mask_guidance_epsilon"] = _float(result["mask_guidance_epsilon"], "generator.mask_guidance_epsilon", minimum=1e-8)
+        if result["mask_guidance_interpolation"] not in ("bilinear", "nearest"):
+            raise ValueError("generator.mask_guidance_interpolation must be bilinear/nearest")
     return result
 
 
@@ -586,59 +468,46 @@ def _normalize_discriminator_type(value: object, name: str) -> DiscriminatorType
 
 
 def _normalize_discriminator(config: dict[str, Any]) -> dict[str, Any]:
-    discriminator = _table(config, "discriminator", "[discriminator]")
-    unknown = set(discriminator) - set(DEFAULT_DISCRIMINATOR_CONFIG)
+    raw = _table(config, "discriminator", "[discriminator]")
+    discriminator_type = _normalize_discriminator_type(
+        raw.get("type", DEFAULT_DISCRIMINATOR_CONFIG["type"]), "discriminator.type",
+    )
+    common_keys = {"type", "img_resolution", "base_ch"}
+    if discriminator_type is DiscriminatorType.UNET:
+        allowed = common_keys | {"skip_connection"}
+        defaults = {
+            "type": discriminator_type.name,
+            "img_resolution": DEFAULT_DISCRIMINATOR_CONFIG["img_resolution"],
+            "base_ch": 64,
+            "skip_connection": True,
+        }
+    elif discriminator_type is DiscriminatorType.FIR_MINIBATCH_STD:
+        allowed = common_keys | {"max_ch", "minibatch_std_group_size"}
+        defaults = dict(DEFAULT_DISCRIMINATOR_CONFIG)
+    else:
+        allowed = common_keys | {"max_ch"}
+        defaults = {key: value for key, value in DEFAULT_DISCRIMINATOR_CONFIG.items() if key in allowed}
+    unknown = set(raw) - allowed
     if unknown:
-        raise ValueError(f"[discriminator] 包含未知字段：{sorted(unknown)}")
+        raise ValueError(f"[discriminator] {discriminator_type.name} 不支持字段：{sorted(unknown)}")
 
-    result: dict[str, Any] = {}
-    common_keys = {"type", "img_resolution", "img_channels", "base_ch", "max_ch"}
-    for stage, fir_defaults in DEFAULT_DISCRIMINATOR_CONFIG.items():
-        raw = _table(discriminator, stage, f"[discriminator.{stage}]")
-        discriminator_type = _normalize_discriminator_type(raw.get("type", fir_defaults["type"]), f"discriminator.{stage}.type")
-        allowed = common_keys | {"minibatch_std_group_size", "skip_connection"}
-        unknown_stage = set(raw) - allowed
-        if unknown_stage:
-            raise ValueError(f"[discriminator.{stage}] 包含未知字段：{sorted(unknown_stage)}")
-
-        if discriminator_type is DiscriminatorType.FIR_MINIBATCH_STD:
-            defaults = dict(fir_defaults)
-            relevant = common_keys | {"minibatch_std_group_size"}
-        else:
-            defaults = {key: fir_defaults[key] for key in common_keys}
-            defaults["type"] = discriminator_type.name
-            relevant = common_keys
-            if discriminator_type is DiscriminatorType.UNET:
-                # BasicSR 的通道数由 base_ch * [1, 2, 4, 8] 决定，UNET 无 max_ch 参数。
-                defaults.pop("max_ch")
-                defaults["base_ch"] = 64
-                defaults["skip_connection"] = True
-                relevant = (common_keys - {"max_ch"}) | {"skip_connection"}
-
-        # 允许复用其他判别器的配置文件；UNET 不消费 max_ch，canonical config 中亦不保留。
-        stage_config = defaults | {key: value for key, value in raw.items() if key in relevant}
-        stage_config["type"] = discriminator_type.name
-        for key in ("img_resolution", "img_channels", "base_ch"):
-            stage_config[key] = _int(stage_config[key], f"discriminator.{stage}.{key}", minimum=1)
-        if discriminator_type is DiscriminatorType.UNET:
-            stage_config["skip_connection"] = _bool(
-                stage_config["skip_connection"], f"discriminator.{stage}.skip_connection",
-            )
-        else:
-            stage_config["max_ch"] = _int(stage_config["max_ch"], f"discriminator.{stage}.max_ch", minimum=1)
-            if stage_config["max_ch"] < stage_config["base_ch"]:
-                raise ValueError(f"discriminator.{stage}.max_ch 必须 >= discriminator.{stage}.base_ch")
-        resolution = stage_config["img_resolution"]
-        if resolution < 16 or resolution & (resolution - 1):
-            raise ValueError(f"discriminator.{stage}.img_resolution 必须是 >=16 的 2 的整数次幂")
-
-        if discriminator_type is DiscriminatorType.FIR_MINIBATCH_STD:
-            stage_config["minibatch_std_group_size"] = _int(
-                stage_config["minibatch_std_group_size"],
-                f"discriminator.{stage}.minibatch_std_group_size",
-                minimum=1,
-            )
-        result[stage] = stage_config
+    result = defaults | raw
+    result["type"] = discriminator_type.name
+    for key in ("img_resolution", "base_ch"):
+        result[key] = _int(result[key], f"discriminator.{key}", minimum=1)
+    if discriminator_type is DiscriminatorType.UNET:
+        result["skip_connection"] = _bool(result["skip_connection"], "discriminator.skip_connection")
+    else:
+        result["max_ch"] = _int(result["max_ch"], "discriminator.max_ch", minimum=1)
+        if result["base_ch"] > result["max_ch"]:
+            raise ValueError("discriminator.base_ch > max_ch")
+    resolution = result["img_resolution"]
+    if resolution < 16 or resolution & (resolution - 1):
+        raise ValueError("discriminator.img_resolution must be a power of 2 >= 16")
+    if discriminator_type is DiscriminatorType.FIR_MINIBATCH_STD:
+        result["minibatch_std_group_size"] = _int(
+            result["minibatch_std_group_size"], "discriminator.minibatch_std_group_size", minimum=1,
+        )
     return result
 
 
@@ -707,50 +576,28 @@ def resolve_train_config(config: dict[str, Any]) -> dict[str, Any]:
     train = _normalize_train(config)
     discriminator = _normalize_discriminator(config)
     generator = _normalize_generator(config)
-    loss = _normalize_loss(config, coarse_type=generator["coarse_type"])
-    for stage, stage_config in discriminator.items():
-        divisor = loss[stage]["l1"]["gaussian_blur"]
-        if divisor:
-            resolution_key = "coarse_resolution" if stage == "coarse" else "img_resolution"
-            resolution = generator[resolution_key]
-            try:
-                _gaussian_blur_parameters(resolution, divisor)
-            except ValueError as exc:
-                raise ValueError(
-                    f"loss.{stage}.l1.gaussian_blur={divisor} 无法用于 "
-                    f"generator.{resolution_key}={resolution}：{exc}"
-                ) from exc
-        discriminator_type = DiscriminatorType[stage_config["type"]]
-        if discriminator_type is DiscriminatorType.UNET:
-            expected_key = "coarse_resolution" if stage == "coarse" else "img_resolution"
-            if stage_config["img_resolution"] != generator[expected_key]:
-                raise ValueError(
-                    f"discriminator.{stage}.img_resolution 必须等于 generator.{expected_key}："
-                    f"{stage_config['img_resolution']} != {generator[expected_key]}"
-                )
-            # UNetDiscriminatorSN 已使用 SpectralNorm；即便输入配置开启 R1，也强制禁用。
-            loss[stage]["r1"]["enable"] = False
-        if "spatial_weight" in loss[stage]["gan"]:
-            raise ValueError(f"loss.{stage}.gan.spatial_weight 已删除：GAN 直接使用判别器的全分辨率输出")
-        if discriminator_type is DiscriminatorType.FIR_MINIBATCH_STD:
-            group_size = stage_config["minibatch_std_group_size"]
-            if train["batch_size"] % group_size:
-                raise ValueError(
-                    f"train.batch_size={train['batch_size']} 必须能被 discriminator.{stage}.minibatch_std_group_size={group_size} 整除"
-                )
-            feature_count = int(math.log2(stage_config["img_resolution"])) - 2
-        elif discriminator_type is DiscriminatorType.UNET:
-            feature_count = 4
-        else:
-            feature_count = int(math.log2(stage_config["img_resolution"] // INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION))
-
-        if loss[stage]["wfm"]["enable"]:
-            indices = [int(index) for index in loss[stage]["wfm"]["weights"]]
-            if indices and max(indices) >= feature_count:
-                raise ValueError(
-                    f"loss.{stage}.wfm.weights 最大层索引={max(indices)} 超出 {discriminator_type.name} feature 数量={feature_count}"
-                )
-
+    loss = _normalize_loss(config, mask_enabled=generator["type"] == "stylegan2" and generator["mask_enabled"])
+    divisor = loss["l1"]["gaussian_blur"]
+    if divisor:
+        _gaussian_blur_parameters(generator["img_resolution"], divisor)
+    if discriminator["img_resolution"] != generator["img_resolution"]:
+        raise ValueError("discriminator.img_resolution must match generator.img_resolution")
+    discriminator_type = DiscriminatorType[discriminator["type"]]
+    if discriminator_type is DiscriminatorType.UNET:
+        loss["r1"]["enable"] = False
+    if "spatial_weight" in loss["gan"]:
+        raise ValueError("loss.gan.spatial_weight is no longer supported")
+    if discriminator_type is DiscriminatorType.FIR_MINIBATCH_STD:
+        group_size = discriminator["minibatch_std_group_size"]
+        if train["batch_size"] % group_size:
+            raise ValueError("train.batch_size must be divisible by discriminator.minibatch_std_group_size")
+        feature_count = int(math.log2(generator["img_resolution"])) - 2
+    elif discriminator_type is DiscriminatorType.UNET:
+        feature_count = 4
+    else:
+        feature_count = int(math.log2(generator["img_resolution"] // INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION))
+    if loss["wfm"]["enable"] and max(map(int, loss["wfm"]["weights"]), default=-1) >= feature_count:
+        raise ValueError("loss.wfm.weights exceeds discriminator feature count")
     return {
         "train": train,
         "optimizer": _normalize_optimizer(config),

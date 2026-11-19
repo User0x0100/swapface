@@ -30,9 +30,9 @@ def load_generator(checkpoint_path: str | Path) -> tuple[Generator, IDEncoderPro
     if face_alignment not in ("ffhq", "arcface"):
         raise ValueError(f"checkpoint 人脸对齐标准无效：{face_alignment!r}")
     config = checkpoint["net_g"]["network_cfg"]
-    if "coarse_type" not in config:
-        raise ValueError("checkpoint Generator 配置缺少 coarse_type")
-    if config["img_channels"] != 3 or config["id_dim"] != 512:
+    if "type" not in config:
+        raise ValueError("checkpoint Generator 配置缺少 type")
+    if config["id_dim"] != 512:
         raise ValueError("当前推理要求 RGB 图像和 512 维身份特征")
     model = Generator(**config)
     # train.py 将用于推理的 EMA 权重存入 net_g；training_state.net_g 是训练权重。

@@ -75,17 +75,8 @@ def main() -> None:
     torch.set_num_threads(2)
     device = torch.device("cpu")
     provider = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16  # 非默认编码器，防止静默回退 BlendFace。
-    model = Generator(
-        img_resolution=16,
-        coarse_resolution=8,
-        coarse_latent_resolution=4,
-        coarse_base_ch=2,
-        coarse_max_ch=8,
-        coarse_num_latent=1,
-        hq_bottleneck_resolution=4,
-        hq_base_ch=2,
-        hq_max_ch=8,
-    ).eval()
+    model = Generator(img_resolution=16, latent_resolution=4, base_ch=4,
+                      max_ch=8, num_latent=1).eval()
     faces = torch.rand(3, 3, 16, 16) * 2 - 1
     identity = torch.nn.functional.normalize(torch.randn(1, 512), dim=1)
     with tempfile.TemporaryDirectory(prefix="swapface-check-") as temporary:
@@ -95,7 +86,7 @@ def main() -> None:
             "version": CHECKPOINT_VERSION,
             "face_alignment": "ffhq",
             "step": 123,
-            "identity_encoders": {"generator": provider.name, "coarse_identity_loss": "BLENDFACE", "hq_identity_loss": "BLENDFACE"},
+            "identity_encoders": {"generator": provider.name, "identity_loss": "BLENDFACE"},
             "net_g": {"network_cfg": model.network_cfg, "state_dict": model.state_dict()},
             "training_state": {"net_g": {key: torch.zeros_like(value) for key, value in model.state_dict().items()}},
         }
@@ -117,15 +108,8 @@ def main() -> None:
             assert native.id_encoder.provider is provider
             with torch.inference_mode():
                 expected = model(faces, identity.expand(3, -1))
-                expected_with_coarse, coarse = model(faces, identity.expand(3, -1), return_coarse=True)
-            torch.testing.assert_close(expected_with_coarse, expected)
-            assert coarse.shape == (3, 3, model.network_cfg["coarse_resolution"], model.network_cfg["coarse_resolution"])
             torch.testing.assert_close(native.swap_faces(faces, identity), expected)
             assert native.swap_faces(faces[:0], identity).shape == (0, 3, 16, 16)
-
-            coarse_only = swapper.SwapFace(str(checkpoint_path), device="cpu", lookup_coarse=True)
-            expected_coarse = NF.interpolate(coarse, size=faces.shape[-2:], mode="bilinear", align_corners=False)
-            torch.testing.assert_close(coarse_only.swap_faces(faces, identity), expected_coarse)
 
             # 源图身份提取直接组合 raw->FFHQ->ArcFace 网格，只允许一次图像重采样。
             image = torch.randint(0, 256, (3, 32, 32), dtype=torch.uint8)
@@ -156,7 +140,7 @@ def main() -> None:
                 onnx_model = onnx.load(exported_path)
                 onnx.checker.check_model(onnx_model)
                 exported_metadata = {item.key: item.value for item in onnx_model.metadata_props}
-                assert exported_metadata["swapface.format"] == "2"
+                assert exported_metadata["swapface.format"] == "3"
                 assert exported_metadata["swapface.step"] == "123"
                 assert exported_metadata["swapface.export.strict"] == "true"
                 assert exported_metadata["swapface.export.dynamo"] == "true"
@@ -275,7 +259,7 @@ def main() -> None:
                 encoded_model = onnx.load(encoded_path)
                 onnx.checker.check_model(encoded_model)
                 metadata = {item.key: item.value for item in encoded_model.metadata_props}
-                assert metadata["swapface.format"] == "2"
+                assert metadata["swapface.format"] == "3"
                 assert metadata["swapface.face_alignment"] == "arcface112"
                 assert metadata["swapface.provider"] == provider.name
                 assert metadata["swapface.layout"] == ("NHWC" if nhwc else "NCHW")

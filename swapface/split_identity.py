@@ -1,4 +1,4 @@
-"""Inference-only identity conditioning split for the InSwapper and StyleGAN2 Coarse models.
+"""Inference-only identity conditioning split for InSwapper and StyleGAN2 models.
 
 All identity-to-modulation weights live exclusively in IdentityProjection. The
 runtime receives only precomputed modulation values; training is unchanged.
@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from models.networks import Coarse, Generator, IDInject, StyleGAN2Coarse
+from models.networks import Generator, IDInject, InSwapper, StyleGAN2Swap
 from models.stylegan2 import ModulatedConv2d, StyledConv, SynthesisStage, ToMask, ToOutput, mask_guided_target_features, mask_probability, stylegan2_mask_layer_index
 
 
@@ -30,7 +30,7 @@ def _static_condition_slices(conditioning: Tensor, widths: list[int]) -> list[Te
 
 
 class InSwapperProjection(nn.Module):
-    def __init__(self, coarse: Coarse) -> None:
+    def __init__(self, coarse: InSwapper) -> None:
         super().__init__()
         self.w_space_map = deepcopy(coarse.w_space_map)
         self.linears = nn.ModuleList(
@@ -74,24 +74,41 @@ class PrecomputedIDInject(nn.Module):
 
 
 class PrecomputedInSwapper(nn.Module):
-    def __init__(self, coarse: Coarse) -> None:
+    """Client U-Net with identity modulation precomputed by the server."""
+    def __init__(self, generator: InSwapper) -> None:
         super().__init__()
-        self.img_resolution = coarse.img_resolution
-        self.from_rgb = deepcopy(coarse.from_rgb)
-        self.encoder = deepcopy(coarse.encoder)
-        self.layers = nn.ModuleList(PrecomputedIDInject(block) for block in coarse.latent_space.layers)
-        self.decoder = deepcopy(coarse.decoder)
-        self.to_rgb = deepcopy(coarse.to_rgb)
-        self.style_widths = [block.adain0.linear.out_features for block in coarse.latent_space.layers for _ in range(2)]
+        self.img_resolution = generator.img_resolution
+        self.from_rgb = deepcopy(generator.from_rgb)
+        self.encoder = deepcopy(generator.encoder)
+        self.layers = nn.ModuleList(PrecomputedIDInject(block) for block in generator.latent_space.layers)
+        self.decoder = deepcopy(generator.decoder)
+        self.to_rgb = deepcopy(generator.to_rgb)
+        self.skip_mode = generator.skip_mode
+        self.skip_layers = generator.skip_layers
+        self.style_widths = [block.adain0.linear.out_features for block in generator.latent_space.layers for _ in range(2)]
         self.condition_width = sum(self.style_widths)
 
     def forward(self, target: Tensor, conditioning: Tensor) -> Tensor:
-        x = F.interpolate(target, size=self.img_resolution, mode="bilinear", align_corners=False)
-        x = self.encoder(self.from_rgb(x))
+        x = target if target.shape[-2:] == (self.img_resolution, self.img_resolution) else F.interpolate(target, size=self.img_resolution, mode="bilinear", align_corners=False)
+        x = self.from_rgb(x)
+        skips: dict[int, Tensor] = {}
+        last_skip = len(self.decoder) - 1
+        if last_skip in self.skip_layers:
+            skips[last_skip] = x
+        for encoder_index, block in enumerate(self.encoder):
+            x = block(x)
+            skip_index = len(self.encoder) - encoder_index - 2
+            if skip_index in self.skip_layers:
+                skips[skip_index] = x
         styles = _static_condition_slices(conditioning, self.style_widths)
         for i, block in enumerate(self.layers):
             x = block(x, styles[2 * i], styles[2 * i + 1])
-        return self.to_rgb(self.decoder(x))
+        for i, block in enumerate(self.decoder):
+            x = block(x)
+            if i in self.skip_layers:
+                feature = skips.pop(i)
+                x = torch.cat((x, feature), dim=1) if self.skip_mode == "cat" else x + feature
+        return self.to_rgb(x)
 
 
 def _modulated_layers(generator: nn.Module) -> list[ModulatedConv2d]:
@@ -106,7 +123,7 @@ def _modulated_layers(generator: nn.Module) -> list[ModulatedConv2d]:
 
 
 class StyleGAN2Projection(nn.Module):
-    def __init__(self, coarse: StyleGAN2Coarse) -> None:
+    def __init__(self, coarse: StyleGAN2Swap) -> None:
         super().__init__()
         generator = coarse.generator
         self.id_mapping = deepcopy(generator.id_mapping)
@@ -220,7 +237,7 @@ class PrecomputedSynthesisStage(nn.Module):
 
 
 class PrecomputedStyleGAN2(nn.Module):
-    def __init__(self, coarse: StyleGAN2Coarse) -> None:
+    def __init__(self, coarse: StyleGAN2Swap) -> None:
         super().__init__()
         generator = coarse.generator
         self.img_resolution = coarse.img_resolution
@@ -268,14 +285,14 @@ class IdentityProjection(nn.Module):
 
     def __init__(self, generator: Generator) -> None:
         super().__init__()
-        if isinstance(generator.coarse, Coarse):
-            self.mapping = InSwapperProjection(generator.coarse)
-            self.coarse_type = "inswapper"
-        elif isinstance(generator.coarse, StyleGAN2Coarse):
-            self.mapping = StyleGAN2Projection(generator.coarse)
-            self.coarse_type = "stylegan2"
+        if isinstance(generator.core, InSwapper):
+            self.mapping = InSwapperProjection(generator.core)
+            self.generator_type = "inswapper"
+        elif isinstance(generator.core, StyleGAN2Swap):
+            self.mapping = StyleGAN2Projection(generator.core)
+            self.generator_type = "stylegan2"
         else:
-            raise TypeError(f"unsupported Coarse type: {type(generator.coarse).__name__}")
+            raise TypeError(f"unsupported Generator type: {type(generator.core).__name__}")
         self.condition_width = self.mapping.width
 
     def forward(self, identity: Tensor) -> Tensor:
@@ -295,23 +312,22 @@ class SplitIdentityEncoder(nn.Module):
 
 
 class SplitGenerator(nn.Module):
-    """Client artifact: target image + precomputed condition -> generated image."""
-
+    """Client artifact: target image + precomputed condition -> final RGB."""
     def __init__(self, generator: Generator) -> None:
         super().__init__()
         self.img_resolution = generator.img_resolution
-        self.coarse_type = "stylegan2" if isinstance(generator.coarse, StyleGAN2Coarse) else "inswapper"
-        if isinstance(generator.coarse, Coarse):
-            self.coarse = PrecomputedInSwapper(generator.coarse)
-        elif isinstance(generator.coarse, StyleGAN2Coarse):
-            self.coarse = PrecomputedStyleGAN2(generator.coarse)
+        if isinstance(generator.core, InSwapper):
+            self.core = PrecomputedInSwapper(generator.core)
+            self.generator_type = "inswapper"
+        elif isinstance(generator.core, StyleGAN2Swap):
+            self.core = PrecomputedStyleGAN2(generator.core)
+            self.generator_type = "stylegan2"
         else:
-            raise TypeError(f"unsupported Coarse type: {type(generator.coarse).__name__}")
-        self.hq = deepcopy(generator.hq)
-        self.condition_width = self.coarse.condition_width
+            raise TypeError(f"unsupported Generator type: {type(generator.core).__name__}")
+        self.condition_width = self.core.condition_width
 
     def forward(self, target: Tensor, conditioning: Tensor) -> Tensor:
-        return self.hq(target, self.coarse(target, conditioning))
+        return self.core(target, conditioning)
 
 
 def build_split_models(generator: Generator, encoder: nn.Module) -> tuple[SplitIdentityEncoder, SplitGenerator]:

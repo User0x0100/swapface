@@ -21,7 +21,7 @@ from .export import OnnxExportOptions, export_to_onnx
 from .inference import load_generator
 from .split_identity import SplitGenerator, SplitIdentityEncoder, build_split_models
 
-SPLIT_PROTOCOL_VERSION = 2
+SPLIT_PROTOCOL_VERSION = 3
 _UNSUPPORTED_TRT_OPS = frozenset({"SplitToSequence", "SequenceAt"})
 
 
@@ -68,7 +68,7 @@ def _pair_identity(
     encoder: nn.Module,
     *,
     provider: IDEncoderProvider,
-    coarse_type: str,
+    generator_type: str,
     condition_width: int,
     batch_size: int,
     layout: str,
@@ -88,7 +88,7 @@ def _pair_identity(
         "generator_id": generator_id,
         "encoder_id": encoder_id,
         "provider": provider.name,
-        "coarse_type": coarse_type,
+        "generator_type": generator_type,
         "condition_width": condition_width,
         "condition_dtype": "float32",
         "batch_size": batch_size,
@@ -102,7 +102,7 @@ def _validate_onnx(path: Path, *, client: bool) -> None:
     onnx.checker.check_model(str(path))
     if client:
         model = onnx.load(str(path), load_external_data=False)
-        unsupported = sorted(set(node.op_type for node in model.graph.node) & _UNSUPPORTED_TRT_OPS)
+        unsupported = sorted({node.op_type for node in model.graph.node} & _UNSUPPORTED_TRT_OPS)
         if unsupported:
             raise RuntimeError(f"客户端 ONNX 存在 TensorRT 不支持的序列算子: {unsupported}")
         if [item.name for item in model.graph.input] != ["faces", "identity_condition"]:
@@ -153,11 +153,11 @@ def export_split(
     generator, provider, step = load_generator(checkpoint_path)
     encoder = IDEncoder(provider)
     server, runtime = build_split_models(generator, encoder)
-    coarse_type = server.projection.coarse_type
+    generator_type = server.projection.generator_type
     width = server.projection.condition_width
     layout = "NHWC" if nhwc else "NCHW"
     contract = _pair_identity(
-        generator, encoder, provider=provider, coarse_type=coarse_type,
+        generator, encoder, provider=provider, generator_type=generator_type,
         condition_width=width, batch_size=batch_size, layout=layout,
     )
     pair_id = contract["pair_id"]
@@ -172,7 +172,7 @@ def export_split(
         "swapface.split.pair_id": pair_id,
         "swapface.split.generator_id": contract["generator_id"],
         "swapface.split.encoder_id": contract["encoder_id"],
-        "swapface.split.coarse_type": coarse_type,
+        "swapface.split.generator_type": generator_type,
         "swapface.split.condition_width": str(width),
         "swapface.split.condition_dtype": "float32",
         "swapface.split.batch_size": str(batch_size),

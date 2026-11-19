@@ -152,7 +152,7 @@ def export_swapface(
     print(f"Loading EMA checkpoint: {checkpoint_path}, step={training_step}, provider={provider.name}")
 
     network_config = model.network_cfg
-    image_resolution, image_channels, identity_dim = network_config["img_resolution"], network_config["img_channels"], network_config["id_dim"]
+    image_resolution, image_channels, identity_dim = network_config["img_resolution"], network_config.get("img_channels", 3), network_config["id_dim"]
 
     if nhwc:
         wrapped = SwapFaceNHWCAdapter(model).to(target_device)

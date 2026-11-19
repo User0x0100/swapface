@@ -117,7 +117,7 @@ class FIRMinibatchStdDiscriminator(nn.Module):
         return_feats: bool = False,
     ) -> Tensor | tuple[Tensor, list[Tensor]]:
         expected = (
-            self.network_cfg["img_channels"],
+            self.network_cfg.get("img_channels", 3),
             self.network_cfg["img_resolution"],
             self.network_cfg["img_resolution"],
         )
@@ -210,7 +210,7 @@ class InstanceNormResidualDiscriminator(nn.Module):
     ) -> Tensor | tuple[Tensor, list[Tensor]]:
         del split_minibatch_std
         expected = (
-            self.network_cfg["img_channels"],
+            self.network_cfg.get("img_channels", 3),
             self.network_cfg["img_resolution"],
             self.network_cfg["img_resolution"],
         )

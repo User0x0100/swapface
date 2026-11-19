@@ -33,7 +33,7 @@ def _configure_swapper_runtime() -> None:
 
 
 class SwapFace:
-    def __init__(self, model_path: str, device: str = "cuda", lookup_coarse: bool = False) -> None:
+    def __init__(self, model_path: str, device: str = "cuda") -> None:
         if not Path(model_path).is_file():
             raise FileNotFoundError(model_path)
         self.device = torch.device(device)
@@ -47,9 +47,6 @@ class SwapFace:
                 # Turing 等设备的软件 BF16 模拟比 FP32 更慢，仅启用原生 BF16。
                 self.bf16 = torch.cuda.is_bf16_supported(including_emulation=False)
         self.is_onnx = str(model_path).lower().endswith(".onnx")
-        self.lookup_coarse = lookup_coarse
-        if self.is_onnx and self.lookup_coarse:
-            raise ValueError("lookup_coarse 仅支持 checkpoint；当前 ONNX 只导出完整 Generator 输出")
 
         if self.is_onnx:
             import onnxruntime as ort
@@ -163,11 +160,6 @@ class SwapFace:
         if not self.is_onnx:
             identity_batch = identity_embedding.expand(faces.size(0), -1)
             with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.bf16):
-                if self.lookup_coarse:
-                    swapped = self.net_g.coarse(faces, identity_batch)
-                    if swapped.shape[-2:] != faces.shape[-2:]:
-                        swapped = NF.interpolate(swapped, size=faces.shape[-2:], mode="bilinear", align_corners=False)
-                    return swapped.float()
                 return self.net_g(faces, identity_batch).float()
 
         if self.device.type == "cuda":
@@ -417,9 +409,8 @@ def main() -> None:
     parser.add_argument("--frames", type=int, help="最多预览多少帧，默认直到视频结束")
     parser.add_argument("--profile", action="store_true", help="输出各阶段耗时；GPU 同步可能降低吞吐")
     parser.add_argument("--full-resolution-detection", action="store_true", help="按原视频分辨率检测，保留原有检测精度；默认大帧使用检测器原生缩放")
-    parser.add_argument("--lookup-coarse", action="store_true", help="仅使用 Coarse 输出进行换脸；默认使用完整 Generator 输出")
     args = parser.parse_args()
-    SwapFace(args.model, device=args.device, lookup_coarse=args.lookup_coarse).swap_video(
+    SwapFace(args.model, device=args.device).swap_video(
         args.video,
         args.identity,
         batch_size=args.batch_size,

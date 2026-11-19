@@ -129,23 +129,22 @@ def test_identity_threshold_validation_and_legacy_config(identity_criterion) -> 
 
     source = Path(__file__).resolve().parents[1] / "experiments" / "train.toml"
     raw = tomllib.loads(source.read_text(encoding="utf-8"))
-    # An original run without the opt-in fields must remain canonical as before.
-    legacy = copy.deepcopy(raw)
-    for stage in ("coarse", "hq"):
-        legacy["loss"][stage]["identity"].pop("min_similarity", None)
-        legacy["loss"][stage]["identity"].pop("transition_width", None)
-    normalized = resolve_train_config(legacy)
-    for stage in ("coarse", "hq"):
-        assert "min_similarity" not in normalized["loss"][stage]["identity"]
-        assert "transition_width" not in normalized["loss"][stage]["identity"]
+    # The single-stage identity criterion retains optional threshold semantics.
+    without_threshold = copy.deepcopy(raw)
+    without_threshold["loss"]["identity"].pop("min_similarity", None)
+    without_threshold["loss"]["identity"].pop("transition_width", None)
+    normalized = resolve_train_config(without_threshold)
+    assert "min_similarity" not in normalized["loss"]["identity"]
+    assert "transition_width" not in normalized["loss"]["identity"]
 
-    new = copy.deepcopy(legacy)
-    new["loss"]["coarse"]["identity"]["min_similarity"] = 0.7
-    new["loss"]["hq"]["identity"].update({"min_similarity": 0.8, "transition_width": 0.04})
+    new = copy.deepcopy(without_threshold)
+    new["loss"]["identity"]["min_similarity"] = 0.7
     normalized = resolve_train_config(new)
-    assert normalized["loss"]["coarse"]["identity"]["transition_width"] == pytest.approx(0.03)
-    assert normalized["loss"]["hq"]["identity"]["min_similarity"] == pytest.approx(0.8)
-    assert normalized["loss"]["hq"]["identity"]["transition_width"] == pytest.approx(0.04)
+    assert normalized["loss"]["identity"]["transition_width"] == pytest.approx(0.03)
+    new["loss"]["identity"]["transition_width"] = 0.04
+    normalized = resolve_train_config(new)
+    assert normalized["loss"]["identity"]["min_similarity"] == pytest.approx(0.7)
+    assert normalized["loss"]["identity"]["transition_width"] == pytest.approx(0.04)
     assert resolve_train_config(normalized) == normalized
 
     for key, value in (
@@ -160,12 +159,12 @@ def test_identity_threshold_validation_and_legacy_config(identity_criterion) -> 
         ("transition_width", math.inf),
     ):
         invalid = copy.deepcopy(new)
-        invalid["loss"]["coarse"]["identity"][key] = value
+        invalid["loss"]["identity"][key] = value
         with pytest.raises((ValueError, TypeError)):
             resolve_train_config(invalid)
 
-    missing_threshold = copy.deepcopy(legacy)
-    missing_threshold["loss"]["coarse"]["identity"]["transition_width"] = 0.03
+    missing_threshold = copy.deepcopy(without_threshold)
+    missing_threshold["loss"]["identity"]["transition_width"] = 0.03
     with pytest.raises(ValueError, match="min_similarity"):
         resolve_train_config(missing_threshold)
 
@@ -178,14 +177,14 @@ def test_trainer_logs_threshold_coverage_without_grad(identity_criterion) -> Non
     trainer.log_interval = 10
     metrics = {}
     trainer.log = lambda key, value: metrics.update({key: value.detach()})
-    trainer._log_identity_threshold_metrics("coarse", criterion, generated, reference)
+    trainer._log_identity_threshold_metrics(criterion, generated, reference)
 
-    assert metrics["coarse_id_similarity_mean"].item() == pytest.approx(sum([0.9, 0.69, 0.4]) / 3, abs=1e-6)
-    assert metrics["coarse_id_satisfied_fraction"].item() == pytest.approx(1 / 3)
-    assert metrics["coarse_id_gradient_scale_mean"].item() == pytest.approx((0 + 1 / 3 + 1) / 3, abs=1e-5)
+    assert metrics["id_similarity_mean"].item() == pytest.approx(sum([0.9, 0.69, 0.4]) / 3, abs=1e-6)
+    assert metrics["id_satisfied_fraction"].item() == pytest.approx(1 / 3)
+    assert metrics["id_gradient_scale_mean"].item() == pytest.approx((0 + 1 / 3 + 1) / 3, abs=1e-5)
     assert not any(value.requires_grad for value in metrics.values())
     metrics.clear()
-    trainer._log_identity_threshold_metrics("hq", identity_criterion(min_similarity=None), generated, reference)
+    trainer._log_identity_threshold_metrics(identity_criterion(min_similarity=None), generated, reference)
     assert metrics == {}
 
 
@@ -233,11 +232,11 @@ def test_threshold_logging_skips_all_similarity_ops_between_intervals(identity_c
 
     monkeypatch.setattr("swapface.train.NF.cosine_similarity", reject)
     generated, reference = _vectors([0.9, 0.4])
-    trainer._log_identity_threshold_metrics("coarse", criterion, generated, reference)
-    trainer._log_identity_threshold_metrics("hq", criterion, generated, reference)
+    trainer._log_identity_threshold_metrics(criterion, generated, reference)
+    trainer._log_identity_threshold_metrics(criterion, generated, reference)
     assert not events
 
     # On the interval boundary, the guard must no longer skip computation.
     trainer._completed_step = 9
     with pytest.raises(AssertionError, match="must not be computed"):
-        trainer._log_identity_threshold_metrics("coarse", criterion, generated, reference)
+        trainer._log_identity_threshold_metrics(criterion, generated, reference)

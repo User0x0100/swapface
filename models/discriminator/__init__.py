@@ -4,13 +4,12 @@ from typing import Any
 
 from torch import nn
 
-from .unet import UNetDiscriminatorSN
-
 from .network import (
     INSTANCE_NORM_RESIDUAL_MIN_RESOLUTION,
     FIRMinibatchStdDiscriminator,
     InstanceNormResidualDiscriminator,
 )
+from .unet import UNetDiscriminatorSN
 
 
 class DiscriminatorType(Enum):
@@ -20,7 +19,7 @@ class DiscriminatorType(Enum):
 
 
 def build_discriminator(config: Mapping[str, Any]) -> nn.Module:
-    cfg = dict(config)
+    cfg = {"img_channels": 3, **config}
     discriminator_type = DiscriminatorType[str(cfg.pop("type"))]
     if discriminator_type is DiscriminatorType.FIR_MINIBATCH_STD:
         model = FIRMinibatchStdDiscriminator(**cfg)

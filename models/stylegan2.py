@@ -2,8 +2,7 @@
 
 The target-image encoder optionally supplies spatial features at selected synthesis resolutions.
 The source identity embedding controls the synthesis convolutions via StyleGAN2
-weight modulation/demodulation. This module is independent of the current
-Coarse/HQ training model; it does not change the active generator selection.
+weight modulation/demodulation. This module is the synthesis backbone for the single-stage StyleGAN2 generator.
 """
 
 import math

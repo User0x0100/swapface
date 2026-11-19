@@ -1,15 +1,44 @@
-# SwapFace 训练运行与结果目录
+# SwapFace 训练协议（单阶段）
 
-本文描述训练配置、run 生命周期、checkpoint 保存与中途恢复的约定。目标是让一次训练具备明确边界、可恢复、可审计，并避免运行时路径污染实验配置。
+生成器统一直接输出 `img_resolution × img_resolution` 的 RGB 图像。不存在 Coarse/HQ 分阶段训练、HQRefiner、中间超分图像或第二个判别器。
 
-## 设计原则
+## 生成器
 
-训练系统区分两类状态：
+`[generator].type` 有两个选项：
 
-- **实验配置**：决定“训练什么”，例如模型结构、数据源、损失、学习率与数据增强。由 TOML 描述，可进入 Git。
-- **运行状态**：决定“这一次从哪里执行、结果写到哪里”，例如 run ID、checkpoint、输出目录。由 CLI 与 run 元数据管理，不写入 TOML。
+- `inswapper`：完整分辨率 U-Net。`FromRGB → Encoder → LatentBlock → Decoder → ToRGB`；Bottleneck 使用既有 `WSpaceMap + IDInject/AdaIN`。`latent_resolution` 控制瓶颈分辨率，`num_latent` 控制身份残差块数量，`base_ch/max_ch` 控制各分辨率通道。`skip_mode = "cat" | "add"`；`skip_layers` 按 Decoder 从瓶颈向外、从 0 开始编号。空数组禁用跨级连接，最后一层是 FromRGB 与最高分辨率 Decoder 输出的融合。`latent_resolution >= 2`（Bottleneck 的反射填充卷积要求空间尺寸至少为 2）；仅缓存实际启用的 Skip 特征。
+- `stylegan2`：直接生成完整分辨率 RGB，维持 StyleSwap Target 编码和多分辨率注入。参数：`w_dim`、`mapping_layers`、`start_resolution`、`channels`、`target_inject_mode`、`target_inject_layers`。可选 `mask_enabled`、`mask_noise_blank_level`、`mask_guidance_epsilon`、`mask_guidance_interpolation`。
 
-因此 `ckpt`、`log_path` 不再是 `[train]` 配置项。真正的 resume 必须继续原 run，并使用该 run 在创建时冻结的配置。
+`cat` 在对应 Decoder 层的上采样完成后与同分辨率 Encoder 特征按通道拼接，后续层的 `in_channels` 自动匹配；`add` 进行逐元素相加。没有 AAD、额外权重门控或隐藏的通道投影。
+
+两类生成器配置互斥；不接受其他类型专属字段。训练配置中的 `img_channels` 已删除，Generator 和 Discriminator 都默认使用 RGB 三通道；该字段不进入 canonical config 或检查点网络配置。`id_dim` 等其他参数仍按其原有设计配置。修改分辨率、跳跃层级或融合方式会改变模型架构，需新建 run。
+
+## 训练
+
+`[train]` 包含 `batch_size`、`precision` (`fp32/fp16/bf16`)、`device`、`compile_module` 和日志/样本/检查点间隔，不再有 `stage`。
+
+- `[optimizer.generator]`、`[optimizer.discriminator]`：两组 Adam 的学习率，`betas=(0,0.99)`，融合优化器。
+- `[scheduler.generator]`、`[scheduler.discriminator]`：各自的 `none/cosine` 调度。
+- `[discriminator]`：只有一个全分辨率判别器，支持 `FIR_MINIBATCH_STD/INSTANCE_NORM_RESIDUAL/UNET`。UNET 的 R1 强制关闭。
+- `[loss.*]`：只有一套 `gan/identity/r1/wfm/gaze/smirk/reconstruction/l1/vgg`。只有 StyleGAN2 能配置 `[loss.mask]`。`reconstruction.scope` 为 `same` 或 `all`；L1/VGG 使用此范围约束。
+- `[identity]`：生成器 Source 身份编码器；`[loss.identity]` 指定独立损失教师，二者可选相同以重用特征。
+
+训练一步：数据加载及增强 → Generator 身份特征 → 生成最终 RGB（可含 Mask Logits）→ 单判别器更新（lazy R1）→ 单组 Generator Loss / backward → EMA / scheduler → 日志/预览/检查点。SMIRK、Gaze、VGG、ID 梯度筛选等逻辑保留。
+
+## Run / Checkpoint
+
+新训练：`uv run python -m swapface.train --config experiments/train.toml [--name NAME]`
+
+严格恢复：`uv run python -m swapface.train --resume experiments/runs/<run_id> [--strict-precision]`
+
+派生新 run：`uv run python -m swapface.train --branch-from <model.pth> --config experiments/train.toml [--step N] [--reset-discriminator]`
+
+Branch 直接尝试加载 Generator 权重（`load_state_dict(strict=True)`），不再比较来源检查点的模型配置、对齐方式、身份编码器、训练精度或训练语义版本。优先继承 `training_state.net_g`，没有训练权重时可以继承 `net_g.state_dict`（EMA/推理模型），也支持直接保存的原始 Generator `state_dict`。Generator 权重的键名或张量形状不兼容时会明确报错，不会悄悄进行部分加载。判别器权重如果能够完整加载就继承；否则自动重新初始化，并把实际结果写入新 Run 的 `metadata.json`。`--reset-discriminator` 可以强制重置判别器。对于无 step 元数据的模型，默认从 step 0 开始，也可用 `--step` 显式指定。Resume 仍要求原 Run 冻结配置及身份教师一致。不支持旧版本 Coarse/HQ 模型或训练状态迁移。新格式 `CHECKPOINT_VERSION=8`、`TRAINING_SEMANTICS_VERSION=25`。检查点包含 `net_g`（EMA）、`net_d` 和 `training_state`（训练权重、优化器、scaler、scheduler）；`face_alignment` 与 Generator identity provider 一并校验。Resume 必须继续原 run 的冻结 canonical config。
+
+预览：`python -m swapface.swapper --model <step.pth> --video <video> --identity <image>`；直接运行完整 Generator，不再提供中间分辨率模式。
+
+
+---
 
 ## 安装 GPU 后端
 
@@ -54,214 +83,6 @@ uv sync --locked --group rocm
 ```
 
 ROCm 不安装 DALI、TorchCodec、ONNX Runtime GPU、xFormers 或 TensorRT。NVIDIA 与 ROCm 组互斥。运行训练时建议使用 `uv run --no-sync ...`，避免再次同步环境。
-
-## 新建训练
-
-使用默认配置：
-
-```bash
-uv run python -m swapface.train
-```
-
-`experiments/train.toml` 在同一个文件中提供两组完整的 `[generator]` 示例：InSwapper 默认启用，StyleGAN2 整块注释。切换架构时，注释当前整块，再取消注释另一块；不能同时启用两个同名 TOML 表。
-
-显式指定配置：
-
-```bash
-uv run python -m swapface.train --config experiments/train.toml
-```
-
-添加便于识别的短标签：
-
-```bash
-uv run python -m swapface.train \
-  --config experiments/train.toml \
-  --name blendface-vgg
-```
-
-`--name` 只参与 run ID，不改变实验配置。默认结果根目录为 `experiments/runs`；如确有需要，可用 `--runs-root PATH` 覆盖。
-
-`[train].compile_module` 控制训练路径的 `torch.compile`：启用时，由 Trainer 分别编译 Coarse、HQRefiner、Discriminator、Generator 身份编码与 Identity Loss embedding 提取，以及启用的 VGG 热路径；设为 `false` 时，训练路径全部保持 eager。
-
-## 配置职责
-
-训练配置只存在一套 canonical schema；`swapface/config.py` 负责默认值、严格校验和 canonical 化，`Trainer` 直接消费该结构，不再维护第二套扁平配置参数。顶层职责为：
-
-- `[train]`：训练 stage、batch、precision、device、compile 与输出周期；
-- `[optimizer.*]` / `[scheduler.*]`：Generator、HQ D、Coarse D 各自的学习率与调度策略；
-- `[identity]`：Generator 的 source identity 条件编码器；
-- `[loss.*]`：每一种训练损失及其共享 reconstruction 策略；
-- `[data.loader]` / `[data.augmentation]` / `[data.sampling]`：数据执行、增强和配对采样；
-  - 色彩参数全部为 `0` 时跳过色彩增强；`flip_prob = 0` 时跳过翻转；几何四组参数分别为 `rotation_range = [0, 0]`、`scale_factor_range = [1, 1]`、`tx_range = [0, 0]`、`ty_range = [0, 0]` 时跳过随机仿射与重采样，直接返回恒等恢复矩阵。三类增强独立判断，FFHQ→ArcFace 固定对齐仍按 `data.alignment` 执行。PyTorch 与 DALI 数据管线均适用。
-  - 当几何增强关闭时，训练阶段的 IDLoss 直接执行固定身份裁剪，不再叠加恒等恢复矩阵；Gaze/SMIRK 与样本梯度可视化跳过恢复网格和重采样。Coarse 仍保留必要的分辨率上采样，在线遮挡和固定对齐不受影响。
-- `[[data.src]]` / `[[data.dst]]`：训练数据源；
-- `[generator]` / `[discriminator.hq]` / `[discriminator.coarse]`：Generator 与两个 Discriminator 的独立模型定义。
-
-Generator 条件编码器仍位于 `[identity]`。Coarse 与 HQ 的训练损失分别位于 `[loss.coarse.*]` 和 `[loss.hq.*]`，两边的 GAN、Identity teacher/weight、gaze、SMIRK（Pose/Expression/Jaw/Eyelid）、L1/VGG 与 reconstruction scope 均独立配置。`gan.weight` 只缩放对应阶段的 Generator adversarial loss，D 的 adversarial loss 固定权重 1.0。HQ 或 Coarse 选择 UNET 时，无论对应 `[loss.<stage>.r1].enable` 原始值如何都强制关闭 R1；其他判别器保留独立 R1 配置。
-
-### IDLoss 面部分割梯度过滤
-
-可在两个阶段的 `identity` 配置中独立指定 BiSeNet/CelebAMask-19 的排除类别：
-
-```toml
-[loss.coarse.identity]
-provider = "BLENDFACE"
-weight = 10.0
-exclude_parsing_labels = [4, 5, 12, 13]  # 左眼、右眼、上唇、下唇
-
-[loss.hq.identity]
-provider = "BLENDFACE"
-weight = 10.0
-exclude_parsing_labels = [4, 5, 11, 12, 13]  # 另外包含口腔内部
-```
-
-编号 4=左眼、5=右眼、11=口腔、12=上唇、13=下唇（CelebAMask-HQ 19 类定义）。支持 0～18 的不重复整数列表；`[]` 是默认值，不加载面部分割模型。开启后两个阶段共用项目已有的 `FaceMasker(mode="parsing")`，对每批尚未叠加在线遮挡的目标图像执行一次 FP32/no-grad 分割，输出与生成结果空间对齐的类别图；每阶段选择自己的排除类别，并与在线遮挡的 ID 门控相乘。Coarse 使用面积插值将门控缩小到其输出分辨率。新增 parsing teacher 不更新参数，结果不会回传到 teacher。
-
-`gate_identity_gradient` 保持输入像素及 IDLoss 标量值不变，但只允许未屏蔽像素向生成器回传 IDLoss 梯度；GAN、VGG、L1 与几何损失仍使用原始生成图像，不受影响。训练样本图中的 ID GRAD 使用同一门控，可以观察过滤效果。
-
-注意：被屏蔽区域的**直接图像梯度**归零，并不意味着训练后该区域的最终视觉结果绝对不变。卷积生成器的共享参数及其他 loss 仍可能间接改变该区域；分割错误、边缘过渡以及 Coarse 下采样同样会影响有效覆盖。使用非空列表需要额外下载 `79999_iter.pth`，并增加每个 batch 的一次分割前向计算；配置变更应使用新 run/branch，而不是修改已冻结 run 的 resume 配置。
-
-### 逐样本平滑阈值 IDLoss
-
-Coarse 与 HQ 可以分别启用最低身份相似度软约束。示例：
-
-```toml
-[loss.coarse.identity]
-provider = "BLENDFACE"
-weight = 10.0
-min_similarity = 0.70
-transition_width = 0.03
-
-[loss.hq.identity]
-provider = "BLENDFACE"
-weight = 10.0
-min_similarity = 0.70
-transition_width = 0.03
-```
-
-其中 `min_similarity` 是生成身份与参考身份的余弦相似度下限，不是 Loss 数值阈值；取值范围 [-1,1]，`transition_width` 必须不小于 1e-6，以避免 FP32 计算中极窄过渡带引起的数值不稳定。未配置 `min_similarity` 时使用基础 IDLoss（权重乘以 `1 - cosine_similarity`）。
-
-令 `s` 为该样本余弦相似度，`e=max(0,min_similarity-s)`，`w=transition_width`。逐样本 IDLoss 在 `e=0` 时为 0，在 `0<e<w` 时为 `weight * e²/(2w)`，在 `e>=w` 时为 `weight * (e-w/2)`，最后对 batch 求平均。由此：
-- 已达到下限的样本不再接收 IDLoss 梯度；
-- 阈值下方宽度为 `w` 的区间内，IDLoss 梯度强度从 0 平滑恢复到原权重；
-- 未达标且低于过渡区的样本保留原始身份梯度强度；
-- 其他 GAN、L1、VGG、SMIRK 等损失保持原权重及训练路径，不因身份达标而放大。
-
-训练日志新增 `coarse_id_similarity_mean` / `hq_id_similarity_mean`、`*_id_satisfied_fraction`、`*_id_gradient_scale_mean`（相对于原始 IDLoss 梯度的平均缩放系数）。仅启用软阈值的阶段输出这些指标。身份相似度门槛应按所选 ID teacher 在同身份/跨身份及多姿态样本上的分布校准；`0.70` 是实验初值，并非所有 encoder 的通用合格线。切换该配置会改变冻结的 run 配置，请创建新 run/branch，不要修改历史 resume 配置。
-
-### WebFace600K ArcFace R50（InSwapper-128 身份编码器）
-
-身份编码器可选 `WEBFACE600K_ARCFACE_R50`。它从项目共用模型仓库 `leehx/model_hub` 加载 `w600k_r50.pth`（原始权重来自 `Icar/buffalo_l-torch`，与 InsightFace `buffalo_l/w600k_r50.onnx` 输出数值等价），复用项目原有 IResNet50 / IBasicBlock 的 `fused_bn=True` 结构（与普通非融合 R50 checkpoint 不可互换）。权重与其他身份编码器一样通过公共 `MODEL_REPOSITORY_ID` 下载到 Hugging Face Hub 缓存，不把模型文件加入 Git。
-
-```toml
-[identity]
-provider = "WEBFACE600K_ARCFACE_R50"  # Generator 的 source embedding
-
-[loss.coarse.identity]
-provider = "MS1MV3_ARCFACE_R50_FP16"  # Identity teacher 可独立选择
-```
-
-与其他 Provider 一样，输入必须是 ArcFace 112 对齐的 RGB、`[-1,1]`，输出是 L2 归一化的 512 维 embedding。`[loss.hq.identity].provider` 也可以独立选择该模型。对应 CLI 的 `id-encoder --provider WEBFACE600K_ARCFACE_R50` 可用于导出 ONNX。这里仅接入 **身份编码器**；InSwapper 换脸模型内部的 `emap` 投影矩阵不属于该编码器，不会用于本项目的生成器。身份编码器始终使用骨干输出的原生 L2 归一化特征。InsightFace 的预训练权重有非商业研究用途限制，不因以 `.pth` 格式分发而获得商业使用授权。
-
-
-优化策略按训练实体分开配置：`[optimizer.generator]`、`[optimizer.hq_discriminator]`、`[optimizer.coarse_discriminator]` 分别设置 LR；对应的 `[scheduler.generator]`、`[scheduler.hq_discriminator]`、`[scheduler.coarse_discriminator]` 分别设置 `type / t_max / min_lr_ratio`。Adam 的 `betas=(0.0, 0.99)` 与 fused 实现仍固定在训练代码中。
-
-两个 Discriminator 的架构也完全独立：`[discriminator.hq].img_resolution` 必须等于 `generator.img_resolution`，`[discriminator.coarse].img_resolution` 必须等于 `generator.coarse_resolution`；两者的 `img_channels` 都必须等于 `generator.img_channels`。FIR_MINIBATCH_STD 和 INSTANCE_NORM_RESIDUAL 支持 `base_ch`/`max_ch`；HQ/Coarse 的 UNET 只消费 `base_ch`，通道数固定按 1、2、4、8 倍扩展。默认 FIR_MINIBATCH_STD 是单 Global Discriminator：Encoder 通过 residual block 与 FIR 抗混叠逐级下采样到 4x4，再经 MinibatchStd、3x3 Conv 和两层 Linear 输出每图一个 logit。INSTANCE_NORM_RESIDUAL 保留全局残差判别器。HQ/Coarse 均可使用 BasicSR `UNetDiscriminatorSN`：三层 stride-2 下采样，双线性上采样、可选加法跳连；`conv1`～`conv8` 使用 SpectralNorm，只有一个全分辨率空间 logits 输出 `[B,1,H,W]`。
-
-下采样残差块采用 StyleGAN2 顺序：残差分支 `Conv3x3 → LeakyReLU → FIR Blur → stride-2 Conv3x3 → LeakyReLU`，shortcut 分支 `FIR Blur → stride-2 Conv1x1`；使用 `DownFIRDn2d(conv_kernel_size=3/1)` 只做 FIR 预滤波，分别应用对应 padding，由后续 Stride-2 Conv 完成下采样；`DownFIRDn2d` 不再支持独立降采样模式。
-
-### 可选 HQ/Coarse UNet 判别器
-
-在新 run 配置中分别为 HQ 和 Coarse 选择（已有 run 修改判别器类型需 branch，并 reset 相应阶段的 Discriminator，不能原地 resume 改架构）：
-
-```toml
-[generator]
-# 以下两个参数在现有 generator 配置上修改，其余参数保持原值：
-coarse_resolution = 256
-
-[discriminator.coarse]
-type = "UNET"
-img_resolution = 256       # 与 generator.coarse_resolution 一致
-img_channels = 3
-base_ch = 64
-skip_connection = true
-
-[discriminator.hq]
-type = "UNET"
-img_resolution = 512       # 与 generator.img_resolution 一致
-img_channels = 3
-base_ch = 64
-skip_connection = true
-
-[loss.coarse.gan]
-weight = 1.0
-
-[loss.hq.gan]
-weight = 1.0
-
-[loss.coarse.r1]
-enable = false              # 使用 UNET 强制关闭；其余 R1 参数无效
-interval = 16
-gamma = 10.0
-
-[loss.hq.r1]
-enable = false              # 使用 UNET 强制关闭；其余 R1 参数无效
-interval = 16
-gamma = 10.0
-```
-
-上述片段仅展示需要关注的字段，**不要把 `[generator]` 覆盖成只有一个键的表**；应在现有完整 TOML 中修改 `generator.coarse_resolution` 和判别器分辨率。两个阶段可以独立选择 UNET，不需要同时启用。UNET 不再有 `max_ch` 参数；从 FIR 配置切换时即使保留 `max_ch`，也不会参与 UNET 模型构造或存入其 canonical config。`minibatch_std_group_size` 同样不参与 UNET。判别器没有固定的 128 分辨率限制；目前项目配置统一要求分辨率为不小于 16 的 2 的整数次幂，同时生成器还要求 Coarse 分辨率与其 latent resolution 满足整数 2 的幂倍率关系；HQ 的 img_resolution 必须与 generator.img_resolution 相等。UNET 内部三层 stride-2 下采样要求宽高都能被 8 整除。训练对抗损失直接对每像素 logits 应用 Hinge 后取均值；`return_feats=True` 返回四层 encoder 特征供 WFM 使用。每个启用 UNET 的阶段只绘制一行对应的 GAN GRAD，UNET 无 Global/Spatial 双头权重或 R1 日志。
-
-### 可选 StyleGAN2 Coarse
-
-现有 `models/networks.py::Generator` 可通过 `[generator].coarse_type` 选择 Coarse 实现。新配置规范始终包含 `coarse_type`（默认 `inswapper`），不再保留旧 run 的 canonical 哈希兼容逻辑。启用新架构示例：
-
-```toml
-[generator]
-img_resolution = 512
-coarse_resolution = 128
-coarse_type = "stylegan2"
-coarse_w_dim = 512
-coarse_mapping_layers = 8
-coarse_start_resolution = 32
-coarse_channels = [64, 512]            # [base_ch, max_ch]
-coarse_target_inject_mode = "add"      # "concat" 或 "add"
-coarse_target_inject_layers = [0]      # 相对于起始分辨率编号
-```
-
-`stylegan2` 使用 `models/stylegan2.py` 的条件生成器：Source Identity 经 Mapping Network 调制每个合成卷积，Target Encoder 仅向选中的分辨率层注入特征。`coarse_w_dim`、`coarse_mapping_layers` 控制身份映射；`coarse_start_resolution` 决定 Constant 与首层合成的分辨率（默认 4）；`coarse_channels = [base_ch, max_ch]` 以 Coarse 输出分辨率的通道数为 `base_ch`，向低分辨率每降低一半则通道数翻倍，最多为 `max_ch`（默认 `[128, 512]`）。即 `C(r) = min(max_ch, base_ch * coarse_resolution / r)`。
-
-StyleGAN2 可选 Mask 分支：`coarse_mask_enabled=true` 时创建独立的逐层 `ToMask` 1 通道调制卷积头；初始层输出 FP32 Logits，后续层将本层 Logits 与上采样的前层 Logits 在 FP32 中累加；仅在 Target 特征引导或请求 Mask 输出时执行 Sigmoid（不同于旧 StyleSwap 的逐层概率累加）。`return_mask=True` / `return_mask_logits=True` 可从 Coarse 或完整 Generator 取回概率 Mask / FP32 Logits；完整 Generator 将 Coarse Mask 双线性插值到 HQ 输出分辨率，`return_coarse=True` 时按 `(RGB, Coarse RGB, Mask)` 返回。HQ 不使用 Mask 参与 RGB 合成，常规 Generator/ONNX 导出仍只输出 RGB。`[loss.coarse.mask].weight` 默认为 `1.0`；教师 Mask 由冻结的 BiSeNet 在**在线遮挡前的 clean DST** 上得到的基础面部区域，乘以实际 Coarse IDLoss 梯度门控而成，包含 `exclude_parsing_labels` 和 `[data.occlusion]` 的可见性/软边缘约束；教师降采样使用 Area 保留软标签，不需要独立 `mask.labels` 配置；跨层累积使用 FP32 Logits，在需要特征引导时计算 FP32 Mask 概率，训练的最终监督使用 FP32 `BCEWithLogits`；不在跨层递推中叠加 Sigmoid，从而避免梯度反复经过非线性压缩；权重为 `0` 则不加载额外教师、也不计算 BCE。另有 `coarse_mask_noise_blank_level`（默认旧值 `9`，从绝对 4×4 层起算：8×8=1、16×16=3、32×32=5、64×64=7、128×128=9、256×256=11，不随 `coarse_start_resolution` 重新编号；满足 `i > level` 时生效）、`coarse_mask_guidance_epsilon`（默认 `1e-4`）及 `coarse_mask_guidance_interpolation`（`bilinear` / `nearest`）：启用 Mask 引导时，对该层需要注入的 Target 特征进行 Mask 加权区域均值替换；没有 Target 注入的层不会执行该计算。使用 `coarse_start_resolution=32` 时可设置 `coarse_mask_noise_blank_level=-1` 从第一层上采样起启用引导。Mask 关闭时不创建 Mask 参数，不改变原有生成器推理路径。
-
-`coarse_target_inject_mode` 可选 `concat`（拼接，开启注入的 StyledConv 输出通道翻倍）和 `add`（逐元素加法），默认 `concat`。`coarse_target_inject_layers` 支持非连续整数索引；`0` 对应 `coarse_start_resolution`，`1` 对应其两倍分辨率，以此类推。上例仅在 32×32 注入 Target；也可以设置 `[0, 2]` 分别在 32×32 和 128×128 注入，或设置 `[]` 禁用全部 Target 注入。未选中层仍接受 Source Identity 调制。默认在所有合成分辨率注入。Target Encoder 最多下采样到实际启用的最低注入分辨率；不启用任何注入时不会构建 Target Encoder。
-
-原 Coarse 的 `coarse_latent_resolution`、`coarse_num_latent`、`coarse_base_ch`、`coarse_max_ch` 不影响 StyleGAN2。`coarse_resolution` 必须为 4～1024 的 2 的整数次幂，且不超过 HQ 输出分辨率；`coarse_start_resolution` 必须是位于 4 到 `coarse_resolution` 之间的 2 的整数次幂。两种架构的检查点均使用当前版本协议，不迁移历史权重。
-
-两种 Coarse 共用 `coarse(target, identity, return_resize_in=True)` 接口：输入自动双线性缩放，输出形状为 `[B,3,coarse_resolution,coarse_resolution]`。当前两种 Coarse 与 HQRefiner 的 RGB 输出均为线性输出，不再通过 `tanh` 限制到 `[-1,1]`；训练损失负责约束输出，预览与保存时再裁剪到显示范围。InSwapper Coarse 与 HQRefiner 的隐藏层使用 SiLU，IDInject 仅在第一个 AdaIN 后使用 SiLU，第二个 AdaIN 的结果直接参与残差相加。InSwapper Coarse 恢复了 WSpaceMap：身份向量先经过四层共享残差映射，再经过 `2 × coarse_num_latent` 个两层私有残差映射，每个 AdaIN 独立接收一个 W 向量；原有 AdaIN 的仿射投影仍然保留。WSpaceMap 的隐藏层使用 SiLU，末层使用小权重初始化。拆分导出时，WSpaceMap 与 AdaIN 仿射投影一同位于服务端身份编码器，客户端只接收预计算的 gamma/beta。StyleGAN2 Coarse 仍使用 LeakyReLU。StyleGAN2 的注入增益初始为 0；训练初期 Target Encoder 的梯度需经注入增益逐步建立。
-
-**激活函数**：InSwapper Coarse/HQ 使用 SiLU 与线性 RGB 输出；新的训练实验不继承旧激活设计的权重。
-
-**新训练阶段**：检查点版本为 `7`，训练语义版本为 `24`，规范化 run 配置格式版本为 `2`。InSwapper 检查点包含 `w_space_map.*`；旧格式不支持加载或迁移。StyleGAN2 使用相同版本协议；新增 Mask 配置会改变开启 Mask 时的网络结构，训练或继承相应 Coarse 必须保持配置一致。
-
-**检查点隔离**：不同 Coarse 架构的权重不可互换。`resume`/继承 Coarse 的 `branch` 必须保持同一架构；HQ rebuild 只允许修改 HQ 配置，不允许把 InSwapper Coarse 的权重当成 StyleGAN2 权重。
-
-**ONNX 导出**：Generator 统一在 CPU 上执行 PyTorch strict export，`upfirdn2d` 展开为标准 ONNX 算子，不需要自定义 runtime 插件；`--device` 仅决定 IDEncoder 的导出设备。导出的 ONNX 仍需在目标 TensorRT 版本中独立验证 Engine 构建和性能。
-
-## Generator 梯度职责
-
-`[train].stage` 决定 active training stage：
-
-- `joint`：Coarse 与 HQRefiner 在同一个 iteration 中同时训练；
-- `coarse`：只训练 Coarse 与 Coarse Discriminator；训练 step 不执行 HQ forward、HQ D 或 HQ losses；
-- `hq`：Coarse 作为冻结的 conditioner 在 `no_grad` 下前向，只训练 HQRefiner 与 HQ Discriminator。
-
-Generator、HQ Discriminator、Coarse Discriminator 分别拥有独立的 optimizer/scheduler/GradScaler。inactive Discriminator 保持在 CPU，不创建 optimizer/scaler/scheduler，也不占用训练 GPU 显存；inactive Generator stage 参数没有 gradient。EMA 只更新 active Generator stage。`hq` 模式下 HQ 输入仍使用冻结 Coarse 的输出；`joint` 模式下 HQ 输入使用 `coarse.detach()`，因此 Final/HQ losses 不会反向修改 Coarse。
-
-- Coarse：`[loss.coarse]` 独立控制 source identity、coarse GAN、R1、gaze / SMIRK，以及 reconstruction scope 下的 L1/VGG；
-- HQ：`[loss.hq]` 独立控制 HQ identity、HQ GAN/R1、gaze / SMIRK，以及 reconstruction scope 下的 L1/VGG；
-- Discriminator：HQ 与 Coarse 分别维护 D optimizer、scheduler 和 GradScaler。默认 FIR 判别器通过 FIR 抗混叠下采样到 4x4，使用 MinibatchStd；普通 D step 将 fake/real 合并为一次 forward，但 MinibatchStd 仍分开统计。任一阶段选择 UNET 时仅使用空间输出 `[B,1,H,W]` 计算 Hinge GAN，保留 encoder WFM 特征接口；SN 为其卷积提供约束，因此在配置解析与 D loss 执行层都强制跳过 R1。其他判别器的 lazy R1 仍只基于 real 输入，在未编译的 FP32 判别器上计算并乘以 interval。joint 下两个 D 独立更新；一个 D 的 FP16 overflow 仅重试该 D。
-
-Coarse 内部首先将真实 `dst` 双线性缩放到 `coarse_resolution`；训练时通过 `return_resize_in=True` 复用这一实际模型输入作为 Coarse Discriminator real，以及 L1/VGG reconstruction target，不在 Trainer 中重复 resize。Coarse/HQ 的 L1 reconstruction 由各自的 `[loss.coarse.l1].gaussian_blur`、`[loss.hq.l1].gaussian_blur` 控制：整数 `0`（默认）直接计算逐像素 L1；正整数 `N` 启用 Gaussian blur（`sigma = 当前阶段分辨率 / N`），例如 `384` 对应之前硬编码的模糊强度，`256` 则更强。开启时仅对 prediction-target 差分进行等价的滤波，不影响 VGG，VGG 始终使用原图。Coarse L1/VGG 由 `[loss.coarse.reconstruction].scope` 控制作用范围；默认 `same`，只对 self-reconstruction pair 生效。Coarse 的 target 属性监督则先将低分辨率输出双线性上采样到训练分辨率，再使用与 Final 相同的 `theta_restore` 恢复到 canonical 坐标系，与 `dst_canonical` 比较。
 
 ## 训练数据源
 
@@ -317,213 +138,27 @@ experiments/
 
 各文件职责如下：
 
-- `config.toml`：启动该 run 时用户提供的 TOML 原文快照，便于人工阅读。
-- `config.resolved.json`：展开显式训练配置协议默认值后的规范配置；这是 run 的机器可读事实来源。
-- `metadata.json`：只记录 run ID、状态、配置摘要和可选的 branch 父来源。
-- `latest.json`：很小的最新 checkpoint 指针，不复制大模型文件，适合本地文件系统和对象存储。
-- `checkpoints/`：完整训练状态。
-- `samples/`：与 completed step 对齐的训练可视化；每一行最左侧标注该行含义。基础图包含 src、dst、Coarse、Final、canonical dst、Final Identity 输入；随后对 active stage 的 GAN/Identity 以及当前实际启用的 WFM/Gaze/SMIRK/VGG/L1 分别绘制原有 `loss_grad_map` 风格的梯度图。未启用的可选损失不占行，R1 不进入 sample 可视化。
+- `config.toml`：原始 TOML 配置快照。
+- `config.resolved.json`：含全部默认值的 canonical 配置及格式版本；Resume 以此为权威来源。
+- `metadata.json`：Run ID、状态、配置哈希及 Branch 父来源。
+- `latest.json`：指向最近一次成功保存的 checkpoint；不复制模型数据。
+- `checkpoints/`：模型、优化器、AMP scaler、调度器和训练状态。
+- `samples/`：EMA 输出、RGB 对比、身份输入和启用损失的梯度热力图。
+- `tensorboard/`：TensorBoard event 数据，Resume 可产生多个 event 文件。
 
-每个 active stage 在 EMA 输出图像上分别计算各项**已加权** Generator loss 的图像梯度 `g_i = dL_i / dx`，梯度只求导一次，标注以下量：
+每次训练完成一个完整 step 后才可保存检查点。检查点先写临时文件、原子替换，再更新 `latest.json`。
+`step_000010000.pth` 表示完成 10,000 步，`step_000010000.png` 是该步的可视化。
 
-- `RMS`：图像梯度的均方根幅度；`STR`：梯度 L2 范数占各损失范数之和的百分比。
-- `DIR`：单项梯度与合成梯度 `g = sum(g_i)` 的余弦相似度，取值 [-1, 1]。
-- `EFF`：`dot(g_i, g) / dot(g, g) * 100%`，表示沿合成梯度方向的有符号投影贡献。可以为负或大于 100%；当 `||g|| / sum(||g_i||) > 0.2` 时计算，其余高抵消率（80% 以上）场景显示 `N/A`，避免近零分母放大为不直观的极端百分比；仅在显示数值时各项之和为 100%。
-- `STAGE CANCEL`：`(1 - ||g|| / sum(||g_i||)) * 100%`，仅在该 stage 第一行梯度标签标注。当所有梯度为 0 时为 `N/A`；合成梯度小于各项范数之和的 0.01% 时，`DIR` 和 `EFF` 为 `N/A`，避免近乎完全抵消时分母过小。
+训练 Run 使用 `.run.lock` 防止并发 Resume 同一目录；创建新 Run 时自动分配唯一名称。
+梯度热力图的 `RMS/STR/DIR/EFF` 度量来自生成图像空间而非参数空间；R1 不参与图像梯度可视化。
 
-梯度图默认沿用**每项损失、每张图片独立归一化**的亮度表现；可将 `swapface/train.py` 中 `SAMPLE_GRADIENT_HEATMAP_SCALE` 改为 `"shared"`，让同一 stage 的不同损失对每张图使用共享亮度标尺。任何热力图归一化都不参与指标计算。上述指标位于**生成图像空间**，不等于生成器参数梯度、Adam 更新份额或实际训练每步的精确贡献；样本生成器采用 EMA 权重。
-- `tensorboard/`：TensorBoard event 文件；一次 resume 可能新增 event 文件，这是正常现象。
+## 恢复、派生与状态管理
 
-`experiments/*.toml` 可以进入 Git；`experiments/*/` 属于运行生成物，默认忽略。
-
-## Step 与文件命名
-
-当前 checkpoint 只保存一个权威的 `step`，表示已经完整完成的训练更新次数。
-
-文件名统一使用 **completed step**：
-
-```text
-step_000000001.pth
-step_000010000.pth
-step_000010000.png
-```
-
-例如 `step_000010000.pth` 表示已经完成 10,000 次训练更新。`train.checkpoint_save_every = 10000` 会在 completed step 10,000、20,000、30,000... 保存。
-
-checkpoint 仍通过临时文件写入后原子 `replace`；只有 checkpoint 成功落盘后才原子更新 `latest.json`。
-
-`completed step` 只在一轮完整的 Discriminator 更新、Generator 更新、scheduler（若启用）和 EMA 更新全部完成后推进。checkpoint 内部 `step` 与文件名中的 step 必须完全一致。因此从 `step_000050000.pth` 恢复后，在下一轮更新真正完成前，completed step 仍是 50,000，不会把正在执行的 partial step 标记成 50,001。
-
-## 中途恢复训练
-
-推荐直接指定 run：
-
-```bash
-uv run python -m swapface.train \
-  --resume experiments/runs/20260910-162600_blendface-vgg
-```
-
-程序会从 `latest.json` 找到 checkpoint，读取该 run 冻结的 resolved config，然后直接恢复 Generator、Discriminator、EMA、optimizer、scheduler 与 step，继续写入原 run。模型/优化器/scheduler 的 state dict 是否可加载由 PyTorch 自己校验。
-
-也可以显式指定同一 run 的 **latest checkpoint**：
-
-```bash
-uv run python -m swapface.train \
-  --resume experiments/runs/20260910-162600_blendface-vgg/checkpoints/step_000070000.pth
-```
-
-显式文件必须位于标准 `run/checkpoints/` 目录中，并且必须与 `latest.json` 指向同一文件。`--resume` 不允许从历史 checkpoint 回滚后继续写入原 run，否则会产生分叉历史并覆盖同 step 的 checkpoint/sample。历史 checkpoint 应通过 branch 创建新的 run。
-
-## Branch：从已有 checkpoint 派生新实验
-
-Branch 是一条新的训练时间线，不是 resume。普通 branch 从父 checkpoint 的**训练态 Generator**继续，默认同时继承父 Discriminator 权重；optimizer、scheduler 和 GradScaler 重新初始化。新配置可以改变 `[train].stage`，因此从 joint checkpoint 派生 `hq` 或 `coarse` 单 stage run 应使用 branch，而不是 resume。普通 branch 的 `completed_step` 默认继承父 checkpoint，便于直接比较分支前后的 TensorBoard loss 趋势：
-
-```bash
-uv run python -m swapface.train \
-  --branch-from experiments/runs/20260910-162600-blendface-vgg/checkpoints/step_000050000.pth \
-  --config experiments/train.toml \
-  --name new-experiment
-```
-
-`--branch-from` 必须显式提供 `--config`。新 run 的 `metadata.json.parent` 会记录父 `run_id`、checkpoint、父 step、配置摘要、branch mode，以及 Generator 的 Coarse/HQ 和两个 Discriminator 分别是 `inherit` 还是 `reset`。
-
-默认继承父 checkpoint 的 step。如果希望从其他 step 开始，单独指定 `--step`：
-
-```bash
-uv run python -m swapface.train \
-  --branch-from experiments/runs/<run_id>/checkpoints/step_000050000.pth \
-  --config experiments/train.toml \
-  --step 30000
-```
-
-`--step 0` 可以让新分支从 0 重新计数。这个值就是新 run 的实际 `completed_step` 起点，因此也会同时影响 EMA decay、sample/checkpoint 保存周期和文件名；它不是单独的 TensorBoard 显示偏移。
-
-普通 branch 要求 `[generator]` 与父 checkpoint 完全一致。默认还要求被继承的 Discriminator 架构一致。HQ D 与 Coarse D 可以分别重建：
-
-```bash
-# 只重建 HQ D
-uv run python -m swapface.train \
-  --branch-from experiments/runs/<run_id>/checkpoints/step_000050000.pth \
-  --config experiments/train.toml \
-  --reset-hq-discriminator
-
-# 只重建 Coarse D
-uv run python -m swapface.train \
-  --branch-from experiments/runs/<run_id>/checkpoints/step_000050000.pth \
-  --config experiments/train.toml \
-  --reset-coarse-discriminator
-```
-
-需要两个 D 都重建时同时传入两个开关。Branch metadata 会分别记录 HQ/Coarse D 的 `inherit` / `reset`。HQ D 与 Coarse D 的架构分别由 `[discriminator.hq]` 和 `[discriminator.coarse]` 控制，因此可以只修改并 reset 其中一个；任何选择 inherit 的 D 都只要求自己的架构与父 checkpoint 保持一致。无论是否恢复 D，Branch 都不会继承 G/D optimizer、scheduler 或 GradScaler；step 默认继承父 checkpoint，也可以由 `--step` 指定。
-
-默认训练语义使用单 Global Discriminator：Encoder 下采样到 4x4，保留 FIR 抗混叠与 MinibatchStd，移除 SpectralNorm，并使用 real-only lazy R1。HQ/Coarse 均可选择 BasicSR UNET 的 SN 单空间输出训练路径，选择的阶段强制关闭 R1。Resume 与 Branch 都只接受当前训练语义版本的 checkpoint，不提供旧训练结果迁移兼容。
-
-### HQ rebuild：继承 Coarse，用新分辨率从零训练 HQ
-
-当新配置使用 `train.stage = "hq"` 且 Generator 架构与父 checkpoint 不同时，Branch 会进入 **HQ rebuild** 模式。该模式只允许 HQ 部分变化；Coarse 的结构参数必须与父 checkpoint 完全一致，并且 `[identity].provider` 必须保持一致，因为冻结 Coarse 仍依赖同一 identity embedding 空间。
-
-HQ rebuild 的固定语义为：
-
-- 从父 checkpoint 的 `training_state.net_g` 中只提取并严格加载 `coarse.*`；
-- 新配置重新创建 HQ，旧 HQ 权重完全不加载；
-- HQ Discriminator 自动重新初始化，不需要额外传 `--reset-hq-discriminator`；
-- Coarse 冻结并保持 `eval()`，HQ 为唯一可训练 Generator stage；
-- Generator optimizer 只包含 HQ 参数；HQ D optimizer/scheduler/GradScaler 全部重新初始化；
-- 新 run 强制从 `step 0` 开始，省略 `--step` 即可；显式非零 `--step` 会被拒绝；
-- EMA 从“继承后的 Coarse + 新初始化 HQ”复制得到，后续只更新 HQ EMA，因此训练态/EMA 的冻结 Coarse 始终一致。
-- 启动时会打印所有实际发生变化的 HQ Generator 配置项（`old -> new`），以及 Coarse/HQ/HQ D 的 inherit/reset 状态、identity provider 和起始 step。
-
-例如，从一个 HQ256/Coarse128 checkpoint 开始训练新的 HQ512：
-
-```bash
-uv run python -m swapface.train \
-  --branch-from experiments/runs/<run_id>/checkpoints/step_000080000.pth \
-  --config experiments/train-hq512.toml \
-  --name hq512
-```
-
-新配置应保持 Coarse 参数不变，只修改 HQ/full-resolution 相关配置，例如：
-
-```toml
-[train]
-stage = "hq"
-
-[generator]
-img_resolution = 512
-coarse_resolution = 128
-coarse_latent_resolution = 32
-coarse_num_latent = 8
-coarse_base_ch = 64
-coarse_max_ch = 512
-hq_bottleneck_resolution = 16
-hq_base_ch = 8
-hq_max_ch = 128
-
-[discriminator.hq]
-img_resolution = 512
-```
-
-`img_resolution`、`hq_bottleneck_resolution`、`hq_base_ch`、`hq_max_ch` 等 HQ 结构参数都可以改变，因为 HQ 会完整重建；`img_channels`、`id_dim` 和所有 `coarse_*` 结构参数共同决定 Coarse 架构，不能变化。
-
-因此三种入口的语义为：
-
-- **fresh**：新 Generator、新 Discriminator、新训练状态；
-- **resume**：原 run、原冻结配置、latest checkpoint，完整恢复训练态 Generator、EMA、Discriminator、optimizer、scheduler、GradScaler 与 step；
-- **branch**：新 run；普通 branch 继承父训练态 Generator，HQ rebuild 只继承 Coarse 并重建 HQ/HQ D；optimizer/scheduler/GradScaler 均重新初始化。普通 branch 的 step 默认继承父 checkpoint，HQ rebuild 固定从 0 开始。
-
-Branch 和 Resume 均要求 `training_config.semantics_version` 与当前版本一致；Branch 虽不恢复优化器状态，也不能导入旧训练语义。
-
-### 可选严格校验训练精度
-
-`[train].precision` 必须显式配置，支持 `fp32`、`fp16`、`bf16`。FP16 使用 Generator、HQ Discriminator、Coarse Discriminator 三个独立 `GradScaler`；BF16 不使用 loss scaling。仿射恢复与 SMIRK 编码器的损失计算固定为 FP32。
-
-FP16 中只有实际执行了 optimizer update 的阶段才推进对应 scheduler。D overflow 时当前 global step 不推进；D 已成功而 G overflow 时只重算并重试 G，直到 G 成功后才更新 EMA 和 `completed_step`。任一 active D stage 的 loss 或 `g_loss` 出现 NaN/Inf 时直接终止，避免把非有限值误当作可通过降低 loss scale 恢复的 overflow。BF16/FP32 在 backward 后、`optimizer.step()` 前额外检查参数梯度；若任一梯度出现 NaN/Inf，则报告首个异常参数并终止，避免污染模型参数和 optimizer state。FP16 的梯度 overflow 仍由 `GradScaler` 负责跳过 update 和动态调整 scale，不走该 fatal gradient guard。
-
-默认 resume 不要求当前实际训练精度与 checkpoint 一致，因为设备和软件环境可能变化。需要严格复现时可显式使用：
-
-```bash
-uv run python -m swapface.train \
-  --resume experiments/runs/<run_id> \
-  --strict-precision
-```
-
-此时程序比较 checkpoint 中记录的实际 `training_config.precision` 与当前进程实际生效的精度；不一致时拒绝 resume。`--strict-precision` 是本次 resume 的运行时策略，不写入 TOML，也不能用于 fresh training。
-
-训练 checkpoint 还记录 `training_config.semantics_version` 和实际 `stage`。Resume 与 Branch 都要求 checkpoint 的 `semantics_version` 与当前训练代码完全一致，不提供旧训练语义迁移；Resume 还要求 active stage 一致，因为它会恢复 optimizer/scheduler/scaler 状态。Branch 不恢复这些状态，因此在当前训练语义版本内仍允许通过新配置切换 stage。纯推理/导出仍只依赖模型 checkpoint 格式。
-
-## 配置冻结与哈希
-
-run 同时保存用户原始 TOML 与由 `swapface/config.py` 按显式训练配置协议展开的规范 JSON：
-
-```text
-config.toml           # 用户输入原文
-config.resolved.json  # 完整、显式、可哈希的规范配置
-```
-
-`config.resolved.json` 会显式记录：
-
-- `[train]` 的协议默认值；
-- Generator / Discriminator 的协议默认值；
-- dataloader 的协议默认值；
-- Identity encoder 的协议默认值；
-- VGG 的协议默认权重；
-- 本地数据源 path/adjustment。
-
-其规范 JSON 内容计算 SHA-256 并写入 `metadata.json`。新 checkpoint 也记录同一摘要与 run ID；resume 时若摘要或 run ID 不一致，会拒绝继续训练。
-
-## Run 状态
-
-`metadata.json` 的 `status` 会在生命周期中更新：
-
-```text
-created -> running -> interrupted
-                   -> failed
-                   -> completed
-```
-
-Ctrl+C 属于 `interrupted`，后续可直接 `--resume`。训练开始后第一次 Ctrl+C 会请求在当前完整 step 结束后退出，从而保存一致的 checkpoint；再次 Ctrl+C 会立即中断，如果此时不在完整 step 边界则拒绝保存 partial checkpoint，并保持已有 `latest.json` 不变。初始化或训练异常会记录错误类型与消息并标记为 `failed`。训练进程因 Ctrl+C 退出时返回非零状态码 130。
-
-同一个 run 还会持有 `.run.lock` 的 Linux advisory lock。若另一个训练进程同时尝试 resume 同一 run，会立即拒绝启动；锁由内核绑定到进程/文件描述符，进程崩溃后会自动释放，因此不会出现“残留 lockfile 导致永久锁死”的问题。
+- `--resume experiments/runs/<run-id>`：必须继续该 Run 的 `latest`，并读取冻结的 `config.resolved.json`。传入历史 checkpoint 会被拒绝。
+- `--branch-from /path/to/model.pth --config experiments/train.toml`：创建新 Run，只要求来源 Generator 权重能严格加载，不限制文件名、模型配置元数据、损失教师及数据对齐方式；没有训练权重时尝试 EMA/推理权重。判别器权重不兼容则自动重置。
+- 可选 `--step N` 只影响 Branch 的新起始 completed step，不重置权重；`--strict-precision` 仅对 Resume 生效。
+- 收到一次 Ctrl+C 时请求在完整 step 边界保存并退出；进程故障不会将 partial step 误写为 latest。
+- Run 状态写入 `metadata.json`：`created`、`running`、`interrupted`、`failed` 或 `completed`。
 
 ## TensorBoard
 
@@ -535,13 +170,9 @@ uv run tensorboard --logdir experiments/runs
 
 恢复同一个 run 后，TensorBoard 目录可能出现多个 `events.out.tfevents.*`。它们仍属于同一逻辑 run；恢复时会设置 `purge_step`，让 TensorBoard 隐藏上次进程在最后 checkpoint 之后写出的失效 future steps，避免回滚恢复后出现重复曲线。
 
-## 在线遮挡增强（Phase 2）
+## 在线遮挡增强
 
-可选 `[data.occlusion]`：`prob` 为样本遮挡概率（0～1），`assets_dir` 为裁剪成透明 RGBA 的 PNG/WebP 遮挡素材目录；不设置目录或设为空字符串时，使用程序化随机纹理遮挡（RandOcc，**真实感弱于 NatOcc 手/物体素材**）。关闭时不加载 OCC 模型、不额外执行推理。素材在初始化时预加载到 GPU，训练循环内仅用批量仿射采样和 Alpha 合成。
-
-遮挡只施加于 `dst`，因此 Generator 输入、Discriminator real/fake、L1/VGG 的 real target 均同步包含遮挡；`src`、`source_identity_faces` 与几何教师使用的干净 `dst_canonical` 不变。新增 `ID` 专属可见区域梯度门控：针对本批被遮挡的样本，使用项目现有 `FaceMasker(mode="occlusion")` 对**遮挡前、已增强的 dst** 推理，并结合合成遮挡的 Alpha，只允许可见面部像素接收 ID 梯度。未遮挡样本不改变原有 ID 梯度。Coarse 门控缩放至对应输出分辨率。遮挡样本的 ID encoder 仍然观察生成的遮挡面部，梯度门控不等价于无损恢复身份特征。
-
-当前 OCC checkpoint 在 `eval()` 模式下可能输出全零，因此跟随现有 `swapper.py` 使用训练模式并冻结参数、关闭梯度；模型内部 BatchNorm 仍依据选中样本的 batch 统计运行。**这并不是几何鲁棒性的完整实现**：Gaze 尚无独立的遮挡置信度控制；SMIRK 已按合成遮挡可见区域比例降权，但该比例并非教师估计置信度，无法可靠识别自然遮挡及极端姿态的估计错误。建议结合模型梯度贡献与遮挡实验评估。OCC 需要在训练时额外执行一次小 batch 前向，当前未对吞吐做硬保证。
+通过 `[data.occlusion]` 启用在线合成遮挡；删除该表或令 `prob = 0.0` 可关闭。`prob` 为样本概率（0～1），`assets_dir` 是本地透明 RGBA PNG/WebP 素材目录；空目录配置可使用程序化遮挡。遮挡影响生成器输入 `dst`，但不改变 Source 身份或目标 canonical 几何参考。ID 梯度可按可见区域过滤，SMIRK 按遮挡的原始可见比例降权；天然遮挡无法由此可靠识别。相关额外教师和遮挡采样可能增加训练时间。
 
 ### 已预处理的 NatOcc 遮挡素材（2026-10-23）
 
@@ -606,7 +237,6 @@ uv run --no-sync python tools/prepare_occluders.py \
   --output /path/to/rgba-occluders
 ```
 
-
 ### 生成对齐标准（FFHQ / ArcFace-128 模板体系）
 
 在 TOML 的 `[data]` 节添加 `alignment = "arcface"` 可启用全局 ArcFace-128 模板体系的生成坐标系（始终按 128 基准五点模板缩放，不是 112 模板等比缩放）。
@@ -626,13 +256,10 @@ uv run --no-sync python tools/prepare_occluders.py \
   严格 resume 禁止切换模式，切换应新建 run（可使用 branch）。
 - 切换对齐标准后的图像空间分布不同，不建议将新模型直接视作原 checkpoint 的无缝续训。
 
+## SMIRK 面部动态监督
 
-### SMIRK 面部动态监督
+`[loss.smirk]` 提供 `enable`、`pose_weight`、`expression_weight`、`jaw_weight`、`eyelid_weight`。使用冻结的 SMIRK Encoder 监督生成图像与 Target 的头部姿态、表情、下颌和眼睑运动。几何增强开启时，先恢复至 Target canonical 坐标系，再使用 RGB `[0,1]`、224×224 的 FP32 输入。
 
-`[loss.coarse.smirk]`、`[loss.hq.smirk]` 独立配置 `enable`、`pose_weight`、`expression_weight`、`jaw_weight`、`eyelid_weight`。对应项使用官方 SMIRK Encoder（不需要 FLAME、PyTorch3D 或生成器），分别对比 Target 与生成图像的 FLAME 轴角姿态所构成的旋转矩阵、50 维 Expression、3 维 Jaw 和 2 维 Eyelid 输出；冻结教师权重、Target 无梯度、生成侧保留反向梯度。监督在恢复至 Target canonical 朝向的图像上计算，SMIRK 输入使用 RGB [0,1]、224×224、FP32，独立于训练 AMP 精度。Coarse/HQ 共用同一教师实例。
+Jaw/Eyelid 越界时仍通过 Straight-Through 估计保持训练梯度，Pose 旋转矩阵与损失归约也固定 FP32。Target 教师结果在一个训练 step 内复用，跳过非有限结果；日志分别记录 `smirk_pose_loss`、`smirk_expression_loss`、`smirk_jaw_loss`、`smirk_eyelid_loss`。该模型不直接约束完整嘴唇轮廓和眼球注视方向（后者由 Gaze Loss 负责）。
 
-SMIRK 监督实现保证：生成分支的 Jaw/Eyelid 物理输出沿用官方的 clamp/ReLU 前向范围，但通过 Straight-Through 估计避免越界时的零梯度；Pose 旋转矩阵与损失归约均强制 FP32，不受外层 FP16/BF16 Autocast 影响。Joint 模式对每个 Batch 的 Target 只运行一次 SMIRK Encoder，并复用于 Coarse/HQ 及 Generator overflow 重试。Target 教师输出中存在 NaN/Inf 的样本被逐样本排除，同时记录 `coarse_smirk_valid_fraction` / `hq_smirk_valid_fraction`。该指标**只说明数值有限**，不是预训练 SMIRK 的姿态/表情置信度。
-
-若启用在线遮挡增强，SMIRK 监督按该增强提供的原始可见区域比例降低权重，不与 IDLoss 的语义分割过滤掩码混用；但这只能降低**合成遮挡**造成的异常监督，并不能可靠识别天然遮挡。当前输入是 FFHQ/ArcFace canonical 图像直接缩放为 224×224；SMIRK 原始训练还有基于面部关键点的裁剪及尺度增强，因此**输入分布是否匹配实际目标数据**仍需用真实样本检验，不应未经标定就引入固定的中心裁剪/放大参数。缺少额外嘴唇关键点教师时，不把 SMIRK Jaw 虚称为 MouthState：完整唇形、露齿与左右嘴角状态目前仍无独立损失。
-
-仅在启用 SMIRK 的阶段初始化时，从 Hugging Face `Skywork/SkyReels-A1` 的 `extra_models/smirk/SMIRK_em1.pt` 自动下载官方预训练权重，复用其他教师模型相同的 `hf_hub_download()` 本地缓存机制（遵循 `HF_HOME`）；不需要配置文件路径，也不需要额外下载脚本。项目公共仓库 `leehx/model_hub` 当前未收录此权重，因此采用经 SHA-256 与 SMIRK 官方 Google Drive 权重逐字节验证的公开镜像，固定 commit revision `6cee256d5ea38dbbe87ff026566c95b6401d3124` 和文件 SHA-256 `26b234e3cc31a5de226bcba4321bb5d7343a2ad48234c028b57a1c2f8c2d22d0`。下载失败、摘要不匹配或 state_dict 不完整时直接报错，拒绝随机教师。阶段日志包含 `coarse_smirk_{pose,expression,jaw,eyelid}_loss` 和 HQ 对应项，样本梯度图包含整体 SMIRK 梯度。眼球方向仍由独立 Gaze Loss 监督；SMIRK Jaw 不等于嘴唇几何。旧训练配置里的两个废弃损失表不再接受，也不提供兼容映射。
+SMIRK 预训练模型由 Hugging Face `Skywork/SkyReels-A1` 仓库的 `extra_models/smirk/SMIRK_em1.pt` 自动下载，固定 revision `6cee256d5ea38dbbe87ff026566c95b6401d3124` 与 SHA-256 `26b234e3cc31a5de226bcba4321bb5d7343a2ad48234c028b57a1c2f8c2d22d0`。未获取到可信的权重时拒绝继续，而非使用随机教师。输出是否匹配真实训练人脸仍需单独验证。

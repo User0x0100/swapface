@@ -36,44 +36,43 @@ class FakeEncoder(nn.Module):
         return F.normalize(self.backbone(image.mean((2, 3))), dim=1)
 
 
-def _generator(coarse_type: str) -> Generator:
-    model = Generator(
-        img_resolution=16, img_channels=3, coarse_resolution=8,
-        coarse_latent_resolution=4, coarse_num_latent=2,
-        coarse_base_ch=4, coarse_max_ch=8,
-        hq_bottleneck_resolution=4, hq_base_ch=2, hq_max_ch=8,
-        coarse_type=coarse_type,
-    ).eval()
+def _generator(generator_type: str) -> Generator:
+    common = {"img_resolution": 16, "id_dim": 512, "type": generator_type}
+    if generator_type == "inswapper":
+        common.update(latent_resolution=4, num_latent=2, base_ch=4, max_ch=8, skip_mode="cat", skip_layers=[0, 1])
+    else:
+        common.update(w_dim=32, mapping_layers=1, start_resolution=4, channels=[8, 16])
+    model = Generator(**common).eval()
     model.face_alignment = "ffhq"
     return model
 
 
-def _run_pair(coarse_type: str, root: Path) -> None:
-    model = _generator(coarse_type)
-    if coarse_type == "stylegan2":
+def _run_pair(generator_type: str, root: Path) -> None:
+    model = _generator(generator_type)
+    if generator_type == "stylegan2":
         # Exercise Target feature concatenation, not only the zero-gain initial state.
         with torch.no_grad():
-            for module in model.coarse.modules():
+            for module in model.core.modules():
                 if hasattr(module, "inject_gain"):
                     module.inject_gain.fill_(0.25)
     encoder = FakeEncoder().eval()
     server, client = build_split_models(model, encoder)
-    assert server.projection.coarse_type == client.coarse_type == coarse_type
+    assert server.projection.generator_type == client.generator_type == generator_type
     assert server.projection.condition_width == client.condition_width
     assert not any(isinstance(module, nn.Linear) for module in client.modules())
-    if coarse_type == "inswapper":
-        assert len(server.projection.mapping.linears) == len(model.coarse.latent_space.layers) * 2
+    if generator_type == "inswapper":
+        assert len(server.projection.mapping.linears) == len(model.core.latent_space.layers) * 2
         assert len(server.projection.mapping.w_space_map.private_delta) == len(server.projection.mapping.linears)
         assert not any("w_space_map" in key for key in client.state_dict())
         with torch.inference_mode():
             identity_probe = torch.randn(2, 512)
-            w_space = model.coarse.w_space_map(identity_probe)
+            w_space = model.core.w_space_map(identity_probe)
             expected = torch.cat([
                 linear(w) for linear, w in zip(server.projection.mapping.linears, w_space, strict=True)
             ], dim=1)
             torch.testing.assert_close(server.projection(identity_probe), expected)
     else:
-        assert len(server.projection.mapping.modulations) == 2 + len(model.coarse.generator.stages) * 3
+        assert len(server.projection.mapping.modulations) == 2 + len(model.core.generator.stages) * 3
     assert not any(
         any(part in key for part in ("linear", "modulation", "id_mapping", ".style."))
         for key in client.state_dict()
@@ -95,7 +94,7 @@ def _run_pair(coarse_type: str, root: Path) -> None:
 
     # Exercise the actual CLI export path, including independent directories,
     # metadata contract, pair ID, and CPU ONNX Runtime numeric compatibility.
-    path = root / f"{coarse_type}.pth"
+    path = root / f"{generator_type}.pth"
     provider = IDEncoderProvider.MS1MV3_ARCFACE_R50_FP16
     torch.save({
         "version": CHECKPOINT_VERSION,
@@ -112,7 +111,7 @@ def _run_pair(coarse_type: str, root: Path) -> None:
         client_path, server_path, actual_provider = export_split(
             checkpoint_path=str(path), batch_size=1,
             device="cpu", output_dir=str(root / "onnx"),
-            file_prefix=coarse_type,
+            file_prefix=generator_type,
             export_options=OnnxExportOptions(opset_version=18),
         )
     assert actual_provider is provider
@@ -122,8 +121,8 @@ def _run_pair(coarse_type: str, root: Path) -> None:
     assert manifest["condition_width"] == client.condition_width
     assert len(manifest["pair_id"]) == 64
     assert manifest["generator_id"] and manifest["encoder_id"]
-    assert manifest["coarse_type"] == coarse_type
-    assert manifest["batch_size"] == 1 and manifest["version"] == 2
+    assert manifest["generator_type"] == generator_type
+    assert manifest["batch_size"] == 1 and manifest["version"] == 3
     assert manifest["artifacts"]["client"]["onnx"] == client_path.name
     assert manifest["artifacts"]["server"]["onnx"] == server_path.name
     assert {item.name for item in client_path.parent.iterdir()} == {client_path.name, server_path.name, "manifest.json"}
@@ -180,9 +179,9 @@ def _run_pair(coarse_type: str, root: Path) -> None:
 
 
 
-def _test_nchw_pair(root: Path, coarse_type: str) -> None:
-    model = _generator(coarse_type)
-    checkpoint = root / f"{coarse_type}-nchw.pth"
+def _test_nchw_pair(root: Path, generator_type: str) -> None:
+    model = _generator(generator_type)
+    checkpoint = root / f"{generator_type}-nchw.pth"
     provider = IDEncoderProvider.BLENDFACE
     torch.save({
         "version": CHECKPOINT_VERSION,
@@ -215,7 +214,7 @@ def _test_pair_identity() -> None:
     provider = IDEncoderProvider.BLENDFACE
 
     def pair(gen: Generator = model, enc: nn.Module = encoder, batch: int = 1, layout: str = "NHWC") -> dict:
-        return _pair_identity(gen, enc, provider=provider, coarse_type="inswapper", condition_width=64, batch_size=batch, layout=layout)
+        return _pair_identity(gen, enc, provider=provider, generator_type="inswapper", condition_width=64, batch_size=batch, layout=layout)
 
     initial = pair()
     assert initial == pair(deepcopy(model), deepcopy(encoder)), "pair id must follow effective weights, not checkpoint packaging"
@@ -223,12 +222,12 @@ def _test_pair_identity() -> None:
     assert initial["pair_id"] != pair(layout="NCHW")["pair_id"]
     changed = deepcopy(model)
     with torch.no_grad():
-        changed.coarse.latent_space.layers[0].adain0.linear.weight[0, 0] += 0.125
+        changed.core.latent_space.layers[0].adain0.linear.weight[0, 0] += 0.125
     assert initial["generator_id"] != pair(gen=changed)["generator_id"]
     assert initial["encoder_id"] == pair(gen=changed)["encoder_id"]
     changed_mapping = deepcopy(model)
     with torch.no_grad():
-        changed_mapping.coarse.w_space_map.private_delta[0][-1].weight[0, 0] += 0.125
+        changed_mapping.core.w_space_map.private_delta[0][-1].weight[0, 0] += 0.125
     assert initial["generator_id"] != pair(gen=changed_mapping)["generator_id"]
     changed_encoder = deepcopy(encoder)
     with torch.no_grad():
@@ -292,10 +291,10 @@ def main() -> None:
     _test_pair_identity()
     with TemporaryDirectory(prefix="swapface-split-test-") as tmp:
         _test_failure_cleanup(Path(tmp))
-        for coarse_type in ("inswapper", "stylegan2"):
-            print(f"Testing split export: {coarse_type}", flush=True)
-            _run_pair(coarse_type, Path(tmp))
-            _test_nchw_pair(Path(tmp), coarse_type)
+        for generator_type in ("inswapper", "stylegan2"):
+            print(f"Testing split export: {generator_type}", flush=True)
+            _run_pair(generator_type, Path(tmp))
+            _test_nchw_pair(Path(tmp), generator_type)
     print("PASS: split InSwapper/StyleGAN2 model parity, ONNX export, and ORT execution")
 
 
