@@ -124,14 +124,18 @@ def main() -> None:
 
     trainer = Trainer.__new__(Trainer)
     trainer.dataset = DummyLoader()
+    trainer.face_parser = None
+    trainer.parsing_exclusion_indices = None
+    trainer.enable_mask_loss = False
     trainer.occlusion = aug
     batch = trainer._next_training_batch()
-    assert len(batch) == 7 and torch.equal(batch[0], torch.ones_like(clean))
+    assert len(batch) == 9 and torch.equal(batch[0], torch.ones_like(clean))
     assert torch.equal(batch[2], clean) and torch.equal(batch[5], torch.zeros(4, 3, 112, 112))
     assert batch[6].shape == (4, 1, 64, 64) and not torch.equal(batch[1], clean)
+    assert batch[7].shape == (4,) and batch[8] is None
     trainer.occlusion = None
     clean_batch = trainer._next_training_batch()
-    assert torch.equal(clean_batch[1], clean) and clean_batch[6] is None
+    assert torch.equal(clean_batch[1], clean) and clean_batch[6:] == (None, None, None)
 
     # 无素材时也能使用 RandOcc 路径，不依赖外部文件。
     aug = OcclusionAugmentor(1.0, "", torch.device("cpu"), visible_face, **GEOMETRY)

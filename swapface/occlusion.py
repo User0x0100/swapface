@@ -85,13 +85,15 @@ class OcclusionAugmentor:
     def apply(self, dst: Tensor) -> tuple[Tensor, Tensor]:
         """返回带遮挡 dst，以及 ID 梯度门控 (B,1,H,W)。非遮挡样本门控恒为 1。"""
         batch, _, height, width = dst.shape
-        selected = (torch.rand(batch, device=dst.device) < self.probability).nonzero().flatten()
+        # 在 CPU 上决定变长索引，避免 GPU nonzero() 强制同步整个 CUDA 流。
+        selected_cpu = (torch.rand(batch, device="cpu") < self.probability).nonzero().flatten()
         gate = torch.ones((batch, 1, height, width), device=dst.device, dtype=dst.dtype)
-        if selected.numel() == 0:
+        count = selected_cpu.numel()
+        if count == 0:
             return dst, gate
 
+        selected = selected_cpu.to(dst.device)
         clean = dst.index_select(0, selected)
-        count = clean.shape[0]
         # 素材画布长边相对于训练图像边长的百分比；中心偏移以图像中心为 0。
         # affine_grid 的坐标范围为 [-1,1]，因此中心偏移百分比乘以 2/100。
         scale = torch.empty((count,), device=dst.device).uniform_(*self.size_range_pct).mul_(0.01)
