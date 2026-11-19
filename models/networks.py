@@ -338,6 +338,50 @@ class Generator(nn.Module):
 
 
 if __name__ == "__main__":
-    model = Generator(img_resolution=32, latent_resolution=8, num_latent=1, base_ch=8,
-                      max_ch=32, skip_layers=[0, 1])
-    print(model(torch.randn(1, 3, 32, 32), torch.randn(1, 512)).shape)
+    import argparse
+    import tomllib
+    from pathlib import Path
+
+    from fvcore.nn import FlopCountAnalysis
+    from torchinfo import summary
+
+    from swapface.config import _normalize_generator
+
+    parser = argparse.ArgumentParser(description="统计单阶段 Generator 的参数量与推理计算量")
+    parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parents[1] / "experiments/train.toml")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    args = parser.parse_args()
+    if args.batch_size < 1:
+        parser.error("--batch-size must be positive")
+
+    with args.config.open("rb") as file:
+        network_cfg = _normalize_generator({"generator": tomllib.load(file)["generator"]})
+    device_name = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
+    device = torch.device(device_name)
+    model = Generator(**network_cfg).to(device).eval()
+    target = torch.randn(args.batch_size, 3, network_cfg["img_resolution"], network_cfg["img_resolution"], device=device)
+    identity = torch.randn(args.batch_size, network_cfg["id_dim"], device=device)
+
+    summary(
+        model,
+        input_data=(target, identity),
+        depth=3,
+        col_names=("input_size", "output_size", "num_params", "kernel_size", "mult_adds"),
+        row_settings=("var_names",),
+    )
+    with torch.inference_mode():
+        output = model(target, identity)
+    print(f"output: {tuple(output.shape)}")
+    print("NetWork_Info:")
+    for key, value in network_cfg.items():
+        print(f"  {key:30}: {value}")
+
+    flops = FlopCountAnalysis(model, (target, identity))
+    flops.unsupported_ops_warnings(False)
+    macs = flops.total()
+    print(f"\n模型总MACs（fvcore 可统计算子）: {macs / 1e9:.4f} GMACs")
+    print(f"约合FLOPs（按 1 MAC = 2 FLOPs）: {2 * macs / 1e9:.4f} GFLOPs")
+    unsupported = flops.unsupported_ops()
+    if unsupported:
+        print(f"未计入算子: {', '.join(sorted(unsupported))}")
