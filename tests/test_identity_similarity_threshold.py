@@ -177,15 +177,13 @@ def test_trainer_logs_threshold_coverage_without_grad(identity_criterion) -> Non
     trainer.log_interval = 10
     metrics = {}
     trainer.log = lambda key, value: metrics.update({key: value.detach()})
-    trainer._log_identity_threshold_metrics(criterion, generated, reference)
+    _, similarity = criterion(generated, reference, return_similarity=True)
+    trainer._log_identity_threshold_metrics(criterion, similarity)
 
     assert metrics["id_similarity_mean"].item() == pytest.approx(sum([0.9, 0.69, 0.4]) / 3, abs=1e-6)
     assert metrics["id_satisfied_fraction"].item() == pytest.approx(1 / 3)
     assert metrics["id_gradient_scale_mean"].item() == pytest.approx((0 + 1 / 3 + 1) / 3, abs=1e-5)
     assert not any(value.requires_grad for value in metrics.values())
-    metrics.clear()
-    trainer._log_identity_threshold_metrics(identity_criterion(min_similarity=None), generated, reference)
-    assert metrics == {}
 
 
 def test_threshold_identity_loss_fullgraph_compile(identity_criterion) -> None:
@@ -219,24 +217,60 @@ def test_minimum_transition_width_has_finite_backward(identity_criterion) -> Non
     assert grad[1].abs().sum() > 0
 
 
-def test_threshold_logging_skips_all_similarity_ops_between_intervals(identity_criterion, monkeypatch) -> None:
+@pytest.mark.parametrize("completed_step", [0, 9])
+def test_trainer_reuses_similarity_without_duplicate_cosine(
+    identity_criterion, monkeypatch, completed_step: int,
+) -> None:
+    criterion = identity_criterion(reduction="mean")
+    generated, reference = _vectors([0.9, 0.69, 0.4])
+    original = F.cosine_similarity
+    cosine_calls = []
+
+    def counting_cosine(*args, **kwargs):
+        cosine_calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr("losses.identity.F.cosine_similarity", counting_cosine)
+
     trainer = Trainer.__new__(Trainer)
-    trainer._completed_step = 0
+    trainer.id_loss = criterion
+    trainer._completed_step = completed_step
     trainer.log_interval = 10
-    events = []
-    trainer.log = lambda key, value: events.append(key)
-    criterion = identity_criterion()
+    trainer.train_d = lambda x: x.sum() * 0
+    trainer.gan_loss = lambda score: score
+    trainer.identity_embeddings_forward = lambda x: x
+    trainer.prepare_identity_encoder_faces = lambda x, theta_restore=None: x
+    trainer.geometry_augmentation_enabled = False
+    trainer.enable_wfm_loss = trainer.enable_mask_loss = False
+    trainer.enable_gaze_loss = trainer.enable_smirk_loss = False
+    trainer.enable_vgg_loss = trainer.enable_l1_loss = False
+    metrics = {}
+    trainer.log = lambda key, value: metrics.update({key: value.detach()})
 
-    def reject(*args, **kwargs):
-        raise AssertionError("cosine similarity must not be computed on an unlogged step")
+    loss = trainer._generator_loss(
+        generated, generated.detach(), generated.detach(),
+        torch.zeros(3, 2, 3), torch.ones(3), reference, None,
+        None, None, None,
+    )
+    assert cosine_calls == [1]
+    assert ("id_similarity_mean" in metrics) is (completed_step == 9)
+    assert ("id_gradient_scale_mean" in metrics) is (completed_step == 9)
+    assert ("id_satisfied_fraction" in metrics) is (completed_step == 9)
+    loss.backward()
+    assert generated.grad[1].abs().sum() > 0
 
-    monkeypatch.setattr("swapface.train.NF.cosine_similarity", reject)
-    generated, reference = _vectors([0.9, 0.4])
-    trainer._log_identity_threshold_metrics(criterion, generated, reference)
-    trainer._log_identity_threshold_metrics(criterion, generated, reference)
-    assert not events
 
-    # On the interval boundary, the guard must no longer skip computation.
-    trainer._completed_step = 9
-    with pytest.raises(AssertionError, match="must not be computed"):
-        trainer._log_identity_threshold_metrics(criterion, generated, reference)
+def test_return_similarity_preserves_loss_value_gradient_and_dtype(identity_criterion) -> None:
+    for dtype in (torch.float32, torch.float16, torch.bfloat16):
+        generated, reference = _vectors([0.9, 0.69, 0.4])
+        generated = generated.detach().to(dtype).requires_grad_(True)
+        reference = reference.to(dtype)
+        criterion = identity_criterion(reduction="mean")
+        standard = criterion(generated, reference)
+        returned, similarity = criterion(generated, reference, return_similarity=True)
+        torch.testing.assert_close(returned, standard, rtol=0, atol=0)
+        assert similarity.dtype == torch.float32
+        assert not similarity.requires_grad
+        grad_standard = torch.autograd.grad(standard, generated, retain_graph=True)[0]
+        grad_returned = torch.autograd.grad(returned, generated)[0]
+        torch.testing.assert_close(grad_returned, grad_standard, rtol=0, atol=0)

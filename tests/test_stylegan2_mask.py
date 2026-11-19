@@ -194,6 +194,7 @@ def test_mask_teacher_and_bce_gradient() -> None:
     trainer.identity_embeddings_forward = lambda x: x.mean(dim=(2, 3))
     trainer.prepare_identity_encoder_faces = lambda x, theta_restore=None: x
     trainer.id_loss = lambda a, b: (a - b).mean() * 0
+    trainer.id_loss.min_similarity = None
     trainer._log_identity_threshold_metrics = lambda *args: None
     trainer.log = lambda *args: None
     trainer.geometry_augmentation_enabled = False
@@ -224,6 +225,7 @@ def test_mask_bce_stays_stable_with_saturated_fp16_logits() -> None:
     trainer.identity_embeddings_forward = lambda x: x.mean(dim=(2, 3))
     trainer.prepare_identity_encoder_faces = lambda x, theta_restore=None: x
     trainer.id_loss = lambda a, b: a.sum() * 0
+    trainer.id_loss.min_similarity = None
     trainer._log_identity_threshold_metrics = lambda *args: None
     trainer.log = lambda *args, **kwargs: None
 

@@ -105,6 +105,7 @@ class TestIdentityParsing(unittest.TestCase):
         trainer.identity_embeddings_forward = lambda x: x
         trainer.prepare_identity_encoder_faces = lambda x, theta_restore=None: x
         trainer.id_loss = lambda generated, ref: generated.sum()
+        trainer.id_loss.min_similarity = None
         trainer._log_identity_threshold_metrics = lambda *args: None
         trainer.enable_wfm_loss = trainer.enable_mask_loss = trainer.enable_gaze_loss = trainer.enable_smirk_loss = trainer.enable_vgg_loss = trainer.enable_l1_loss = False
         trainer.geometry_augmentation_enabled = False

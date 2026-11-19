@@ -1,6 +1,7 @@
 import argparse
 import copy
 import signal
+from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -504,6 +505,7 @@ class Trainer:
             path.mkdir(parents=True, exist_ok=True)
         self.log_writer = SummaryWriter(self.run_paths.tensorboard, purge_step=self.completed_step + 1 if state is not None else None)
         self._log_buffer = {}
+        self._pending_logs: deque[tuple[torch.cuda.Event, int, tuple[str, ...], Tensor]] = deque()
 
     @property
     def completed_step(self) -> int:
@@ -521,19 +523,36 @@ class Trainer:
         if force or (self.completed_step + 1) % self.log_interval == 0:
             self._log_buffer[key] = value.detach().mean()
 
+    def _write_ready_logs(self, *, wait: bool = False) -> None:
+        while self._pending_logs:
+            ready, step, keys, values = self._pending_logs[0]
+            if wait:
+                ready.synchronize()
+            elif not ready.query():
+                break
+            self._pending_logs.popleft()
+            for key, val in zip(keys, values.tolist(), strict=True):
+                self.log_writer.add_scalar(f"Loss/{key}", val, step)
+
     @torch.no_grad()
     def flush_logs(self) -> None:
         if not self._log_buffer: return
+        self._write_ready_logs()
         keys = tuple(self._log_buffer)
-        values = torch.stack(tuple(self._log_buffer[key] for key in keys)).float().cpu().tolist()
+        values = torch.stack(tuple(self._log_buffer[key] for key in keys)).float()
+        host_values = torch.empty(values.shape, dtype=values.dtype, pin_memory=True)
+        host_values.copy_(values, non_blocking=True)
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(values.device))
+        self._pending_logs.append((ready, self.completed_step, keys, host_values))
         self._log_buffer.clear()
-        for key, val in zip(keys, values, strict=True):
-            self.log_writer.add_scalar(f"Loss/{key}", val, self.completed_step)
+
+    def close_logs(self) -> None:
+        self._write_ready_logs(wait=True)
+        self.log_writer.close()
 
     @torch.no_grad()
-    def _log_identity_threshold_metrics(self, criterion: IdentityLoss, generated: Tensor, reference: Tensor) -> None:
-        if criterion.min_similarity is None or (self.completed_step + 1) % self.log_interval: return
-        similarity = NF.cosine_similarity(generated.float(), reference.float(), dim=1)
+    def _log_identity_threshold_metrics(self, criterion: IdentityLoss, similarity: Tensor) -> None:
         excess = (criterion.min_similarity - similarity).clamp_min(0)
         self.log("id_similarity_mean", similarity.mean())
         self.log("id_satisfied_fraction", (excess == 0).float().mean())
@@ -613,9 +632,12 @@ class Trainer:
             self.log("wfm_loss", wfm)
             total = total + wfm
         identity_output = self.identity_embeddings_forward(self.prepare_identity_encoder_faces(gate_identity_gradient(fake, id_gate), theta_restore if self.geometry_augmentation_enabled else None))
-        id_loss = self.id_loss(identity_output, source_identity)
+        if self.id_loss.min_similarity is not None and (self.completed_step + 1) % self.log_interval == 0:
+            id_loss, similarity = self.id_loss(identity_output, source_identity, return_similarity=True)
+            self._log_identity_threshold_metrics(self.id_loss, similarity)
+        else:
+            id_loss = self.id_loss(identity_output, source_identity)
         self.log("id_loss", id_loss)
-        self._log_identity_threshold_metrics(self.id_loss, identity_output, source_identity)
         total = total + id_loss
         if self.enable_gaze_loss or self.enable_smirk_loss:
             restored = self._restore_for_geometry_loss(fake, tuple(canonical.shape[-2:]), restore_grid)
@@ -797,6 +819,7 @@ class Trainer:
         sample_weights = sample[7][:half].detach().cpu() if sample[7] is not None else None
         with tqdm(total=None, initial=self.completed_step, mininterval=1, bar_format="{n_fmt:7} | 速度 {rate_fmt:3} | 训练时间 {elapsed}") as progress:
             while True:
+                torch.compiler.cudagraph_mark_step_begin()
                 if self._stop_requested: raise KeyboardInterrupt
                 src, dst, canonical, theta, same_mask, id_faces, gate, weights, mask_teacher = self._next_training_batch()
                 self._step_in_progress = True
@@ -964,7 +987,7 @@ def main() -> None:
             update_metadata(paths, status="completed")
         finally:
             if trainer is not None:
-                trainer.log_writer.close()
+                trainer.close_logs()
 
 
 if __name__ == "__main__":

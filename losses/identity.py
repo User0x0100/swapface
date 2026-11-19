@@ -58,7 +58,7 @@ class IdentityLoss(nn.Module):
             形状通常为 ``(N, 512)`` 的身份嵌入向量。"""
         return self.id_encoder(faces)
 
-    def forward(self, generated_embeddings: Tensor, reference_embeddings: Tensor) -> Tensor:
+    def forward(self, generated_embeddings: Tensor, reference_embeddings: Tensor, *, return_similarity: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         """计算生成身份与参考身份嵌入向量的余弦距离。
 
         参数:
@@ -66,12 +66,14 @@ class IdentityLoss(nn.Module):
             reference_embeddings: 目标身份嵌入向量，必须与生成嵌入向量同形。
 
         返回:
-            默认计算余弦距离；配置 min_similarity 后计算逐样本平滑阈值，再乘权重并按照 reduction 聚合。"""
+            默认计算余弦距离；配置 min_similarity 后计算逐样本平滑阈值，再乘权重并按照 reduction 聚合。
+            return_similarity=True 时同时返回计算 Loss 时已有的逐样本余弦相似度（不保留梯度）。"""
         if generated_embeddings.shape != reference_embeddings.shape:
             raise ValueError(f"generated and reference embedding shapes must match: {tuple(generated_embeddings.shape)} != {tuple(reference_embeddings.shape)}")
         if self.min_similarity is None:
             # Preserve the exact legacy loss and dtype path when not configured.
-            loss = 1.0 - F.cosine_similarity(generated_embeddings, reference_embeddings, dim=1)
+            similarity = F.cosine_similarity(generated_embeddings, reference_embeddings, dim=1)
+            loss = 1.0 - similarity
         else:
             # Use FP32 for a stable threshold comparison under FP16/BF16 autocast.
             similarity = F.cosine_similarity(generated_embeddings.float(), reference_embeddings.float(), dim=1)
@@ -85,7 +87,8 @@ class IdentityLoss(nn.Module):
                 transition_excess.square() / (2.0 * width),
                 excess - width / 2.0,
             )
-        return _reduce_loss(loss * self.weight, self.reduction)
+        result = _reduce_loss(loss * self.weight, self.reduction)
+        return (result, similarity.detach()) if return_similarity else result
 
 
 class IFSRLoss(nn.Module):
