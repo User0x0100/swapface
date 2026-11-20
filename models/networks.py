@@ -37,14 +37,13 @@ class IDInject(nn.Module):
         self.adain1 = AdaIN(channels, w_dim)
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, padding_mode="reflect")
 
-    def forward(self, x: Tensor, w: tuple[Tensor, Tensor]) -> Tensor:
-        w0, w1 = w
+    def forward(self, x: Tensor, w: Tensor) -> Tensor:
         residual = self.conv0(x)
-        residual = self.adain0(residual, w0)
+        residual = self.adain0(residual, w)
         residual = self.act(residual)
 
         residual = self.conv1(residual)
-        residual = self.adain1(residual, w1)
+        residual = self.adain1(residual, w)
 
         return x + residual
 
@@ -85,43 +84,16 @@ class DownSample(nn.Sequential):
         )
 
 
-class WSpaceMap(nn.Module):
-    """Shared identity mapping plus one private residual mapping per AdaIN."""
+class WSpaceMap(nn.Sequential):
+    """Two Linear-SiLU layers mapping identity into one shared W."""
 
-    def __init__(self, id_dim: int, num: int, num_share_layers: int = 4, num_w_p_layers: int = 2) -> None:
-        super().__init__()
-
-        self.shared_delta = nn.Sequential()
-        for _ in range(num_share_layers - 1):
-            self.shared_delta.append(nn.Linear(id_dim, id_dim))
-            self.shared_delta.append(nn.SiLU())
-        self.shared_delta.append(nn.Linear(id_dim, id_dim))
-
-        self.private_delta = nn.ModuleList()
-        for _ in range(num):
-            layers = nn.Sequential()
-            for _ in range(num_w_p_layers):
-                layers.append(nn.SiLU())
-                layers.append(nn.Linear(id_dim, id_dim))
-            self.private_delta.append(layers)
-
-        self.num = num
-        self.id_dim = id_dim
-
-        shared_output = self.shared_delta[-1]
-        assert isinstance(shared_output, nn.Linear)
-        nn.init.normal_(shared_output.weight, mean=0.0, std=0.005)
-        nn.init.zeros_(shared_output.bias)
-
-        for head in self.private_delta:
-            private_output = head[-1]
-            assert isinstance(private_output, nn.Linear)
-            nn.init.normal_(private_output.weight, mean=0.0, std=0.005)
-            nn.init.zeros_(private_output.bias)
-
-    def forward(self, id_feat: Tensor) -> tuple[Tensor, ...]:
-        w = id_feat + self.shared_delta(id_feat)
-        return tuple(w + head(w) for head in self.private_delta)
+    def __init__(self, id_dim: int) -> None:
+        super().__init__(
+            nn.Linear(id_dim, id_dim),
+            nn.SiLU(),
+            nn.Linear(id_dim, id_dim),
+            nn.SiLU(),
+        )
 
 
 class LatentBlock(nn.Module):
@@ -130,11 +102,9 @@ class LatentBlock(nn.Module):
 
         self.layers = nn.ModuleList([IDInject(channels, w_dim) for _ in range(num_layers)])
 
-    def forward(self, x: Tensor, w_space: tuple[Tensor, ...]) -> Tensor:
-        if len(w_space) != len(self.layers) * 2:
-            raise ValueError(f"Expected {len(self.layers) * 2} W vectors, got {len(w_space)}")
-        for index, layer in enumerate(self.layers):
-            x = layer(x, (w_space[index * 2], w_space[index * 2 + 1]))
+    def forward(self, x: Tensor, w: Tensor) -> Tensor:
+        for layer in self.layers:
+            x = layer(x, w)
         return x
 
 
@@ -173,7 +143,7 @@ class InSwapper(nn.Module):
         channels = [min(max_ch, base_ch * 2**i) for i in range(depth + 1)]
         self.from_rgb = FromRGB(img_channels, base_ch)
         self.encoder = nn.ModuleList(DownSample(channels[i], channels[i + 1]) for i in range(depth))
-        self.w_space_map = WSpaceMap(id_dim, num_latent * 2)
+        self.w_space_map = WSpaceMap(id_dim)
         self.latent_space = LatentBlock(channels[-1], id_dim, num_latent)
         self.decoder = nn.ModuleList()
         current_ch = channels[-1]

@@ -2,7 +2,7 @@
 
 单阶段 InSwapper 和 StyleGAN2 使用同一接口：服务端输入已对齐 Source 图像，输出身份调制条件；客户端输入 Target 图像与该条件，直接输出最终分辨率 RGB 图像。
 
-- InSwapper 的服务端包含身份编码器、WSpaceMap 和 Bottleneck 每个 AdaIN 的线性层。客户端包含 FromRGB、完整 U-Net（包括启用的 cat/add Skip）、预计算 AdaIN、ToRGB，不保留身份映射权重。
+- InSwapper 的服务端包含身份编码器、共享 W 的 WSpaceMap 和 Bottleneck 每个 AdaIN 的独立线性层。客户端包含 FromRGB、完整 U-Net（包括启用的 cat/add Skip）、预计算 AdaIN、ToRGB，不保留身份映射权重。
 - StyleGAN2 的服务端包含身份编码器、ID Mapping、Style Mapping 与各调制线性层；客户端包含原 StyleSwap Target 编码、Synthesis、可选 Mask 分支。
 - 两者的完整 Generator 与客户端+服务端组合在数学上等价，更新 U-Net 跳层必须同步更新 `PrecomputedInSwapper`。
 - 仅发布 `client.onnx`；`server.onnx` 为服务端私有。导出结果的 manifest 使用 `generator_type` 字段及 `SPLIT_PROTOCOL_VERSION=3`。该协议不兼容旧版使用 `coarse_type` 的消费端，需要同步调整客户端协议解析。

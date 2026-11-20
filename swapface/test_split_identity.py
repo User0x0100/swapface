@@ -62,14 +62,11 @@ def _run_pair(generator_type: str, root: Path) -> None:
     assert not any(isinstance(module, nn.Linear) for module in client.modules())
     if generator_type == "inswapper":
         assert len(server.projection.mapping.linears) == len(model.core.latent_space.layers) * 2
-        assert len(server.projection.mapping.w_space_map.private_delta) == len(server.projection.mapping.linears)
         assert not any("w_space_map" in key for key in client.state_dict())
         with torch.inference_mode():
             identity_probe = torch.randn(2, 512)
-            w_space = model.core.w_space_map(identity_probe)
-            expected = torch.cat([
-                linear(w) for linear, w in zip(server.projection.mapping.linears, w_space, strict=True)
-            ], dim=1)
+            w = model.core.w_space_map(identity_probe)
+            expected = torch.cat([linear(w) for linear in server.projection.mapping.linears], dim=1)
             torch.testing.assert_close(server.projection(identity_probe), expected)
     else:
         assert len(server.projection.mapping.modulations) == 2 + len(model.core.generator.stages) * 3
@@ -227,7 +224,7 @@ def _test_pair_identity() -> None:
     assert initial["encoder_id"] == pair(gen=changed)["encoder_id"]
     changed_mapping = deepcopy(model)
     with torch.no_grad():
-        changed_mapping.core.w_space_map.private_delta[0][-1].weight[0, 0] += 0.125
+        changed_mapping.core.w_space_map[0].weight[0, 0] += 0.125
     assert initial["generator_id"] != pair(gen=changed_mapping)["generator_id"]
     changed_encoder = deepcopy(encoder)
     with torch.no_grad():

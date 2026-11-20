@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from models.networks import AdaIN, Generator, IDInject, InSwapper, WSpaceMap
@@ -17,6 +18,18 @@ from swapface.inference import load_generator
 
 def main() -> None:
     torch.set_num_threads(2)
+    torch.manual_seed(2026)
+    mapping = WSpaceMap(512)
+    torch.manual_seed(2026)
+    expected = nn.Sequential(nn.Linear(512, 512), nn.SiLU(), nn.Linear(512, 512), nn.SiLU())
+    assert len(mapping) == 4
+    for key, value in expected.state_dict().items():
+        torch.testing.assert_close(mapping.state_dict()[key], value, rtol=0, atol=0)
+    identity = F.normalize(torch.randn(2, 512), dim=1)
+    w = mapping(identity)
+    torch.testing.assert_close(w, expected(identity), rtol=0, atol=0)
+    assert w.shape == identity.shape
+    assert not torch.allclose(w[0], w[1])
     for mode in ("cat", "add"):
         for skips in ([], [0], [1], [0, 1]):
             net = InSwapper(img_resolution=16, latent_resolution=4, num_latent=2, base_ch=4, max_ch=16,
@@ -41,6 +54,12 @@ def main() -> None:
         "type": "inswapper", "img_resolution": 16, "latent_resolution": 4,
         "num_latent": 2, "base_ch": 4, "max_ch": 16, "skip_layers": [0, 1],
     }})
+    assert "mapping_layers" not in cfg
+    try:
+        _normalize_generator({"generator": {**cfg, "mapping_layers": 2}})
+        raise AssertionError("InSwapper mapping_layers must not be configurable")
+    except ValueError:
+        pass
     model = Generator(**cfg)
     assert model.network_cfg == cfg
     with TemporaryDirectory() as temp:

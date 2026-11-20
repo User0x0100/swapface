@@ -41,8 +41,8 @@ class InSwapperProjection(nn.Module):
         self.width = sum(linear.out_features for linear in self.linears)
 
     def forward(self, identity: Tensor) -> Tensor:
-        w_space = self.w_space_map(identity)
-        return torch.cat([linear(w) for linear, w in zip(self.linears, w_space, strict=True)], dim=1)
+        w = self.w_space_map(identity)
+        return torch.cat([linear(w) for linear in self.linears], dim=1)
 
 
 class PrecomputedAdaIN(nn.Module):
