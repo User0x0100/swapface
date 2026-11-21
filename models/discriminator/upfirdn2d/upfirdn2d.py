@@ -53,19 +53,6 @@ def _parse_padding(padding):
     return padx0, padx1, pady0, pady1
 
 
-def is_rocm_gfx1100(device: torch.device | int | None = None) -> bool:
-    """Return whether *device* is exactly a ROCm gfx1100 GPU.
-
-    ROCm may append feature flags to gcnArchName; only the base architecture
-    name is compared.
-    """
-    if torch.version.hip is None or not torch.cuda.is_available():
-        return False
-
-    gcn_arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
-    return gcn_arch.split(":", 1)[0] == "gfx1100"
-
-
 def _get_filter_size(f: Tensor):
 
     assert isinstance(f, torch.Tensor) and f.ndim in [1, 2]
@@ -202,7 +189,7 @@ def upfirdn2d(
         2. Apply FIR filter (low-pass filtering)
         3. Downsample (strided subsampling)
 
-    This function dispatches to a custom CUDA kernel:
+    On GPUs this function dispatches to a fused CUDA/HIP kernel:
         torch.ops.upfirdn2d.upfirdn2d
 
     Args:
@@ -238,7 +225,7 @@ def upfirdn2d(
                 W_out = floor((W * upx + padx0 + padx1 - fw) / downx) + 1
 
     Implementation details:
-        - If f is 2D → single fused CUDA call
+        - If f is 2D → single fused GPU kernel call
         - If f is 1D → separable filtering:
             * horizontal pass
             * vertical pass
@@ -250,10 +237,9 @@ def upfirdn2d(
         - Critical for preventing aliasing in downsampling
     """
 
-    # ONNX exports standard ATen ops instead of the fused CUDA kernel.
-    # Regular NVIDIA execution remains on the optimized fused path.
-    # PyTorch ROCm 保持 CUDA 设备 API 兼容，因此通过 torch.version.hip 区分后端。
-    if torch.onnx.is_in_onnx_export() or x.device.type != "cuda" or torch.version.hip is not None:
+    # ONNX exports standard ATen ops instead of the fused GPU kernel.
+    # NVIDIA CUDA 与 AMD ROCm 都使用 fused C++ 扩展；CPU/ONNX 保留原生算子。
+    if torch.onnx.is_in_onnx_export() or x.device.type != "cuda":
         return _upfirdn2d_native(x, f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain)
 
     initialize_upfirdn2d()
@@ -348,46 +334,6 @@ class UpFIRDn2d(nn.Module):
         return upfirdn2d(x, self.get_buffer("f"), self.upx, self.upy, self.downx, self.downy, self.padx0, self.padx1, self.pady0, self.pady1, self.flip_filter, self.gain)
 
 
-def _downfirdn2d_separable(
-    x: Tensor,
-    f: Tensor,
-    downx: int,
-    downy: int,
-    padx0: int,
-    padx1: int,
-    pady0: int,
-    pady1: int,
-    flip_filter: bool,
-    gain: float,
-) -> Tensor:
-    """Separable binomial FIR implementation used by the gfx1100 fast path."""
-    x = F.pad(x, (max(padx0, 0), max(padx1, 0), max(pady0, 0), max(pady1, 0)))
-    crop_x0, crop_x1 = max(-padx0, 0), max(-padx1, 0)
-    crop_y0, crop_y1 = max(-pady0, 0), max(-pady1, 0)
-    if crop_x0 or crop_x1 or crop_y0 or crop_y1:
-        x = x[:, :, crop_y0 : x.shape[2] - crop_y1, crop_x0 : x.shape[3] - crop_x1]
-
-    kernel = f if flip_filter else f.flip((0, 1))
-    kernel = kernel.to(device=x.device, dtype=x.dtype).mul(gain)
-    kernel_y = kernel.sum(dim=1)
-    kernel_x = kernel.sum(dim=0) / kernel.sum()
-
-    out_w = (x.shape[3] - kernel_x.numel()) // downx + 1
-    horizontal = None
-    for index_x in range(kernel_x.numel()):
-        term = x[:, :, :, index_x : index_x + out_w * downx : downx] * kernel_x[index_x]
-        horizontal = term if horizontal is None else horizontal + term
-    assert horizontal is not None
-
-    out_h = (horizontal.shape[2] - kernel_y.numel()) // downy + 1
-    output = None
-    for index_y in range(kernel_y.numel()):
-        term = horizontal[:, :, index_y : index_y + out_h * downy : downy, :] * kernel_y[index_y]
-        output = term if output is None else output + term
-    assert output is not None
-    return output
-
-
 class DownFIRDn2d(nn.Module):
     """StyleGAN2 FIR prefilter for a following strided convolution.
 
@@ -441,76 +387,20 @@ class DownFIRDn2d(nn.Module):
         self.gain = gain
 
     def forward(self, x: Tensor) -> Tensor:
-        r"""
-        Args:
-            x:           Float32/float64/float16/bfloat16 input tensor of the shape
-                    `[batch_size, num_channels, in_height, in_width]`.
-        Returns:
-            Tensor of the shape `[batch_size, num_channels, out_height, out_width]`.
-        """
-        f = self.get_buffer("f")
-        if torch.onnx.is_in_onnx_export():
-            # This wrapper calls the fused op directly on CUDA in normal execution.
-            return _upfirdn2d_native(
-                x,
-                f,
-                self.upx,
-                self.upy,
-                self.downx,
-                self.downy,
-                self.padx0,
-                self.padx1,
-                self.pady0,
-                self.pady1,
-                self.flip_filter,
-                self.gain,
-            )
-
-        match (x.device.type, torch.version.hip):
-            case ("cuda", None):
-                initialize_upfirdn2d()
-                return torch.ops.upfirdn2d.upfirdn2d(
-                    x,
-                    f,
-                    self.upx,
-                    self.upy,
-                    self.downx,
-                    self.downy,
-                    self.padx0,
-                    self.padx1,
-                    self.pady0,
-                    self.pady1,
-                    self.flip_filter,
-                    self.gain,
-                )
-            case ("cuda", _) if is_rocm_gfx1100(x.device):
-                return _downfirdn2d_separable(
-                    x,
-                    f,
-                    self.downx,
-                    self.downy,
-                    self.padx0,
-                    self.padx1,
-                    self.pady0,
-                    self.pady1,
-                    self.flip_filter,
-                    self.gain,
-                )
-            case _:
-                return _upfirdn2d_native(
-                    x,
-                    f,
-                    self.upx,
-                    self.upy,
-                    self.downx,
-                    self.downy,
-                    self.padx0,
-                    self.padx1,
-                    self.pady0,
-                    self.pady1,
-                    self.flip_filter,
-                    self.gain,
-                )
+        return upfirdn2d(
+            x,
+            self.get_buffer("f"),
+            self.upx,
+            self.upy,
+            self.downx,
+            self.downy,
+            self.padx0,
+            self.padx1,
+            self.pady0,
+            self.pady1,
+            self.flip_filter,
+            self.gain,
+        )
 
 
 def setup_context(
@@ -558,16 +448,13 @@ _kernel_init_lock = threading.Lock()
 
 
 def initialize_upfirdn2d() -> None:
-    """在 NVIDIA CUDA 环境中加载 fused 扩展；ROCm 使用原生 PyTorch 路径。
+    """加载 GPU fused 扩展；ROCm 由 PyTorch HIPIFY 自动转换 CUDA 源码。
 
     初始化完成后的快速路径不加锁。锁同时覆盖扩展加载与 autograd 注册，
     避免并发首次调用观察到或发布未完整初始化的算子。若初始化抛出异常，
     已加载标志保持为 false，后续调用仍可再次尝试。
     """
     global _kernel_loaded
-
-    if torch.version.hip is not None:
-        return
 
     if _kernel_loaded:
         return
@@ -585,7 +472,7 @@ def initialize_upfirdn2d() -> None:
             sources=[str(base_dir / "upfirdn2d.cpp"), str(base_dir / "upfirdn2d.cu")],
             is_python_module=False,
             verbose=True,
-            extra_cuda_cflags=["-O3", "-use_fast_math", "--expt-relaxed-constexpr"],
+            extra_cuda_cflags=["-O3", "-ffast-math"] if torch.version.hip is not None else ["-O3", "-use_fast_math", "--expt-relaxed-constexpr"],
             extra_cflags=["-O3"],
         )
 
