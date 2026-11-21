@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import socket
+import tomllib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -185,6 +186,38 @@ def update_metadata(paths: RunPaths, **changes: Any) -> None:
     metadata.update(changes)
     metadata["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     atomic_write_json(paths.metadata, metadata)
+
+
+def update_run_train_options(paths: RunPaths, config: dict[str, Any], updates: dict[str, str | bool]) -> None:
+    """Persist explicitly overridden resume options without rewriting an existing checkpoint."""
+    source = paths.config.read_text(encoding="utf-8")
+    section = re.search(r"(?m)^\[train\][^\n]*\n", source)
+    if section is None:
+        raise ValueError(f"训练配置缺少 [train]：{paths.config}")
+    tail = source[section.end():]
+    next_section = re.search(r"(?m)^\s*\[[^\n]+\]", tail)
+    end = section.end() + next_section.start() if next_section else len(source)
+    body = source[section.end():end]
+    for key, value in updates.items():
+        literal = ("true" if value else "false") if isinstance(value, bool) else json.dumps(value, ensure_ascii=False)
+        pattern = re.compile(rf"(?m)^([ \t]*{re.escape(key)}[ \t]*=[ \t]*)[^\r\n]*")
+        body, count = pattern.subn(lambda match: match[1] + literal, body, count=1)
+        if not count:
+            body += ("" if body.endswith("\n") else "\n") + f"{key} = {literal}\n"
+    updated_source = source[:section.end()] + body + source[end:]
+    tomllib.loads(updated_source)  # Verify the edited source remains valid TOML.
+
+    metadata = load_metadata(paths)
+    old_hash = metadata["config_sha256"]
+    new_hash = config_sha256(config)
+    if old_hash == new_hash:
+        return
+    history = metadata.get("prior_config_sha256", [])
+    if old_hash not in history:
+        history = [*history, old_hash]
+    _atomic_write_text(paths.config, updated_source)
+    atomic_write_json(paths.resolved_config, {"format_version": RESOLVED_CONFIG_FORMAT_VERSION, "config": config})
+    update_metadata(paths, config_sha256=new_hash, prior_config_sha256=history)
 
 
 def write_latest(paths: RunPaths, checkpoint: Path) -> None:

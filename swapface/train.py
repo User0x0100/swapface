@@ -50,6 +50,7 @@ from .experiment import (
     resolve_branch_target,
     resolve_resume_target,
     update_metadata,
+    update_run_train_options,
     write_latest,
 )
 from .occlusion import OcclusionAugmentor, gate_identity_gradient
@@ -304,6 +305,7 @@ class Trainer:
         checkpoint_mode: Literal["resume", "branch"] = "resume",
         preloaded_checkpoint: dict[str, Any] | None = None,
         reset_discriminator: bool = False, start_step: int | None = None,
+        allowed_resume_config_hashes: tuple[str, ...] = (),
     ) -> None:
         train_cfg = config["train"]
         generator_cfg = dict(config["generator"])
@@ -363,8 +365,9 @@ class Trainer:
                     identity_loss_provider=loss_cfg["identity"]["provider"],
                     checkpoint_mode=checkpoint_mode,
                 )
-                if checkpoint["run"] != {"id": run_id, "config_sha256": resolved_config_sha256}:
-                    raise ValueError("checkpoint run does not match frozen config")
+                checkpoint_run = checkpoint["run"]
+                if checkpoint_run["id"] != run_id or checkpoint_run["config_sha256"] not in (resolved_config_sha256, *allowed_resume_config_hashes):
+                    raise ValueError("checkpoint run does not match run config history")
                 if checkpoint["net_d"]["network_cfg"] != discriminator_cfg:
                     raise ValueError("checkpoint discriminator mismatch")
                 self._completed_step = checkpoint["step"]
@@ -917,6 +920,8 @@ def main() -> None:
     parser.add_argument("--reset-discriminator", action="store_true")
     parser.add_argument("--step", type=int, default=None)
     parser.add_argument("--strict-precision", action="store_true")
+    parser.add_argument("--compile-mode", type=str, default=None, help="仅 --resume：覆盖 torch.compile mode")
+    parser.add_argument("--compile-module", choices=("true", "false"), default=None, help="仅 --resume：覆盖 compile_module")
     args = parser.parse_args()
     is_resume, is_branch = args.resume is not None, args.branch_from is not None
     if is_resume and (args.config is not None or args.name is not None or args.runs_root is not None):
@@ -929,12 +934,13 @@ def main() -> None:
         parser.error("--step requires --branch-from and nonnegative value")
     if args.strict_precision and not is_resume:
         parser.error("--strict-precision only applies to resume")
+    if not is_resume and (args.compile_mode is not None or args.compile_module is not None):
+        parser.error("--compile-mode/--compile-module only apply to resume")
     checkpoint = None
     preloaded = None
     checkpoint_mode: Literal["resume", "branch"] = "resume"
     if is_resume:
         paths, checkpoint = resolve_resume_target(args.resume)
-        resolved = _load_run_config(paths)
     elif is_branch:
         checkpoint = resolve_branch_target(args.branch_from)
         resolved = load_train_config(args.config)
@@ -945,17 +951,33 @@ def main() -> None:
         source_path = args.config or DEFAULT_TRAIN_CONFIG_PATH
         resolved = load_train_config(source_path)
         paths = create_run(args.runs_root or DEFAULT_RUNS_ROOT, source_path, resolved, name=args.name)
-    metadata = load_metadata(paths)
     with RunLock(paths):
+        metadata = load_metadata(paths)
+        train_updates: dict[str, str | bool] = {}
+        allowed_hashes: tuple[str, ...] = ()
         if is_resume:
             _, checkpoint = resolve_resume_target(paths.root)
+            resolved = _load_run_config(paths)
+            allowed_hashes = (metadata["config_sha256"], *metadata.get("prior_config_sha256", []))
+            requested = {
+                "compile_mode": args.compile_mode,
+                "compile_module": None if args.compile_module is None else args.compile_module == "true",
+            }
+            train_updates = {key: value for key, value in requested.items()
+                             if value is not None and value != resolved["train"][key]}
+            if train_updates:
+                resolved = copy.deepcopy(resolved)
+                resolved["train"].update(train_updates)
         update_metadata(paths, status="running", error=None)
         trainer = None
         try:
             trainer = Trainer(resolved, run_dir=paths.root, checkpoint_path=checkpoint,
                               run_id=metadata["run_id"], resolved_config_sha256=config_sha256(resolved),
                               strict_precision_resume=args.strict_precision, checkpoint_mode=checkpoint_mode,
-                              preloaded_checkpoint=preloaded, reset_discriminator=args.reset_discriminator, start_step=args.step)
+                              preloaded_checkpoint=preloaded, reset_discriminator=args.reset_discriminator, start_step=args.step,
+                              allowed_resume_config_hashes=allowed_hashes)
+            if train_updates:
+                update_run_train_options(paths, resolved, train_updates)
             if is_branch:
                 parent = dict(metadata["parent"])
                 parent["discriminator"] = trainer.branch_discriminator_state

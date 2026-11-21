@@ -136,3 +136,99 @@ def test_no_implicit_channel_field_and_generator_identity_dimension_stays_config
         bad[part]["img_channels"] = 3
         with pytest.raises(ValueError, match="img_channels"):
             resolve_train_config(bad)
+
+
+def test_resume_compile_options_persist_in_both_configs_and_keep_hash_history(prepared_run):
+    from swapface.experiment import update_run_train_options
+
+    paths, canonical = prepared_run
+    original_hash = config_sha256(canonical)
+    changed = copy.deepcopy(canonical)
+    changed['train'].update(compile_mode='reduce-overhead', compile_module=False)
+    update_run_train_options(paths, changed, {'compile_mode': 'reduce-overhead', 'compile_module': False})
+
+    assert load_resolved_config(paths) == changed
+    assert load_train_config(paths.config) == changed
+    assert load_metadata(paths)['prior_config_sha256'] == [original_hash]
+    assert load_metadata(paths)['config_sha256'] == config_sha256(changed)
+    assert 'compile_mode = "reduce-overhead"' in paths.config.read_text()
+    assert 'compile_module = false' in paths.config.read_text()
+
+    newer = copy.deepcopy(changed)
+    newer['train']['compile_mode'] = 'default'
+    update_run_train_options(paths, newer, {'compile_mode': 'default'})
+    assert load_train_config(paths.config) == newer
+    assert load_metadata(paths)['prior_config_sha256'] == [original_hash, config_sha256(changed)]
+    assert load_resolved_config(paths) == newer
+
+
+def test_resume_compile_override_cli_persists_only_after_trainer_load(prepared_run, monkeypatch):
+    import sys
+    import swapface.train as training
+
+    paths, original = prepared_run
+    checkpoint = paths.checkpoints / 'step_000000010.pth'
+    checkpoint.write_bytes(b'test-checkpoint')
+    write_latest(paths, checkpoint)
+    original_hash = config_sha256(original)
+    calls = []
+
+    class FakeTrainer:
+        def __init__(self, cfg, **kwargs):
+            assert kwargs['checkpoint_path'] == checkpoint
+            assert original_hash in kwargs['allowed_resume_config_hashes']
+            assert kwargs['run_id'] == paths.root.name
+            calls.append((cfg['train'].copy(), kwargs['resolved_config_sha256']))
+
+        def train(self):
+            pass
+
+        def close_logs(self):
+            pass
+
+    monkeypatch.setattr(training, '_configure_training_runtime', lambda: None)
+    monkeypatch.setattr(training, 'Trainer', FakeTrainer)
+    monkeypatch.setattr(sys, 'argv', ['swapface.train', '--resume', str(paths.root),
+                                    '--compile-mode', 'default', '--compile-module', 'false'])
+    training.main()
+    assert calls[-1][0]['compile_mode'] == 'default'
+    assert calls[-1][0]['compile_module'] is False
+    assert calls[-1][1] == load_metadata(paths)['config_sha256']
+    assert load_train_config(paths.config) == load_resolved_config(paths)
+    assert original_hash in load_metadata(paths)['prior_config_sha256']
+
+    # A later resume without overrides must still accept a checkpoint with the original hash.
+    monkeypatch.setattr(sys, 'argv', ['swapface.train', '--resume', str(paths.root)])
+    training.main()
+    assert calls[-1][0]['compile_mode'] == 'default'
+    assert calls[-1][0]['compile_module'] is False
+    assert len(load_metadata(paths)['prior_config_sha256']) == 1
+
+    class FailedTrainer:
+        def __init__(self, *_args, **_kwargs):
+            raise ValueError('invalid checkpoint')
+
+    monkeypatch.setattr(training, 'Trainer', FailedTrainer)
+    before = (paths.config.read_bytes(), paths.resolved_config.read_bytes(), load_metadata(paths)['config_sha256'])
+    monkeypatch.setattr(sys, 'argv', ['swapface.train', '--resume', str(paths.root), '--compile-mode', 'max-autotune'])
+    with pytest.raises(ValueError, match='invalid checkpoint'):
+        training.main()
+    after = (paths.config.read_bytes(), paths.resolved_config.read_bytes(), load_metadata(paths)['config_sha256'])
+    assert before == after
+
+
+@pytest.mark.parametrize('args', [
+    ['--compile-module', 'true'],
+    ['--compile-mode', 'default'],
+    ['--branch-from', 'anything.pth', '--config', 'anything.toml', '--compile-module', 'false'],
+])
+def test_compile_overrides_rejected_outside_resume(monkeypatch, capsys, args):
+    import sys
+    import swapface.train as training
+
+    monkeypatch.setattr(training, '_configure_training_runtime', lambda: None)
+    monkeypatch.setattr(sys, 'argv', ['swapface.train', *args])
+    with pytest.raises(SystemExit) as exc:
+        training.main()
+    assert exc.value.code == 2
+    assert '--compile-mode/--compile-module only apply to resume' in capsys.readouterr().err
