@@ -313,7 +313,15 @@ def create_dataloader_pipeline(
     dst_canonical = _normalize_chw(dst_image)
     if apply_geometry:
         affine_matrix, theta_restore = _random_affine_matrices(img_resolution, rotation_range, scale_factor_range, tx_range, ty_range)
-        dst_image = fn.warp_affine(dst_image, affine_matrix, device="gpu", inverse_map=False, fill_value=-1.0)
+        # WarpAffine 仅支持常量填充/边缘复制；Perspective 支持镜像反射。
+        # 将原 2x3 仿射矩阵补为 3x3 单应矩阵，保持原几何增强语义。
+        perspective_matrix = fn.cat(
+            fn.copy(affine_matrix, device="gpu"),
+            fn.constant(fdata=[0.0, 0.0, 1.0], shape=(1, 3), dtype=DALIDataType.FLOAT, device="gpu"),
+            axis=0,
+        )
+        dst_image = fn.experimental.warp_perspective(dst_image, perspective_matrix, device="gpu", inverse_map=False,
+                                                     border_mode="reflect")
         dst_output = _normalize_chw(dst_image)
     else:
         # 恒等矩阵作为 DALI 常量输出，跳过随机仿射计算、warp 和重复归一化。

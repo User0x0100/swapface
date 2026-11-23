@@ -25,6 +25,8 @@
 
 训练一步：数据加载及增强 → Generator 身份特征 → 生成最终 RGB（可含 Mask Logits）→ 单判别器更新（lazy R1）→ 单组 Generator Loss / backward → EMA / scheduler → 日志/预览/检查点。SMIRK、Gaze、VGG、ID 梯度筛选等逻辑保留。
 
+几何增强（旋转、平移、缩放）越界区域使用镜像反射填充，不再产生常量黑边。PyTorch/ROCm 使用 `grid_sample(padding_mode="reflection")`，NVIDIA DALI 使用 `warp_perspective(border_mode="reflect")` 执行同一仿射变换。极端增强下，反射区域仍可能产生镜像重复纹理。
+
 ## 性能优化的作用范围
 
 - **通用路径**：生成器/预览张量及时释放、异步 TensorBoard 日志、IdentityLoss 相似度复用、避免训练热路径重复检查，以及遮挡样本 CPU 索引通过 pinned memory 异步上传，均不依赖具体 GPU 厂商。`upfirdn2d` 在 CUDA/ROCm 上使用对应融合内核，CPU/ONNX 使用标准算子。

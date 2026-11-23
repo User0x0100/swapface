@@ -6,7 +6,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
+
+from misc.face_alignment import invert_grid_theta
 
 from .config import DEFAULT_DATA_CONFIG
 from .dataloader import TrainingDataLoader
@@ -71,12 +74,20 @@ def main() -> None:
         torch.testing.assert_close(shifted_canonical, original.expand(2, -1, -1, -1), atol=1e-4, rtol=0)
         assert not torch.equal(shifted, shifted_canonical)
         assert not torch.equal(shifted_theta, identity_theta.expand(2, -1, -1))
+        # 越界像素应与 PyTorch reflection 一致，而不是常量黑色或边缘复制。
+        shifted_grid = F.affine_grid(invert_grid_theta(shifted_theta), shifted.shape, align_corners=False)
+        expected_shifted = F.grid_sample(shifted_canonical, shifted_grid, padding_mode="reflection", align_corners=False)
+        torch.testing.assert_close(shifted, expected_shifted, atol=0.02, rtol=0)
+        assert float(shifted[0, 0, 0, 0]) > float(shifted_canonical[0, 0, 0, 0])
 
         # 单独使用固定角度/缩放也应正常工作，其他恒等参数不能生成零宽随机范围。
         _, rotated, rotated_canonical, rotated_theta, _, _ = load_one(rotation_range=(10.0, 10.0), scale_factor_range=(1.1, 1.1))
         torch.testing.assert_close(rotated_canonical, original.expand(2, -1, -1, -1), atol=1e-4, rtol=0)
         assert not torch.equal(rotated, rotated_canonical)
         assert not torch.equal(rotated_theta, identity_theta.expand(2, -1, -1))
+        rotated_grid = F.affine_grid(invert_grid_theta(rotated_theta), rotated.shape, align_corners=False)
+        expected_rotated = F.grid_sample(rotated_canonical, rotated_grid, padding_mode="reflection", align_corners=False)
+        torch.testing.assert_close(rotated, expected_rotated, atol=0.02, rtol=0)
 
         # 固定的 FFHQ->ArcFace 坐标变换仍需执行（不属于随机几何增强）。
         _, aligned, aligned_canonical, aligned_theta, _, _ = load_one(alignment="arcface")

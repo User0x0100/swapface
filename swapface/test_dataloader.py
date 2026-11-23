@@ -136,8 +136,25 @@ def main() -> None:
             patch("swapface.dataloader_native.torch.rand", side_effect=AssertionError("几何增强不应执行翻转")),
         ):
             _, geo_target, geo_canonical, geo_theta, _, _ = geometry_loader.next()
-        assert not torch.equal(geo_target, geo_canonical)
+        # 常量图片平移后仍应保持原色，不得产生零填充黑边。
+        torch.testing.assert_close(geo_target, geo_canonical, atol=1e-6, rtol=0)
         assert float(geo_theta[0, 0, 2]) > 0.0
+
+        # 有纹理的图像平移出界时，应镜像反射而非补黑或重复边缘像素。
+        gradient_dst = root / "gradient_dst"
+        gradient_dst.mkdir()
+        y, x = np.mgrid[:16, :16]
+        gradient = np.stack((x * 8, np.full_like(x, 64), np.full_like(x, 128)), axis=-1).astype(np.uint8)
+        Image.fromarray(gradient).save(gradient_dst / "gradient.png")
+        reflection_loader = TrainingDataLoader(
+            batch_size=1, device=torch.device("cpu"), img_resolution=16,
+            src=[rgb_src], dst=[gradient_dst], **geometry_config,
+        )
+        _, reflected, reflected_canonical, _, _, _ = reflection_loader.next()
+        # 向右平移 4 像素，最左列应反射采到原图 x=3，而非黑色或 x=0。
+        expected_red = 24 / 127.5 - 1.0
+        torch.testing.assert_close(reflected[0, 0, 8, 0], torch.tensor(expected_red), atol=1e-6, rtol=0)
+        torch.testing.assert_close(reflected_canonical[0, 0, 8, 0], torch.tensor(-1.0), atol=1e-6, rtol=0)
 
         # same_prob=1 时 src 必须直接来自同一张 dst 原图，而不是继续从 src pool 独立采样。
         config.update(same_prob=1.0)
@@ -147,14 +164,14 @@ def main() -> None:
         torch.testing.assert_close(same_src, same_canonical, atol=1e-6, rtol=0)
         torch.testing.assert_close(same_target, same_canonical, atol=1e-6, rtol=0)
 
-        # canonical 必须绕过 geometric affine；固定平移后 target 出现 padding，但 canonical 仍保持仿射前图像。
+        # canonical 必须绕过 geometric affine；对纯色图像，反射填充不应改变像素。
         config.update(same_prob=0.0)
         config.update(tx_range=(0.25, 0.25))
         shifted_loader = TrainingDataLoader(batch_size=1, device=torch.device("cpu"), img_resolution=8, src=[rgb_src], dst=[rgb_dst], **config)
         _, shifted_target, shifted_canonical, _, shifted_same, identity_faces = shifted_loader.next()
         expected_canonical = (torch.tensor((0, 64, 255), dtype=torch.float32) / 127.5 - 1.0).view(1, 3, 1, 1).expand(1, 3, 8, 8)
         torch.testing.assert_close(shifted_canonical, expected_canonical, atol=1e-6, rtol=0)
-        assert not torch.equal(shifted_target, shifted_canonical)
+        torch.testing.assert_close(shifted_target, shifted_canonical, atol=1e-6, rtol=0)
         assert not shifted_same.item()
 
     # backend selector 必须真正区分同一个 CUDA device 上的 HIP 与 NVIDIA build。

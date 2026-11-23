@@ -337,7 +337,7 @@ class _NativeTrainingDataLoader:
                 batch_size, self.img_resolution, self.rotation_range, self.scale_factor_range, self.tx_range, self.ty_range, self.device
             )
             grid = F.affine_grid(theta_augment, dst_canonical.shape, align_corners=False)
-            dst = F.grid_sample(dst_canonical, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+            dst = F.grid_sample(dst_canonical, grid, mode="bilinear", padding_mode="reflection", align_corners=False)
             dst = dst.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
         else:
             assert self.identity_theta_restore is not None
