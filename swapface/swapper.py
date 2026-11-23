@@ -12,7 +12,7 @@ from torch import Tensor
 from torchcodec.decoders import VideoDecoder
 from torchvision.io import ImageReadMode, decode_image
 
-from misc.face_alignment import align_faces, invert_grid_theta, make_alignment_grid_theta, make_ffhq_to_arcface_112_grid, transform_sampling_grid
+from misc.face_alignment import align_faces, invert_grid_theta, make_alignment_grid_theta, make_arcface128_to_arcface112_grid, make_ffhq_to_arcface_112_grid, transform_sampling_grid
 from misc.models import ImageInputRange
 from misc.models.face_mask import FaceMasker
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
@@ -117,11 +117,15 @@ class SwapFace:
             if self.face_alignment == "ffhq"
             else get_arcface_alignment_template(self.img_resolution, self.device)
         )
-        self.identity_encoder_grid = make_ffhq_to_arcface_112_grid(self.img_resolution, 1, self.device)
+        self.identity_encoder_grid = (
+            make_ffhq_to_arcface_112_grid(self.img_resolution, 1, self.device)
+            if self.face_alignment == "ffhq"
+            else make_arcface128_to_arcface112_grid(self.img_resolution, 1, self.device)
+        )
 
     @torch.inference_mode()
     def extract_identity_embedding(self, image_path: str | Path) -> Tensor:
-        """使用训练端相同的 FFHQ -> ArcFace 112 映射提取 [1,512] 身份特征。"""
+        """使用训练端对应对齐模式的 ArcFace-112 裁剪提取 [1,512] 身份特征。"""
         image = decode_image(str(image_path), mode=ImageReadMode.RGB).to(device=self.device, dtype=torch.float32).unsqueeze(0)
         normalized = image / 127.5 - 1.0
         detections, segment_lengths = self.face_detector.detect(image)
@@ -138,11 +142,8 @@ class SwapFace:
             tuple(image.shape[-2:]),
             self.img_resolution,
         )
-        # FFHQ 模式复合一次原图->FFHQ->ArcFace 的采样；ArcFace 模式直接 112 对齐。
-        if self.face_alignment == "ffhq":
-            identity_grid = transform_sampling_grid(self.identity_encoder_grid, raw_to_alignment_theta)
-        else:
-            identity_grid = NF.affine_grid(raw_to_alignment_theta, (1, 3, 112, 112), align_corners=False)
+        # 将训练端的生成对齐->ArcFace-112 裁剪复合到原图网格，只采样一次。
+        identity_grid = transform_sampling_grid(self.identity_encoder_grid, raw_to_alignment_theta)
         identity_faces = NF.grid_sample(normalized, identity_grid, mode="bilinear", padding_mode="border", align_corners=False)
         return self.id_encoder(identity_faces)
 
