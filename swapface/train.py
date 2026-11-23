@@ -2,6 +2,7 @@ import argparse
 import copy
 import signal
 from collections import deque
+from contextlib import nullcontext
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -32,7 +33,7 @@ from losses import (
 from misc.face_alignment import arcface_to_identity_112, ffhq_to_arcface_112, make_arcface128_to_arcface112_grid, make_ffhq_to_arcface_112_grid, transform_sampling_grid
 from misc.models.face_mask import FaceMasker
 from misc.models.id_encoder import IDEncoder, IDEncoderProvider
-from models.discriminator import UNetDiscriminatorSN, build_discriminator
+from models.discriminator import FIRMinibatchStdDiscriminator, UNetDiscriminatorSN, build_discriminator
 from models.discriminator.upfirdn2d import initialize_upfirdn2d
 from models.networks import Generator
 
@@ -54,6 +55,7 @@ from .experiment import (
     write_latest,
 )
 from .occlusion import OcclusionAugmentor, gate_identity_gradient
+from .r1_matmul import make_r1_matmul_discriminator
 
 EPS = 1e-8
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -444,6 +446,14 @@ class Trainer:
         self.enable_r1_loss = loss_cfg["r1"]["enable"]
         self.r1_reg_step = loss_cfg["r1"]["interval"]
         self.r1_gamma = loss_cfg["r1"]["gamma"]
+        # On ROCm BF16, conv gradgrad is much slower than unfold + matmul.
+        # A separate forward model shares the live discriminator parameters.
+        self.r1_matmul_discriminator = (
+            make_r1_matmul_discriminator(self.net_d)
+            if self.enable_r1_loss and torch.version.hip is not None
+            and self.amp_dtype == torch.bfloat16 and isinstance(self.net_d, FIRMinibatchStdDiscriminator)
+            else None
+        )
         self.excluded_parsing_labels = tuple(loss_cfg["identity"]["exclude_parsing_labels"])
         self.d_loss = DiscriminatorAdversarialLoss(weight=1, reduction="mean").to(self.device)
         self.gan_loss = GeneratorAdversarialLoss(weight=loss_cfg["gan"]["weight"], reduction="mean").to(self.device)
@@ -571,13 +581,20 @@ class Trainer:
             return ffhq_to_arcface_112(faces, transform_sampling_grid(grid, theta_restore), padding_mode="reflection")
         return ffhq_to_arcface_112(faces, grid)
 
+    def _is_r1_step(self) -> bool:
+        return self.enable_r1_loss and not isinstance(self.net_d, UNetDiscriminatorSN) and self.completed_step % self.r1_reg_step == 0
+
     def _discriminator_loss(self, fake: Tensor, real: Tensor) -> Tensor:
-        r1_step = self.enable_r1_loss and not isinstance(self.net_d, UNetDiscriminatorSN) and self.completed_step % self.r1_reg_step == 0
-        if r1_step:
-            with autocast(device_type="cuda", enabled=False):
+        if self._is_r1_step():
+            # ROCm BF16 training: use BF16 convolutions for R1 while retaining a
+            # float32 image gradient. FP32 training and CUDA keep the original math.
+            r1_bf16 = (torch.version.hip is not None and self.amp_dtype == torch.bfloat16
+                       and isinstance(self.net_d, FIRMinibatchStdDiscriminator))
+            with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=r1_bf16):
                 fake_score = self.net_d(fake.detach().float())
                 real_img = real.detach().float().requires_grad_(True)
-                real_score = self.net_d(real_img)
+                r1_discriminator = self.r1_matmul_discriminator if self.r1_matmul_discriminator is not None else self.net_d
+                real_score = r1_discriminator(real_img)
                 adv = self.d_loss(fake_score, real_score)
                 r1_raw = r1_reg_loss(real_score, real_img, gamma=self.r1_gamma)
                 r1 = r1_raw * self.r1_reg_step
@@ -594,11 +611,17 @@ class Trainer:
         return total
 
     def _update_discriminator(self, fake: Tensor, real: Tensor) -> None:
-        for retry in range(MAX_AMP_OVERFLOW_RETRIES):
-            self.optim_d.zero_grad(set_to_none=True)
-            loss = self._discriminator_loss(fake, real)
-            if _scaled_backward_step(loss, self.optim_d, self.scaler_d):
-                return
+        # Only FIRMinibatchStd on ROCm uses this measured ATen convolution path.
+        # Other discriminators and CUDA keep their original backend selection.
+        use_native_conv = (torch.version.hip is not None and isinstance(self.net_d, FIRMinibatchStdDiscriminator)
+                           and (self._is_r1_step() or (self.amp_enabled and self.amp_dtype == torch.bfloat16)))
+        backend = torch.backends.cudnn.flags(enabled=False) if use_native_conv else nullcontext()
+        with backend:
+            for retry in range(MAX_AMP_OVERFLOW_RETRIES):
+                self.optim_d.zero_grad(set_to_none=True)
+                loss = self._discriminator_loss(fake, real)
+                if _scaled_backward_step(loss, self.optim_d, self.scaler_d):
+                    return
         raise FloatingPointError("Discriminator FP16 overflow retries exhausted")
 
     def _restore_for_geometry_loss(self, fake: Tensor, canonical_size: tuple[int, int], restore_grid: Tensor | None) -> Tensor:

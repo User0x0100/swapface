@@ -92,7 +92,8 @@ class OcclusionAugmentor:
         if count == 0:
             return dst, gate
 
-        selected = selected_cpu.to(dst.device)
+        # Async H2D avoids synchronizing the entire training stream for a few indices.
+        selected = selected_cpu.pin_memory().to(dst.device, non_blocking=True) if dst.is_cuda else selected_cpu
         clean = dst.index_select(0, selected)
         # 素材画布长边相对于训练图像边长的百分比；中心偏移以图像中心为 0。
         # affine_grid 的坐标范围为 [-1,1]，因此中心偏移百分比乘以 2/100。

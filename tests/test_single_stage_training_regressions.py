@@ -1,5 +1,6 @@
 """Single-stage training regression tests."""
 
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -70,11 +71,14 @@ def test_bf16_fp32_step_does_not_inspect_gradients() -> None:
 
 def test_discriminator_fp16_overflow_retries_only_one_optimizer() -> None:
     trainer = Trainer.__new__(Trainer)
+    trainer.net_d = nn.Identity()
     parameter = nn.Parameter(torch.tensor(1.0))
     unrelated = nn.Parameter(torch.tensor(2.0))
     trainer.optim_d = torch.optim.SGD([parameter], lr=0.1)
     unrelated_optimizer = torch.optim.SGD([unrelated], lr=0.1)
     trainer.scaler_d = SimulatedScaler(overflows=1)
+    trainer.enable_r1_loss = False
+    trainer.amp_enabled = False
     trainer._discriminator_loss = lambda _fake, _real: parameter.square()
     trainer._update_discriminator(torch.empty(0), torch.empty(0))
     assert trainer.scaler_d.attempts == 2
@@ -82,6 +86,46 @@ def test_discriminator_fp16_overflow_retries_only_one_optimizer() -> None:
     torch.testing.assert_close(parameter.detach(), torch.tensor(0.8))
     torch.testing.assert_close(unrelated.detach(), torch.tensor(2.0))
     assert not unrelated_optimizer.state
+
+
+@pytest.mark.parametrize(
+    ("hip", "amp_enabled", "amp_dtype", "r1_step", "discriminator", "expected_native"),
+    [
+        ("7.2", True, torch.bfloat16, False, "FIR_MINIBATCH_STD", True),
+        ("7.2", True, torch.float16, False, "FIR_MINIBATCH_STD", False),
+        ("7.2", False, torch.bfloat16, False, "FIR_MINIBATCH_STD", False),
+        ("7.2", False, torch.float32, True, "FIR_MINIBATCH_STD", True),
+        (None, True, torch.bfloat16, False, "FIR_MINIBATCH_STD", False),
+        ("7.2", True, torch.bfloat16, False, "INSTANCE_NORM_RESIDUAL", False),
+        ("7.2", False, torch.float32, True, "INSTANCE_NORM_RESIDUAL", False),
+    ],
+)
+def test_discriminator_native_conv_scope(hip, amp_enabled, amp_dtype, r1_step, discriminator, expected_native, monkeypatch):
+    trainer = Trainer.__new__(Trainer)
+    cfg = {"type": discriminator, "img_resolution": 16, "base_ch": 4, "max_ch": 8}
+    if discriminator == "FIR_MINIBATCH_STD":
+        cfg["minibatch_std_group_size"] = 2
+    trainer.net_d = build_discriminator(cfg)
+    trainer.optim_d = torch.optim.SGD([nn.Parameter(torch.tensor(1.0))], lr=0.1)
+    trainer.scaler_d = None
+    trainer.amp_enabled = amp_enabled
+    trainer.amp_dtype = amp_dtype
+    trainer._is_r1_step = lambda: r1_step
+    trainer._discriminator_loss = lambda _fake, _real: torch.tensor(1.0)
+
+    calls = []
+
+    @contextmanager
+    def flags(*, enabled):
+        calls.append(enabled)
+        yield
+
+    monkeypatch.setattr("swapface.train.torch.version.hip", hip)
+    monkeypatch.setattr("swapface.train.torch.backends.cudnn.flags", flags)
+    monkeypatch.setattr("swapface.train._scaled_backward_step", lambda *args: True)
+
+    trainer._update_discriminator(torch.empty(0), torch.empty(0))
+    assert calls == ([False] if expected_native else [])
 
 
 def test_lazy_r1_second_order_gradients_and_logging() -> None:
@@ -95,6 +139,7 @@ def test_lazy_r1_second_order_gradients_and_logging() -> None:
     trainer.enable_r1_loss = True
     trainer.r1_reg_step = 16
     trainer.r1_gamma = 10.0
+    trainer.r1_matmul_discriminator = None
     trainer.amp_dtype = None
     trainer.amp_enabled = False
     trainer.d_loss = DiscriminatorAdversarialLoss(weight=1.0, reduction="mean")

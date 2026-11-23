@@ -25,6 +25,14 @@
 
 训练一步：数据加载及增强 → Generator 身份特征 → 生成最终 RGB（可含 Mask Logits）→ 单判别器更新（lazy R1）→ 单组 Generator Loss / backward → EMA / scheduler → 日志/预览/检查点。SMIRK、Gaze、VGG、ID 梯度筛选等逻辑保留。
 
+## 性能优化的作用范围
+
+- **通用路径**：生成器/预览张量及时释放、异步 TensorBoard 日志、IdentityLoss 相似度复用、避免训练热路径重复检查，以及遮挡样本 CPU 索引通过 pinned memory 异步上传，均不依赖具体 GPU 厂商。`upfirdn2d` 在 CUDA/ROCm 上使用对应融合内核，CPU/ONNX 使用标准算子。
+- **ROCm 专用路径**：仅对 `FIR_MINIBATCH_STD` 判别器启用 ATen 卷积后端（关闭 MIOpen 路径），用于 BF16 常规判别器更新和 R1 步；其他判别器、CUDA 保持原后端选择。
+- **ROCm BF16 R1 专用路径**：仅在 `FIR_MINIBATCH_STD` 上使用共享实时参数的 `unfold + matmul` 卷积前向，以避开昂贵的卷积二阶梯度；R1 的输入图像仍使用 FP32，但部分卷积使用 BF16 autocast。**这会改变相对纯 FP32 R1 的数值精度**，不是严格等价的纯性能替换。
+
+上述后端选择基于当前 ROCm 训练场景，不向其他模型或后端扩展；未来是否启用应以对应硬件上的正确性和性能测试为依据。
+
 ## Run / Checkpoint
 
 新训练：`uv run python -m swapface.train --config experiments/train.toml [--name NAME]`
