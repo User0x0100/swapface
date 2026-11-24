@@ -1,3 +1,4 @@
+import math
 
 import torch
 import torch.nn.functional as F
@@ -94,6 +95,13 @@ class WSpaceMap(nn.Sequential):
             nn.Linear(id_dim, id_dim),
             nn.SiLU(),
         )
+        self.input_scale = math.sqrt(id_dim)
+        nn.init.zeros_(self[0].bias)
+        nn.init.zeros_(self[2].bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Restore unit RMS for L2-normalized identity embeddings.
+        return super().forward(x * self.input_scale)
 
 
 class LatentBlock(nn.Module):
