@@ -8,18 +8,20 @@ from .stylegan2 import Generator as StyleGAN2Generator
 
 
 class AdaIN(nn.Module):
-    def __init__(self, channels: int, w_dim: int) -> None:
+    def __init__(
+        self, channels: int, w_dim: int, *,
+        gamma_std: float = 0.01, gamma_bias: float = 1.0, beta_std: float = 0.01,
+    ) -> None:
         super().__init__()
 
         self.norm = nn.InstanceNorm2d(channels, affine=False, eps=1e-8)
         # InSwapper-style affine modulation: one id_dim -> 2*C projection,
-        # first half gamma, second half beta. The scale/shift initialization
-        # preserves the project's previous near-identity AdaIN starting point.
+        # First half gamma, second half beta.
         self.linear = nn.Linear(w_dim, channels * 2)
-        nn.init.normal_(self.linear.weight, mean=0.0, std=0.01)
-        with torch.no_grad():
-            self.linear.bias[:channels].fill_(1.0)
-            self.linear.bias[channels:].zero_()
+        nn.init.normal_(self.linear.weight[:channels], std=gamma_std)
+        nn.init.normal_(self.linear.weight[channels:], std=beta_std)
+        nn.init.constant_(self.linear.bias[:channels], gamma_bias)
+        nn.init.zeros_(self.linear.bias[channels:])
 
     def forward(self, x: Tensor, id_feat: Tensor) -> Tensor:
         gamma, beta = self.linear(id_feat).chunk(2, dim=1)
@@ -35,7 +37,7 @@ class IDInject(nn.Module):
         self.adain0 = AdaIN(channels, w_dim)
         self.conv0 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, padding_mode="reflect")
 
-        self.adain1 = AdaIN(channels, w_dim)
+        self.adain1 = AdaIN(channels, w_dim, gamma_std=0.1, gamma_bias=0.5, beta_std=0.02)
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, padding_mode="reflect")
 
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
@@ -160,6 +162,13 @@ class InSwapper(nn.Module):
             self.decoder.append(UpSample(current_ch, out_ch))
             current_ch = out_ch * (2 if index in enabled and skip_mode == "cat" else 1)
         self.to_rgb = ToRGB(current_ch, img_channels)
+        if skip_mode == "cat":
+            # Scale only the Skip half of each consuming convolution at initialization.
+            with torch.no_grad():
+                for index in self.skip_layers:
+                    resolution = latent_resolution * 2 ** (index + 1)
+                    conv = self.decoder[index + 1][1] if index + 1 < depth else self.to_rgb[0]
+                    conv.weight[:, conv.in_channels // 2:].mul_(0.1 if resolution <= 64 else 0.25)
 
     def forward(self, x: Tensor, id_feat: Tensor, return_resize_in: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         resized = x if x.shape[-2:] == (self.img_resolution, self.img_resolution) else F.interpolate(x, size=self.img_resolution, mode="bilinear", align_corners=False)

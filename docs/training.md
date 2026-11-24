@@ -9,7 +9,7 @@
 - `inswapper`：完整分辨率 U-Net。`FromRGB → Encoder → LatentBlock → Decoder → ToRGB`；Bottleneck 使用 `WSpaceMap + IDInject/AdaIN`：L2 归一化身份向量先乘以 `sqrt(id_dim)` 恢复单位 RMS，再通过固定两组 `Linear(id_dim, id_dim) + SiLU`（无残差，权重采用 PyTorch 默认初始化，偏置零初始化）生成共享 W，各 AdaIN 使用独立仿射层从同一 W 生成 gamma/beta。`latent_resolution` 控制瓶颈分辨率，`num_latent` 控制身份残差块数量，`base_ch/max_ch` 控制各分辨率通道。`skip_mode = "cat" | "add"`；`skip_layers` 按 Decoder 从瓶颈向外、从 0 开始编号。空数组禁用跨级连接，最后一层是 FromRGB 与最高分辨率 Decoder 输出的融合。`latent_resolution >= 2`（Bottleneck 的反射填充卷积要求空间尺寸至少为 2）；仅缓存实际启用的 Skip 特征。
 - `stylegan2`：直接生成完整分辨率 RGB，维持 StyleSwap Target 编码和多分辨率注入。参数：`w_dim`、`mapping_layers`、`start_resolution`、`channels`、`target_inject_mode`、`target_inject_layers`。可选 `mask_enabled`、`mask_noise_blank_level`、`mask_guidance_epsilon`、`mask_guidance_interpolation`。
 
-`cat` 在对应 Decoder 层的上采样完成后与同分辨率 Encoder 特征按通道拼接，后续层的 `in_channels` 自动匹配；`add` 进行逐元素相加。没有 AAD、额外权重门控或隐藏的通道投影。
+`cat` 在对应 Decoder 层的上采样完成后与同分辨率 Encoder 特征按通道拼接，后续层的 `in_channels` 自动匹配；`add` 进行逐元素相加。没有 AAD、额外权重门控或隐藏的通道投影。 IDInject 的第一组 AdaIN 保持 Gamma/Beta 权重标准差 0.01、Gamma 偏置 1；第二组采用 Gamma 权重标准差 0.1、偏置 0.5，Beta 权重标准差 0.02、偏置 0。Cat Skip 的消费卷积仅在初始化时将 Skip 输入通道权重乘以 0.1（分辨率不超过 64）或 0.25（更高分辨率）；Decoder 输入通道及 add 模式保持原初始化。
 
 两类生成器配置互斥；不接受其他类型专属字段。训练配置中的 `img_channels` 已删除，Generator 和 Discriminator 都默认使用 RGB 三通道；该字段不进入 canonical config 或检查点网络配置。`id_dim` 等其他参数仍按其原有设计配置。修改分辨率、跳跃层级或融合方式会改变模型架构，需新建 run。
 

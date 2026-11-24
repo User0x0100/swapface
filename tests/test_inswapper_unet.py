@@ -1,16 +1,54 @@
 """Single-stage InSwapper U-Net architecture, topology, and client split contract."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
 from torch import nn
 
-from models.networks import Generator, InSwapper
+from models.networks import Generator, IDInject, InSwapper
 from swapface.config import _normalize_generator
 from swapface.contracts import CHECKPOINT_VERSION
 from swapface.inference import load_generator
 from swapface.split_identity import build_split_models
+
+
+def test_identity_residual_initialization() -> None:
+    torch.manual_seed(2026)
+    block = IDInject(channels=128, w_dim=512)
+    for adain, gamma_std, gamma_bias, beta_std in (
+        (block.adain0, 0.01, 1.0, 0.01),
+        (block.adain1, 0.1, 0.5, 0.02),
+    ):
+        gamma, beta = adain.linear.weight.chunk(2)
+        gamma_b, beta_b = adain.linear.bias.chunk(2)
+        assert gamma.std().item() == pytest.approx(gamma_std, rel=0.02)
+        assert beta.std().item() == pytest.approx(beta_std, rel=0.02)
+        torch.testing.assert_close(gamma_b, torch.full_like(gamma_b, gamma_bias))
+        torch.testing.assert_close(beta_b, torch.zeros_like(beta_b))
+
+
+@pytest.mark.parametrize("mode", ["cat", "add"])
+@pytest.mark.parametrize("layers", [[], [0, 2, 4], [0, 1, 2, 3, 4]])
+def test_skip_initialization_scales_only_consumed_cat_channels(mode, layers) -> None:
+    original = nn.Conv2d.reset_parameters
+    initial_weights = {}
+
+    def capture(conv):
+        original(conv)
+        initial_weights[conv] = conv.weight.detach().clone()
+
+    with patch.object(nn.Conv2d, "reset_parameters", capture):
+        model = InSwapper(img_resolution=256, latent_resolution=8, num_latent=1,
+                          base_ch=4, max_ch=16, skip_mode=mode, skip_layers=layers)
+
+    if mode == "cat":
+        for index in layers:
+            conv = model.decoder[index + 1][1] if index < 4 else model.to_rgb[0]
+            initial_weights[conv][:, conv.in_channels // 2:].mul_(0.1 if index <= 2 else 0.25)
+    for conv, expected in initial_weights.items():
+        torch.testing.assert_close(conv.weight, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("mode", ["cat", "add"])
