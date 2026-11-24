@@ -14,7 +14,7 @@ from PIL import Image
 
 from .config import DEFAULT_DATA_CONFIG, resolve_train_config
 from .dataloader import TrainingDataLoader
-from .dataloader_common import ImageSource, LocalImagePool, build_image_pools, print_image_pools
+from .dataloader_common import ImagePairSampler, ImageSource
 from .experiment import config_sha256, create_run
 from .train import _load_run_config
 from misc.face_alignment import make_ffhq_to_arcface_112_grid, ffhq_to_arcface_112
@@ -93,7 +93,7 @@ def main():
             torch.testing.assert_close(identity[old_match],old[old_match],atol=0,rtol=0)
         # same pair 取 FFHQ dst，忽略独立 ArcFace src 池。
         cfg['same_prob']=1.0;cfg['flip_prob']=0.0
-        same_loader=TrainingDataLoader(batch_size=2,device=torch.device('cpu'),img_resolution=256,src=[(arc,0.0,'arcface')],dst=[dst],**cfg)
+        same_loader=TrainingDataLoader(batch_size=2,device=torch.device('cpu'),img_resolution=256,src=[(arc,0.0,'arcface','flat')],dst=[dst],**cfg)
         same_src,_,same_canonical,_,same_mask,identity=same_loader.next()
         assert same_mask.all()
         torch.testing.assert_close(same_src,same_canonical)
@@ -101,11 +101,11 @@ def main():
         torch.testing.assert_close(identity,expected_same,atol=0,rtol=0)
         # 展示和身份分支共享同一次 src flip，原始 112 身份像素不发生插值。
         cfg['same_prob']=0.0;cfg['flip_prob']=1.0
-        flip_loader=TrainingDataLoader(batch_size=2,device=torch.device('cpu'),img_resolution=256,src=[(arc,0.0,'arcface')],dst=[dst],**cfg)
+        flip_loader=TrainingDataLoader(batch_size=2,device=torch.device('cpu'),img_resolution=256,src=[(arc,0.0,'arcface','flat')],dst=[dst],**cfg)
         flipped,_,_,_,_,identity=flip_loader.next()
         expected=normalized.flip(-1).unsqueeze(0).expand(2,-1,-1,-1)
         torch.testing.assert_close(identity,expected,atol=0,rtol=0)
-        display=_RandomImagePairDataset([(arc,0.0,'arcface')],[dst],256,0.0)._decode_resize(str(arc/'ramp.png'))
+        display=_RandomImagePairDataset([(arc,0.0,'arcface','flat')],[dst],256,0.0)._decode_resize(str(arc/'ramp.png'))
         expected_display=display.float().div(127.5).sub(1).flip(-1).unsqueeze(0).expand(2,-1,-1,-1)
         torch.testing.assert_close(flipped,expected_display,atol=0,rtol=0)
         # FFHQ 翻转仍发生在旧裁剪之前。
@@ -116,14 +116,14 @@ def main():
         # Exercise DALI Python source without importing the unavailable CUDA-only SDK.
         source_tree=ast.parse(Path(__file__).with_name('dataloader_dali.py').read_text())
         source_node=next(n for n in source_tree.body if isinstance(n,ast.ClassDef) and n.name=='_RandomImagePairSource')
-        namespace: dict[str, Any] = {'np':np,'ndarray':np.ndarray,'os':os,'Sequence':Sequence,'Any':Any,'ImageSource':ImageSource,'LocalImagePool':LocalImagePool,'build_image_pools':build_image_pools,'print_image_pools':print_image_pools}
+        namespace: dict[str, Any] = {'np':np,'ndarray':np.ndarray,'os':os,'Sequence':Sequence,'Any':Any,'ImageSource':ImageSource,'ImagePairSampler':ImagePairSampler}
         exec(compile(ast.Module(body=[source_node],type_ignores=[]),'<DALI source>','exec'),namespace)
         source_type=namespace['_RandomImagePairSource']
-        dali=source_type([(arc,0.0,'arcface')],[dst],0.0)
+        dali=source_type([(arc,0.0,'arcface','flat')],[dst],0.0)
         encoded,_,same,arcface=dali(None)
         assert not bool(same) and bool(arcface)
         assert encoded.tobytes()==(arc/'ramp.png').read_bytes()
-        dali_same=source_type([(arc,0.0,'arcface')],[dst],1.0)
+        dali_same=source_type([(arc,0.0,'arcface','flat')],[dst],1.0)
         encoded,dst_encoded,same,arcface=dali_same(None)
         assert bool(same) and not bool(arcface)
         assert np.array_equal(encoded,dst_encoded)

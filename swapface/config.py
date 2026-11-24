@@ -196,14 +196,14 @@ def _normalize_image_sources(entries: object, section: str) -> list[dict[str, An
         raise ValueError(f"[[{section}]] 数据源不能为空")
 
     normalized: list[dict[str, Any]] = []
-    allowed_fields = {"path", "adjustment", "alignment"}
+    allowed_fields = {"path", "adjustment", "alignment", "layout"}
     for index, raw_entry in enumerate(entries):
         if not isinstance(raw_entry, dict):
             raise TypeError(f"[[{section}]] 第 {index} 项必须是表/对象")
         entry = dict(raw_entry)
         unknown = set(entry) - allowed_fields
         if unknown:
-            raise ValueError(f"[[{section}]] 第 {index} 项包含未知字段：{sorted(unknown)}；训练数据源仅支持本地 path/adjustment/alignment")
+            raise ValueError(f"[[{section}]] 第 {index} 项包含未知字段：{sorted(unknown)}；训练数据源仅支持本地 path/adjustment/alignment/layout")
         path = entry.get("path")
         if not isinstance(path, str) or not path:
             raise ValueError(f"[[{section}]] 第 {index} 项 path 必须为非空字符串")
@@ -214,6 +214,12 @@ def _normalize_image_sources(entries: object, section: str) -> list[dict[str, An
             raise ValueError("data.dst 仅支持 ffhq 对齐；arcface 仅用于 source identity")
         item = {"path": path, "adjustment": _float(entry.get("adjustment", 0.0), f"{section}[{index}].adjustment")}
         item["alignment"] = alignment
+        layout = entry.get("layout", "flat")
+        if layout not in ("flat", "identity"):
+            raise ValueError(f"{section}[{index}].layout 必须为 flat 或 identity，实际为 {layout!r}")
+        # flat 为历史默认值，不写入 canonical config，保持旧实验哈希。
+        if layout != "flat":
+            item["layout"] = layout
         normalized.append(item)
     return normalized
 
@@ -539,7 +545,15 @@ def _normalize_data(config: dict[str, Any]) -> dict[str, Any]:
     for key in DATALOADER_RANGE_KEYS:
         augmentation[key] = _range(augmentation[key], f"data.augmentation.{key}", positive=key == "scale_factor_range")
 
-    sampling = _with_defaults(_table(data, "sampling", "[data.sampling]"), DEFAULT_DATA_CONFIG["sampling"], "[data.sampling]")
+    src = _normalize_image_sources(data.get("src"), "data.src")
+    dst = _normalize_image_sources(data.get("dst"), "data.dst")
+    has_identity_dst = any(entry.get("layout") == "identity" for entry in dst)
+    sampling_defaults = DEFAULT_DATA_CONFIG["sampling"]
+    if has_identity_dst:
+        sampling_defaults = sampling_defaults | {"cross_view_prob": 0.75}
+    sampling = _with_defaults(_table(data, "sampling", "[data.sampling]"), sampling_defaults, "[data.sampling]")
+    if has_identity_dst:
+        sampling["cross_view_prob"] = _float(sampling["cross_view_prob"], "data.sampling.cross_view_prob", minimum=0.0, maximum=1.0)
     sampling["same_prob"] = _float(sampling["same_prob"], "data.sampling.same_prob", minimum=0.0, maximum=1.0)
 
     occlusion = None
@@ -558,8 +572,8 @@ def _normalize_data(config: dict[str, Any]) -> dict[str, Any]:
         "loader": loader,
         "augmentation": augmentation,
         "sampling": sampling,
-        "src": _normalize_image_sources(data.get("src"), "data.src"),
-        "dst": _normalize_image_sources(data.get("dst"), "data.dst"),
+        "src": src,
+        "dst": dst,
     }
     result["alignment"] = alignment
     if occlusion is not None:

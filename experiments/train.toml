@@ -132,9 +132,11 @@ ty_range = [-0.15, 0.15]
 
 
 [data.sampling]
-# 每个样本令 src/dst 从同一张 dst 原图构造的概率。
+# 每个样本使用同身份重建的总概率（同图或跨视角）。
 # scope="same" 时，L1/VGG 只作用于这些样本。
 same_prob = 0.2
+# 仅存在 layout = "identity" 的 data.dst 时可设置；同身份重建中跨视角所占比例，默认 0.75。
+# cross_view_prob = 0.75
 
 
 
@@ -228,6 +230,18 @@ alignment = "ffhq"
 path = "/path/to/occlusion_faces"
 adjustment = 1.0
 alignment = "ffhq"
+
+# 可选身份型数据源：根目录下每个一级子目录对应一个身份。
+# 同一数据集可同时用于 src/dst，共享目录索引。layout 默认 flat。
+# [[data.src]]
+# path = "/path/to/vggface2-hq"
+# layout = "identity"
+# adjustment = 0.0
+#
+# [[data.dst]]
+# path = "/path/to/vggface2-hq"
+# layout = "identity"
+# adjustment = 0.0
 
 # 可选在线遮挡增强；不设置该段时完全禁用、也不加载 OCC 模型。
 # 已处理的 NatOcc 素材：Hugging Face 私有 Dataset leehx/swapface-occluders

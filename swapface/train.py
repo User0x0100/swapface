@@ -486,8 +486,8 @@ class Trainer:
         augmentation = data_cfg["augmentation"]
         self.geometry_augmentation_enabled = not is_identity_geometry(tuple(augmentation["rotation_range"]), tuple(augmentation["scale_factor_range"]), tuple(augmentation["tx_range"]), tuple(augmentation["ty_range"]))
         self.dataset = TrainingDataLoader(batch_size=self.batch_size, device=self.device, img_resolution=self.img_resolution,
-                                          src=[(e["path"], e["adjustment"], e["alignment"]) for e in data_cfg["src"]],
-                                          dst=[(e["path"], e["adjustment"]) for e in data_cfg["dst"]],
+                                          src=[(e["path"], e["adjustment"], e["alignment"], e.get("layout", "flat")) for e in data_cfg["src"]],
+                                          dst=[(e["path"], e["adjustment"], e["alignment"], e.get("layout", "flat")) for e in data_cfg["dst"]],
                                           **(data_cfg["loader"] | augmentation | data_cfg["sampling"] | {"alignment": self.face_alignment, "decoder_backend": ImageDecoderBackend(data_cfg["loader"]["decoder_backend"])}))
         self.occlusion = None
         occlusion = data_cfg.get("occlusion", {})

@@ -1,7 +1,6 @@
 """不依赖厂商 SDK 的 PyTorch 训练数据管线，主要用于 ROCm。"""
 
 import math
-import os
 from collections.abc import Iterator, Sequence
 
 import numpy as np
@@ -17,13 +16,11 @@ from .dataloader_common import (
     FFHQ_TO_ARCFACE112_ROI,
     FloatRange,
     ImageDecoderBackend,
+    ImagePairSampler,
     ImageSource,
-    LocalImagePool,
-    build_image_pools,
     generation_alignment_rois,
     is_identity_geometry,
     prepare_source_identity_faces,
-    print_image_pools,
     validate_range,
 )
 
@@ -49,7 +46,8 @@ def _image_to_tensor(image: Image.Image) -> Tensor:
 class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool, bool, Tensor, bool, bool]]):
     """在 CPU worker 中随机采样、解码并 Lanczos resize 成固定尺寸。"""
 
-    def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource], img_resolution: int, same_prob: float, alignment: str = "ffhq", gpu_align_ffhq: bool = False) -> None:
+    def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource], img_resolution: int, same_prob: float, alignment: str = "ffhq", gpu_align_ffhq: bool = False,
+                 cross_view_prob: float = 0.75) -> None:
         super().__init__()
         if img_resolution <= 0:
             raise ValueError(f"img_resolution 必须为正数，实际为 {img_resolution}")
@@ -63,20 +61,7 @@ class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool, bool, 
         # 原图恰好等于生成尺寸且输出 >=512 时，固定对齐可留到 GPU：
         # 无需提前缩小，不会发生二次采样，避免 CPU 同尺寸 Lanczos 的高额成本。
         self.gpu_align_ffhq = gpu_align_ffhq
-        self.same_prob = same_prob
-        self.src_pools, self.src_cdf, src_info = build_image_pools(src)
-        self.dst_pools, self.dst_cdf, dst_info = build_image_pools(dst)
-        if any(pool.alignment != "ffhq" for pool in self.dst_pools):
-            raise ValueError("dst 数据池必须使用 ffhq 对齐")
-        print_image_pools("SRC Sources", src_info)
-        print_image_pools("DST Sources", dst_info)
-
-    @staticmethod
-    def _sample_path(rng: np.random.Generator, pools: tuple[LocalImagePool, ...], cdf: np.ndarray) -> tuple[str, str]:
-        pool_index = min(int(np.searchsorted(cdf, rng.random(), side="right")), len(pools) - 1)
-        pool = pools[pool_index]
-        file_name = pool.file_names[int(rng.integers(len(pool.file_names)))]
-        return os.path.join(pool.root, file_name), pool.alignment
+        self.sampler = ImagePairSampler(src, dst, same_prob, cross_view_prob)
 
     def _resize_generation(self, image: Image.Image, source_alignment: str) -> tuple[Image.Image, bool]:
         if self.gpu_align_ffhq and source_alignment == "ffhq" and image.size == (self.img_resolution, self.img_resolution):
@@ -115,19 +100,17 @@ class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool, bool, 
         # DataLoader 会为每个 worker 设置独立 torch seed；以它初始化 NumPy RNG。
         rng = np.random.default_rng(torch.initial_seed())
         while True:
-            dst_path, _ = self._sample_path(rng, self.dst_pools, self.dst_cdf)
-            same = bool(rng.random() < self.same_prob)
-            src_path, alignment = (dst_path, "ffhq") if same else self._sample_path(rng, self.src_pools, self.src_cdf)
-            if same:
+            src_path, dst_path, same, arcface = self.sampler.sample(rng)
+            if same and src_path == dst_path:
                 if self.alignment == "arcface":
                     image, identity, needs_gpu_align = self._decode_source(dst_path, False)
                 else:
                     image, identity, needs_gpu_align = self._decode_resize(dst_path), torch.zeros((3, 112, 112), dtype=torch.uint8), False
                 yield image, image, True, False, identity, needs_gpu_align, needs_gpu_align
             else:
-                display, identity, src_gpu_align = self._decode_source(src_path, alignment == "arcface")
+                display, identity, src_gpu_align = self._decode_source(src_path, arcface)
                 dst, dst_gpu_align = self._decode_resize_with_meta(dst_path)
-                yield display, dst, False, alignment == "arcface", identity, src_gpu_align, dst_gpu_align
+                yield display, dst, same, arcface, identity, src_gpu_align, dst_gpu_align
 
 
 def _uniform(batch_size: int, value_range: FloatRange, device: torch.device) -> Tensor:
@@ -240,6 +223,7 @@ class _NativeTrainingDataLoader:
         tx_range: FloatRange,
         ty_range: FloatRange,
         alignment: str = "ffhq",
+        cross_view_prob: float = 0.75,
     ) -> None:
         del num_threads, prefetch_queue_depth, decoder_backend, decoder_hw_load
         if batch_size <= 0:
@@ -281,7 +265,7 @@ class _NativeTrainingDataLoader:
             if not self.apply_geometry else None
         )
 
-        dataset = _RandomImagePairDataset(src, dst, img_resolution, same_prob, alignment, gpu_align_ffhq)
+        dataset = _RandomImagePairDataset(src, dst, img_resolution, same_prob, alignment, gpu_align_ffhq, cross_view_prob)
         loader_kwargs: dict[str, object] = {
             "batch_size": batch_size,
             "num_workers": py_num_workers,

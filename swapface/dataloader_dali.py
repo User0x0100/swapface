@@ -1,7 +1,7 @@
 """高吞吐、可配置的 DALI 人脸交换训练数据管线。
 
 数据流:
-    1. ``src`` 与 ``dst`` 默认独立采样；按 ``same_prob`` 可令二者来自同一张 dst 原图。
+    1. ``src`` 与 ``dst`` 默认独立采样；按 ``same_prob`` 采样同图或跨视角同身份重建。
     2. ArcFace 模式从解码原图直接使用 Lanczos ROI resize，FFHQ 模式保持普通 resize；随后在 GPU 上执行随机水平翻转。
     3. ``dst`` 额外执行亮度、对比度、饱和度增强，并保留几何增强前的 ``dst_canonical``。
     4. ``dst`` 再执行随机仿射增强。
@@ -10,9 +10,9 @@
        将生成结果映射回仿射增强前的目标坐标系。
 
 图片源:
-    每个源可以是路径、``(path, adjustment)`` 或 ``(path, adjustment, alignment)``。alignment 默认为 ffhq；arcface 仅用于 src。文件夹首先按
+    每个源可以是路径或 ``(path, adjustment, alignment, layout)`` 的 2~4 项前缀元组。alignment 默认为 ffhq；arcface 仅用于 src。layout 默认为 flat，identity 表示一级子目录为身份。数据源首先按
     ``sqrt(file_count) * 2**adjustment`` 分配采样概率，再在选中的文件夹内均匀
-    采样图片。训练数据只从本地目录读取，不包含网络访问或远程数据源状态。
+    采样图片（identity 布局先均匀选择身份）。训练数据只从本地目录读取，不包含网络访问或远程数据源状态。
     ``adjustment=1`` 表示将该数据源的基础权重翻倍，``-1`` 表示减半。
 
 性能原则:
@@ -26,13 +26,12 @@
     ``dst_canonical``: ``float32``，与 ``dst`` 相同的 flip/color，但未做几何仿射。
     ``theta_restore``: ``float32``，形状 ``(B, 2, 3)``，可直接传给
     ``torch.nn.functional.affine_grid(..., align_corners=False)``。
-    ``same_mask``: ``bool``，形状 ``(B,)``，标记 src/dst 是否来自同一张原图。
+    ``same_mask``: ``bool``，形状 ``(B,)``，标记 src/dst 是否属于同身份重建样本（含跨视角）。
     ``src_arcface_mask``: ``bool``，形状 ``(B,)``，标记 src 是否已经使用 ArcFace 对齐；same pair 为 False。
     ``src_arcface_faces``: ArcFace 模式下是从原图直接采样的 112×112 身份输入；FFHQ 模式下保留原有 ArcFace 源图分支。
     FFHQ 生成模式保留 PyTorch 侧原有身份裁剪；ArcFace 生成模式直接返回解码原图产生的身份图。
 """
 
-import os
 from collections.abc import Sequence
 from typing import Any
 
@@ -48,13 +47,11 @@ from .dataloader_common import (
     FFHQ_TO_ARCFACE112_ROI,
     FloatRange,
     ImageDecoderBackend,
+    ImagePairSampler,
     ImageSource,
-    LocalImagePool,
-    build_image_pools,
     generation_alignment_rois,
     is_identity_geometry,
     prepare_source_identity_faces,
-    print_image_pools,
     validate_range,
 )
 
@@ -62,17 +59,10 @@ from .dataloader_common import (
 class _RandomImagePairSource:
     """为 DALI parallel external_source 提供本地 source/target 编码图像。"""
 
-    def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource], same_prob: float) -> None:
-        if not 0.0 <= same_prob <= 1.0:
-            raise ValueError(f"same_prob 必须位于 [0, 1]，实际为 {same_prob}")
-        self.same_prob = same_prob
-        self.src_pools, self.src_cdf, src_info = build_image_pools(src)
-        self.dst_pools, self.dst_cdf, dst_info = build_image_pools(dst)
-        if any(pool.alignment != "ffhq" for pool in self.dst_pools):
-            raise ValueError("dst 数据池必须使用 ffhq 对齐")
+    def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource], same_prob: float,
+                 cross_view_prob: float = 0.75) -> None:
+        self.sampler = ImagePairSampler(src, dst, same_prob, cross_view_prob)
         self.rng = np.random.default_rng()
-        print_image_pools("SRC Sources", src_info)
-        print_image_pools("DST Sources", dst_info)
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -83,16 +73,10 @@ class _RandomImagePairSource:
         self.__dict__.update(state)
         self.rng = np.random.default_rng()
 
-    def _sample_encoded(self, pools: tuple[LocalImagePool, ...], cdf: ndarray) -> tuple[ndarray, bool]:
-        pool_index = min(int(np.searchsorted(cdf, self.rng.random(), side="right")), len(pools) - 1)
-        pool = pools[pool_index]
-        file_name = pool.file_names[int(self.rng.integers(len(pool.file_names)))]
-        return np.fromfile(os.path.join(pool.root, file_name), dtype=np.uint8), pool.alignment == "arcface"
-
     def __call__(self, _sample_info) -> tuple[ndarray, ndarray, ndarray, ndarray]:
-        dst, _ = self._sample_encoded(self.dst_pools, self.dst_cdf)
-        same = self.rng.random() < self.same_prob
-        src, arcface = (dst, False) if same else self._sample_encoded(self.src_pools, self.src_cdf)
+        src_path, dst_path, same, arcface = self.sampler.sample(self.rng)
+        dst = np.fromfile(dst_path, dtype=np.uint8)
+        src = dst if same and src_path == dst_path else np.fromfile(src_path, dtype=np.uint8)
         return src, dst, np.asarray(same, dtype=np.bool_), np.asarray(arcface, dtype=np.bool_)
 
 
@@ -194,6 +178,7 @@ def create_dataloader_pipeline(
     tx_range: FloatRange = (-0.15, 0.15),
     ty_range: FloatRange = (-0.15, 0.15),
     alignment: str = "ffhq",
+    cross_view_prob: float = 0.75,
 ):
     """构建训练用 DALI pipeline。
 
@@ -211,7 +196,8 @@ def create_dataloader_pipeline(
         contrast: ``dst`` 对比度随机乘数的最大偏移。
         saturation: ``dst`` 饱和度随机乘数的最大偏移。
         flip_prob: ``src`` 和 ``dst`` 各自独立水平翻转的概率。
-        same_prob: 每个样本令 ``src`` 与 ``dst`` 来自同一张 dst 原图的概率。
+        same_prob: 同身份重建的总概率。
+        cross_view_prob: 同身份重建中使用跨视角数据的条件概率。
         rotation_range: ``dst`` 随机旋转角范围，单位为度。
         scale_factor_range: ``dst`` **实际缩放倍数**范围，例如 ``(0.8, 1.2)``。
             不再使用旧式“缩放偏移”语义。
@@ -253,7 +239,7 @@ def create_dataloader_pipeline(
     apply_geometry = not is_identity_geometry(rotation_range, scale_factor_range, tx_range, ty_range)
 
     src_raw, dst_raw, same_mask, src_arcface_mask = fn.external_source(
-        source=_RandomImagePairSource(src, dst, same_prob),
+        source=_RandomImagePairSource(src, dst, same_prob, cross_view_prob),
         num_outputs=4,
         device="cpu",
         parallel=True,
@@ -271,7 +257,7 @@ def create_dataloader_pipeline(
         # 112 teacher 分支也从原图独立采样，绝不经过生成图缩放。
         # 纯 FFHQ 或纯 ArcFace（且无 same pair）使用静态 ROI，避免逐样本构造动态参数。
         ffhq_roi, native_arcface_roi = generation_alignment_rois(img_resolution)
-        source_alignments = {entry[2] if isinstance(entry, tuple) and len(entry) == 3 else "ffhq" for entry in src}
+        source_alignments = {entry[2] if isinstance(entry, tuple) and len(entry) >= 3 else "ffhq" for entry in src}
         if same_prob >= 1.0 or source_alignments == {"ffhq"}:
             src_start, src_end = _roi_in_dali_order(ffhq_roi)
             id_start, id_end = _roi_in_dali_order(FFHQ_TO_ARCFACE112_ROI)

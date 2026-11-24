@@ -96,7 +96,7 @@ ROCm 不安装 DALI、TorchCodec、ONNX Runtime GPU、xFormers 或 TensorRT。NV
 
 ## 训练数据源
 
-训练数据只支持本地图片目录，不再由训练进程访问 Hugging Face、ModelScope 或其他在线数据集。`[[data.src]]` / `[[data.dst]]` 的 schema 只包含本地路径、权重调整和可选对齐方式：
+训练数据只支持本地图片目录，不再由训练进程访问 Hugging Face、ModelScope 或其他在线数据集。`[[data.src]]` / `[[data.dst]]` 的 schema 包含本地路径、权重调整、对齐方式和目录布局：
 
 ```toml
 [[data.src]]
@@ -110,6 +110,44 @@ adjustment = 0.0
 ```
 
 `alignment = "arcface"` 仅允许用于 `data.src`。这类目录中的图片应已经是 canonical ArcFace 对齐；训练管线会直接保留其 112×112 身份分支，不再经过 FFHQ→ArcFace 裁剪。`data.dst` 固定使用 FFHQ 对齐。多个目录仍按 `sqrt(file_count) * 2**adjustment` 分配目录采样权重。`backend`、`repo_id`、`revision`、`path_prefix`、在线数据集 proxy/cache 等旧字段均不再接受。模型权重仍可由各模型模块通过 Hugging Face Hub 获取；这与训练数据源是两个独立职责。
+
+### 身份型数据源与跨视角同身份重建
+
+`layout = "flat"`（默认）表示平铺图片；`layout = "identity"` 表示按身份目录组织。身份型数据源可用于普通换脸及自重建。同一个根目录与布局在 SRC/DST 间共享索引。旧 flat 配置的采样及配置哈希不变。
+
+```toml
+[data.sampling]
+same_prob = 0.2
+cross_view_prob = 0.75
+
+[[data.src]]
+path = "/mnt/datasets/vggface2-hq"
+layout = "identity"
+adjustment = 0.0
+
+[[data.dst]]
+path = "/mnt/datasets/vggface2-hq"
+layout = "identity"
+adjustment = 0.0
+```
+
+目录结构固定为根目录/身份目录/图片文件；只扫描两级，忽略根目录图片、非图片文件和空身份目录。只有一张图片的身份仍可参与普通换脸与同图重建。DST 图片必须预先完成 FFHQ 对齐。
+
+```text
+vggface2-hq/
+├── n000001/
+│   ├── 0001.jpg
+│   └── 0002.jpg
+└── n000002/
+    ├── 0001.jpg
+    └── 0002.jpg
+```
+
+`same_prob` 是同身份重建总概率，`cross_view_prob` 是其中跨视角的条件概率（默认 0.75）。上例对应 80% 独立采样、15% 跨视角重建和 5% 同图重建。普通换脸和同图重建使用全部对应数据源，按图片数量的平方根及 adjustment 选择数据源。身份型数据源先均匀采样身份，再均匀采样图片；普通换脸在 SRC/DST 指向同一身份型数据集时排除目标身份（不同根目录的身份标签不做匹配）。跨视角仅从 DST 的身份型数据源中选择至少两张图片的身份，按可用于跨视角的图片数量计算数据源权重，然后均匀选择一个身份并无放回采样两张图片。没有可用跨视角身份时退回同图重建。仅配置身份型 SRC 不启用跨视角重建。不预生成配对、不进行在线姿态检测；不同图片不保证姿态角度不同。
+
+启动日志输出各身份型数据源的身份总数、有效多视角身份数，以及最终生效的三种采样概率；无可用跨视角身份导致回退时会明确提示。启用跨视角时先选择采样模式，避免无效 DST 采样；禁用时保持历史随机采样顺序。
+
+DALI 与 native 共用路径采样逻辑，跨视角与同图样本均返回 `same_mask=True`，L1/VGG 在 `scope="same"` 时以目标图为监督。身份编码始终使用 source 图片，而非 target。
 
 FairFace 可直接作为额外的 source identity 池。项目固定下载 `HuggingFaceM4/FairFace` 的 `0.25` 配置，并将官方 `train` 与 `validation` 三个 Parquet 统一映射为一个本地 identity pool；这里不保留训练/验证语义，因为 FairFace 仅作为 source ID 素材使用。随后通过项目 RetinaFace 5 点检测重新对齐到 ArcFace 112，而不是简单缩放原始图像：
 
