@@ -10,7 +10,7 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 
-from misc.face_alignment import make_ffhq_to_arcface_112_grid, make_ffhq_to_arcface_grid
+from misc.face_alignment import ffhq_to_arcface_112, make_ffhq_to_arcface_112_grid, make_ffhq_to_arcface_grid
 
 from .dataloader_common import (
     FFHQ_TO_ARCFACE112_ROI,
@@ -21,6 +21,7 @@ from .dataloader_common import (
     generation_alignment_rois,
     is_identity_geometry,
     prepare_source_identity_faces,
+    source_identity_mode,
     validate_range,
 )
 
@@ -62,6 +63,11 @@ class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool, bool, 
         # 无需提前缩小，不会发生二次采样，避免 CPU 同尺寸 Lanczos 的高额成本。
         self.gpu_align_ffhq = gpu_align_ffhq
         self.sampler = ImagePairSampler(src, dst, same_prob, cross_view_prob)
+        self.identity_mode = source_identity_mode(src, same_prob, alignment)
+        # 纯 FFHQ 不携带 112 图像；混合模式保留固定形状以供默认 collate。
+        self.identity_placeholder = torch.empty(0, dtype=torch.uint8) if self.identity_mode == "ffhq" else (
+            torch.zeros((3, 112, 112), dtype=torch.uint8) if self.identity_mode == "mixed" else None
+        )
 
     def _resize_generation(self, image: Image.Image, source_alignment: str) -> tuple[Image.Image, bool]:
         if self.gpu_align_ffhq and source_alignment == "ffhq" and image.size == (self.img_resolution, self.img_resolution):
@@ -93,7 +99,7 @@ class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool, bool, 
                 # 112 teacher 必须直接从原始 FFHQ 图生成，不能从生成用的 128/256 图再次裁剪。
                 identity = _resize_roi(image, 112, FFHQ_TO_ARCFACE112_ROI)
             else:
-                return _image_to_tensor(display), torch.zeros((3, 112, 112), dtype=torch.uint8), False
+                return _image_to_tensor(display), self.identity_placeholder, False
             return _image_to_tensor(display), _image_to_tensor(identity), needs_gpu_align
 
     def __iter__(self) -> Iterator[tuple[Tensor, Tensor, bool, bool, Tensor, bool, bool]]:
@@ -105,7 +111,7 @@ class _RandomImagePairDataset(IterableDataset[tuple[Tensor, Tensor, bool, bool, 
                 if self.alignment == "arcface":
                     image, identity, needs_gpu_align = self._decode_source(dst_path, False)
                 else:
-                    image, identity, needs_gpu_align = self._decode_resize(dst_path), torch.zeros((3, 112, 112), dtype=torch.uint8), False
+                    image, identity, needs_gpu_align = self._decode_resize(dst_path), self.identity_placeholder, False
                 yield image, image, True, False, identity, needs_gpu_align, needs_gpu_align
             else:
                 display, identity, src_gpu_align = self._decode_source(src_path, arcface)
@@ -137,46 +143,21 @@ def make_affine_thetas(
     if scale_factor_range[0] <= 0.0:
         raise ValueError(f"scale_factor_range 必须为正数范围，实际为 {scale_factor_range}")
 
-    # 现有 DALI 图先采样 angle，再传给 transforms.rotation(angle=-angle)。
+    # 与 DALI 一致：旋转中心为 H/2，而 align_corners=False 的像素中心为 (H-1)/2。
+    # 直接在归一化坐标构造矩阵，保留这半像素偏移及相同的随机参数采样顺序。
     angle = -_uniform(batch_size, rotation_range, device) * (math.pi / 180.0)
     scale = _uniform(batch_size, scale_factor_range, device)
-    tx = _uniform(batch_size, tx_range, device) * img_resolution
-    ty = _uniform(batch_size, ty_range, device) * img_resolution
+    tx = _uniform(batch_size, tx_range, device)
+    ty = _uniform(batch_size, ty_range, device)
+    cos, sin = angle.cos(), angle.sin()
+    a, b = cos * scale, sin * scale
+    x = 2.0 * tx + (1.0 - a + b) / img_resolution
+    y = 2.0 * ty + (1.0 - b - a) / img_resolution
+    theta_restore = torch.stack((a, -b, x, b, a, y), dim=1).reshape(batch_size, 2, 3)
 
-    cos = angle.cos() * scale
-    sin = angle.sin() * scale
-    center = img_resolution * 0.5
-
-    # 像素坐标 src->dst：T * C * S * R * C^-1。
-    affine = torch.empty((batch_size, 2, 3), device=device, dtype=torch.float32)
-    affine[:, 0, 0] = cos
-    affine[:, 0, 1] = -sin
-    affine[:, 1, 0] = sin
-    affine[:, 1, 1] = cos
-    affine[:, 0, 2] = center + tx - cos * center + sin * center
-    affine[:, 1, 2] = center + ty - sin * center - cos * center
-
-    # 与 DALI norm_to_pixel -> src_to_dst -> pixel_to_norm 完全相同的
-    # align_corners=False 坐标变换。线性部分不变，只转换 translation。
-    offset = center - 0.5
-    norm_offset = 1.0 / img_resolution - 1.0
-    theta_restore = torch.empty_like(affine)
-    theta_restore[:, :, :2] = affine[:, :, :2]
-    theta_restore[:, 0, 2] = (2.0 / img_resolution) * (affine[:, 0, 0] * offset + affine[:, 0, 1] * offset + affine[:, 0, 2]) + norm_offset
-    theta_restore[:, 1, 2] = (2.0 / img_resolution) * (affine[:, 1, 0] * offset + affine[:, 1, 1] * offset + affine[:, 1, 2]) + norm_offset
-
-    # grid_sample 需要 augmented output -> canonical input，因此取恢复 theta 的逆。
-    a, b = theta_restore[:, 0, 0], theta_restore[:, 0, 1]
-    c, d = theta_restore[:, 1, 0], theta_restore[:, 1, 1]
-    x, y = theta_restore[:, 0, 2], theta_restore[:, 1, 2]
-    det = a * d - b * c
-    theta_augment = torch.empty_like(theta_restore)
-    theta_augment[:, 0, 0] = d / det
-    theta_augment[:, 0, 1] = -b / det
-    theta_augment[:, 1, 0] = -c / det
-    theta_augment[:, 1, 1] = a / det
-    theta_augment[:, 0, 2] = -(theta_augment[:, 0, 0] * x + theta_augment[:, 0, 1] * y)
-    theta_augment[:, 1, 2] = -(theta_augment[:, 1, 0] * x + theta_augment[:, 1, 1] * y)
+    # grid_sample 需要 output->input；相似变换的逆线性部分为 R^T / scale。
+    p, q = cos / scale, sin / scale
+    theta_augment = torch.stack((p, q, -p * x - q * y, -q, p, q * x - p * y), dim=1).reshape(batch_size, 2, 3)
     return theta_augment, theta_restore
 
 
@@ -187,11 +168,10 @@ def _color_twist(images: Tensor, brightness: float, contrast: float, saturation:
     contrast_factor = _uniform(batch_size, (1.0 - contrast, 1.0 + contrast), device).view(-1, 1, 1, 1)
     saturation_factor = _uniform(batch_size, (1.0 - saturation, 1.0 + saturation), device).view(-1, 1, 1, 1)
 
-    # DALI ColorTwist 的无 hue 路径：BT.601 luminance 饱和度变换，contrast 以 0.5
-    # 为中心，最后乘 brightness。输入保持 DALI 当前的 0..255 float 语义。
+    # BT.601 luminance 饱和度变换；0..255 像素的对比度中心为 127.5，最后乘 brightness。
     gray = images[:, 0:1] * 0.299 + images[:, 1:2] * 0.587 + images[:, 2:3] * 0.114
     images = gray + saturation_factor * (images - gray)
-    images = images * contrast_factor + (1.0 - contrast_factor) * 0.5
+    images = images * contrast_factor + (1.0 - contrast_factor) * 127.5
     return images * brightness_factor
 
 
@@ -244,7 +224,8 @@ class _NativeTrainingDataLoader:
         if alignment not in ("ffhq", "arcface"):
             raise ValueError(f"无效的生成对齐标准：{alignment!r}")
         self.alignment = alignment
-        self.source_ffhq_grid = make_ffhq_to_arcface_112_grid(img_resolution, batch_size, device) if alignment == "ffhq" else None
+        self.identity_mode = source_identity_mode(src, same_prob, alignment)
+        self.source_ffhq_grid = make_ffhq_to_arcface_112_grid(img_resolution, batch_size, device) if self.identity_mode != "direct" else None
         gpu_align_ffhq = alignment == "arcface" and device.type == "cuda" and img_resolution >= 512
         self.generation_grid = make_ffhq_to_arcface_grid(img_resolution, img_resolution, batch_size, device) if gpu_align_ffhq else None
         self.brightness = brightness
@@ -291,8 +272,10 @@ class _NativeTrainingDataLoader:
         src = src.to(device=self.device, dtype=torch.float32, non_blocking=True)
         dst = dst.to(device=self.device, dtype=torch.float32, non_blocking=True)
         same_mask = same_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
-        src_arcface_mask = src_arcface_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
-        arcface_faces = arcface_faces.to(device=self.device, dtype=torch.float32, non_blocking=True)
+        if self.identity_mode == "mixed":
+            src_arcface_mask = src_arcface_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        if self.identity_mode != "ffhq":
+            arcface_faces = arcface_faces.to(device=self.device, dtype=torch.float32, non_blocking=True)
         batch_size = src.shape[0]
 
         if self.generation_grid is not None:
@@ -309,7 +292,8 @@ class _NativeTrainingDataLoader:
             src_flip = torch.rand((batch_size, 1, 1, 1), device=self.device) < self.flip_prob
             dst_flip = torch.rand((batch_size, 1, 1, 1), device=self.device) < self.flip_prob
             src = torch.where(src_flip, src.flip(-1), src)
-            arcface_faces = torch.where(src_flip, arcface_faces.flip(-1), arcface_faces)
+            if self.identity_mode != "ffhq":
+                arcface_faces = torch.where(src_flip, arcface_faces.flip(-1), arcface_faces)
             dst = torch.where(dst_flip, dst.flip(-1), dst)
 
         if self.apply_color_twist:
@@ -332,11 +316,12 @@ class _NativeTrainingDataLoader:
         if not self.apply_geometry:
             # 无仿射时直接共用 canonical，避免重采样和原地重复归一化。
             dst = dst_canonical
-        arcface_faces = arcface_faces.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
-        # Identity 始终从原始 source 对齐标准裁剪；不要从重采样的生成输入再次裁剪。
-        if self.alignment == "arcface":
+        if self.identity_mode != "ffhq":
+            arcface_faces = arcface_faces.clamp_(0.0, 255.0).div_(127.5).sub_(1.0)
+        if self.identity_mode == "direct":
             source_identity_faces = arcface_faces
+        elif self.identity_mode == "ffhq":
+            source_identity_faces = ffhq_to_arcface_112(src, self.source_ffhq_grid)
         else:
-            assert self.source_ffhq_grid is not None
             source_identity_faces = prepare_source_identity_faces(src, arcface_faces, src_arcface_mask, self.source_ffhq_grid)
         return src, dst, dst_canonical, theta_restore, same_mask, source_identity_faces

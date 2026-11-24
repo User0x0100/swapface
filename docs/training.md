@@ -147,6 +147,10 @@ vggface2-hq/
 
 启动日志输出各身份型数据源的身份总数、有效多视角身份数，以及最终生效的三种采样概率；无可用跨视角身份导致回退时会明确提示。启用跨视角时先选择采样模式，避免无效 DST 采样；禁用时保持历史随机采样顺序。
 
+DALI 支持 `py_num_workers = 0` 的同步读取模式；常规 GPU 训练使用 `spawn`（默认）或 `forkserver`。DALI 的 `fork` 仅能在主进程尚未初始化 CUDA 时启动 worker。每个 worker 在首次采样时独立初始化随机数生成器。
+
+颜色增强按 0～255 像素的中灰 127.5 计算对比度（DALI 在 0～1 浮点范围内进行颜色变换，后续几何增强沿用该值域，最终直接归一化至 -1～1）。这会修正旧实现的增强分布，继续旧实验时配置哈希不变，但启用对比度增强的样本数值会发生变化。FFHQ 生成模式根据有效的 source 对齐类型在初始化阶段选择纯 FFHQ、原生 ArcFace 或混合身份图像路径；ArcFace 生成模式仍直接从原图采样 112×112 teacher。
+
 DALI 与 native 共用路径采样逻辑，跨视角与同图样本均返回 `same_mask=True`，L1/VGG 在 `scope="same"` 时以目标图为监督。身份编码始终使用 source 图片，而非 target。
 
 FairFace 可直接作为额外的 source identity 池。项目固定下载 `HuggingFaceM4/FairFace` 的 `0.25` 配置，并将官方 `train` 与 `validation` 三个 Parquet 统一映射为一个本地 identity pool；这里不保留训练/验证语义，因为 FairFace 仅作为 source ID 素材使用。随后通过项目 RetinaFace 5 点检测重新对齐到 ArcFace 112，而不是简单缩放原始图像：

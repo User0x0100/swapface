@@ -267,6 +267,26 @@ class ImagePairSampler:
         return src_path, dst_path, False, src_pool.alignment == "arcface"
 
 
+def effective_source_alignments(src: Sequence[ImageSource], same_prob: float) -> set[str]:
+    """重建样本的 source 来自 FFHQ DST；仅考虑实际可能采样的对齐类型。"""
+    alignments = {entry[2] if isinstance(entry, tuple) and len(entry) >= 3 else "ffhq" for entry in src} if same_prob < 1.0 else set()
+    if same_prob > 0.0:
+        alignments.add("ffhq")
+    return alignments
+
+
+def source_identity_mode(src: Sequence[ImageSource], same_prob: float, alignment: str) -> str:
+    """FFHQ 生成模式可复用展示图；ArcFace 生成模式始终从原图直接生成 teacher。"""
+    if alignment == "arcface":
+        return "direct"
+    alignments = effective_source_alignments(src, same_prob)
+    if alignments == {"ffhq"}:
+        return "ffhq"
+    if alignments == {"arcface"}:
+        return "direct"
+    return "mixed"
+
+
 def prepare_source_identity_faces(src: Tensor, arcface_faces: Tensor, src_arcface_mask: Tensor, ffhq_grid: Tensor) -> Tensor:
     """FFHQ 使用原裁剪；ArcFace 使用独立保留的 112 像素，避免展示分辨率往返缩放。"""
     ffhq_faces = ffhq_to_arcface_112(src, ffhq_grid)

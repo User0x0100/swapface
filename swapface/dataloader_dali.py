@@ -37,11 +37,11 @@ from typing import Any
 
 import numpy as np
 from numpy import ndarray
-from nvidia.dali import fn, pipeline_def
+from nvidia.dali import Pipeline, fn, pipeline_def
 from nvidia.dali.math import clamp
 from nvidia.dali.types import DALIDataType, DALIImageType, DALIInterpType
 
-from misc.face_alignment import make_ffhq_to_arcface_112_grid
+from misc.face_alignment import ffhq_to_arcface_112, make_ffhq_to_arcface_112_grid
 
 from .dataloader_common import (
     FFHQ_TO_ARCFACE112_ROI,
@@ -49,9 +49,11 @@ from .dataloader_common import (
     ImageDecoderBackend,
     ImagePairSampler,
     ImageSource,
+    effective_source_alignments,
     generation_alignment_rois,
     is_identity_geometry,
     prepare_source_identity_faces,
+    source_identity_mode,
     validate_range,
 )
 
@@ -60,9 +62,10 @@ class _RandomImagePairSource:
     """为 DALI parallel external_source 提供本地 source/target 编码图像。"""
 
     def __init__(self, src: Sequence[ImageSource], dst: Sequence[ImageSource], same_prob: float,
-                 cross_view_prob: float = 0.75) -> None:
+                 cross_view_prob: float = 0.75, include_arcface_mask: bool = True) -> None:
         self.sampler = ImagePairSampler(src, dst, same_prob, cross_view_prob)
-        self.rng = np.random.default_rng()
+        self.include_arcface_mask = include_arcface_mask
+        self.rng = None
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -71,13 +74,19 @@ class _RandomImagePairSource:
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
-        self.rng = np.random.default_rng()
+        self.rng = None
 
-    def __call__(self, _sample_info) -> tuple[ndarray, ndarray, ndarray, ndarray]:
+    def __call__(self, _sample_info) -> tuple[ndarray, ...]:
+        # fork 不经过反序列化；在每个 worker 第一次调用时独立初始化。
+        if self.rng is None:
+            self.rng = np.random.default_rng()
         src_path, dst_path, same, arcface = self.sampler.sample(self.rng)
         dst = np.fromfile(dst_path, dtype=np.uint8)
         src = dst if same and src_path == dst_path else np.fromfile(src_path, dtype=np.uint8)
-        return src, dst, np.asarray(same, dtype=np.bool_), np.asarray(arcface, dtype=np.bool_)
+        outputs = (src, dst, np.asarray(same, dtype=np.bool_))
+        if self.include_arcface_mask:
+            outputs += (np.asarray(arcface, dtype=np.bool_),)
+        return outputs
 
 
 def _constant_or_random_uniform(value_range: FloatRange):
@@ -133,15 +142,16 @@ def _decode(encoded, backend: ImageDecoderBackend, decoder_hw_load: float):
     return decoded
 
 
-def _normalize_chw(image):
-    image = clamp(image, lo=0.0, hi=255.0)
+def _normalize_chw(image, pixel_max: float = 255.0):
+    image = clamp(image, lo=0.0, hi=pixel_max)
+    midpoint = pixel_max * 0.5
     return fn.crop_mirror_normalize(
         image,
         device="gpu",
         dtype=DALIDataType.FLOAT,
         output_layout="CHW",
-        mean=(127.5, 127.5, 127.5),
-        std=(127.5, 127.5, 127.5),
+        mean=(midpoint, midpoint, midpoint),
+        std=(midpoint, midpoint, midpoint),
     )
 
 
@@ -205,7 +215,7 @@ def create_dataloader_pipeline(
         ty_range: ``dst`` 垂直平移范围，相对于图像高度。
 
     返回:
-        七个 DALI DataNode：``src``、``dst``、``dst_canonical``、``theta_restore`` 、``same_mask`` 、``src_arcface_mask`` 和 ``src_arcface_faces``。
+        五个基础 DataNode：``src``、``dst``、``dst_canonical``、``theta_restore``、``same_mask``；按身份模式追加混合掩码与独立 112 图像。
         图像输出均为 RGB/NCHW/float32/``[-1, 1]``；``dst_canonical`` 保留与 ``dst``
         相同的 flip/color，但未做几何仿射；``theta_restore`` 为 ``(2, 3)`` 每样本矩阵，
         batch 经 DALIGenericIterator 后形状为 ``(B, 2, 3)``；``same_mask`` 为逐样本 bool。
@@ -238,16 +248,23 @@ def create_dataloader_pipeline(
         raise ValueError("scale_factor_range 必须为正数范围")
     apply_geometry = not is_identity_geometry(rotation_range, scale_factor_range, tx_range, ty_range)
 
-    src_raw, dst_raw, same_mask, src_arcface_mask = fn.external_source(
-        source=_RandomImagePairSource(src, dst, same_prob, cross_view_prob),
-        num_outputs=4,
+    parallel = Pipeline.current().py_num_workers > 0
+    identity_mode = source_identity_mode(src, same_prob, alignment)
+    source_alignments = effective_source_alignments(src, same_prob)
+    include_arcface_mask = identity_mode == "mixed" or (alignment == "arcface" and len(source_alignments) > 1)
+    raw_outputs = fn.external_source(
+        source=_RandomImagePairSource(src, dst, same_prob, cross_view_prob, include_arcface_mask),
+        num_outputs=4 if include_arcface_mask else 3,
         device="cpu",
-        parallel=True,
-        prefetch_queue_depth=reader_prefetch_queue_depth,
-        dtype=(DALIDataType.UINT8, DALIDataType.UINT8, DALIDataType.BOOL, DALIDataType.BOOL),
-        ndim=(1, 1, 0, 0),
+        parallel=parallel,
+        **({"prefetch_queue_depth": reader_prefetch_queue_depth} if parallel else {}),
+        dtype=(DALIDataType.UINT8, DALIDataType.UINT8, DALIDataType.BOOL) + ((DALIDataType.BOOL,) if include_arcface_mask else ()),
+        ndim=(1, 1, 0) + ((0,) if include_arcface_mask else ()),
         batch=False,
     )
+    src_raw, dst_raw, same_mask = raw_outputs[:3]
+    if include_arcface_mask:
+        src_arcface_mask = raw_outputs[3]
 
     src_image = _decode(src_raw, decoder_backend, decoder_hw_load)
     dst_image = _decode(dst_raw, decoder_backend, decoder_hw_load)
@@ -257,11 +274,10 @@ def create_dataloader_pipeline(
         # 112 teacher 分支也从原图独立采样，绝不经过生成图缩放。
         # 纯 FFHQ 或纯 ArcFace（且无 same pair）使用静态 ROI，避免逐样本构造动态参数。
         ffhq_roi, native_arcface_roi = generation_alignment_rois(img_resolution)
-        source_alignments = {entry[2] if isinstance(entry, tuple) and len(entry) >= 3 else "ffhq" for entry in src}
-        if same_prob >= 1.0 or source_alignments == {"ffhq"}:
+        if source_alignments == {"ffhq"}:
             src_start, src_end = _roi_in_dali_order(ffhq_roi)
             id_start, id_end = _roi_in_dali_order(FFHQ_TO_ARCFACE112_ROI)
-        elif source_alignments == {"arcface"} and same_prob <= 0.0:
+        elif source_alignments == {"arcface"}:
             # same pair 的 src 来自 FFHQ dst；只要 same_prob>0，就不能使用 ArcFace 静态 ROI。
             src_start, src_end = _roi_in_dali_order(native_arcface_roi)
             id_start, id_end = (0.0, 0.0), (1.0, 1.0)
@@ -277,26 +293,31 @@ def create_dataloader_pipeline(
                               roi_start=dst_start, roi_end=dst_end, roi_relative=True, antialias=True)
     else:
         # FFHQ 快速路径保持原样，无固定对齐仿射和额外重采样。
-        src_arcface_faces = fn.resize(src_image, device="gpu", size=112, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
+        if identity_mode != "ffhq":
+            src_arcface_faces = fn.resize(src_image, device="gpu", size=112, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
         src_image = fn.resize(src_image, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
         dst_image = fn.resize(dst_image, device="gpu", size=img_resolution, dtype=DALIDataType.FLOAT, interp_type=DALIInterpType.INTERP_LANCZOS3)
 
     if flip_prob > 0.0:
         src_flip = fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.INT32)
         src_image = fn.flip(src_image, device="gpu", horizontal=src_flip)
-        src_arcface_faces = fn.flip(src_arcface_faces, device="gpu", horizontal=src_flip)
+        if identity_mode != "ffhq":
+            src_arcface_faces = fn.flip(src_arcface_faces, device="gpu", horizontal=src_flip)
         dst_image = fn.flip(dst_image, device="gpu", horizontal=fn.random.coin_flip(probability=flip_prob, dtype=DALIDataType.INT32))
 
+    dst_pixel_max = 255.0
     if any(value != 0.0 for value in (brightness, contrast, saturation)):
+        # DALI float color_twist 以 0.5 为对比度中心；后续几何增强沿用单位值域。
+        dst_pixel_max = 1.0
         dst_image = fn.color_twist(
-            dst_image,
+            dst_image * (1.0 / 255.0),
             device="gpu",
             brightness=fn.random.uniform(range=(1.0 - brightness, 1.0 + brightness)) if brightness else 1.0,
             contrast=fn.random.uniform(range=(1.0 - contrast, 1.0 + contrast)) if contrast else 1.0,
             saturation=fn.random.uniform(range=(1.0 - saturation, 1.0 + saturation)) if saturation else 1.0,
         )
 
-    dst_canonical = _normalize_chw(dst_image)
+    dst_canonical = _normalize_chw(dst_image, dst_pixel_max)
     if apply_geometry:
         affine_matrix, theta_restore = _random_affine_matrices(img_resolution, rotation_range, scale_factor_range, tx_range, ty_range)
         # WarpAffine 仅支持常量填充/边缘复制；Perspective 支持镜像反射。
@@ -308,13 +329,18 @@ def create_dataloader_pipeline(
         )
         dst_image = fn.experimental.warp_perspective(dst_image, perspective_matrix, device="gpu", inverse_map=False,
                                                      border_mode="reflect")
-        dst_output = _normalize_chw(dst_image)
+        dst_output = _normalize_chw(dst_image, dst_pixel_max)
     else:
         # 恒等矩阵作为 DALI 常量输出，跳过随机仿射计算、warp 和重复归一化。
         theta_restore = fn.constant(fdata=[1.0, 0.0, 0.0, 0.0, 1.0, 0.0], shape=[2, 3], dtype=DALIDataType.FLOAT, device="gpu")
         dst_output = dst_canonical
 
-    return _normalize_chw(src_image), dst_output, dst_canonical, theta_restore, fn.copy(same_mask, device="gpu"), fn.copy(src_arcface_mask, device="gpu"), _normalize_chw(src_arcface_faces)
+    outputs = (_normalize_chw(src_image), dst_output, dst_canonical, theta_restore, fn.copy(same_mask, device="gpu"))
+    if identity_mode == "mixed":
+        outputs += (fn.copy(src_arcface_mask, device="gpu"),)
+    if identity_mode != "ffhq":
+        outputs += (_normalize_chw(src_arcface_faces),)
+    return outputs
 
 
 class _DALITrainingDataLoader:
@@ -337,7 +363,7 @@ class _DALITrainingDataLoader:
         if alignment not in ("ffhq", "arcface"):
             raise ValueError(f"生成对齐标准无效：{alignment!r}")
         self.alignment = alignment
-        self._source_ffhq_grid = make_ffhq_to_arcface_112_grid(img_resolution, batch_size, device) if alignment == "ffhq" else None
+        self.identity_mode = source_identity_mode(src, config.get("same_prob", 0.2), alignment)
         device_id = device.index if device.index is not None else torch.cuda.current_device()
         pipe = create_dataloader_pipeline(
             batch_size=batch_size,
@@ -348,19 +374,25 @@ class _DALITrainingDataLoader:
             alignment=alignment,
             **config,
         )
-        self._output_map = ["src", "dst", "dst_canonical", "theta_restore", "same_mask", "src_arcface_mask", "src_arcface_faces"]
+        self._output_map = ["src", "dst", "dst_canonical", "theta_restore", "same_mask"]
+        if self.identity_mode == "mixed":
+            self._output_map.append("src_arcface_mask")
+        if self.identity_mode != "ffhq":
+            self._output_map.append("src_arcface_faces")
         self._iterator = DALIGenericIterator(
             pipelines=pipe,
             output_map=self._output_map,
             auto_reset=True,
             last_batch_policy=LastBatchPolicy.DROP,
         )
+        self._source_ffhq_grid = make_ffhq_to_arcface_112_grid(img_resolution, batch_size, device) if self.identity_mode != "direct" else None
 
     def next(self):
         data = self._iterator.next()[0]
-        if self.alignment == "arcface":
+        if self.identity_mode == "direct":
             identity = data["src_arcface_faces"]
+        elif self.identity_mode == "ffhq":
+            identity = ffhq_to_arcface_112(data["src"], self._source_ffhq_grid)
         else:
-            assert self._source_ffhq_grid is not None
             identity = prepare_source_identity_faces(data["src"], data["src_arcface_faces"], data["src_arcface_mask"], self._source_ffhq_grid)
         return data["src"], data["dst"], data["dst_canonical"], data["theta_restore"], data["same_mask"], identity
