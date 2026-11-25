@@ -5,6 +5,7 @@ import hashlib
 import io
 import os
 import subprocess
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -332,6 +333,17 @@ class DownloaderTests(unittest.TestCase):
         process.wait(timeout=2)
         self.assertIsNotNone(process.returncode)
 
+    def test_vggface2hq_artifacts_are_pinned_tar_shards(self) -> None:
+        artifacts = downloader.selected_artifacts("vggface2hq")
+        self.assertEqual(len(artifacts), 5)
+        for index, artifact in enumerate(artifacts, 1):
+            self.assertEqual(artifact.repo_id, "RichardErkhov/VGGFace2-HQ")
+            self.assertEqual(artifact.revision, "6771c0319f29a7b77e4f71ebfb09f7b40066e2cc")
+            self.assertEqual(artifact.filename, f"vgg_face_parts/{index}.tar")
+            self.assertEqual(artifact.output, Path(f"vggface2hq/{index}.tar"))
+            self.assertGreater(artifact.size, 0)
+            self.assertRegex(artifact.sha256, r"^[a-f0-9]{64}$")
+
     def test_fairface_artifacts_merge_train_and_validation_into_one_pool(self) -> None:
         artifacts = downloader.DATASETS["fairface"]
         self.assertEqual(len(artifacts), 3)
@@ -370,11 +382,72 @@ class PostprocessTests(unittest.TestCase):
     def args(self, archives: list[Path], output: Path) -> argparse.Namespace:
         return argparse.Namespace(
             archives=archives,
+            format="zip",
             output=output,
             size=8,
             workers=2,
         )
 
+
+    def make_tar(self, path: Path, members: list[tuple[str, int]]) -> None:
+        with tarfile.open(path, "w") as archive:
+            for name, value in members:
+                buffer = io.BytesIO()
+                Image.new("RGB", (16, 16), (value, 20, 30)).save(buffer, "PNG")
+                data = buffer.getvalue()
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+
+    def test_vggface2hq_preserves_identity_and_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first, second = root / "1.tar", root / "2.tar"
+            self.make_tar(first, [("1/n000002/0001_01.png", 10), ("1/n000002/0002_01.png", 20)])
+            self.make_tar(second, [("2/n001834/0001_01.png", 30)])
+            args = self.args([first, second], root / "out")
+            args.format = "vggface2hq"
+            items, identities = postprocess.scan_vggface2hq_archives(args.archives)
+            self.assertEqual(len(items), 3)
+            postprocess.run(args, items, identities)
+
+            one = args.output / "n000002/0001_01.png"
+            two = args.output / "n000002/0002_01.png"
+            three = args.output / "n001834/0001_01.png"
+            for path, value in [(one, 10), (two, 20), (three, 30)]:
+                with Image.open(path) as image:
+                    self.assertEqual(image.size, (8, 8))
+                    self.assertEqual(image.mode, "RGB")
+                    self.assertEqual(image.getpixel((0, 0)), (value, 20, 30))
+
+            one_bytes = one.read_bytes()
+            two.unlink()
+            stale = two.with_suffix(".png.stale.part")
+            stale.write_bytes(b"partial")
+            postprocess.run(args, items, identities)
+            self.assertEqual(one.read_bytes(), one_bytes)
+            self.assertTrue(two.is_file())
+            self.assertFalse(stale.exists())
+
+            args.format = "zip"
+            with self.assertRaisesRegex(RuntimeError, "different postprocess run"):
+                postprocess.run(args, items, identities)
+
+    def test_vggface2hq_duplicate_identity_image_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first, second = root / "1.tar", root / "2.tar"
+            self.make_tar(first, [("1/n000002/0001.png", 10)])
+            self.make_tar(second, [("2/n000002/0001.png", 20)])
+            with self.assertRaisesRegex(RuntimeError, "identity-name collision"):
+                postprocess.scan_vggface2hq_archives([first, second])
+
+    def test_vggface2hq_invalid_identity_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            archive = Path(td) / "1.tar"
+            self.make_tar(archive, [("1/unknown/0001.png", 10)])
+            with self.assertRaisesRegex(RuntimeError, "expected VGGFace2-HQ identity directory"):
+                postprocess.scan_vggface2hq_archives([archive])
 
     def test_fairface_race_grouping(self) -> None:
         self.assertEqual(postprocess.fairface_group(0), "asian")

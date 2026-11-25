@@ -3,7 +3,7 @@
 本目录包含当前训练数据准备使用的两个脚本：
 
 - `download_datasets.py`：从 Hugging Face 固定 revision 直接下载数据文件；使用并行 HTTP Range、持久分块和断点续传，默认针对大文件使用 24 路并发。
-- `postprocess_dataset.py`：将 ZIP 图片数据转换为统一 PNG，或将 FairFace 转换为按粗粒度人种分类的 ArcFace 112 source identity 数据。
+- `postprocess_dataset.py`：将 ZIP 图片数据转换为统一 PNG、将 VGGFace2-HQ TAR 转换为按身份组织的 PNG，或将 FairFace 转换为按粗粒度人种分类的 ArcFace 112 source identity 数据。
 
 建议从项目根目录执行本文中的命令。
 
@@ -36,6 +36,7 @@ uv run --no-sync python tools/download_datasets.py --list
 - `lpff`
 - `ffhq`
 - `fairface`
+- `vggface2hq`
 - `all`
 
 不指定数据集时等价于 `all`。
@@ -83,6 +84,16 @@ datasets/downloads/fairface/
 ```
 
 总计 97,698 张图片。
+
+### 下载 VGGFace2-HQ
+
+```bash
+uv run --no-sync python tools/download_datasets.py vggface2hq
+```
+
+使用 [RichardErkhov/VGGFace2-HQ](https://huggingface.co/datasets/RichardErkhov/VGGFace2-HQ) 的五个独立未压缩 TAR 分卷（约 96.6 GB），固定 revision 和 SHA-256；不重复下载原始分卷 ZIP。
+
+默认输出：`datasets/downloads/vggface2hq/{1,2,3,4,5}.tar`。该数据源为 FFHQ 对齐的 GFPGAN 恢复图像，仓库标注 CC BY-NC 4.0。
 
 ### 指定下载目录
 
@@ -180,6 +191,18 @@ uv run --no-sync python tools/postprocess_dataset.py \
 ```
 
 注意：ZIP 模式会将目录结构压平成文件名。如果不同 ZIP 或不同子目录中存在同名图片，脚本会直接报错，而不是静默覆盖。
+
+### VGGFace2-HQ 身份目录后处理
+
+```bash
+uv run --no-sync python tools/postprocess_dataset.py \
+  datasets/downloads/vggface2hq/*.tar \
+  --format vggface2hq \
+  --size 512 \
+  --output datasets/vggface2-hq
+```
+
+直接读取 TAR 中的图片，无需事先解压；复用 RGB PNG、Lanczos resize、并行 worker 和断点续处理。默认尺寸仍为 256，指定 512 则输出 512×512。保留身份目录（如 `1/n000002/0001_01.jpg` → `n000002/0001_01.png`），不重新做人脸检测或对齐。训练配置使用 `layout = "identity"` 和 `alignment = "ffhq"`，可作为 SRC 和 DST 使用。
 
 ## 3. FairFace -> ArcFace 112
 
@@ -415,7 +438,7 @@ alignment = "arcface"
 ### `download_datasets.py`
 
 ```text
-dataset                 lpff / ffhq / fairface / all
+dataset                 lpff / ffhq / fairface / vggface2hq / all
 --root PATH               实际输出目录，默认 datasets/downloads
 --source direct           Hugging Face 官方源
 --source mirror           hf-mirror.com
@@ -431,13 +454,13 @@ dataset                 lpff / ffhq / fairface / all
 通用：
 
 ```text
-archives ...            一个或多个输入 ZIP / Parquet
+archives ...            一个或多个输入 ZIP / TAR / Parquet
 --output PATH           输出目录，必填
---format zip|fairface   默认 zip
+--format zip|vggface2hq|fairface   默认 zip
 --workers N             CPU 并行数
 ```
 
-ZIP 模式：
+ZIP / VGGFace2-HQ 模式：
 
 ```text
 --size N                输出边长，默认 256

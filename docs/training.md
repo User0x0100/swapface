@@ -131,6 +131,8 @@ layout = "identity"
 adjustment = 0.0
 ```
 
+VGGFace2-HQ 可使用 `tools/download_datasets.py vggface2hq` 下载，并通过 `tools/postprocess_dataset.py --format vggface2hq` 保留身份目录进行处理，完整命令见 [数据集工具](../tools/README.md#vggface2-hq-身份目录后处理)。
+
 目录结构固定为根目录/身份目录/图片文件；只扫描两级，忽略根目录图片、非图片文件和空身份目录。只有一张图片的身份仍可参与普通换脸与同图重建。DST 图片必须预先完成 FFHQ 对齐。
 
 ```text

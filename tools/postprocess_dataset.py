@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import tarfile
 import tempfile
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +16,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from multiprocessing import Pool
 from pathlib import Path
+from typing import BinaryIO
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -47,6 +49,8 @@ FAIRFACE_SHARD_PATTERN = re.compile(r"^(?P<split>.+?)-(?P<shard>\d+)-of-(?P<coun
 
 _WORKER_ARCHIVE: str | None = None
 _WORKER_ZIP: zipfile.ZipFile | None = None
+_WORKER_TAR_PATH: str | None = None
+_WORKER_TAR: BinaryIO | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +58,7 @@ class ImageItem:
     archive: Path
     member: str
     output_name: str
+    byte_range: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,11 +77,11 @@ class FairFaceItem:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Postprocess project datasets. ZIP mode produces a flat RGB PNG dataset; FairFace mode produces race-grouped ArcFace-112 source faces."
+        description="Postprocess project datasets. ZIP mode produces flat RGB PNGs; VGGFace2-HQ preserves identity directories; FairFace produces race-grouped ArcFace-112 source faces."
     )
     parser.add_argument("archives", nargs="+", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--format", choices=("zip", "fairface"), default="zip")
+    parser.add_argument("--format", choices=("zip", "vggface2hq", "fairface"), default="zip")
     parser.add_argument("--size", type=int)
     parser.add_argument(
         "--workers",
@@ -108,6 +113,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise FileNotFoundError(archive)
         if args.format == "fairface" and archive.suffix.lower() != ".parquet":
             raise ValueError(f"FairFace input must be a Parquet file: {archive}")
+        if args.format == "vggface2hq" and archive.suffix.lower() != ".tar":
+            raise ValueError(f"VGGFace2-HQ input must be an uncompressed TAR file: {archive}")
 
 
 def archive_identity(path: Path) -> ArchiveIdentity:
@@ -155,15 +162,47 @@ def scan_archives(archives: list[Path]) -> tuple[list[ImageItem], list[ArchiveId
     return items, identities
 
 
+def scan_vggface2hq_archives(archives: list[Path]) -> tuple[list[ImageItem], list[ArchiveIdentity]]:
+    items: list[ImageItem] = []
+    identities: list[ArchiveIdentity] = []
+    output_names: set[str] = set()
+
+    for archive in archives:
+        identities.append(archive_identity(archive))
+        with tarfile.open(archive, mode="r:") as source:
+            # The archive is uncompressed: workers can read each image directly
+            # by offset without extracting files or building their own TAR index.
+            while (member := source.next()) is not None:
+                source.members.clear()
+                path = Path(member.name)
+                if not member.isfile() or path.suffix.lower() not in IMAGE_EXTS:
+                    continue
+                identity = path.parent.name
+                if not re.fullmatch(r"n[0-9]+", identity):
+                    raise RuntimeError(f"expected VGGFace2-HQ identity directory: {archive}::{member.name}")
+                output_name = f"{identity}/{path.stem}.png"
+                key = output_name.casefold()
+                if key in output_names:
+                    raise RuntimeError(f"identity-name collision: {archive}::{member.name} -> {output_name}")
+                output_names.add(key)
+                items.append(ImageItem(archive, member.name, output_name, (member.offset_data, member.size)))
+
+    return items, identities
+
+
 def manifest_value(
     size: int,
     archives: list[ArchiveIdentity],
+    dataset_format: str = "zip",
 ) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "version": VERSION,
         "size": size,
         "archives": [asdict(archive) for archive in archives],
     }
+    if dataset_format != "zip":
+        value["format"] = dataset_format
+    return value
 
 
 def fairface_manifest_value(args: argparse.Namespace, archives: list[ArchiveIdentity]) -> dict[str, object]:
@@ -219,10 +258,11 @@ def prepare_output(
     output: Path,
     size: int,
     archives: list[ArchiveIdentity],
+    dataset_format: str = "zip",
 ) -> None:
     output.mkdir(parents=True, exist_ok=True)
     manifest_path = output / MANIFEST_NAME
-    expected = manifest_value(size, archives)
+    expected = manifest_value(size, archives, dataset_format)
 
     if manifest_path.exists():
         try:
@@ -233,7 +273,7 @@ def prepare_output(
         if actual != expected:
             raise RuntimeError(f"output directory belongs to a different postprocess run: {manifest_path}")
 
-        for temporary in output.glob("*.part"):
+        for temporary in (output.rglob("*.part") if dataset_format == "vggface2hq" else output.glob("*.part")):
             temporary.unlink()
         return
 
@@ -282,8 +322,27 @@ def worker_zip(archive: str) -> zipfile.ZipFile:
     return _WORKER_ZIP
 
 
-def process_one(task: tuple[str, str, str, int]) -> str:
-    archive, member, destination, size = task
+def worker_image(archive: str, member: str, byte_range: tuple[int, int] | None) -> BinaryIO:
+    if byte_range is None:
+        return worker_zip(archive).open(member)
+
+    global _WORKER_TAR_PATH, _WORKER_TAR
+    if _WORKER_TAR_PATH != archive or _WORKER_TAR is None:
+        if _WORKER_TAR is not None:
+            _WORKER_TAR.close()
+        _WORKER_TAR = open(archive, "rb")  # noqa: SIM115 - cached for the lifetime of the worker
+        _WORKER_TAR_PATH = archive
+
+    offset, length = byte_range
+    _WORKER_TAR.seek(offset)
+    data = _WORKER_TAR.read(length)
+    if len(data) != length:
+        raise RuntimeError(f"truncated TAR member: {archive}::{member}")
+    return io.BytesIO(data)
+
+
+def process_one(task: tuple[str, str, str, int, tuple[int, int] | None]) -> str:
+    archive, member, destination, size, byte_range = task
     target = Path(destination)
     fd, temporary = tempfile.mkstemp(
         prefix=target.name + ".",
@@ -292,7 +351,7 @@ def process_one(task: tuple[str, str, str, int]) -> str:
     )
 
     try:
-        with worker_zip(archive).open(member) as source, Image.open(source) as opened:
+        with worker_image(archive, member, byte_range) as source, Image.open(source) as opened:
             opened.load()
             image = ImageOps.exif_transpose(opened)
             if image.mode != "RGB":
@@ -331,7 +390,12 @@ def run(
     archives: list[ArchiveIdentity],
 ) -> None:
     with output_lock(args.output):
-        prepare_output(args.output, args.size, archives)
+        dataset_format = args.format
+        prepare_output(args.output, args.size, archives, dataset_format)
+
+        if dataset_format == "vggface2hq":
+            for directory in {item.output_name.split("/", 1)[0] for item in items}:
+                (args.output / directory).mkdir(exist_ok=True)
 
         tasks = []
         existing = 0
@@ -343,16 +407,12 @@ def run(
                 existing += 1
                 continue
 
-            tasks.append((
-                str(item.archive),
-                item.member,
-                str(destination),
-                args.size,
-            ))
+            tasks.append(item)
 
         processed = 0
+        worker_tasks = ((str(item.archive), item.member, str(args.output / item.output_name), args.size, item.byte_range) for item in tasks)
         with Pool(processes=args.workers) as pool:
-            for _ in pool.imap_unordered(process_one, tasks, chunksize=1):
+            for _ in pool.imap_unordered(process_one, worker_tasks, chunksize=16 if dataset_format == "vggface2hq" else 1):
                 processed += 1
                 if processed % 500 == 0 or processed == len(tasks):
                     print(
@@ -573,7 +633,8 @@ def main() -> None:
         run_fairface(args)
         return
 
-    items, archives = scan_archives(args.archives)
+    scanner = scan_vggface2hq_archives if args.format == "vggface2hq" else scan_archives
+    items, archives = scanner(args.archives)
     if not items:
         raise RuntimeError("no images found")
 
