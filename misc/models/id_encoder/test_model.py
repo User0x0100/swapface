@@ -78,7 +78,29 @@ class TestW600KIDEncoder(unittest.TestCase):
             torch.testing.assert_close(result.norm(dim=1), torch.ones(2))
             # WebFace600K 输出原生骨干特征的 L2 归一化结果，不再执行 emap。
             self.assertFalse(hasattr(encoder, "inswapper_emap"))
-            torch.testing.assert_close(result, torch.nn.functional.normalize(encoder.backbone(faces), p=2, dim=1))
+            torch.testing.assert_close(result, torch.nn.functional.normalize(encoder.backbone(faces.clamp(-1.0, 1.0)), p=2, dim=1))
+
+    def test_clamp_before_provider_normalization(self) -> None:
+        for provider in (IDEncoderProvider.BLENDFACE, IDEncoderProvider.QCFACE_ARC_IR100):
+            with self.subTest(provider=provider):
+                encoder = IDEncoder.__new__(IDEncoder)
+                nn.Module.__init__(encoder)
+                encoder.backbone = nn.Flatten()
+                mean, std = provider.value.input_mean, provider.value.input_std
+                encoder.register_buffer("input_mean", None if mean is None else torch.tensor(mean).view(1, 3, 1, 1))
+                encoder.register_buffer("input_std", None if std is None else torch.tensor(std).view(1, 3, 1, 1))
+                faces = torch.tensor([-1.73, 0.25, 1.94]).view(1, 3, 1, 1).expand(1, 3, 112, 112).clone().requires_grad_()
+                captured = []
+                handle = encoder.backbone.register_forward_pre_hook(lambda _, args: captured.append(args[0]))
+                encoder(faces)
+                handle.remove()
+                expected = faces.detach().clamp(-1.0, 1.0)
+                if mean is not None:
+                    expected = ((expected + 1.0) * 0.5 - encoder.input_mean) / encoder.input_std
+                torch.testing.assert_close(captured[0], expected)
+                grad, = torch.autograd.grad(captured[0].sum(), faces)
+                torch.testing.assert_close(grad[:, [0, 2]], torch.zeros_like(grad[:, [0, 2]]))
+                self.assertTrue(torch.all(grad[:, 1] > 0))
 
     def test_strict_load_rejects_wrong_keys(self) -> None:
         with tempfile.TemporaryDirectory() as d:

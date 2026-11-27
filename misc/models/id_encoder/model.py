@@ -117,6 +117,7 @@ class IDEncoder(nn.Module):
 
         if x.shape[2:] != ID_ENCODER_INPUT_SIZE:
             x = F.interpolate(x, ID_ENCODER_INPUT_SIZE, mode="bilinear", align_corners=False)
+        x = x.clamp(-1.0, 1.0)
         input_mean = self.input_mean
         input_std = self.input_std
         if isinstance(input_mean, Tensor) and isinstance(input_std, Tensor):
